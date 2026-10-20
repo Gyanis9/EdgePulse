@@ -82,7 +82,7 @@ EdgePulse/
 │  ├─ App/
 │  │  ├─ Main.cpp
 │  │  ├─ Application.h/.cpp
-│  │  ├─ Config.h/.cpp
+│  │  ├─ ApplicationConfiguration.h/.cpp
 │  │  ├─ ListenerAssembly.h/.cpp
 │  │  └─ WorkerAssembly.h/.cpp
 │  ├─ Common/
@@ -235,7 +235,6 @@ App
 | POST | `/api/nodes` | `device:node:write` | `{name,labels?}` |
 | PUT | `/api/nodes/{id}` | `device:node:write` | `{name?,labels?,version}`；冲突 409 |
 | DELETE | `/api/nodes/{id}` | `device:node:write` | 软删除 |
-| GET | `/api/ops/protocols` | `ops:view` | `{h1,h2,h3,ws,sse}` 累计计数 |
 | GET | `/api/probe/h3` | 匿名，仅 h3 路由器 | 固定 200 `{"proto":"h3"}`；TCP 路由器返回 404 |
 | POST | `/api/agent/register` | mTLS 监听器 | `{name,agentVersion,certFingerprint,labels?}` → 节点 |
 | POST | `/api/agent/heartbeat` | mTLS 监听器 | `{nodeId,agentVersion}` → 节点；广播状态 |
@@ -251,7 +250,7 @@ WS 协议：
 
 ### 6.2 推迟到后续阶段
 
-`/api/system/*`、`/api/monitor/*`、`/api/dashboard/summary`、`/api/devices*`、`/api/telemetry/*`、`/api/alarms*`、`/api/firmware*`、`/api/commands*`、`/api/ops/summary`、`/api/events/logs`（SSE）、Agent WS、Agent 遥测/固件接口。
+`/api/system/*`、`/api/monitor/*`、`/api/dashboard/summary`、`/api/devices*`、`/api/telemetry/*`、`/api/alarms*`、`/api/firmware*`、`/api/commands*`、`/api/ops/summary`、`/api/ops/protocols`、`/api/events/logs`（SSE）、Agent WS、Agent 遥测/固件接口。
 
 ## 7. 网络与安全
 
@@ -290,7 +289,7 @@ WS 协议：
 |---|---|
 | 无 SPA `index.html` 回退 | `Web::StaticSite` 自行解析 `web/`；未命中的 GET 回 `index.html`，`/api/*` 仍 404 |
 | 无每请求客户端证书指纹 | mTLS 白名单在握手层；Agent 注册自报 SHA-256 指纹并与白名单比对（R6） |
-| HttpClient 不能强制 h3 | h3 专属探针路由 + `/api/ops/protocols` 计数双重判定（R5） |
+| HttpClient 不能强制 h3 | h3 专属探针路由；同一路径走 TCP 为 404，回落不会被误判成 h3（R5） |
 | 无 SSE 自动心跳 | P2 用 `SseStream::sendComment()` 每 15 秒发一次 |
 | 无 PBKDF2/会话存储 | `Common::PasswordHash` 直接用 OpenSSL `PKCS5_PBKDF2_HMAC`；`Auth::SessionStore` 自研 |
 | 无每路由中间件 | 全局中间件按路径前缀分派，或处理器内调用权限校验 |

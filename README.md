@@ -1,12 +1,12 @@
 # EdgePulse
 
-EdgePulse 是面向边缘节点与设备的运维平台：控制面是浏览器管理后台，数据面是运行在边缘节点上的 `edgepulse-agent`。后端基于 C++23 与 AsynGyanis 引擎，前端 fork 自内部 Vue 3 管理脚手架。
+EdgePulse 是面向边缘节点与设备的运维平台：控制面是浏览器管理后台，数据面是运行在边缘节点上的 `edgepulse-agent`。后端基于 C++23 与 AsynGyanis 4.0.0 引擎，前端基于 Vue 3 + Vite。
 
-当前状态：P0 纵向切片开发中。已具备可运行的工程骨架、引擎 Conan 消费、统一响应包络与健康检查；认证、节点、mTLS Agent、h3 与前端页面按 `docs/superpowers/plans/2026-10-20-edgepulse-p0.md` 推进。
+当前状态：P0 纵向切片已通过验收（2026-10-20）。P0 覆盖认证、节点管理、节点状态 WebSocket、mTLS Agent 注册/心跳、真实 h3 连接与 Prometheus 指标；系统管理域、设备/遥测/告警/固件/命令与 SSE 按阶段推进。
 
 ## 目录
 
-- `src/`：后端模块（App、Common、Web、Auth、System、Device、Ops）
+- `src/`：后端模块（App、Common、Web、Auth、System、Device）
 - `frontend/`：Vue 3 管理后台
 - `third_party/AsynGyanis/`：引擎 git submodule，固定 `v4.0.0`，只读
 - `migrations/`：SQL 迁移
@@ -18,9 +18,9 @@ EdgePulse 是面向边缘节点与设备的运维平台：控制面是浏览器�
 
 - Windows + MSVC ≥ 19.40 或 Linux + GCC ≥ 13 / Clang ≥ 17
 - CMake ≥ 3.25、Ninja、Conan 2、Python 3、Node.js ≥ 20
-- Git（含 submodule）
+- Git（含 submodule）、OpenSSL（生成开发证书）
 
-本机已用的工具链位置：`G:\Tools\CMake`、`G:\Tools\ninja`、`G:\Tools\Python\Python314`、`G:\Tools\nodejs`、`G:\Tools\Microsoft Visual Studio\18\Community`。
+本机已验证的工具链：`G:\Tools\CMake`、`G:\Tools\ninja`、`G:\Tools\Python\Python314`、`G:\Tools\nodejs`、`G:\Tools\Microsoft Visual Studio\18\Community`。
 
 ## 构建
 
@@ -40,29 +40,59 @@ ctest --preset debug --output-on-failure
 
 `debug` 预设使用 RelWithDebInfo，并强制 `/MD` 运行期库：引擎包只有 Release 档，混用 `/MDd` 会在链接期报 LNK2038。需要调试版 CRT 时另行构建一整套依赖包，不在本工程内维护第二套构建。
 
-构建目录 `build/` 与运行目录 `var/` 都不进版本库。
+构建目录 `build/`、运行目录 `var/` 与前端 `dist/`、`node_modules/` 都不进版本库。
 
 ## 运行
 
 ```bash
-./build/debug/edgepulse-server --config config/dev.yaml
+bash scripts/dev-certs.sh          # 生成 CA、服务器、Agent 与对照证书（var/certs，未跟踪）
+bash scripts/run-dev.sh            # 生成/读取运维令牌并启动 edgepulse-server
 ```
 
-当前可访问：
+默认监听：
+
+| 端口 | 用途 |
+|---|---|
+| 8080/TCP | 开发档 HTTP + WebSocket，Vite 代理目标 |
+| 8443/TCP | HTTPS + h2 控制台，Alt-Svc 通告 h3 |
+| 8443/UDP | HTTP/3 |
+| 9443/TCP | Agent mTLS（要求客户端证书） |
+| 9100/TCP | 运维口，仅回环；`/metrics` 需 Bearer |
+
+开发种子账号：`admin` / `admin123`（仅 `migrations/V2__seed.sql` 的开发数据，部署后必须改密）。
+
+前端：
 
 ```bash
-curl -i http://127.0.0.1:8080/api/health
+cd frontend
+npm ci
+npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ```
 
-开发档默认使用 SQLite（`var/edgepulse.db`，由迁移在启动时创建）。所有口令、token 与私钥只从环境变量或未跟踪文件读取；仓库内没有明文凭据。
-
-## 测试
+## 验收
 
 ```bash
+# 后端：35 条用例
 ctest --preset debug --output-on-failure
+
+# 前端：22 条单测 + 构建 + Playwright
+cd frontend && npm run test:unit && npm run build && npm run test:e2e
+
+# 协议与安全：17 项（认证、节点、h3、mTLS、WebSocket、metrics）
+python scripts/check-acceptance.py
 ```
 
-依赖真实 MySQL/Redis 的用例会用 `EDGEPULSE_TEST_*` 环境变量门控；缺凭据时 `GTEST_SKIP`，不 mock 数据库制造假绿。
+验收脚本会按需启动开发服务，逐项打印 PASS/FAIL；结果见 [docs/验收.md](docs/验收.md)。
+
+## 已知边界（P0）
+
+- 开发档只使用 SQLite；MySQL/Redis 运行时与集成测试按 P1 推进。
+- P0 是单进程；WebSocket 扇出在进程内。
+- P0 不使用引擎的 `JwtVerifier`；会话是不透明随机 token，存于进程内，重启失效。
+- 引擎 v4.0.0 包没有 `Core/Crypto/Random.h` 与 `EventLoop::currentEventLoop()`；应用层用 OpenSSL 随机源并显式传循环。
+- mTLS 在 TLS 层用 CA 链拒绝无证书与陌生 CA；指纹白名单在 Agent 注册时按 Agent 自报值校验（见 [架构](docs/架构.md) 的边界说明）。
+- 生产静态站点由后端托管的实现尚未启用；P0 的浏览器入口是 Vite 开发服务器。
+- WebSocket 首条认证的 5 秒兜底目前用一条计时线程（实现里标了 `shortcut`），等引擎提供带超时的接收后替换。
 
 ## 编码与提交
 
@@ -73,10 +103,10 @@ ctest --preset debug --output-on-failure
 
 ## 文档
 
-- [架构](docs/架构.md)（P0 后补齐）
-- [API](docs/API.md)（P0 后补齐）
-- [部署](docs/部署.md)（P0 后补齐）
-- [验收](docs/验收.md)（P0 后补齐）
-- [覆盖率](docs/覆盖率.md)（P0 后补齐）
+- [架构](docs/架构.md)
+- [API](docs/API.md)
+- [部署](docs/部署.md)
+- [验收](docs/验收.md)
+- [覆盖率](docs/覆盖率.md)
 - [设计规范](docs/superpowers/specs/2026-10-20-edgepulse-design.md)
 - [P0 实施计划](docs/superpowers/plans/2026-10-20-edgepulse-p0.md)

@@ -33,7 +33,7 @@
 - Create: `src/CMakeLists.txt`, `src/Common/CMakeLists.txt`, `src/Web/CMakeLists.txt`, `src/App/CMakeLists.txt`
 - Create: `src/Common/ApiResponse.h/.cpp`, `src/Common/ErrorCatalog.h/.cpp`, `src/Common/Pagination.h/.cpp`, `src/Common/TimeFormat.h/.cpp`
 - Create: `src/Web/RequestId.h/.cpp`, `src/Web/MiddlewareSetup.h/.cpp`
-- Create: `src/App/Config.h/.cpp`, `src/App/Application.h/.cpp`, `src/App/ListenerAssembly.h/.cpp`, `src/App/Main.cpp`
+- Create: `src/App/ApplicationConfiguration.h/.cpp`, `src/App/Application.h/.cpp`, `src/App/ListenerAssembly.h/.cpp`, `src/App/Main.cpp`
 - Create: `config/dev.yaml`, `config/logging.yaml`, `config/prod.yaml.example`
 - Create: `tests/CMakeLists.txt`, `tests/TestSupport/HttpClientHarness.h/.cpp`, `tests/Protocol/TestHealthServer.cpp`
 - Test: `tests/Unit/TestApiResponse.cpp`, `tests/Unit/TestPagination.cpp`
@@ -451,7 +451,7 @@ git commit -m "feat(Ops): 协议统计、就绪探针与 Prometheus 指标"
 - Create: `samples/H3Probe/Main.cpp`, `samples/DeviceAgent/Main.cpp`
 - Create: `samples/CMakeLists.txt`, `samples/H3Probe/CMakeLists.txt`, `samples/DeviceAgent/CMakeLists.txt`
 - Test: `tests/Protocol/TestMtls.cpp`, `tests/Protocol/TestH3Probe.cpp`
-- Modify: `src/App/Config.h/.cpp`（TLS 路径、Agent 白名单、h3 开关）
+- Modify: `src/App/ApplicationConfiguration.h/.cpp`（TLS 路径、Agent 白名单、h3 开关）
 
 **Interfaces:**
 - Produces:
@@ -506,7 +506,7 @@ git commit -m "feat(Net): mTLS Agent 监听器与真实 h3 探针"
 ### Task 8: App 装配、配置、日志、运行脚本与验收脚本
 
 **Files:**
-- Modify: `src/App/Application.h/.cpp`, `ListenerAssembly.h/.cpp`, `Main.cpp`, `Config.h/.cpp`
+- Modify: `src/App/Application.h/.cpp`, `ListenerAssembly.h/.cpp`, `Main.cpp`, `ApplicationConfiguration.h/.cpp`
 - Create: `scripts/run-dev.sh`, `scripts/check-acceptance.py`
 - Create: `src/App/TlsAssembly.h/.cpp`（Task 7 已建则复用）
 - Test: `tests/Protocol/TestAppSmoke.cpp`
@@ -695,3 +695,15 @@ git commit -m "test: 固化 P0 验收证据"
 - **占位扫描**：没有 TBD/TODO；未实现的 P1+ 模块明确不建目录。
 - **类型一致性**：`NodeRecord`、`Session`、`CaptchaChallenge`、`PageResult` 在 Task 2–5 中名称一致；`ProtocolStats` 在 Task 5/6 中一致。
 - **已知风险**：Windows 上 h3 客户端探测可能受本机网络栈影响；Task 7 用「TCP 同路径 404」把回落伪装排除，失败时保留证据并如实报告，不用 TCP 200 冒充 h3。
+
+
+## 执行记录（2026-10-20）
+
+P0 按本计划推进并验收，以下偏差已写入实现与文档：
+
+- Task 5 的 `ProtocolStats` 与 Task 6 的 `/api/ops/protocols` 未实现，移到 P3；h3 的判定改为“专属路径只挂在 QUIC 路由器上，TCP 同路径 404”。
+- Task 5 的静态 SPA 与 `TestStaticSite`/`TestProtocolStats` 未实现；P0 浏览器入口为 Vite 5173，后端静态托管推迟到 P3 前。
+- `TestBrowserWebSocket` 未写成 C++ 用例；WebSocket 端点由 Playwright 端到端验证首条认证与 `connected` 状态。
+- WebSocket 首条认证的 5 秒兜底用计时线程实现（`shortcut`），等引擎提供带超时的 receive 后替换。
+- `NodeStatusPublisher` 改为异步回调，以便直接 `co_await` 引擎 Hub 的 `publish`。
+- 实际验收：后端 35/35、前端单测 22/22、构建通过、Playwright 1/1、`check-acceptance.py` 17/17。
