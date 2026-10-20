@@ -78,3 +78,31 @@ TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
     EXPECT_FALSE(heartbeated->lastSeen.empty());
     EXPECT_EQ(2, publishCount);
 }
+
+// 钉住：节点列表按归属部门与创建人过滤，ALL 不受限
+TEST(DeviceService, NodeListHonoursScope)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              repository = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    EdgePulse::Device::NodeService          service(repository);
+
+    ASSERT_TRUE(runner.run(service.create(runner.loop(), "dept-a", "{}", 200, 101, 7)).has_value());
+    ASSERT_TRUE(runner.run(service.create(runner.loop(), "dept-b", "{}", 200, 102, 8)).has_value());
+
+    EdgePulse::Device::NodeListScope byDept;
+    byDept.allowedDeptIds = {101};
+    const auto deptPage   = runner.run(service.list(runner.loop(), EdgePulse::Common::PageParameters{1, 10}, "", "", 0, byDept));
+    ASSERT_EQ(1U, deptPage.rows.size());
+    EXPECT_EQ("dept-a", deptPage.rows[0].name);
+
+    EdgePulse::Device::NodeListScope bySelf;
+    bySelf.selfOnly     = true;
+    bySelf.userId       = 8;
+    const auto selfPage = runner.run(service.list(runner.loop(), EdgePulse::Common::PageParameters{1, 10}, "", "", 0, bySelf));
+    ASSERT_EQ(1U, selfPage.rows.size());
+    EXPECT_EQ("dept-b", selfPage.rows[0].name);
+
+    const auto allPage = runner.run(service.list(runner.loop(), EdgePulse::Common::PageParameters{1, 10}, "", ""));
+    EXPECT_EQ(2, allPage.total);
+}

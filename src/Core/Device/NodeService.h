@@ -55,7 +55,7 @@ namespace EdgePulse::Device
          * @brief 分页查询
          */
         AsynGyanis::Core::Task<NodePage> list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status,
-                                              std::int64_t groupId = 0);
+                                              std::int64_t groupId = 0, NodeListScope scope = {});
 
         /**
          * @brief 创建节点
@@ -65,7 +65,7 @@ namespace EdgePulse::Device
          * @return 成功返回节点；失败返回可恢复错误
          */
         AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson,
-                                                                                   std::int64_t groupId = 200, std::int64_t ownerDeptId = 0);
+                                                                                   std::int64_t groupId = 200, std::int64_t ownerDeptId = 0, std::int64_t createdBy = 0);
 
         /**
          * @brief 乐观锁更新
@@ -85,6 +85,14 @@ namespace EdgePulse::Device
          * @return 是否命中一行
          */
         AsynGyanis::Core::Task<bool> remove(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
+
+        /**
+         * @brief 按标识查节点
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点标识
+         * @return std::optional<NodeRecord> 节点
+         */
+        AsynGyanis::Core::Task<std::optional<NodeRecord>> find(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
 
     private:
         std::shared_ptr<NodeRepository> m_repository; ///< 节点仓储

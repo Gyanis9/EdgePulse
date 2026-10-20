@@ -27,6 +27,11 @@ namespace AsynGyanis::Net
     class Router;
 } // namespace AsynGyanis::Net
 
+namespace EdgePulse::Auth
+{
+    class DataScopeService;
+}
+
 namespace EdgePulse::Device
 {
     class NodeService;
@@ -52,6 +57,8 @@ namespace EdgePulse::Device
      * @param loop 服务器所属事件循环
      * @param nodeService 节点服务
      * @param accessResolver 身份解析回调，由 App 用认证服务注入
+     * @param dataScopes 数据范围解析；空表示不限制
      */
-    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver);
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
+                        Auth::DataScopeService *dataScopes = nullptr);
 } // namespace EdgePulse::Device

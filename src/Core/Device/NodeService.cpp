@@ -58,13 +58,14 @@ namespace EdgePulse::Device
     }
 
     AsynGyanis::Core::Task<NodePage> NodeService::list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status,
-                                                       const std::int64_t groupId)
+                                                       const std::int64_t groupId, NodeListScope scope)
     {
-        co_return co_await m_repository->list(loop, parameters, std::move(keyword), std::move(status), groupId);
+        co_return co_await m_repository->list(loop, parameters, std::move(keyword), std::move(status), groupId, std::move(scope));
     }
 
     AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> NodeService::create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson,
-                                                                                            const std::int64_t groupId, const std::int64_t ownerDeptId)
+                                                                                            const std::int64_t groupId, const std::int64_t ownerDeptId,
+                                                                                            const std::int64_t createdBy)
     {
         if (const std::string nameError = validateName(name); !nameError.empty())
         {
@@ -81,7 +82,7 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(NodeServiceError{NodeServiceError::Reason::Conflict, "节点名已存在"});
         }
-        co_return co_await m_repository->create(loop, std::move(name), *normalizedLabels, groupId, ownerDeptId);
+        co_return co_await m_repository->create(loop, std::move(name), *normalizedLabels, groupId, ownerDeptId, createdBy);
     }
 
     AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> NodeService::update(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
@@ -129,5 +130,10 @@ namespace EdgePulse::Device
     AsynGyanis::Core::Task<bool> NodeService::remove(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
     {
         co_return co_await m_repository->remove(loop, nodeId);
+    }
+
+    AsynGyanis::Core::Task<std::optional<NodeRecord>> NodeService::find(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
+    {
+        co_return co_await m_repository->findById(loop, nodeId);
     }
 } // namespace EdgePulse::Device

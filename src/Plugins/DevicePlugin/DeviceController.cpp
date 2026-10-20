@@ -6,6 +6,7 @@
 #include "Base/Api/QueryParameters.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
+#include "Core/Auth/DataScopeService.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
 #include "Net/Http/Router.h"
@@ -109,41 +110,68 @@ namespace EdgePulse::Device
         /**
          * @brief 解析身份与权限；失败时已经写好响应，调用方直接返回
          */
-        [[nodiscard]] AsynGyanis::Core::Task<bool> requirePermission(const AccessResolver &resolver, AsynGyanis::Core::EventLoop &loop, AsynGyanis::Net::HttpRequest &request,
-                                                                     AsynGyanis::Net::HttpResponse &response, const std::string_view permission, const std::string_view traceId)
+        [[nodiscard]] AsynGyanis::Core::Task<std::optional<AccessContext>> requireAccess(const AccessResolver &resolver, AsynGyanis::Core::EventLoop &loop,
+                                                                                         AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response,
+                                                                                         const std::string_view permission, const std::string_view traceId)
         {
             const std::optional<AccessContext> access = co_await resolver(loop, request);
             // 未认证与无权限是两件事：401 让前端回登录页，403 让前端提示无权访问
             if (!access.has_value())
             {
                 Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, "未登录或会话已过期", traceId);
-                co_return false;
+                co_return std::nullopt;
             }
             if (!hasPermission(*access, permission))
             {
                 Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "无权执行该操作", traceId);
-                co_return false;
+                co_return std::nullopt;
             }
-            co_return true;
+            co_return access;
+        }
+
+        [[nodiscard]] AsynGyanis::Core::Task<Auth::DataScope> resolveScope(Auth::DataScopeService *dataScopes, AsynGyanis::Core::EventLoop &loop, const AccessContext &access)
+        {
+            if (dataScopes == nullptr)
+            {
+                co_return Auth::DataScope{true, false, access.userId, {}};
+            }
+            co_return co_await dataScopes->resolve(loop, access.userId);
+        }
+
+        [[nodiscard]] bool nodeInScope(const NodeRecord &node, const Auth::DataScope &scope)
+        {
+            if (scope.all)
+            {
+                return true;
+            }
+            if (scope.selfOnly)
+            {
+                return node.createdBy == scope.userId;
+            }
+            return std::find(scope.deptIds.begin(), scope.deptIds.end(), node.ownerDeptId) != scope.deptIds.end();
         }
     } // namespace
 
-    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver)
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
+                        Auth::DataScopeService *dataScopes)
     {
         router.get("/api/nodes",
-                   [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       if (!co_await requirePermission(accessResolver, loop, request, response, kListPermission, traceId))
+                       const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kListPermission, traceId);
+                       if (!access.has_value())
                        {
                            co_return;
                        }
+                       const Auth::DataScope                              scope = co_await resolveScope(dataScopes, loop, *access);
+                       const NodeListScope                                nodeScope{scope.all ? std::vector<std::int64_t>{} : scope.deptIds, scope.selfOnly, scope.userId};
                        const std::unordered_map<std::string, std::string> query   = request.queryParams();
                        const std::string                                  keyword = query.contains("keyword") ? query.at("keyword") : std::string{};
                        const std::string                                  status  = query.contains("status") ? query.at("status") : std::string{};
                        const std::int64_t                                 groupId = Common::queryInteger(query, "groupId").value_or(0);
-                       const NodePage                                     page    = co_await nodeService.list(loop, Common::parsePageParameters(query), keyword, status, groupId);
-                       AsynGyanis::Base::ConfigValue                      rows    = AsynGyanis::Base::ConfigValue::array();
+                       const NodePage                page = co_await nodeService.list(loop, Common::parsePageParameters(query), keyword, status, groupId, nodeScope);
+                       AsynGyanis::Base::ConfigValue rows = AsynGyanis::Base::ConfigValue::array();
                        for (const NodeRecord &node: page.rows)
                        {
                            rows.push_back(nodeToJson(node));
@@ -157,7 +185,8 @@ namespace EdgePulse::Device
                     [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string traceId = Web::resolveRequestId(request);
-                        if (!co_await requirePermission(accessResolver, loop, request, response, kWritePermission, traceId))
+                        const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
+                        if (!access.has_value())
                         {
                             co_return;
                         }
@@ -175,7 +204,7 @@ namespace EdgePulse::Device
                             co_return;
                         }
                         const std::int64_t groupId = body->contains("groupId") ? body->value("groupId", std::int64_t{200}) : 200;
-                        const auto         result  = co_await nodeService.create(loop, *name, *labels, groupId);
+                        const auto         result  = co_await nodeService.create(loop, *name, *labels, groupId, access->departmentId, access->userId);
                         if (!result.has_value())
                         {
                             writeNodeError(response, result.error(), traceId);
@@ -186,10 +215,11 @@ namespace EdgePulse::Device
                     });
 
         router.put("/api/nodes/:id",
-                   [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       if (!co_await requirePermission(accessResolver, loop, request, response, kWritePermission, traceId))
+                       const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
+                       if (!access.has_value())
                        {
                            co_return;
                        }
@@ -197,6 +227,13 @@ namespace EdgePulse::Device
                        if (!nodeId.has_value())
                        {
                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "节点标识不合法", traceId);
+                           co_return;
+                       }
+                       const Auth::DataScope scope    = co_await resolveScope(dataScopes, loop, *access);
+                       const auto            existing = co_await nodeService.find(loop, *nodeId);
+                       if (!existing.has_value() || !nodeInScope(*existing, scope))
+                       {
+                           Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                            co_return;
                        }
                        const std::optional<AsynGyanis::Base::ConfigValue> body = request.jsonBody();
@@ -245,10 +282,11 @@ namespace EdgePulse::Device
                    });
 
         router.del("/api/nodes/:id",
-                   [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       if (!co_await requirePermission(accessResolver, loop, request, response, kWritePermission, traceId))
+                       const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
+                       if (!access.has_value())
                        {
                            co_return;
                        }
@@ -256,6 +294,13 @@ namespace EdgePulse::Device
                        if (!nodeId.has_value())
                        {
                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "节点标识不合法", traceId);
+                           co_return;
+                       }
+                       const Auth::DataScope scope    = co_await resolveScope(dataScopes, loop, *access);
+                       const auto            existing = co_await nodeService.find(loop, *nodeId);
+                       if (!existing.has_value() || !nodeInScope(*existing, scope))
+                       {
+                           Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                            co_return;
                        }
                        if (!co_await nodeService.remove(loop, *nodeId))

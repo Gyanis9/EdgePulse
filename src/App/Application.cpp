@@ -552,7 +552,7 @@ namespace EdgePulse::App
             }
             co_return Device::AccessContext{session->userId, session->username, session->departmentId, session->roles, session->permissions};
         };
-        Device::registerRoutes(router, loop, *m_nodeService, accessResolver);
+        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get());
         m_browserWebSocket->registerRoute(
                 router, [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<bool>
                 { co_return (co_await auth->authenticate(loop, token)).has_value(); }, m_configuration.allowedOrigins);

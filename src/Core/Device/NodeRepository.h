@@ -39,6 +39,7 @@ namespace EdgePulse::Device
         std::int64_t groupId{0};      ///< 所属分组
         std::string  groupName;       ///< 分组名
         std::int64_t ownerDeptId{0};  ///< 归属部门，供数据范围
+        std::int64_t createdBy{0};    ///< 创建人，供 SELF 范围
         std::int64_t version{1};      ///< 乐观锁版本
     };
 
@@ -72,6 +73,16 @@ namespace EdgePulse::Device
     };
 
     /**
+     * @brief 节点列表的数据范围
+     */
+    struct NodeListScope
+    {
+        std::vector<std::int64_t> allowedDeptIds;  ///< 可见部门；空表示全部
+        bool                      selfOnly{false}; ///< 仅本人创建
+        std::int64_t              userId{0};       ///< 当前账号
+    };
+
+    /**
      * @brief 节点与 Agent 的 SQL 访问
      */
     class NodeRepository
@@ -92,7 +103,7 @@ namespace EdgePulse::Device
          * @return 当前页与总数
          */
         AsynGyanis::Core::Task<NodePage> list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status,
-                                              std::int64_t groupId = 0);
+                                              std::int64_t groupId = 0, NodeListScope scope = {});
 
         /**
          * @brief 按主键查未删除节点
@@ -112,7 +123,7 @@ namespace EdgePulse::Device
          * @return 新建节点
          */
         AsynGyanis::Core::Task<NodeRecord> create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson, std::int64_t groupId = 200,
-                                                  std::int64_t ownerDeptId = 0);
+                                                  std::int64_t ownerDeptId = 0, std::int64_t createdBy = 0);
 
         /**
          * @brief 带乐观锁更新节点
