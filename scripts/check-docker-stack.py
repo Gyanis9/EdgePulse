@@ -46,21 +46,24 @@ def prepare() -> dict[str, str]:
     if not (ROOT / "var" / "certs" / "server.pem").exists():
         subprocess.run(["bash", "scripts/dev-certs.sh"], cwd=ROOT, check=True)
 
-    if not ENV_FILE.exists():
-        values = {
-            "MYSQL_ROOT_PASSWORD": secrets.token_hex(16),
-            "EDGEPULSE_DB_PASSWORD": secrets.token_hex(16),
-            "EDGEPULSE_REDIS_PASSWORD": secrets.token_hex(16),
-            "EDGEPULSE_OPS_BEARER_TOKEN": secrets.token_hex(32),
-            "EDGEPULSE_AGENT_FINGERPRINT": "",
-            "EDGEPULSE_INITIAL_PASSWORD": "",
-        }
-        ENV_FILE.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
-    values = {}
-    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip()
+    values: dict[str, str] = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    required = {
+        "MYSQL_ROOT_PASSWORD": secrets.token_hex(16),
+        "EDGEPULSE_DB_PASSWORD": secrets.token_hex(16),
+        "EDGEPULSE_REDIS_PASSWORD": secrets.token_hex(16),
+        "EDGEPULSE_OPS_BEARER_TOKEN": secrets.token_hex(32),
+        "EDGEPULSE_AGENT_FINGERPRINT": "",
+        "EDGEPULSE_INITIAL_PASSWORD": "",
+    }
+    for key, fallback in required.items():
+        if not values.get(key):
+            values[key] = fallback
+    ENV_FILE.write_text("".join(f"{key}={values[key]}\n" for key in required), encoding="utf-8")
     (ROOT / "deploy" / "prometheus" / "ops-token").write_text(values["EDGEPULSE_OPS_BEARER_TOKEN"] + "\n", encoding="utf-8")
 
     TEST_CONFIG.mkdir(parents=True, exist_ok=True)
