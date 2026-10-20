@@ -41,7 +41,7 @@ services:
       EDGEPULSE_AGENT_FINGERPRINT: ${EDGEPULSE_AGENT_FINGERPRINT:-}
       EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
     volumes:
-      - ../../config:/app/config
+      - ../../config:/app/config:ro
       - ../../var/certs:/etc/edgepulse/tls:ro
       - firmware-data:/var/lib/edgepulse/firmware
     ports:
@@ -50,6 +50,13 @@ services:
       - "8443:8443/udp"
       - "9443:9443"
       - "9100:9100"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 30s
 
   prometheus:
     image: prom/prometheus:v2.53.0

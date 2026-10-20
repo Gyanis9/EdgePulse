@@ -13,7 +13,8 @@ edgepulse:
   https_port: 8443
   agent_port: 9443
   ops_port: 9100
-  ops_address: 127.0.0.1
+  # 容器或 Prometheus 要跨网络抓取时必须绑 0.0.0.0；只在本机抓取可改回 127.0.0.1
+  ops_address: 0.0.0.0
   web_root: web
   cert_dir: /etc/edgepulse/tls
   firmware_dir: /var/lib/edgepulse/firmware

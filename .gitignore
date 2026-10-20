@@ -14,6 +14,7 @@ Thumbs.db
 /web/
 /deploy/prometheus/ops-token
 /deploy/docker/.env
+/config/prod.yaml
 .idea/
 
 # Python 临时字节码

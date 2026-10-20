@@ -9,3 +9,6 @@ frontend/playwright-report/
 *.log
 *.pdb
 *.ilk
+deploy/docker/.env
+deploy/prometheus/ops-token
+config/prod.yaml
