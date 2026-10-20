@@ -1,7 +1,7 @@
 #include "App/ApplicationConfiguration.h"
 
 #include "Base/Config/ConfigManager.h"
-#include "Common/Environment.h"
+#include "Base/Runtime/Environment.h"
 
 #include <algorithm>
 #include <cctype>

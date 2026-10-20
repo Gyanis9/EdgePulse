@@ -1,0 +1,136 @@
+#include "Plugins/DevicePlugin/AgentController.h"
+
+#include "Base/Api/ApiResponse.h"
+#include "Base/Api/ErrorCatalog.h"
+#include "Core/Device/AgentRegistry.h"
+#include "Plugins/DevicePlugin/NodeJson.h"
+#include "Net/Http/HttpRequest.h"
+#include "Net/Http/HttpResponse.h"
+#include "Net/Http/Router.h"
+#include "Core/Http/RequestId.h"
+
+#include <Core/EventLoop/EventLoop.h>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+
+namespace EdgePulse::Device
+{
+    namespace
+    {
+        [[nodiscard]] std::optional<std::string> stringField(const AsynGyanis::Base::ConfigValue &body, const std::string_view key)
+        {
+            if (!body.is_object())
+            {
+                return std::nullopt;
+            }
+            const auto iterator = body.find(key);
+            if (iterator == body.end() || !iterator->is_string())
+            {
+                return std::nullopt;
+            }
+            return iterator->get<std::string>();
+        }
+
+        [[nodiscard]] std::optional<std::string> labelsField(const AsynGyanis::Base::ConfigValue &body)
+        {
+            if (!body.is_object())
+            {
+                return std::nullopt;
+            }
+            const auto iterator = body.find("labels");
+            if (iterator == body.end() || iterator->is_null())
+            {
+                return std::string{};
+            }
+            if (iterator->is_object())
+            {
+                return iterator->dump();
+            }
+            if (iterator->is_string())
+            {
+                return iterator->get<std::string>();
+            }
+            return std::nullopt;
+        }
+
+        void writeAgentError(AsynGyanis::Net::HttpResponse &response, const AgentError &error, const std::string_view traceId)
+        {
+            switch (error.reason)
+            {
+                case AgentError::Reason::InvalidRequest:
+                    Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, error.message, traceId);
+                    break;
+                case AgentError::Reason::FingerprintRejected:
+                    Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, error.message, traceId);
+                    break;
+                case AgentError::Reason::NotFound:
+                    Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, error.message, traceId);
+                    break;
+            }
+        }
+    } // namespace
+
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry)
+    {
+        router.post("/api/agent/register",
+                    [&loop, &registry](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string                                  traceId = Web::resolveRequestId(request);
+                        const std::optional<AsynGyanis::Base::ConfigValue> body    = request.jsonBody();
+                        if (!body.has_value())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
+                            co_return;
+                        }
+                        const std::optional<std::string> name        = stringField(*body, "name");
+                        const std::optional<std::string> version     = stringField(*body, "agentVersion");
+                        const std::optional<std::string> fingerprint = stringField(*body, "certFingerprint");
+                        const std::optional<std::string> labels      = labelsField(*body);
+                        if (!name.has_value() || !version.has_value() || !fingerprint.has_value() || !labels.has_value())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少 name、agentVersion、certFingerprint，或 labels 格式不合法",
+                                                 traceId);
+                            co_return;
+                        }
+                        const auto result = co_await registry.registerAgent(loop, AgentRegistration{*name, *version, *fingerprint, *labels});
+                        if (!result.has_value())
+                        {
+                            writeAgentError(response, result.error(), traceId);
+                            co_return;
+                        }
+                        Common::writeSuccess(response, nodeToJson(*result), traceId);
+                        co_return;
+                    });
+
+        router.post("/api/agent/heartbeat",
+                    [&loop, &registry](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string                                  traceId = Web::resolveRequestId(request);
+                        const std::optional<AsynGyanis::Base::ConfigValue> body    = request.jsonBody();
+                        if (!body.has_value() || !body->is_object())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
+                            co_return;
+                        }
+                        const auto                       nodeIdIterator = body->find("nodeId");
+                        const std::optional<std::string> agentVersion   = stringField(*body, "agentVersion");
+                        if (nodeIdIterator == body->end() || !nodeIdIterator->is_number_integer() || !agentVersion.has_value())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少整数 nodeId 或字符串 agentVersion", traceId);
+                            co_return;
+                        }
+                        const auto result = co_await registry.heartbeat(loop, nodeIdIterator->get<std::int64_t>(), *agentVersion);
+                        if (!result.has_value())
+                        {
+                            writeAgentError(response, result.error(), traceId);
+                            co_return;
+                        }
+                        Common::writeSuccess(response, nodeToJson(*result), traceId);
+                        co_return;
+                    });
+    }
+} // namespace EdgePulse::Device
