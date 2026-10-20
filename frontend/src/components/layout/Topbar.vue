@@ -95,7 +95,7 @@ onBeforeUnmount(() => closeMenu())
       <Avatar :name="currentUser?.nickname" :size="32" />
       <span class="user-meta">
         <span class="user-name" style="display: block">{{ currentUser?.nickname }}</span>
-        <span class="user-role" style="display: block">{{ currentUser?.deptName || currentUser?.username }}</span>
+        <span class="user-role" style="display: block">{{ currentUser?.tenantName ? `${currentUser.tenantName} · ` : '' }}{{ currentUser?.deptName || currentUser?.username }}</span>
       </span>
       <Icon name="chevronDown" :size="14" style="color: var(--ink-soft)" />
     </button>

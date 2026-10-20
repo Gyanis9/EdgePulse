@@ -16,7 +16,7 @@ import { APP } from '@/data'
 const router = useRouter()
 const route = useRoute()
 
-const form = reactive({ username: '', password: '', captcha: '' })
+const form = reactive({ tenantCode: 'default', username: '', password: '', captcha: '' })
 const errors = ref<Partial<Record<keyof typeof form, string>>>({})
 const captchaImage = computed(() => (captchaSvg.value ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(captchaSvg.value)}` : ''))
 const remember = ref(true)
@@ -126,7 +126,7 @@ async function submit() {
   if (Object.keys(errors.value).length) return
   submitting.value = true
   try {
-    await login({ username: form.username.trim(), password: form.password, captcha: form.captcha.trim(), captchaUuid: captchaUuid.value }, remember.value)
+    await login({ tenantCode: form.tenantCode.trim() || undefined, username: form.username.trim(), password: form.password, captcha: form.captcha.trim(), captchaUuid: captchaUuid.value }, remember.value)
     await playSuccess()
     const redirect = typeof route.query.redirect === 'string' && route.query.redirect.startsWith('/') ? route.query.redirect : '/'
     const failure = await router.replace(redirect)
@@ -307,6 +307,9 @@ onBeforeUnmount(() => {
           <p class="login-card-sub">使用管理员分配的账号登录系统</p>
 
           <form class="login-form" novalidate @submit.prevent="submit">
+            <Field label="租户编码">
+              <TextInput v-model="form.tenantCode" icon="dept" placeholder="默认租户可留空" autocomplete="organization" />
+            </Field>
             <Field label="账号" :error="errors.username">
               <TextInput v-model="form.username" icon="user" placeholder="请输入账号" autocomplete="username" :invalid="!!errors.username" />
             </Field>

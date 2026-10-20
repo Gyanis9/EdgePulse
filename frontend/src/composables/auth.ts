@@ -44,6 +44,7 @@ const COMPONENT_MAP: Record<string, () => Promise<{ default: Component }>> = {
   'system/post/index': () => import('@/views/system/Posts.vue'),
   'system/dict/index': () => import('@/views/system/Dict.vue'),
   'system/config/index': () => import('@/views/system/Configs.vue'),
+  'system/tenant/index': () => import('@/views/system/Tenants.vue'),
   'monitor/operlog/index': () => import('@/views/monitor/OperLog.vue'),
   'monitor/loginlog/index': () => import('@/views/monitor/LoginLog.vue'),
   'device/Nodes': () => import('@/views/device/Nodes.vue'),

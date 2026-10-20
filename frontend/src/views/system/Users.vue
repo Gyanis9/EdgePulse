@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { pathOf } from '@/composables/auth'
+import { currentUser, pathOf } from '@/composables/auth'
 import { Avatar, Field, HoverCard, Segmented, Select, StatusTag, Switch, Tag, TextInput, type Column } from '@/components/ui'
 import { DeptSelect, DeptTree, DictSelect, FormDialog, ListPage, PermissionButton } from '@/components/business'
 import BoardView, { type BoardColumn } from '@/components/business/BoardView.vue'
@@ -30,8 +30,10 @@ const list = useListPage<UserRow, { keyword: string; status: string; deptId: num
   exportName: '用户列表.csv',
 })
 
-const columns: Column[] = [
+const platformAdmin = computed(() => Boolean(currentUser.value?.platformAdmin))
+const columns = computed<Column[]>(() => [
   { key: 'nickname', title: '用户', minWidth: 200 },
+  ...(platformAdmin.value ? [{ key: 'tenantName', title: '租户', minWidth: 120 }] : []),
   { key: 'deptName', title: '部门' },
   { key: 'postName', title: '岗位' },
   { key: 'roleName', title: '角色' },
@@ -39,7 +41,7 @@ const columns: Column[] = [
   { key: 'status', title: '状态', width: 96 },
   { key: 'createTime', title: '创建时间', width: 150 },
   { key: 'actions', title: '操作', width: 150, className: 'col-actions' },
-]
+])
 
 /* ── 看板视图：按部门 / 角色 / 状态分列；只有「按状态」允许拖动（改状态是单字段接口） ── */
 const view = useViewMode('users', 'table', ['table', 'board'] as const, 'table')
@@ -112,16 +114,19 @@ async function moveStatus({ item, to }: { item: UserRow; to: BoardColumn<UserRow
 /* ── 选项 ── */
 const roles = ref<Array<{ id: number; name: string }>>([])
 const posts = ref<Array<{ id: number; name: string }>>([])
+const tenants = ref<Array<{ id: number; name: string; code: string }>>([])
 const departments = ref<Dept[]>([])
 const initPassword = ref('')
 const roleOptions = computed(() => roles.value.map(r => ({ label: r.name, value: r.id })))
 const postOptions = computed(() => posts.value.map(p => ({ label: p.name, value: p.id })))
+const tenantOptions = computed(() => tenants.value.map(t => ({ label: `${t.name}（${t.code}）`, value: t.id })))
 
 onMounted(async () => {
   try {
     const options = await systemApi.users.options()
     roles.value = options.roles
     posts.value = options.posts
+    tenants.value = options.tenants ?? []
     departments.value = options.depts as unknown as Dept[]
     initPassword.value = options.initPassword
   } catch (error) {
@@ -135,6 +140,7 @@ watch(() => list.query.deptId, () => list.search())
 /* ── 新增 / 编辑 ── */
 interface UserForm {
   id?: number
+  tenantId: number | null
   username: string
   nickname: string
   password: string
@@ -147,6 +153,7 @@ interface UserForm {
 }
 const emptyForm = (): UserForm => ({
   username: '', nickname: '', password: initPassword.value, phone: '', email: '',
+  tenantId: currentUser.value?.tenantId ?? null,
   deptId: list.query.deptId, roleId: null, postId: null, status: 1,
 })
 const dialog = ref(false)
@@ -170,6 +177,7 @@ function openEdit(row: UserRow) {
   const dept = flattenDepts(departments.value).find(d => d.dept.name === row.deptName)
   Object.assign(form, {
     id: row.id,
+    tenantId: row.tenantId ?? currentUser.value?.tenantId ?? null,
     username: row.username,
     nickname: row.nickname,
     password: '',
@@ -205,6 +213,7 @@ async function submit() {
     status: form.status,
     roleIds: form.roleId ? [form.roleId] : [],
     postIds: form.postId ? [form.postId] : [],
+    tenantId: platformAdmin.value && !form.id ? form.tenantId ?? undefined : undefined,
   }
   try {
     if (form.id) {
@@ -403,6 +412,7 @@ async function batchRemove(ids: (string | number)[]) {
       </div>
     </template>
     <template #cell-postName="{ row }"><span class="muted">{{ row.postName || '—' }}</span></template>
+    <template #cell-tenantName="{ row }"><Tag v-if="row.tenantName" tone="info">{{ row.tenantName }}</Tag><span v-else class="faint">—</span></template>
     <template #cell-roleName="{ row }"><Tag v-if="row.roleName" tone="info">{{ row.roleName }}</Tag><span v-else class="faint">未分配</span></template>
     <template #cell-phone="{ row }"><span class="tnum muted">{{ row.phone || '—' }}</span></template>
     <template #cell-status="{ row }"><StatusTag :status="row.status" /></template>
@@ -417,6 +427,9 @@ async function batchRemove(ids: (string | number)[]) {
     </template>
 
     <FormDialog :open="dialog" :title="isEdit ? '编辑用户' : '新增用户'" :saving="saving" @close="dialog = false" @submit="submit">
+      <Field v-if="platformAdmin" label="所属租户" :hint="isEdit ? '租户归属创建后不可变更' : '跨租户创建时指定目标租户'">
+        <Select v-model="form.tenantId" :options="tenantOptions" :disabled="isEdit" />
+      </Field>
       <Field label="登录账号" required :error="errors.username">
         <TextInput v-model="form.username" placeholder="字母、数字组合" :disabled="isEdit" :invalid="!!errors.username" autocomplete="off" />
       </Field>

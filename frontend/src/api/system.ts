@@ -13,6 +13,10 @@ export interface IdResponse {
 
 export interface UserRow {
   id: number
+  tenantId?: number
+  tenantCode?: string
+  tenantName?: string
+  platformAdmin?: boolean
   username: string
   nickname: string
   phone: string
@@ -35,13 +39,39 @@ export interface UserWriteRequest {
   status?: number
   roleIds?: number[]
   postIds?: number[]
+  tenantId?: number
 }
 
 export interface UserOptions {
   depts: Record<string, unknown>[]
   roles: Array<{ id: number; name: string }>
   posts: Array<{ id: number; name: string }>
+  tenants: Array<{ id: number; name: string; code: string }>
   initPassword: string
+}
+
+export interface TenantRow {
+  id: number
+  code: string
+  name: string
+  status: number
+  remark: string
+  createTime: string
+}
+
+export interface TenantCreateRequest {
+  code: string
+  name: string
+  remark?: string
+  adminUsername: string
+  adminNickname?: string
+  adminPassword: string
+}
+
+export interface TenantUpdateRequest {
+  name?: string
+  status?: number
+  remark?: string
 }
 
 export interface RoleWriteRequest {
@@ -189,6 +219,10 @@ export function createSystemApi(client: HttpClient) {
       export: (query?: QueryParams) => client.download('/system/users/export', query),
       updateStatus: (id: number, status: number) => client.put<void>(`/system/users/${id}/status`, { status }),
       resetPassword: (id: number, password: string) => client.put<void>(`/system/users/${id}/password`, { password }),
+    },
+    tenants: {
+      ...crudPage<TenantRow, TenantUpdateRequest>(client, '/system/tenants'),
+      create: (body: TenantCreateRequest) => client.post<{ tenantId: number; adminUserId: number }>('/system/tenants', body),
     },
     roles: {
       ...crudPage<Record<string, unknown>, RoleWriteRequest>(client, '/system/roles'),

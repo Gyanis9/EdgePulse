@@ -5,6 +5,7 @@ export interface LoginRequest {
   password: string
   captcha: string
   captchaUuid: string
+  tenantCode?: string
 }
 
 export interface CaptchaResponse {
@@ -29,6 +30,10 @@ export interface CurrentUser {
   nickname: string
   deptId?: number
   deptName?: string
+  tenantId?: number
+  tenantCode?: string
+  tenantName?: string
+  platformAdmin?: boolean
   roles: string[]
   permissions: string[]
 }
