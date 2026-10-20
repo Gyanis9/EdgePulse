@@ -77,7 +77,8 @@ namespace EdgePulse::Device
      */
     struct NodeListScope
     {
-        std::vector<std::int64_t> allowedDeptIds;  ///< 可见部门；空表示全部
+        bool                      all{true};       ///< 可见全部
+        std::vector<std::int64_t> allowedDeptIds;  ///< 可见部门；仅在 all 为假时有意义
         bool                      selfOnly{false}; ///< 仅本人创建
         std::int64_t              userId{0};       ///< 当前账号
     };

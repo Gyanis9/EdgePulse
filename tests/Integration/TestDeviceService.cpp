@@ -91,12 +91,19 @@ TEST(DeviceService, NodeListHonoursScope)
     ASSERT_TRUE(runner.run(service.create(runner.loop(), "dept-b", "{}", 200, 102, 8)).has_value());
 
     EdgePulse::Device::NodeListScope byDept;
+    byDept.all            = false;
     byDept.allowedDeptIds = {101};
     const auto deptPage   = runner.run(service.list(runner.loop(), EdgePulse::Common::PageParameters{1, 10}, "", "", 0, byDept));
     ASSERT_EQ(1U, deptPage.rows.size());
     EXPECT_EQ("dept-a", deptPage.rows[0].name);
 
+    EdgePulse::Device::NodeListScope withoutDept;
+    withoutDept.all      = false;
+    const auto emptyPage = runner.run(service.list(runner.loop(), EdgePulse::Common::PageParameters{1, 10}, "", "", 0, withoutDept));
+    EXPECT_EQ(0, emptyPage.total);
+
     EdgePulse::Device::NodeListScope bySelf;
+    bySelf.all          = false;
     bySelf.selfOnly     = true;
     bySelf.userId       = 8;
     const auto selfPage = runner.run(service.list(runner.loop(), EdgePulse::Common::PageParameters{1, 10}, "", "", 0, bySelf));

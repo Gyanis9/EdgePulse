@@ -156,19 +156,26 @@ namespace EdgePulse::Device
                     const std::string keywordPattern = "%" + keyword + "%";
                     std::string       filter         = " FROM biz_node WHERE deleted = 0 AND (? = '' OR name LIKE ?) AND (? = '' OR status = ?) AND (? = 0 OR group_id = ?)";
                     std::vector<AsynGyanis::Database::DatabaseValue> countParameters{keyword, keywordPattern, status, status, groupId, groupId};
-                    if (scope.selfOnly)
+                    if (!scope.all)
                     {
-                        filter += " AND created_by = ?";
-                        countParameters.emplace_back(scope.userId);
-                    } else if (!scope.allowedDeptIds.empty())
-                    {
-                        filter += " AND owner_dept_id IN (";
-                        for (std::size_t index = 0; index < scope.allowedDeptIds.size(); ++index)
+                        if (scope.selfOnly)
                         {
-                            filter += index == 0 ? "?" : ", ?";
-                            countParameters.emplace_back(scope.allowedDeptIds[index]);
+                            filter += " AND created_by = ?";
+                            countParameters.emplace_back(scope.userId);
+                        } else if (scope.allowedDeptIds.empty())
+                        {
+                            // 受限角色没有任何可见部门时不能退化成不过滤
+                            filter += " AND 1 = 0";
+                        } else
+                        {
+                            filter += " AND owner_dept_id IN (";
+                            for (std::size_t index = 0; index < scope.allowedDeptIds.size(); ++index)
+                            {
+                                filter += index == 0 ? "?" : ", ?";
+                                countParameters.emplace_back(scope.allowedDeptIds[index]);
+                            }
+                            filter += ")";
                         }
-                        filter += ")";
                     }
                     const std::unique_ptr<AsynGyanis::Database::DatabaseResult> countResult = connection.execute("SELECT COUNT(*)" + filter, countParameters);
                     if (!countResult)

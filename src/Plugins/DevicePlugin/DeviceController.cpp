@@ -165,7 +165,7 @@ namespace EdgePulse::Device
                            co_return;
                        }
                        const Auth::DataScope                              scope = co_await resolveScope(dataScopes, loop, *access);
-                       const NodeListScope                                nodeScope{scope.all ? std::vector<std::int64_t>{} : scope.deptIds, scope.selfOnly, scope.userId};
+                       const NodeListScope                                nodeScope{scope.all, scope.deptIds, scope.selfOnly, scope.userId};
                        const std::unordered_map<std::string, std::string> query   = request.queryParams();
                        const std::string                                  keyword = query.contains("keyword") ? query.at("keyword") : std::string{};
                        const std::string                                  status  = query.contains("status") ? query.at("status") : std::string{};
