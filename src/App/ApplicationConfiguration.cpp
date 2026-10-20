@@ -135,6 +135,8 @@ namespace EdgePulse::App
         configuration.telemetryRetentionDays   = static_cast<int>(configurationManager.getInt("edgepulse.telemetry_retention_days", configuration.telemetryRetentionDays));
         configuration.certificateDirectory     = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
         configuration.agentFingerprint         = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
+        configuration.udpTelemetryEnabled      = configurationManager.getBool("edgepulse.udp_telemetry.enabled", configuration.udpTelemetryEnabled);
+        configuration.udpTelemetryAddress      = configurationManager.getString("edgepulse.udp_telemetry.address", configuration.udpTelemetryAddress);
         configuration.captchaTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.captcha.ttl_seconds", configuration.captchaTtlSeconds));
         configuration.captchaRequestsPerMinute = static_cast<int>(configurationManager.getInt("edgepulse.captcha.requests_per_minute", configuration.captchaRequestsPerMinute));
         configuration.sessionTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.session.ttl_seconds", configuration.sessionTtlSeconds));
@@ -157,6 +159,10 @@ namespace EdgePulse::App
                 configuration.agentFingerprint = *fingerprint;
             }
         }
+        if (const auto secret = Common::environmentValue("EDGEPULSE_UDP_TELEMETRY_SECRET"); secret.has_value())
+        {
+            configuration.udpTelemetrySecret = *secret;
+        }
 
         if (configuration.databaseDriver != "sqlite" && configuration.databaseDriver != "mysql")
         {
@@ -165,6 +171,10 @@ namespace EdgePulse::App
         if (configuration.threads < 1 || configuration.threads > 64)
         {
             return std::unexpected(ConfigurationError{"edgepulse.threads 必须在 1 到 64 之间"});
+        }
+        if (configuration.udpTelemetryEnabled && configuration.udpTelemetrySecret.size() < 16)
+        {
+            return std::unexpected(ConfigurationError{"启用 UDP 遥测时必须在 EDGEPULSE_UDP_TELEMETRY_SECRET 中配置至少 16 字节的共享密钥"});
         }
         // TTL 参与定时器与过期判定，非正数会让条目永不过期或立即过期
         if (configuration.captchaTtlSeconds < kMinimumTtl || configuration.sessionTtlSeconds < kMinimumTtl)
@@ -185,6 +195,13 @@ namespace EdgePulse::App
             return std::unexpected(httpsPort.error());
         }
         configuration.httpsPort = *httpsPort;
+
+        const auto udpTelemetryPort = readPort(configurationManager, "edgepulse.udp_telemetry.port", configuration.udpTelemetryPort);
+        if (!udpTelemetryPort)
+        {
+            return std::unexpected(udpTelemetryPort.error());
+        }
+        configuration.udpTelemetryPort = *udpTelemetryPort;
 
         const auto agentPort = readPort(configurationManager, "edgepulse.agent_port", configuration.agentPort);
         if (!agentPort)

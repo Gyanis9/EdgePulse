@@ -32,7 +32,10 @@ add_library(edgepulse-core STATIC
         System/OrgRepository.cpp
         System/RoleRepository.cpp
         System/UserRepository.cpp
-        Telemetry/TelemetryRepository.cpp)
+        Telemetry/TelemetryIngest.cpp
+        Telemetry/TelemetryRepository.cpp
+        Telemetry/UdpTelemetryEndpoint.cpp
+        Telemetry/UdpTelemetryProtocol.cpp)
 add_library(EdgePulse::Core ALIAS edgepulse-core)
 
 target_include_directories(edgepulse-core PUBLIC ${PROJECT_SOURCE_DIR}/src)

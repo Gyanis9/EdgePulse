@@ -11,6 +11,7 @@
 #include "Core/Device/NodeRepository.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
+#include "Core/Telemetry/TelemetryIngest.h"
 #include "Core/Telemetry/TelemetryRepository.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
@@ -137,11 +138,6 @@ namespace EdgePulse::Telemetry
                             fail(response, Common::kCodeBadRequest, "nodeId 或 samples 不合法（1 到 500 条）", traceId);
                             co_return;
                         }
-                        if (!(co_await deps->nodes->findById(loop, *nodeId)).has_value())
-                        {
-                            fail(response, Common::kCodeNotFound, "节点不存在，请先注册", traceId);
-                            co_return;
-                        }
                         std::vector<TelemetrySample> parsed;
                         parsed.reserve(samples->size());
                         for (const ConfigValue &sample: *samples)
@@ -170,15 +166,20 @@ namespace EdgePulse::Telemetry
                             }
                             parsed.push_back(std::move(value));
                         }
-                        const bool stored = co_await deps->telemetry->insertBatch(loop, *nodeId, parsed);
-                        if (!stored)
+                        const std::size_t            sampleCount = parsed.size();
+                        const TelemetryIngestOutcome outcome     = co_await ingestTelemetry(loop, *deps->nodes, *deps->telemetry, *deps->alarms, *nodeId, std::move(parsed));
+                        if (!outcome.nodeExists)
+                        {
+                            fail(response, Common::kCodeNotFound, "节点不存在，请先注册", traceId);
+                            co_return;
+                        }
+                        if (!outcome.stored)
                         {
                             fail(response, Common::kCodeInternalServerError, "遥测写入失败", traceId);
                             co_return;
                         }
-                        const auto  alarms    = co_await deps->alarms->evaluate(loop, *nodeId, parsed);
                         ConfigValue alarmRows = ConfigValue::array();
-                        for (const Alarm::AlarmRecord &alarm: alarms)
+                        for (const Alarm::AlarmRecord &alarm: outcome.alarms)
                         {
                             alarmRows.push_back(ConfigValue::object({{"id", alarm.id},
                                                                      {"nodeId", alarm.nodeId},
@@ -187,7 +188,7 @@ namespace EdgePulse::Telemetry
                                                                      {"status", alarm.status},
                                                                      {"message", alarm.message}}));
                         }
-                        Common::writeSuccess(response, ConfigValue::object({{"accepted", static_cast<std::int64_t>(samples->size())}, {"alarms", std::move(alarmRows)}}), traceId);
+                        Common::writeSuccess(response, ConfigValue::object({{"accepted", static_cast<std::int64_t>(sampleCount)}, {"alarms", std::move(alarmRows)}}), traceId);
                         co_return;
                     });
     }

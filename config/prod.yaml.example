@@ -42,6 +42,10 @@ edgepulse:
     allowed_origins: https://console.example.com
   agent:
     fingerprint: ""
+  udp_telemetry:
+    enabled: false
+    address: 0.0.0.0
+    port: 9555
 
 server:
   limits:

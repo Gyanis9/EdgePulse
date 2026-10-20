@@ -23,7 +23,8 @@ add_executable(edgepulse-unit-tests
         Unit/TestPagination.cpp
         Unit/TestPasswordHash.cpp
         Unit/TestSessionStore.cpp
-        Unit/TestTimeFormat.cpp)
+        Unit/TestTimeFormat.cpp
+        Unit/TestUdpTelemetryProtocol.cpp)
 target_include_directories(edgepulse-unit-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(edgepulse-unit-tests PRIVATE EdgePulse::Core GTest::gtest_main)
 edgepulse_enable_warnings(edgepulse-unit-tests)
@@ -36,7 +37,8 @@ add_executable(edgepulse-integration-tests
         Integration/TestExternalStores.cpp
         Integration/TestMigrations.cpp
         Integration/TestFleetServices.cpp
-        Integration/TestSystemServices.cpp)
+        Integration/TestSystemServices.cpp
+        Integration/TestUdpTelemetry.cpp)
 target_include_directories(edgepulse-integration-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(edgepulse-integration-tests PRIVATE EDGEPULSE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(edgepulse-integration-tests PRIVATE EdgePulse::Core edgepulse-test-support GTest::gtest_main)

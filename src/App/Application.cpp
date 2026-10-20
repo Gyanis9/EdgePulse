@@ -34,6 +34,7 @@
 #include "Core/System/UserRepository.h"
 #include "Core/Device/NodeGroupRepository.h"
 #include "Core/Telemetry/TelemetryRepository.h"
+#include "Core/Telemetry/UdpTelemetryEndpoint.h"
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Firmware/FirmwareRepository.h"
@@ -223,6 +224,18 @@ namespace EdgePulse::App
             m_commandRepository  = std::make_shared<Command::CommandRepository>(m_database);
             m_agentChannels      = std::make_shared<Command::AgentChannelRegistry>();
             m_opsRepository      = std::make_shared<Ops::OpsRepository>(m_database);
+
+            if (m_configuration.udpTelemetryEnabled)
+            {
+                Telemetry::UdpTelemetryEndpoint::Configuration udpConfiguration;
+                udpConfiguration.address = m_configuration.udpTelemetryAddress;
+                udpConfiguration.port    = m_configuration.udpTelemetryPort;
+                udpConfiguration.secret  = m_configuration.udpTelemetrySecret;
+                m_udpTelemetry           = std::make_unique<Telemetry::UdpTelemetryEndpoint>(loop, udpConfiguration, *m_nodeRepository, *m_telemetryRepository, *m_alarmService);
+                m_udpListen.emplace(m_udpTelemetry->listen());
+                loop.scheduler().schedule(m_udpListen->handle());
+                LOG_INFO_FMT("UDP 遥测监听已排入事件循环：{}:{}", m_configuration.udpTelemetryAddress, m_configuration.udpTelemetryPort);
+            }
 
             m_databaseReady.store(m_database->probe(), std::memory_order_release);
             m_healthProbe = std::jthread(
@@ -610,6 +623,10 @@ namespace EdgePulse::App
                         if (application->m_opsServer)
                         {
                             co_await application->m_opsServer->drain(drainBudget);
+                        }
+                        if (application->m_udpTelemetry)
+                        {
+                            application->m_udpTelemetry->stop();
                         }
                         application->m_stopThread = std::jthread([application] { application->m_ioContext->stop(); });
                         static_cast<void>(eventLoop);

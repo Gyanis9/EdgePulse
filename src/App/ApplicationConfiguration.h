@@ -63,6 +63,10 @@ namespace EdgePulse::App
         bool                     exposeCaptchaCode{false};                  ///< 开发档在响应里带验证码答案
         std::vector<std::string> allowedOrigins;                            ///< 浏览器 WebSocket 的 Origin 白名单
         std::string              agentFingerprint;                          ///< 允许的 Agent 证书 SHA-256 指纹，空表示只校验 CA
+        bool                     udpTelemetryEnabled{false};                ///< 是否启用 UDP 遥测监听
+        std::string              udpTelemetryAddress{"0.0.0.0"};            ///< UDP 遥测监听地址
+        std::uint16_t            udpTelemetryPort{9555};                    ///< UDP 遥测端口
+        std::string              udpTelemetrySecret;                        ///< HMAC 共享密钥，只从环境变量读取
 
         /**
          * @brief 读取 YAML 并组装配置；同目录存在 logging.yaml 时一并载入

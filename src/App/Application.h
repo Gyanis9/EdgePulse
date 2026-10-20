@@ -81,7 +81,8 @@ namespace EdgePulse::System
 namespace EdgePulse::Telemetry
 {
     class TelemetryRepository;
-}
+    class UdpTelemetryEndpoint;
+} // namespace EdgePulse::Telemetry
 namespace EdgePulse::Alarm
 {
     class AlarmRepository;
@@ -182,6 +183,8 @@ namespace EdgePulse::App
         std::shared_ptr<Auth::DataScopeService>                   m_dataScopeService;     ///< 数据范围
         std::shared_ptr<Device::NodeGroupRepository>              m_nodeGroupRepository;  ///< 节点分组
         std::shared_ptr<Telemetry::TelemetryRepository>           m_telemetryRepository;  ///< 遥测
+        std::unique_ptr<Telemetry::UdpTelemetryEndpoint>          m_udpTelemetry;         ///< UDP 遥测监听
+        std::optional<AsynGyanis::Core::Task<>>                   m_udpListen;            ///< UDP 收包协程
         std::shared_ptr<Alarm::AlarmRepository>                   m_alarmRepository;      ///< 告警
         std::shared_ptr<Alarm::AlarmService>                      m_alarmService;         ///< 告警评估
         std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;   ///< 固件

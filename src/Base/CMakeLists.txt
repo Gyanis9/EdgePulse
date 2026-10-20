@@ -6,6 +6,7 @@ add_library(edgepulse-base STATIC
         Runtime/Environment.cpp
         Runtime/IdGenerator.cpp
         Runtime/TimeFormat.cpp
+        Security/Hmac.cpp
         Security/PasswordHash.cpp
         Security/RandomBytes.cpp
         Security/RandomToken.cpp)

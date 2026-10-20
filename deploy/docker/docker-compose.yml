@@ -39,6 +39,7 @@ services:
       EDGEPULSE_REDIS_PASSWORD: ${EDGEPULSE_REDIS_PASSWORD}
       EDGEPULSE_OPS_BEARER_TOKEN: ${EDGEPULSE_OPS_BEARER_TOKEN:?请在 .env 中设置 EDGEPULSE_OPS_BEARER_TOKEN}
       EDGEPULSE_AGENT_FINGERPRINT: ${EDGEPULSE_AGENT_FINGERPRINT:-}
+      EDGEPULSE_UDP_TELEMETRY_SECRET: ${EDGEPULSE_UDP_TELEMETRY_SECRET:-}
       EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
     volumes:
       - ../../config:/app/config:ro
@@ -50,6 +51,7 @@ services:
       - "8443:8443/udp"
       - "9443:9443"
       - "9100:9100"
+      - "9555:9555/udp"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       interval: 10s
