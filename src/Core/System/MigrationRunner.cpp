@@ -297,7 +297,7 @@ namespace EdgePulse::System
                 }
             }
 
-            const std::array<AsynGyanis::Database::DatabaseValue, 4> parameters{file.version, file.description, checksum, Common::nowIso8601Utc()};
+            const std::array<AsynGyanis::Database::DatabaseValue, 4> parameters{file.version, file.description, checksum, Common::nowDateTimeUtc()};
             if (!connection.execute("INSERT INTO schema_migrations (version, description, checksum, applied_at) VALUES (?, ?, ?, ?)", parameters))
             {
                 throw Common::MigrationException("记录迁移 V" + std::to_string(file.version) + " 失败：" + connection.lastError());
