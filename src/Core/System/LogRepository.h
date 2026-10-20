@@ -119,6 +119,17 @@ namespace EdgePulse::System
     };
 
     /**
+     * @brief 日志查询的数据范围
+     */
+    struct LogScope
+    {
+        bool                      all{true};       ///< 可见全部
+        bool                      selfOnly{false}; ///< 仅本人
+        std::int64_t              userId{0};       ///< 当前账号
+        std::vector<std::int64_t> deptIds;         ///< 可见部门
+    };
+
+    /**
      * @brief 日志仓储
      */
     class LogRepository
@@ -147,7 +158,7 @@ namespace EdgePulse::System
          * @return Common::PageRows<OperLogRecord> 当前页
          */
         AsynGyanis::Core::Task<Common::PageRows<OperLogRecord>> listOperLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string result,
-                                                                             const Common::PageParameters &page);
+                                                                             const Common::PageParameters &page, LogScope scope = {});
 
         /**
          * @brief 导出操作日志
@@ -156,7 +167,7 @@ namespace EdgePulse::System
          * @param result 结果
          * @return std::vector<OperLogRecord> 行
          */
-        AsynGyanis::Core::Task<std::vector<OperLogRecord>> exportOperLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string result);
+        AsynGyanis::Core::Task<std::vector<OperLogRecord>> exportOperLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string result, LogScope scope = {});
 
         /**
          * @brief 删除一条操作日志
@@ -182,7 +193,7 @@ namespace EdgePulse::System
          * @return Common::PageRows<LoginLogRecord> 当前页
          */
         AsynGyanis::Core::Task<Common::PageRows<LoginLogRecord>> listLoginLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status,
-                                                                               const Common::PageParameters &page);
+                                                                               const Common::PageParameters &page, LogScope scope = {});
 
         /**
          * @brief 导出登录日志
@@ -191,7 +202,7 @@ namespace EdgePulse::System
          * @param status 状态
          * @return std::vector<LoginLogRecord> 行
          */
-        AsynGyanis::Core::Task<std::vector<LoginLogRecord>> exportLoginLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status);
+        AsynGyanis::Core::Task<std::vector<LoginLogRecord>> exportLoginLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status, LogScope scope = {});
 
         /**
          * @brief 删除一条登录日志
@@ -214,7 +225,7 @@ namespace EdgePulse::System
          * @param range 24h、7d、30d
          * @return LoginStats 统计
          */
-        AsynGyanis::Core::Task<LoginStats> loginStats(AsynGyanis::Core::EventLoop &loop, std::string range);
+        AsynGyanis::Core::Task<LoginStats> loginStats(AsynGyanis::Core::EventLoop &loop, std::string range, LogScope scope = {});
 
         /**
          * @brief 操作统计
@@ -222,7 +233,7 @@ namespace EdgePulse::System
          * @param range 24h、7d、30d
          * @return OperStats 统计
          */
-        AsynGyanis::Core::Task<OperStats> operStats(AsynGyanis::Core::EventLoop &loop, std::string range);
+        AsynGyanis::Core::Task<OperStats> operStats(AsynGyanis::Core::EventLoop &loop, std::string range, LogScope scope = {});
 
         /**
          * @brief 当日操作泳道
@@ -230,7 +241,7 @@ namespace EdgePulse::System
          * @param date 日期 YYYY-MM-DD；空表示今天
          * @return OperTimeline 泳道
          */
-        AsynGyanis::Core::Task<OperTimeline> operTimeline(AsynGyanis::Core::EventLoop &loop, std::string date);
+        AsynGyanis::Core::Task<OperTimeline> operTimeline(AsynGyanis::Core::EventLoop &loop, std::string date, LogScope scope = {});
 
         /**
          * @brief 登录热力与异常
@@ -238,7 +249,7 @@ namespace EdgePulse::System
          * @param days 7 或 30
          * @return LoginHeatmap 热力
          */
-        AsynGyanis::Core::Task<LoginHeatmap> loginHeatmap(AsynGyanis::Core::EventLoop &loop, int days);
+        AsynGyanis::Core::Task<LoginHeatmap> loginHeatmap(AsynGyanis::Core::EventLoop &loop, int days, LogScope scope = {});
 
         /**
          * @brief 近 N 天每日操作量
@@ -246,7 +257,7 @@ namespace EdgePulse::System
          * @param days 天数
          * @return std::vector<TimeBucket> 每日桶
          */
-        AsynGyanis::Core::Task<std::vector<TimeBucket>> dailyOper(AsynGyanis::Core::EventLoop &loop, int days);
+        AsynGyanis::Core::Task<std::vector<TimeBucket>> dailyOper(AsynGyanis::Core::EventLoop &loop, int days, LogScope scope = {});
 
         /**
          * @brief 最近登录记录，供工作台活动流
@@ -254,7 +265,7 @@ namespace EdgePulse::System
          * @param limit 条数
          * @return std::vector<LoginLogRecord> 记录
          */
-        AsynGyanis::Core::Task<std::vector<LoginLogRecord>> recentLogins(AsynGyanis::Core::EventLoop &loop, int limit);
+        AsynGyanis::Core::Task<std::vector<LoginLogRecord>> recentLogins(AsynGyanis::Core::EventLoop &loop, int limit, LogScope scope = {});
 
         /**
          * @brief 指定时间窗内的登录次数
@@ -263,7 +274,7 @@ namespace EdgePulse::System
          * @param to SQL DATETIME 终点
          * @return std::int64_t 次数
          */
-        AsynGyanis::Core::Task<std::int64_t> loginCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to);
+        AsynGyanis::Core::Task<std::int64_t> loginCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to, LogScope scope = {});
 
         /**
          * @brief 指定时间窗内的操作次数
@@ -272,7 +283,7 @@ namespace EdgePulse::System
          * @param to SQL DATETIME 终点
          * @return std::int64_t 次数
          */
-        AsynGyanis::Core::Task<std::int64_t> operCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to);
+        AsynGyanis::Core::Task<std::int64_t> operCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to, LogScope scope = {});
 
         /**
          * @brief 指定时刻之后出现过的登录账号数
@@ -280,7 +291,7 @@ namespace EdgePulse::System
          * @param since SQL DATETIME 起点
          * @return std::int64_t 账号数
          */
-        AsynGyanis::Core::Task<std::int64_t> distinctLoginUsersSince(AsynGyanis::Core::EventLoop &loop, std::string since);
+        AsynGyanis::Core::Task<std::int64_t> distinctLoginUsersSince(AsynGyanis::Core::EventLoop &loop, std::string since, LogScope scope = {});
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装

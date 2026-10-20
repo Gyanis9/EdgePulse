@@ -65,13 +65,15 @@ protected:
                     systemDependencies.dictionaries = m_dictionary.get();
                     EdgePulse::System::registerSystemRoutes(router, loop, systemDependencies);
                     EdgePulse::Monitor::MonitorDependencies monitorDependencies;
-                    monitorDependencies.auth = m_context->auth.get();
-                    monitorDependencies.logs = m_logs.get();
+                    monitorDependencies.auth       = m_context->auth.get();
+                    monitorDependencies.dataScopes = m_dataScopes.get();
+                    monitorDependencies.logs       = m_logs.get();
                     EdgePulse::Monitor::registerMonitorRoutes(router, loop, monitorDependencies);
                     EdgePulse::Dashboard::DashboardDependencies dashboardDependencies;
-                    dashboardDependencies.auth  = m_context->auth.get();
-                    dashboardDependencies.logs  = m_logs.get();
-                    dashboardDependencies.roles = m_roles.get();
+                    dashboardDependencies.auth       = m_context->auth.get();
+                    dashboardDependencies.dataScopes = m_dataScopes.get();
+                    dashboardDependencies.logs       = m_logs.get();
+                    dashboardDependencies.roles      = m_roles.get();
                     EdgePulse::Dashboard::registerDashboardRoutes(router, loop, dashboardDependencies);
                 });
     }
@@ -194,6 +196,24 @@ TEST_F(SystemEndpointsTest, EnforcesAuthenticationAndPermission)
     const std::string lowToken = login("limited", "userpass1");
     EXPECT_EQ(403, m_server->get("/api/system/users", bearer(lowToken)).status);
     EXPECT_EQ(403, m_server->get("/api/system/roles", bearer(lowToken)).status);
+    EXPECT_EQ(200, m_server->get("/api/dashboard/summary?range=24h", bearer(lowToken)).status);
+}
+
+// 钉住：低权限账号的日志查询按本人范围过滤，工作台统计同样受范围约束
+TEST_F(SystemEndpointsTest, ScopesLogsToSessionScope)
+{
+    const std::string  adminToken = login("admin", "admin123");
+    const std::int64_t roleId     = createRole(adminToken, "本人日志", "self_log_role", {1202});
+    createUser(adminToken, "logself", "本人日志", roleId);
+    const std::string lowToken = login("logself", "userpass1");
+
+    const auto adminLogins = m_server->get("/api/monitor/login-logs?pageNum=1&pageSize=10", bearer(adminToken));
+    ASSERT_EQ(200, adminLogins.status) << adminLogins.body;
+    const auto lowLogins = m_server->get("/api/monitor/login-logs?pageNum=1&pageSize=10", bearer(lowToken));
+    ASSERT_EQ(200, lowLogins.status) << lowLogins.body;
+    EXPECT_EQ(1, (*lowLogins.json())["data"]["total"].get<std::int64_t>());
+    EXPECT_GE((*adminLogins.json())["data"]["total"].get<std::int64_t>(), 2);
+
     EXPECT_EQ(200, m_server->get("/api/dashboard/summary?range=24h", bearer(lowToken)).status);
 }
 

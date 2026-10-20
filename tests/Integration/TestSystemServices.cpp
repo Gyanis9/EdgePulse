@@ -1,6 +1,9 @@
 #include "Base/Security/PasswordHash.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/DataScopeService.h"
+#include "Core/Auth/LoginAudit.h"
 #include "Core/System/DictionaryRepository.h"
+#include "Core/System/LogRepository.h"
 #include "Core/System/MenuRepository.h"
 #include "Core/System/OrgRepository.h"
 #include "Core/System/RoleRepository.h"
@@ -179,4 +182,46 @@ TEST(SystemServices, DictionaryAndConfigCrud)
     const std::int64_t configId = runner.run(dictionary.createConfig(runner.loop(), configWrite, 1));
     EXPECT_TRUE(runner.run(dictionary.configKeyExists(runner.loop(), "test.option")));
     ASSERT_TRUE(runner.run(dictionary.removeConfig(runner.loop(), configId)));
+}
+
+// 钉住：操作日志与登录日志按部门/本人范围过滤，分页总数与行一致
+TEST(SystemServices, LogScopeFiltersOperAndLoginLogs)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::System::LogRepository        logs(context.database);
+    EdgePulse::Auth::LoginAudit             loginAudit(context.database);
+
+    for (const auto &[dept, oper, name]: {std::tuple<std::int64_t, std::int64_t, const char *>{101, 7, "alice"}, {102, 8, "bob"}})
+    {
+        EdgePulse::System::OperLogRecord record;
+        record.module   = "验收";
+        record.action   = "查询";
+        record.operName = name;
+        record.operId   = oper;
+        record.deptId   = dept;
+        record.operTime = EdgePulse::Common::nowDateTimeUtc();
+        ASSERT_TRUE(runner.run(logs.insertOperLog(runner.loop(), record)));
+        ASSERT_TRUE(runner.run(loginAudit.record(runner.loop(), EdgePulse::Auth::LoginAuditEntry{"user", "127.0.0.1", true, "ok", "t", oper, dept})));
+    }
+
+    EdgePulse::System::LogScope deptScope;
+    deptScope.all       = false;
+    deptScope.deptIds   = {101};
+    const auto operPage = runner.run(logs.listOperLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}, deptScope));
+    EXPECT_EQ(1, operPage.total);
+    ASSERT_EQ(1U, operPage.rows.size());
+    EXPECT_EQ("alice", operPage.rows[0].operName);
+    const auto loginPage = runner.run(logs.listLoginLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}, deptScope));
+    EXPECT_EQ(1, loginPage.total);
+
+    EdgePulse::System::LogScope selfScope;
+    selfScope.all       = false;
+    selfScope.selfOnly  = true;
+    selfScope.userId    = 8;
+    const auto selfOper = runner.run(logs.listOperLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}, selfScope));
+    ASSERT_EQ(1U, selfOper.rows.size());
+    EXPECT_EQ("bob", selfOper.rows[0].operName);
+    const auto allLogin = runner.run(logs.listLoginLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}));
+    EXPECT_EQ(2, allLogin.total);
 }

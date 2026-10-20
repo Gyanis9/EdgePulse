@@ -125,6 +125,8 @@ namespace EdgePulse::System
         std::string  ip;        ///< 来源地址
         std::string  operName;  ///< 操作人
         std::string  deptName;  ///< 部门
+        std::int64_t operId{0}; ///< 操作人标识
+        std::int64_t deptId{0}; ///< 部门标识
         std::string  params;    ///< 请求参数
         int          result{1}; ///< 1 成功、0 失败
         std::string  errorMsg;  ///< 失败原因
@@ -148,6 +150,8 @@ namespace EdgePulse::System
         std::string  location;  ///< 归属地
         std::string  browser;   ///< 浏览器
         std::string  os;        ///< 操作系统
+        std::int64_t userId{0}; ///< 账号标识
+        std::int64_t deptId{0}; ///< 部门标识
     };
 
     /**

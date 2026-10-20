@@ -7,6 +7,7 @@
 #include "Base/Api/QueryParameters.h"
 #include "Base/Api/RequestParsing.h"
 #include "Core/Auth/AuthService.h"
+#include "Core/Auth/DataScopeService.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 #include "Core/System/LogRepository.h"
@@ -163,6 +164,17 @@ namespace EdgePulse::Monitor
             response.setOwnedBody(writer.take());
         }
 
+        [[nodiscard]] AsynGyanis::Core::Task<System::LogScope> resolveLogScope(Auth::DataScopeService *dataScopes, AsynGyanis::Core::EventLoop &loop,
+                                                                               const EdgePulse::Auth::SessionRecord &session)
+        {
+            if (dataScopes == nullptr)
+            {
+                co_return System::LogScope{};
+            }
+            const EdgePulse::Auth::DataScope scope = co_await dataScopes->resolve(loop, session.userId);
+            co_return System::LogScope{scope.all, scope.selfOnly, scope.userId, scope.deptIds};
+        }
+
         void fail(AsynGyanis::Net::HttpResponse &response, const int status, const std::string &message, const std::string_view traceId)
         {
             Common::writeFailure(response, status, status, message, traceId);
@@ -183,10 +195,11 @@ namespace EdgePulse::Monitor
                        {
                            co_return;
                        }
-                       const Common::QueryMap       query  = request.queryParams();
-                       const Common::PageParameters page   = Common::parsePageParameters(query);
-                       const auto                   result = co_await deps->logs->listOperLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "result"), page);
-                       ConfigValue                  rows   = ConfigValue::array();
+                       const Common::QueryMap       query = request.queryParams();
+                       const Common::PageParameters page  = Common::parsePageParameters(query);
+                       const System::LogScope       scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const auto  result = co_await deps->logs->listOperLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "result"), page, scope);
+                       ConfigValue rows   = ConfigValue::array();
                        for (const OperLogRecord &record: result.rows)
                        {
                            rows.push_back(operLogJson(record));
@@ -209,7 +222,8 @@ namespace EdgePulse::Monitor
                        {
                            range = "24h";
                        }
-                       const OperStats stats = co_await deps->logs->operStats(loop, range);
+                       const System::LogScope scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const OperStats        stats = co_await deps->logs->operStats(loop, range, scope);
                        Common::writeSuccess(response, operStatsJson(stats, range), traceId);
                        co_return;
                    });
@@ -223,7 +237,8 @@ namespace EdgePulse::Monitor
                        {
                            co_return;
                        }
-                       const OperTimeline timeline = co_await deps->logs->operTimeline(loop, Common::queryText(request.queryParams(), "date"));
+                       const System::LogScope scope    = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const OperTimeline     timeline = co_await deps->logs->operTimeline(loop, Common::queryText(request.queryParams(), "date"), scope);
                        Common::writeSuccess(response, timelineJson(timeline), traceId);
                        co_return;
                    });
@@ -238,7 +253,8 @@ namespace EdgePulse::Monitor
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             rows  = co_await deps->logs->exportOperLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "result"));
+                       const System::LogScope scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const auto             rows  = co_await deps->logs->exportOperLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "result"), scope);
                        Common::CsvWriter      writer;
                        writer.addRow({"日志ID", "模块", "动作", "操作人", "部门", "方法", "请求", "来源", "参数", "结果", "错误", "耗时ms", "操作时间"});
                        for (const OperLogRecord &record: rows)
@@ -299,8 +315,9 @@ namespace EdgePulse::Monitor
                        }
                        const Common::QueryMap       query = request.queryParams();
                        const Common::PageParameters page  = Common::parsePageParameters(query);
-                       const auto  result                 = co_await deps->logs->listLoginLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page);
-                       ConfigValue rows                   = ConfigValue::array();
+                       const System::LogScope       scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const auto  result = co_await deps->logs->listLoginLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page, scope);
+                       ConfigValue rows   = ConfigValue::array();
                        for (const LoginLogRecord &record: result.rows)
                        {
                            rows.push_back(loginLogJson(record));
@@ -323,7 +340,8 @@ namespace EdgePulse::Monitor
                        {
                            range = "24h";
                        }
-                       const LoginStats stats = co_await deps->logs->loginStats(loop, range);
+                       const System::LogScope scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const LoginStats       stats = co_await deps->logs->loginStats(loop, range, scope);
                        Common::writeSuccess(response, loginStatsJson(stats, range), traceId);
                        co_return;
                    });
@@ -337,8 +355,9 @@ namespace EdgePulse::Monitor
                        {
                            co_return;
                        }
-                       const std::int64_t days    = Common::queryInteger(request.queryParams(), "days").value_or(7);
-                       const LoginHeatmap heatmap = co_await deps->logs->loginHeatmap(loop, days == 30 ? 30 : 7);
+                       const std::int64_t     days    = Common::queryInteger(request.queryParams(), "days").value_or(7);
+                       const System::LogScope scope   = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const LoginHeatmap     heatmap = co_await deps->logs->loginHeatmap(loop, days == 30 ? 30 : 7, scope);
                        Common::writeSuccess(response, heatmapJson(heatmap), traceId);
                        co_return;
                    });
@@ -353,7 +372,8 @@ namespace EdgePulse::Monitor
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             rows  = co_await deps->logs->exportLoginLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
+                       const System::LogScope scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       const auto             rows  = co_await deps->logs->exportLoginLogs(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), scope);
                        Common::CsvWriter      writer;
                        writer.addRow({"日志ID", "登录账号", "结果", "说明", "来源", "归属地", "浏览器", "操作系统", "登录时间"});
                        for (const LoginLogRecord &record: rows)

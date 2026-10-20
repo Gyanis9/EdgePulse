@@ -30,9 +30,9 @@ namespace EdgePulse::System
         using AsynGyanis::Database::DatabaseResult;
         using AsynGyanis::Database::DatabaseValue;
 
-        constexpr std::string_view kSelectOper =
-                "SELECT id, title, module, action, method, url, ip, oper_name, dept_name, params, result, error_msg, cost_ms, trace_id, oper_time FROM sys_oper_log ";
-        constexpr std::string_view kSelectLogin = "SELECT id, username, ip, status, message, trace_id, login_time, location, browser, os FROM sys_login_log ";
+        constexpr std::string_view kSelectOper = "SELECT id, title, module, action, method, url, ip, oper_name, dept_name, oper_id, dept_id, params, result, error_msg, cost_ms, "
+                                                 "trace_id, oper_time FROM sys_oper_log ";
+        constexpr std::string_view kSelectLogin = "SELECT id, username, ip, status, message, trace_id, login_time, location, browser, os, user_id, dept_id FROM sys_login_log ";
 
         [[nodiscard]] std::int64_t nowEpoch()
         {
@@ -122,6 +122,8 @@ namespace EdgePulse::System
             record.ip       = Sql::text(result, "ip");
             record.operName = Sql::text(result, "oper_name");
             record.deptName = Sql::text(result, "dept_name");
+            record.operId   = Sql::integer(result, "oper_id");
+            record.deptId   = Sql::integer(result, "dept_id");
             record.params   = Sql::text(result, "params");
             record.result   = static_cast<int>(Sql::integer(result, "result"));
             record.errorMsg = Sql::text(result, "error_msg");
@@ -144,6 +146,8 @@ namespace EdgePulse::System
             record.location  = Sql::text(result, "location");
             record.browser   = Sql::text(result, "browser");
             record.os        = Sql::text(result, "os");
+            record.userId    = Sql::integer(result, "user_id");
+            record.deptId    = Sql::integer(result, "dept_id");
             return record;
         }
 
@@ -193,6 +197,56 @@ namespace EdgePulse::System
             }
             const auto index = static_cast<std::size_t>((epoch - spec.startEpoch) / spec.bucketSeconds);
             return index < static_cast<std::size_t>(spec.bucketCount) ? index : std::numeric_limits<std::size_t>::max();
+        }
+
+        [[nodiscard]] std::string operScopeFilter(const LogScope &scope, std::vector<DatabaseValue> &parameters)
+        {
+            if (scope.all)
+            {
+                return {};
+            }
+            if (scope.selfOnly)
+            {
+                parameters.emplace_back(scope.userId);
+                return " AND oper_id = ?";
+            }
+            if (scope.deptIds.empty())
+            {
+                return " AND 1 = 0";
+            }
+            std::string clause = " AND dept_id IN (";
+            for (std::size_t index = 0; index < scope.deptIds.size(); ++index)
+            {
+                clause += index == 0 ? "?" : ", ?";
+                parameters.emplace_back(scope.deptIds[index]);
+            }
+            clause += ")";
+            return clause;
+        }
+
+        [[nodiscard]] std::string loginScopeFilter(const LogScope &scope, std::vector<DatabaseValue> &parameters)
+        {
+            if (scope.all)
+            {
+                return {};
+            }
+            if (scope.selfOnly)
+            {
+                parameters.emplace_back(scope.userId);
+                return " AND user_id = ?";
+            }
+            if (scope.deptIds.empty())
+            {
+                return " AND 1 = 0";
+            }
+            std::string clause = " AND dept_id IN (";
+            for (std::size_t index = 0; index < scope.deptIds.size(); ++index)
+            {
+                clause += index == 0 ? "?" : ", ?";
+                parameters.emplace_back(scope.deptIds[index]);
+            }
+            clause += ")";
+            return clause;
         }
 
         [[nodiscard]] std::string buildOperFilter(const std::string &keyword, const std::string &result, std::vector<DatabaseValue> &parameters)
@@ -252,7 +306,7 @@ namespace EdgePulse::System
                     {
                         record.operTime = Common::nowDateTimeUtc();
                     }
-                    const std::array<DatabaseValue, 15> parameters{record.id,
+                    const std::array<DatabaseValue, 17> parameters{record.id,
                                                                    record.title,
                                                                    record.module,
                                                                    record.action,
@@ -261,6 +315,8 @@ namespace EdgePulse::System
                                                                    record.ip,
                                                                    record.operName,
                                                                    record.deptName,
+                                                                   record.operId,
+                                                                   record.deptId,
                                                                    record.params,
                                                                    static_cast<std::int64_t>(record.result),
                                                                    record.errorMsg,
@@ -268,23 +324,24 @@ namespace EdgePulse::System
                                                                    record.traceId,
                                                                    record.operTime};
                     Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_oper_log (id, title, module, action, method, url, ip, oper_name, dept_name, params, result, error_msg, cost_ms, "
-                                            "trace_id, oper_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            "INSERT INTO sys_oper_log (id, title, module, action, method, url, ip, oper_name, dept_name, oper_id, dept_id, params, result, "
+                                            "error_msg, cost_ms, trace_id, oper_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             parameters);
                     return true;
                 });
     }
 
     AsynGyanis::Core::Task<Common::PageRows<OperLogRecord>> LogRepository::listOperLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string result,
-                                                                                        const Common::PageParameters &page)
+                                                                                        const Common::PageParameters &page, const LogScope scope)
     {
         co_return co_await m_database->withConnection<Common::PageRows<OperLogRecord>>(
                 loop,
-                [keyword = std::move(keyword), result = std::move(result), page](DatabaseConnection &connection) -> Common::PageRows<OperLogRecord>
+                [keyword = std::move(keyword), result = std::move(result), page, scope](DatabaseConnection &connection) -> Common::PageRows<OperLogRecord>
                 {
-                    std::vector<DatabaseValue>      parameters;
-                    const std::string               filter = buildOperFilter(keyword, result, parameters);
-                    const auto                      count  = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_oper_log " + filter, parameters);
+                    std::vector<DatabaseValue> parameters;
+                    std::string                filter = buildOperFilter(keyword, result, parameters);
+                    filter += operScopeFilter(scope, parameters);
+                    const auto                      count = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_oper_log " + filter, parameters);
                     Common::PageRows<OperLogRecord> pageRows;
                     if (count->next())
                     {
@@ -305,14 +362,16 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<std::vector<OperLogRecord>> LogRepository::exportOperLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string result)
+    AsynGyanis::Core::Task<std::vector<OperLogRecord>> LogRepository::exportOperLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string result,
+                                                                                     const LogScope scope)
     {
         co_return co_await m_database->withConnection<std::vector<OperLogRecord>>(
                 loop,
-                [keyword = std::move(keyword), result = std::move(result)](DatabaseConnection &connection) -> std::vector<OperLogRecord>
+                [keyword = std::move(keyword), result = std::move(result), scope](DatabaseConnection &connection) -> std::vector<OperLogRecord>
                 {
                     std::vector<DatabaseValue> parameters;
-                    const std::string          filter = buildOperFilter(keyword, result, parameters);
+                    std::string                filter = buildOperFilter(keyword, result, parameters);
+                    filter += operScopeFilter(scope, parameters);
                     parameters.emplace_back(std::int64_t{10000});
                     const auto                 rows = Sql::executeOrThrow(connection, std::string{kSelectOper} + filter + " ORDER BY oper_time DESC, id DESC LIMIT ?", parameters);
                     std::vector<OperLogRecord> records;
@@ -346,15 +405,16 @@ namespace EdgePulse::System
     }
 
     AsynGyanis::Core::Task<Common::PageRows<LoginLogRecord>> LogRepository::listLoginLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status,
-                                                                                          const Common::PageParameters &page)
+                                                                                          const Common::PageParameters &page, const LogScope scope)
     {
         co_return co_await m_database->withConnection<Common::PageRows<LoginLogRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status), page](DatabaseConnection &connection) -> Common::PageRows<LoginLogRecord>
+                [keyword = std::move(keyword), status = std::move(status), page, scope](DatabaseConnection &connection) -> Common::PageRows<LoginLogRecord>
                 {
-                    std::vector<DatabaseValue>       parameters;
-                    const std::string                filter = buildLoginFilter(keyword, status, parameters);
-                    const auto                       count  = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_login_log " + filter, parameters);
+                    std::vector<DatabaseValue> parameters;
+                    std::string                filter = buildLoginFilter(keyword, status, parameters);
+                    filter += loginScopeFilter(scope, parameters);
+                    const auto                       count = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_login_log " + filter, parameters);
                     Common::PageRows<LoginLogRecord> pageRows;
                     if (count->next())
                     {
@@ -375,14 +435,16 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<std::vector<LoginLogRecord>> LogRepository::exportLoginLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status)
+    AsynGyanis::Core::Task<std::vector<LoginLogRecord>> LogRepository::exportLoginLogs(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status,
+                                                                                       const LogScope scope)
     {
         co_return co_await m_database->withConnection<std::vector<LoginLogRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status)](DatabaseConnection &connection) -> std::vector<LoginLogRecord>
+                [keyword = std::move(keyword), status = std::move(status), scope](DatabaseConnection &connection) -> std::vector<LoginLogRecord>
                 {
                     std::vector<DatabaseValue> parameters;
-                    const std::string          filter = buildLoginFilter(keyword, status, parameters);
+                    std::string                filter = buildLoginFilter(keyword, status, parameters);
+                    filter += loginScopeFilter(scope, parameters);
                     parameters.emplace_back(std::int64_t{10000});
                     const auto rows = Sql::executeOrThrow(connection, std::string{kSelectLogin} + filter + " ORDER BY login_time DESC, id DESC LIMIT ?", parameters);
                     std::vector<LoginLogRecord> records;
@@ -415,18 +477,20 @@ namespace EdgePulse::System
                                                             });
     }
 
-    AsynGyanis::Core::Task<LoginStats> LogRepository::loginStats(AsynGyanis::Core::EventLoop &loop, std::string range)
+    AsynGyanis::Core::Task<LoginStats> LogRepository::loginStats(AsynGyanis::Core::EventLoop &loop, std::string range, const LogScope scope)
     {
         co_return co_await m_database->withConnection<LoginStats>(
                 loop,
-                [range = std::move(range)](DatabaseConnection &connection) -> LoginStats
+                [range = std::move(range), scope](DatabaseConnection &connection) -> LoginStats
                 {
                     const RangeSpec spec = rangeSpecOf(range);
                     LoginStats      stats;
                     stats.series = makeBuckets(spec);
                     const std::array<DatabaseValue, 1> parameters{Common::formatDateTimeUtc(std::chrono::system_clock::time_point{std::chrono::seconds{spec.startEpoch}})};
-                    const auto                         rows =
-                            Sql::executeOrThrow(connection, "SELECT username, ip, status, login_time FROM sys_login_log WHERE login_time >= ? ORDER BY login_time", parameters);
+                    std::vector<DatabaseValue>         scoped(parameters.begin(), parameters.end());
+                    const std::string                  filter =
+                            "SELECT username, ip, status, login_time FROM sys_login_log WHERE login_time >= ?" + loginScopeFilter(scope, scoped) + " ORDER BY login_time";
+                    const auto            rows = Sql::executeOrThrow(connection, filter, scoped);
                     std::set<std::string> users;
                     std::set<std::string> ips;
                     while (rows->next())
@@ -455,18 +519,20 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<OperStats> LogRepository::operStats(AsynGyanis::Core::EventLoop &loop, std::string range)
+    AsynGyanis::Core::Task<OperStats> LogRepository::operStats(AsynGyanis::Core::EventLoop &loop, std::string range, const LogScope scope)
     {
         co_return co_await m_database->withConnection<OperStats>(
                 loop,
-                [range = std::move(range)](DatabaseConnection &connection) -> OperStats
+                [range = std::move(range), scope](DatabaseConnection &connection) -> OperStats
                 {
                     const RangeSpec spec = rangeSpecOf(range);
                     OperStats       stats;
                     stats.series = makeBuckets(spec);
                     const std::array<DatabaseValue, 1> parameters{Common::formatDateTimeUtc(std::chrono::system_clock::time_point{std::chrono::seconds{spec.startEpoch}})};
-                    const auto                         rows =
-                            Sql::executeOrThrow(connection, "SELECT oper_name, result, cost_ms, oper_time FROM sys_oper_log WHERE oper_time >= ? ORDER BY oper_time", parameters);
+                    std::vector<DatabaseValue>         scoped(parameters.begin(), parameters.end());
+                    const std::string                  filter =
+                            "SELECT oper_name, result, cost_ms, oper_time FROM sys_oper_log WHERE oper_time >= ?" + operScopeFilter(scope, scoped) + " ORDER BY oper_time";
+                    const auto                rows = Sql::executeOrThrow(connection, filter, scoped);
                     std::set<std::string>     users;
                     std::vector<std::int64_t> costs;
                     while (rows->next())
@@ -506,11 +572,11 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<OperTimeline> LogRepository::operTimeline(AsynGyanis::Core::EventLoop &loop, std::string date)
+    AsynGyanis::Core::Task<OperTimeline> LogRepository::operTimeline(AsynGyanis::Core::EventLoop &loop, std::string date, const LogScope scope)
     {
         co_return co_await m_database->withConnection<OperTimeline>(
                 loop,
-                [date = std::move(date)](DatabaseConnection &connection) -> OperTimeline
+                [date = std::move(date), scope](DatabaseConnection &connection) -> OperTimeline
                 {
                     const std::int64_t now = nowEpoch();
                     const std::string  day = date.empty() ? formatDate(now) : date;
@@ -524,8 +590,13 @@ namespace EdgePulse::System
                     }
                     const std::array<DatabaseValue, 2> parameters{Common::formatDateTimeUtc(std::chrono::system_clock::time_point{std::chrono::seconds{start}}),
                                                                   Common::formatDateTimeUtc(std::chrono::system_clock::time_point{std::chrono::seconds{end}})};
-                    const auto                         rows = Sql::executeOrThrow(
-                            connection, "SELECT id, module, result, cost_ms, oper_time FROM sys_oper_log WHERE oper_time >= ? AND oper_time < ? ORDER BY oper_time", parameters);
+                    const auto                         rows = [&]
+                    {
+                        std::vector<DatabaseValue> scoped(parameters.begin(), parameters.end());
+                        const std::string          filter = "SELECT id, module, result, cost_ms, oper_time FROM sys_oper_log WHERE oper_time >= ? AND oper_time < ?" +
+                                                            operScopeFilter(scope, scoped) + " ORDER BY oper_time";
+                        return Sql::executeOrThrow(connection, filter, scoped);
+                    }();
                     struct LaneState
                     {
                         std::int64_t                                  count{0};
@@ -575,11 +646,11 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<LoginHeatmap> LogRepository::loginHeatmap(AsynGyanis::Core::EventLoop &loop, const int days)
+    AsynGyanis::Core::Task<LoginHeatmap> LogRepository::loginHeatmap(AsynGyanis::Core::EventLoop &loop, const int days, const LogScope scope)
     {
         co_return co_await m_database->withConnection<LoginHeatmap>(
                 loop,
-                [days](DatabaseConnection &connection) -> LoginHeatmap
+                [days, scope](DatabaseConnection &connection) -> LoginHeatmap
                 {
                     LoginHeatmap heatmap;
                     heatmap.days             = days;
@@ -597,8 +668,10 @@ namespace EdgePulse::System
                         }
                     }
                     const std::array<DatabaseValue, 1> parameters{heatmap.since};
-                    const auto                         rows =
-                            Sql::executeOrThrow(connection, "SELECT username, ip, status, login_time FROM sys_login_log WHERE login_time >= ? ORDER BY login_time", parameters);
+                    std::vector<DatabaseValue>         scoped(parameters.begin(), parameters.end());
+                    const std::string                  filter =
+                            "SELECT username, ip, status, login_time FROM sys_login_log WHERE login_time >= ?" + loginScopeFilter(scope, scoped) + " ORDER BY login_time";
+                    const auto rows = Sql::executeOrThrow(connection, filter, scoped);
                     struct KeyState
                     {
                         std::int64_t          failed{0};
@@ -667,11 +740,11 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<std::vector<TimeBucket>> LogRepository::dailyOper(AsynGyanis::Core::EventLoop &loop, const int days)
+    AsynGyanis::Core::Task<std::vector<TimeBucket>> LogRepository::dailyOper(AsynGyanis::Core::EventLoop &loop, const int days, const LogScope scope)
     {
         co_return co_await m_database->withConnection<std::vector<TimeBucket>>(
                 loop,
-                [days](DatabaseConnection &connection) -> std::vector<TimeBucket>
+                [days, scope](DatabaseConnection &connection) -> std::vector<TimeBucket>
                 {
                     const std::int64_t      now   = nowEpoch();
                     const std::int64_t      start = dayStart(now) - static_cast<std::int64_t>(days - 1) * 86400;
@@ -680,8 +753,9 @@ namespace EdgePulse::System
                     {
                         buckets[static_cast<std::size_t>(index)].label = formatDate(start + static_cast<std::int64_t>(index) * 86400);
                     }
-                    const std::array<DatabaseValue, 1> parameters{Common::formatDateTimeUtc(std::chrono::system_clock::time_point{std::chrono::seconds{start}})};
-                    const auto                         rows = Sql::executeOrThrow(connection, "SELECT result, oper_time FROM sys_oper_log WHERE oper_time >= ?", parameters);
+                    std::vector<DatabaseValue> parameters{Common::formatDateTimeUtc(std::chrono::system_clock::time_point{std::chrono::seconds{start}})};
+                    const std::string          filter = "SELECT result, oper_time FROM sys_oper_log WHERE oper_time >= ?" + operScopeFilter(scope, parameters);
+                    const auto                 rows   = Sql::executeOrThrow(connection, filter, parameters);
                     while (rows->next())
                     {
                         const std::int64_t epoch = parseEpoch(Sql::dateTimeText(*rows, "oper_time"));
@@ -701,52 +775,57 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<std::int64_t> LogRepository::loginCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to)
+    AsynGyanis::Core::Task<std::int64_t> LogRepository::loginCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to, const LogScope scope)
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [from = std::move(from), to = std::move(to)](DatabaseConnection &connection) -> std::int64_t
+                [from = std::move(from), to = std::move(to), scope](DatabaseConnection &connection) -> std::int64_t
                 {
-                    const std::array<DatabaseValue, 2> parameters{from, to};
-                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_login_log WHERE login_time >= ? AND login_time < ?", parameters);
+                    std::vector<DatabaseValue> parameters{from, to};
+                    const std::string filter = "SELECT COUNT(*) AS total FROM sys_login_log WHERE login_time >= ? AND login_time < ?" + loginScopeFilter(scope, parameters);
+                    const auto        rows   = Sql::executeOrThrow(connection, filter, parameters);
                     return rows->next() ? Sql::integer(*rows, "total") : 0;
                 });
     }
 
-    AsynGyanis::Core::Task<std::int64_t> LogRepository::operCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to)
+    AsynGyanis::Core::Task<std::int64_t> LogRepository::operCountBetween(AsynGyanis::Core::EventLoop &loop, std::string from, std::string to, const LogScope scope)
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [from = std::move(from), to = std::move(to)](DatabaseConnection &connection) -> std::int64_t
+                [from = std::move(from), to = std::move(to), scope](DatabaseConnection &connection) -> std::int64_t
                 {
-                    const std::array<DatabaseValue, 2> parameters{from, to};
-                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_oper_log WHERE oper_time >= ? AND oper_time < ?", parameters);
+                    std::vector<DatabaseValue> parameters{from, to};
+                    const std::string          filter = "SELECT COUNT(*) AS total FROM sys_oper_log WHERE oper_time >= ? AND oper_time < ?" + operScopeFilter(scope, parameters);
+                    const auto                 rows   = Sql::executeOrThrow(connection, filter, parameters);
                     return rows->next() ? Sql::integer(*rows, "total") : 0;
                 });
     }
 
-    AsynGyanis::Core::Task<std::int64_t> LogRepository::distinctLoginUsersSince(AsynGyanis::Core::EventLoop &loop, std::string since)
+    AsynGyanis::Core::Task<std::int64_t> LogRepository::distinctLoginUsersSince(AsynGyanis::Core::EventLoop &loop, std::string since, const LogScope scope)
     {
-        co_return co_await m_database->withConnection<std::int64_t>(
-                loop,
-                [since = std::move(since)](DatabaseConnection &connection) -> std::int64_t
-                {
-                    const std::array<DatabaseValue, 1> parameters{since};
-                    const auto                         rows =
-                            Sql::executeOrThrow(connection, "SELECT COUNT(DISTINCT username) AS total FROM sys_login_log WHERE login_time >= ? AND status = 1", parameters);
-                    return rows->next() ? Sql::integer(*rows, "total") : 0;
-                });
+        co_return co_await m_database->withConnection<std::int64_t>(loop,
+                                                                    [since = std::move(since), scope](DatabaseConnection &connection) -> std::int64_t
+                                                                    {
+                                                                        std::vector<DatabaseValue> parameters{since};
+                                                                        const std::string          filter =
+                                                                                "SELECT COUNT(DISTINCT username) AS total FROM sys_login_log WHERE login_time >= ? AND status = 1" +
+                                                                                loginScopeFilter(scope, parameters);
+                                                                        const auto rows = Sql::executeOrThrow(connection, filter, parameters);
+                                                                        return rows->next() ? Sql::integer(*rows, "total") : 0;
+                                                                    });
     }
 
-    AsynGyanis::Core::Task<std::vector<LoginLogRecord>> LogRepository::recentLogins(AsynGyanis::Core::EventLoop &loop, const int limit)
+    AsynGyanis::Core::Task<std::vector<LoginLogRecord>> LogRepository::recentLogins(AsynGyanis::Core::EventLoop &loop, const int limit, const LogScope scope)
     {
         co_return co_await m_database->withConnection<std::vector<LoginLogRecord>>(
                 loop,
-                [limit](DatabaseConnection &connection) -> std::vector<LoginLogRecord>
+                [limit, scope](DatabaseConnection &connection) -> std::vector<LoginLogRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{static_cast<std::int64_t>(limit)};
-                    const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectLogin} + "ORDER BY login_time DESC, id DESC LIMIT ?", parameters);
-                    std::vector<LoginLogRecord>        records;
+                    std::vector<DatabaseValue> scoped;
+                    const std::string          filter = std::string{kSelectLogin} + "WHERE 1 = 1" + loginScopeFilter(scope, scoped) + " ORDER BY login_time DESC, id DESC LIMIT ?";
+                    scoped.emplace_back(static_cast<std::int64_t>(limit));
+                    const auto                  rows = Sql::executeOrThrow(connection, filter, scoped);
+                    std::vector<LoginLogRecord> records;
                     while (rows->next())
                     {
                         records.push_back(readLogin(*rows));

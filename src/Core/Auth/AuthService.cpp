@@ -88,7 +88,7 @@ namespace EdgePulse::Auth
         const bool isMatch = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop, [storedHash, password] { return Common::verifyPassword(storedHash, password); });
         if (!isMatch)
         {
-            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "口令不匹配", credentials.traceId});
+            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "口令不匹配", credentials.traceId, user->id, user->departmentId});
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
         }
 
@@ -113,7 +113,7 @@ namespace EdgePulse::Auth
         {
             LOG_WARN_FMT("登录时间未更新：user={}", user->username);
         }
-        co_await recordAudit(loop, LoginAuditEntry{user->username, credentials.clientIp, true, "登录成功", credentials.traceId});
+        co_await recordAudit(loop, LoginAuditEntry{user->username, credentials.clientIp, true, "登录成功", credentials.traceId, user->id, user->departmentId});
 
         co_return LoginResult{session.token, m_sessions->ttlSeconds()};
     }

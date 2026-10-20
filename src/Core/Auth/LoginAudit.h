@@ -14,6 +14,7 @@
 #include <Core/Coroutine/Task.h>
 #include <Core/EventLoop/EventLoop.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -24,11 +25,13 @@ namespace EdgePulse::Auth
      */
     struct LoginAuditEntry
     {
-        std::string username;       ///< 登录名，失败时也记录
-        std::string ip;             ///< 来源 IP
-        bool        success{false}; ///< 是否成功
-        std::string message;        ///< 结果说明，不含口令
-        std::string traceId;        ///< 请求标识
+        std::string  username;        ///< 登录名，失败时也记录
+        std::string  ip;              ///< 来源 IP
+        bool         success{false};  ///< 是否成功
+        std::string  message;         ///< 结果说明，不含口令
+        std::string  traceId;         ///< 请求标识
+        std::int64_t userId{0};       ///< 账号标识；账号不存在时为 0
+        std::int64_t departmentId{0}; ///< 归属部门；未知时为 0
     };
 
     /**

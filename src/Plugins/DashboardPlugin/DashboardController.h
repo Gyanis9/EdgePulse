@@ -20,7 +20,8 @@ namespace AsynGyanis::Net
 namespace EdgePulse::Auth
 {
     class AuthService;
-}
+    class DataScopeService;
+} // namespace EdgePulse::Auth
 namespace EdgePulse::System
 {
     class LogRepository;
@@ -34,9 +35,10 @@ namespace EdgePulse::Dashboard
      */
     struct DashboardDependencies
     {
-        Auth::AuthService      *auth{nullptr};  ///< 认证服务
-        System::LogRepository  *logs{nullptr};  ///< 日志与统计
-        System::RoleRepository *roles{nullptr}; ///< 角色分布
+        Auth::AuthService      *auth{nullptr};       ///< 认证服务
+        Auth::DataScopeService *dataScopes{nullptr}; ///< 数据范围
+        System::LogRepository  *logs{nullptr};       ///< 日志与统计
+        System::RoleRepository *roles{nullptr};      ///< 角色分布
     };
 
     /**

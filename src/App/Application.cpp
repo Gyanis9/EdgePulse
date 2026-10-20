@@ -471,13 +471,15 @@ namespace EdgePulse::App
         systemDependencies.dictionaries = m_dictionaryRepository.get();
         System::registerSystemRoutes(router, loop, systemDependencies);
         Monitor::MonitorDependencies monitorDependencies;
-        monitorDependencies.auth = m_authService.get();
-        monitorDependencies.logs = m_logRepository.get();
+        monitorDependencies.auth       = m_authService.get();
+        monitorDependencies.dataScopes = m_dataScopeService.get();
+        monitorDependencies.logs       = m_logRepository.get();
         Monitor::registerMonitorRoutes(router, loop, monitorDependencies);
         Dashboard::DashboardDependencies dashboardDependencies;
-        dashboardDependencies.auth  = m_authService.get();
-        dashboardDependencies.logs  = m_logRepository.get();
-        dashboardDependencies.roles = m_roleRepository.get();
+        dashboardDependencies.auth       = m_authService.get();
+        dashboardDependencies.dataScopes = m_dataScopeService.get();
+        dashboardDependencies.logs       = m_logRepository.get();
+        dashboardDependencies.roles      = m_roleRepository.get();
         Dashboard::registerDashboardRoutes(router, loop, dashboardDependencies);
 
         Device::NodeGroupDependencies groupDependencies;

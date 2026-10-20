@@ -4,6 +4,7 @@
 #include "Base/Api/QueryParameters.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/AuthService.h"
+#include "Core/Auth/DataScopeService.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 #include "Core/System/LogRepository.h"
@@ -60,6 +61,17 @@ namespace EdgePulse::Dashboard
             }
             return array;
         }
+
+        [[nodiscard]] AsynGyanis::Core::Task<System::LogScope> resolveLogScope(Auth::DataScopeService *dataScopes, AsynGyanis::Core::EventLoop &loop,
+                                                                               const EdgePulse::Auth::SessionRecord &session)
+        {
+            if (dataScopes == nullptr)
+            {
+                co_return System::LogScope{};
+            }
+            const EdgePulse::Auth::DataScope scope = co_await dataScopes->resolve(loop, session.userId);
+            co_return System::LogScope{scope.all, scope.selfOnly, scope.userId, scope.deptIds};
+        }
     } // namespace
 
     void registerDashboardRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const DashboardDependencies &dependencyInput)
@@ -79,19 +91,20 @@ namespace EdgePulse::Dashboard
                        {
                            range = "24h";
                        }
-                       const std::int64_t now      = static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
-                       const std::int64_t length   = rangeSeconds(range);
-                       const std::int64_t start    = now - length;
-                       const std::int64_t previous = start - length;
+                       const std::int64_t     now      = static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+                       const std::int64_t     length   = rangeSeconds(range);
+                       const std::int64_t     start    = now - length;
+                       const std::int64_t     previous = start - length;
+                       const System::LogScope scope    = co_await resolveLogScope(deps->dataScopes, loop, *session);
 
-                       const LoginStats   loginStats     = co_await deps->logs->loginStats(loop, range);
-                       const OperStats    operStats      = co_await deps->logs->operStats(loop, range);
-                       const std::int64_t previousLogins = co_await deps->logs->loginCountBetween(loop, timeText(previous), timeText(start));
-                       const std::int64_t previousOps    = co_await deps->logs->operCountBetween(loop, timeText(previous), timeText(start));
-                       const std::int64_t onlineUsers    = co_await deps->logs->distinctLoginUsersSince(loop, timeText(now - 3600));
+                       const LoginStats   loginStats     = co_await deps->logs->loginStats(loop, range, scope);
+                       const OperStats    operStats      = co_await deps->logs->operStats(loop, range, scope);
+                       const std::int64_t previousLogins = co_await deps->logs->loginCountBetween(loop, timeText(previous), timeText(start), scope);
+                       const std::int64_t previousOps    = co_await deps->logs->operCountBetween(loop, timeText(previous), timeText(start), scope);
+                       const std::int64_t onlineUsers    = co_await deps->logs->distinctLoginUsersSince(loop, timeText(now - 3600), scope);
                        const auto         roles          = co_await deps->roles->listOptions(loop);
-                       const auto         recent         = co_await deps->logs->recentLogins(loop, 6);
-                       const auto         dailyOps       = co_await deps->logs->dailyOper(loop, 7);
+                       const auto         recent         = co_await deps->logs->recentLogins(loop, 6, scope);
+                       const auto         dailyOps       = co_await deps->logs->dailyOper(loop, 7, scope);
 
                        ConfigValue trend = ConfigValue::array();
                        for (const TimeBucket &bucket: loginStats.series)
