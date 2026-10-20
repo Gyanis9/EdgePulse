@@ -50,6 +50,17 @@ export interface RoutesResponse {
   routes: RouteItem[]
 }
 
+export interface OidcEnabledResponse {
+  enabled: boolean
+  label: string
+}
+
+export interface OidcExchangeResponse {
+  token: string
+  expiresIn: number
+  returnPath: string
+}
+
 export function createAuthApi(client: HttpClient) {
   return {
     captcha: () => client.get<CaptchaResponse>('/auth/captcha'),
@@ -58,5 +69,7 @@ export function createAuthApi(client: HttpClient) {
     routes: () => client.get<RoutesResponse>('/auth/routes'),
     changePassword: (body: ChangePasswordRequest) => client.put<void>('/auth/password', body),
     logout: () => client.post<void>('/auth/logout'),
+    oidcEnabled: () => client.get<OidcEnabledResponse>('/auth/oidc/enabled'),
+    oidcExchange: (body: { code: string }) => client.post<OidcExchangeResponse>('/auth/oidc/exchange', body),
   }
 }

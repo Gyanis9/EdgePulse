@@ -67,6 +67,14 @@ namespace EdgePulse::System
         AsynGyanis::Core::Task<std::optional<UserRecord>> findByUsername(AsynGyanis::Core::EventLoop &loop, std::string username);
 
         /**
+         * @brief 按邮箱查未删除用户
+         * @param loop 恢复协程用的事件循环
+         * @param email 邮箱
+         * @return std::optional<UserRecord> 用户行
+         */
+        AsynGyanis::Core::Task<std::optional<UserRecord>> findByEmail(AsynGyanis::Core::EventLoop &loop, std::string email);
+
+        /**
          * @brief 按主键查未删除用户
          * @param loop 恢复协程用的事件循环
          * @param userId 用户标识

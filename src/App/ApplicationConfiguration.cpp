@@ -147,6 +147,16 @@ namespace EdgePulse::App
         configuration.reverseProxyMaximumRequestBytes = configurationManager.getInt("edgepulse.reverse_proxy.maximum_request_bytes", configuration.reverseProxyMaximumRequestBytes);
         configuration.reverseProxyMaximumResponseBytes =
                 configurationManager.getInt("edgepulse.reverse_proxy.maximum_response_bytes", configuration.reverseProxyMaximumResponseBytes);
+        configuration.oidcEnabled              = configurationManager.getBool("edgepulse.oidc.enabled", configuration.oidcEnabled);
+        configuration.oidcIssuer               = configurationManager.getString("edgepulse.oidc.issuer", configuration.oidcIssuer);
+        configuration.oidcClientId             = configurationManager.getString("edgepulse.oidc.client_id", configuration.oidcClientId);
+        configuration.oidcRedirectUri          = configurationManager.getString("edgepulse.oidc.redirect_uri", configuration.oidcRedirectUri);
+        configuration.oidcFrontendRedirect     = configurationManager.getString("edgepulse.oidc.frontend_redirect", configuration.oidcFrontendRedirect);
+        configuration.oidcScopes               = configurationManager.getString("edgepulse.oidc.scopes", configuration.oidcScopes);
+        configuration.oidcAllowedEmailDomains  = configurationManager.getString("edgepulse.oidc.allowed_email_domains", configuration.oidcAllowedEmailDomains);
+        configuration.oidcAutoProvision        = configurationManager.getBool("edgepulse.oidc.auto_provision", configuration.oidcAutoProvision);
+        configuration.oidcDefaultRoleId        = configurationManager.getInt("edgepulse.oidc.default_role_id", configuration.oidcDefaultRoleId);
+        configuration.oidcDefaultDepartmentId  = configurationManager.getInt("edgepulse.oidc.default_dept_id", configuration.oidcDefaultDepartmentId);
         configuration.captchaTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.captcha.ttl_seconds", configuration.captchaTtlSeconds));
         configuration.captchaRequestsPerMinute = static_cast<int>(configurationManager.getInt("edgepulse.captcha.requests_per_minute", configuration.captchaRequestsPerMinute));
         configuration.sessionTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.session.ttl_seconds", configuration.sessionTtlSeconds));
@@ -185,6 +195,28 @@ namespace EdgePulse::App
         if (configuration.udpTelemetryEnabled && configuration.udpTelemetrySecret.size() < 16)
         {
             return std::unexpected(ConfigurationError{"启用 UDP 遥测时必须在 EDGEPULSE_UDP_TELEMETRY_SECRET 中配置至少 16 字节的共享密钥"});
+        }
+        if (const auto secret = Common::environmentValue("EDGEPULSE_OIDC_CLIENT_SECRET"); secret.has_value())
+        {
+            configuration.oidcClientSecret = *secret;
+        }
+        if (configuration.oidcEnabled)
+        {
+            if (configuration.oidcIssuer.empty() || configuration.oidcClientId.empty() || configuration.oidcRedirectUri.empty())
+            {
+                return std::unexpected(ConfigurationError{"启用 OIDC 时必须配置 issuer、client_id 与 redirect_uri"});
+            }
+            if ((!configuration.oidcIssuer.starts_with("https://") && !configuration.oidcIssuer.starts_with("http://127.0.0.1") &&
+                 !configuration.oidcIssuer.starts_with("http://localhost")) ||
+                (!configuration.oidcRedirectUri.starts_with("https://") && !configuration.oidcRedirectUri.starts_with("http://127.0.0.1") &&
+                 !configuration.oidcRedirectUri.starts_with("http://localhost")))
+            {
+                return std::unexpected(ConfigurationError{"OIDC 的 issuer 与 redirect_uri 必须是 https，或指向本机回环地址"});
+            }
+            if (configuration.oidcScopes.find("openid") == std::string::npos)
+            {
+                return std::unexpected(ConfigurationError{"OIDC scopes 必须包含 openid"});
+            }
         }
         if (configuration.reverseProxyEnabled)
         {

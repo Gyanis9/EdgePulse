@@ -4,6 +4,8 @@ add_library(edgepulse-core STATIC
         Auth/LoginAudit.cpp
         Auth/SessionStore.cpp
         Auth/DataScopeService.cpp
+        Auth/Jwt.cpp
+        Auth/OidcService.cpp
         Cache/MemoryKeyValueStore.cpp
         Cache/RedisKeyValueStore.cpp
         Alarm/AlarmRepository.cpp

@@ -46,6 +46,17 @@ edgepulse:
     enabled: false
     address: 0.0.0.0
     port: 9555
+  oidc:
+    enabled: false
+    issuer: https://idp.example.com
+    client_id: edgepulse
+    redirect_uri: https://console.example.com/api/auth/oidc/callback
+    frontend_redirect: /login
+    scopes: openid profile email
+    allowed_email_domains: ""
+    auto_provision: false
+    default_role_id: 0
+    default_dept_id: 101
   reverse_proxy:
     enabled: false
     prefix: /edge

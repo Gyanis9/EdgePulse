@@ -438,6 +438,13 @@ def check_udp_telemetry() -> None:
     report("UDP 遥测数据报签名、落库与回读", result.returncode == 0, detail)
 
 
+def check_oidc() -> None:
+    result = subprocess.run([sys.executable, str(ROOT / "scripts" / "check-oidc.py")], capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=180, check=False)
+    detail = (result.stdout or result.stderr).strip().replace("\n", "；")
+    report("OIDC 授权码登录与自动建号", result.returncode == 0, detail)
+
+
 def check_websocket(token: str) -> None:
     script = ROOT / "build" / "gate" / "ws-check.mjs"
     script.parent.mkdir(parents=True, exist_ok=True)
@@ -489,6 +496,7 @@ def main() -> int:
         check_ops()
         check_otlp()
         check_udp_telemetry()
+        check_oidc()
         if token:
             check_system(token)
             node_id = check_nodes(token)

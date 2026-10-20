@@ -88,6 +88,19 @@ namespace EdgePulse::Auth
         AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> login(AsynGyanis::Core::EventLoop &loop, LoginCredentials credentials);
 
         /**
+         * @brief 为已确认的外部身份签发会话
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         * @param clientIp 来源 IP
+         * @param traceId 请求标识
+         * @param auditMessage 登录审计文案
+         * @return 成功返回 token 与有效期；账号不存在或停用时返回 401
+         * @note 调用方必须已完成外部身份校验（如 OIDC）
+         */
+        AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> issueSessionForUser(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string clientIp,
+                                                                                          std::string traceId, std::string auditMessage);
+
+        /**
          * @brief 校验令牌并滑动续期
          * @param loop 恢复协程用的事件循环
          * @param token 会话令牌
@@ -136,6 +149,19 @@ namespace EdgePulse::Auth
         [[nodiscard]] int sessionTtlSeconds() const noexcept;
 
     private:
+        /**
+         * @brief 为通过认证的用户建立会话、更新登录时间并写审计
+         * @param loop 恢复协程用的事件循环
+         * @param user 用户行
+         * @param clientIp 来源 IP
+         * @param traceId 请求标识
+         * @param auditMessage 登录审计文案
+         * @return 会话令牌与有效期
+         */
+        AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> createSessionForUser(AsynGyanis::Core::EventLoop &loop, const System::UserRecord &user,
+                                                                                           const std::string &clientIp, const std::string &traceId,
+                                                                                           const std::string &auditMessage);
+
         /**
          * @brief 写审计；失败只记日志，不改变登录结果
          */

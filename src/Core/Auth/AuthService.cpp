@@ -92,29 +92,49 @@ namespace EdgePulse::Auth
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
         }
 
-        const std::vector<std::string> roles       = co_await m_users.rolesFor(loop, user->id);
-        const std::vector<std::string> permissions = co_await m_users.permissionsFor(loop, user->id);
+        auto issued = co_await createSessionForUser(loop, *user, credentials.clientIp, credentials.traceId, "登录成功");
+        if (issued.has_value())
+        {
+            // 成功登录清空该来源的失败计数，避免此前几次输错影响后续正常使用
+            static_cast<void>(co_await m_cache->erase(loop, failureKey));
+        }
+        co_return issued;
+    }
+
+    AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> AuthService::issueSessionForUser(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId,
+                                                                                                   std::string clientIp, std::string traceId, std::string auditMessage)
+    {
+        const std::optional<System::UserRecord> user = co_await m_users.findById(loop, userId);
+        if (!user.has_value() || user->status != 1)
+        {
+            co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "账号不存在或已停用"});
+        }
+        co_return co_await createSessionForUser(loop, *user, clientIp, traceId, auditMessage);
+    }
+
+    AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> AuthService::createSessionForUser(AsynGyanis::Core::EventLoop &loop, const System::UserRecord &user,
+                                                                                                    const std::string &clientIp, const std::string &traceId,
+                                                                                                    const std::string &auditMessage)
+    {
+        const std::vector<std::string> roles       = co_await m_users.rolesFor(loop, user.id);
+        const std::vector<std::string> permissions = co_await m_users.permissionsFor(loop, user.id);
 
         SessionRecord record;
-        record.userId               = user->id;
-        record.username             = user->username;
-        record.nickname             = user->nickname;
-        record.departmentId         = user->departmentId;
-        record.departmentName       = user->departmentName;
+        record.userId               = user.id;
+        record.username             = user.username;
+        record.nickname             = user.nickname;
+        record.departmentId         = user.departmentId;
+        record.departmentName       = user.departmentName;
         record.roles                = roles;
         record.permissions          = permissions;
         const SessionRecord session = co_await m_sessions->create(loop, std::move(record));
 
-        // 成功登录清空该来源的失败计数，避免此前几次输错影响后续正常使用
-        static_cast<void>(co_await m_cache->erase(loop, failureKey));
-
         // 登录时间更新失败不影响本次登录，但必须在日志里留下原因
-        if (!co_await m_users.touchLastLogin(loop, user->id, Common::nowDateTimeUtc()))
+        if (!co_await m_users.touchLastLogin(loop, user.id, Common::nowDateTimeUtc()))
         {
-            LOG_WARN_FMT("登录时间未更新：user={}", user->username);
+            LOG_WARN_FMT("登录时间未更新：user={}", user.username);
         }
-        co_await recordAudit(loop, LoginAuditEntry{user->username, credentials.clientIp, true, "登录成功", credentials.traceId, user->id, user->departmentId});
-
+        co_await recordAudit(loop, LoginAuditEntry{user.username, clientIp, true, auditMessage, traceId, user.id, user.departmentId});
         co_return LoginResult{session.token, m_sessions->ttlSeconds()};
     }
 

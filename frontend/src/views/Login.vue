@@ -8,7 +8,7 @@ import TextInput from '@/components/ui/TextInput.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
 import { ApiError, authApi, portalApi } from '@/api'
 import NeuralNet from '@/components/NeuralNet.vue'
-import { login } from '@/composables/auth'
+import { login, loginWithOidc } from '@/composables/auth'
 import { EASE, afterTwoFrames, gsap, motionSkipped, prefersReducedMotion, trackGlow } from '@/composables/motion'
 import { required, validate } from '@/utils/validate'
 import { APP } from '@/data'
@@ -29,6 +29,7 @@ const captchaLoading = ref(false)
 const root = ref<HTMLElement | null>(null)
 const card = ref<HTMLElement | null>(null)
 const succeeded = ref(false)
+const oidcEnabled = ref(false)
 
 /* ── 左侧仪表：实时时钟（秒针刻度逐格推进）与服务健康 ── */
 const now = ref(new Date())
@@ -140,6 +141,36 @@ async function submit() {
   }
 }
 
+function redirectTarget() {
+  const value = route.query.redirect
+  return typeof value === 'string' && value.startsWith('/') ? value : '/'
+}
+
+function startOidc() {
+  window.location.assign('/api/auth/oidc/start?return=' + encodeURIComponent(redirectTarget()))
+}
+
+/** OIDC 回调：用一次性 code 换会话，成功后进入原目标页。 */
+async function completeOidc() {
+  const code = typeof route.query.oidcCode === 'string' ? route.query.oidcCode : ''
+  const errorText = typeof route.query.oidcError === 'string' ? route.query.oidcError : ''
+  if (errorText) formError.value = errorText
+  if (!code) return
+  submitting.value = true
+  try {
+    const result = await loginWithOidc(code, true)
+    await playSuccess()
+    const target = result.returnPath || redirectTarget()
+    const failure = await router.replace(target)
+    if (failure || router.currentRoute.value.name === 'login') succeeded.value = false
+  } catch (error) {
+    succeeded.value = false
+    formError.value = error instanceof ApiError ? error.message : '企业登录失败，请稍后重试'
+  } finally {
+    submitting.value = false
+  }
+}
+
 /* ── 一次性开场：本次会话只播一次；任意点击或按键快进而不是硬切 ── */
 const INTRO_KEY = 'scaffold.login-intro'
 let intro: gsap.core.Timeline | null = null
@@ -181,6 +212,10 @@ function onVisibility() {
 onMounted(() => {
   refreshCaptcha()
   probeHealth()
+  authApi.oidcEnabled()
+    .then(result => { oidcEnabled.value = Boolean(result.enabled) })
+    .catch(() => { oidcEnabled.value = false })
+  void completeOidc()
   clockTimer = window.setInterval(() => { if (!document.hidden) now.value = new Date() }, 1000)
   if (card.value && window.matchMedia('(hover: hover)').matches) {
     tiltX = gsap.quickTo(card.value, 'rotationX', { duration: 0.6, ease: 'power3.out' })
@@ -303,6 +338,9 @@ onBeforeUnmount(() => {
                 </svg>
               </div>
             </div>
+            <Button v-if="oidcEnabled && !succeeded" type="button" variant="secondary" block class="login-oidc" :disabled="submitting" @click="startOidc">
+              企业登录
+            </Button>
           </form>
         </div>
       </div>

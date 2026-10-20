@@ -153,6 +153,27 @@ export async function login(credentials: LoginRequest, remember: boolean) {
   }
 }
 
+/** OIDC 回调带回的一次性 code 换会话；成功后加载当前身份与权限。 */
+export async function loginWithOidc(code: string, remember: boolean) {
+  clearSession()
+  const version = sessionVersion.value
+  try {
+    const exchanged = await authApi.oidcExchange({ code })
+    if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
+    authSession.save({ token: exchanged.token, expiresIn: exchanged.expiresIn }, { username: 'oidc', nickname: 'oidc' }, remember)
+    const user = await authApi.me()
+    if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
+    authSession.save({ token: exchanged.token, expiresIn: exchanged.expiresIn }, user, remember)
+    currentUser.value = user
+    setPermissions(user.permissions ?? [])
+    authed.value = true
+    return { user, returnPath: exchanged.returnPath }
+  } catch (error) {
+    if (version === sessionVersion.value) clearSession()
+    throw error
+  }
+}
+
 export function clearSession() {
   sessionVersion.value += 1
   authed.value = false

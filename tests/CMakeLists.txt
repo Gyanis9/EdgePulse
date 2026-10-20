@@ -19,6 +19,7 @@ add_executable(edgepulse-unit-tests
         Unit/TestCsvWriter.cpp
         Unit/TestIdGenerator.cpp
         Unit/TestMemoryKeyValueStore.cpp
+        Unit/TestOidcJwt.cpp
         Unit/TestMigrationSqlSplitter.cpp
         Unit/TestPagination.cpp
         Unit/TestPasswordHash.cpp

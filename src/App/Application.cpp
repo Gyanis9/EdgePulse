@@ -3,7 +3,9 @@
 #include "App/ListenerAssembly.h"
 #include "Base/Config/ConfigValue.h"
 #include "Plugins/AuthPlugin/AuthController.h"
+#include "Plugins/AuthPlugin/OidcController.h"
 #include "Core/Auth/AuthService.h"
+#include "Core/Auth/OidcService.h"
 #include "Core/Auth/CaptchaService.h"
 #include "Core/Auth/LoginAudit.h"
 #include "Core/Auth/SessionStore.h"
@@ -187,8 +189,24 @@ namespace EdgePulse::App
                 const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "node.status"}, {"data", Device::nodeToJson(node)}}).dump();
                 co_await webSocket->hub().publish("nodes", payload);
             };
-            m_agentRegistry        = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
-            m_userRepository       = std::make_shared<System::UserRepository>(m_database);
+            m_agentRegistry  = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
+            m_userRepository = std::make_shared<System::UserRepository>(m_database);
+            if (m_configuration.oidcEnabled)
+            {
+                Auth::OidcConfiguration oidcConfiguration;
+                oidcConfiguration.enabled             = true;
+                oidcConfiguration.issuer              = m_configuration.oidcIssuer;
+                oidcConfiguration.clientId            = m_configuration.oidcClientId;
+                oidcConfiguration.clientSecret        = m_configuration.oidcClientSecret;
+                oidcConfiguration.redirectUri         = m_configuration.oidcRedirectUri;
+                oidcConfiguration.frontendRedirect    = m_configuration.oidcFrontendRedirect;
+                oidcConfiguration.scopes              = m_configuration.oidcScopes;
+                oidcConfiguration.autoProvision       = m_configuration.oidcAutoProvision;
+                oidcConfiguration.defaultRoleId       = m_configuration.oidcDefaultRoleId;
+                oidcConfiguration.defaultDepartmentId = m_configuration.oidcDefaultDepartmentId;
+                oidcConfiguration.allowedEmailDomains = m_configuration.oidcAllowedEmailDomains;
+                m_oidcService                         = std::make_unique<Auth::OidcService>(oidcConfiguration, *m_userRepository, *m_cache, *m_authService);
+            }
             m_roleRepository       = std::make_shared<System::RoleRepository>(m_database);
             m_menuRepository       = std::make_shared<System::MenuRepository>(m_database);
             m_orgRepository        = std::make_shared<System::OrgRepository>(m_database);
@@ -475,6 +493,10 @@ namespace EdgePulse::App
         Web::registerAuditMiddleware(router, loop, *m_authService, *m_logRepository);
         registerHealthRoutes(router);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
+        if (m_oidcService)
+        {
+            Auth::registerOidcRoutes(router, loop, *m_oidcService);
+        }
         System::SystemDependencies systemDependencies;
         systemDependencies.auth         = m_authService.get();
         systemDependencies.dataScopes   = m_dataScopeService.get();

@@ -76,6 +76,17 @@ namespace EdgePulse::App
         std::int64_t             reverseProxyTimeoutMs{15000};                        ///< 单次转发时限
         std::int64_t             reverseProxyMaximumRequestBytes{8LL * 1024 * 1024};  ///< 请求正文上限
         std::int64_t             reverseProxyMaximumResponseBytes{8LL * 1024 * 1024}; ///< 响应正文上限
+        bool                     oidcEnabled{false};                                  ///< 是否启用 OIDC 登录
+        std::string              oidcIssuer;                                          ///< 签发者基地址
+        std::string              oidcClientId;                                        ///< 客户端标识
+        std::string              oidcClientSecret;                                    ///< 客户端密钥，只从环境变量读取
+        std::string              oidcRedirectUri;                                     ///< 回调地址
+        std::string              oidcFrontendRedirect{"/login"};                      ///< 回调后回到的前端路径
+        std::string              oidcScopes{"openid profile email"};                  ///< 申请的 scope
+        std::string              oidcAllowedEmailDomains;                             ///< 允许的邮箱域，逗号分隔
+        bool                     oidcAutoProvision{false};                            ///< 首次登录自动建号
+        std::int64_t             oidcDefaultRoleId{0};                                ///< 自动建号角色
+        std::int64_t             oidcDefaultDepartmentId{101};                        ///< 自动建号部门
 
         /**
          * @brief 读取 YAML 并组装配置；同目录存在 logging.yaml 时一并载入

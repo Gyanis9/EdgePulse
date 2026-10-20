@@ -1,0 +1,92 @@
+#include "Plugins/AuthPlugin/OidcController.h"
+
+#include "Base/Api/ApiResponse.h"
+#include "Base/Api/ErrorCatalog.h"
+#include "Base/Api/QueryParameters.h"
+#include "Base/Json/JsonFields.h"
+#include "Core/Auth/OidcService.h"
+#include "Core/Http/RequestId.h"
+#include "Net/Http/HttpRequest.h"
+#include "Net/Http/HttpResponse.h"
+#include "Net/Http/Router.h"
+
+#include <Core/EventLoop/EventLoop.h>
+
+#include <string>
+
+namespace EdgePulse::Auth
+{
+    namespace
+    {
+        using AsynGyanis::Base::ConfigValue;
+
+        [[nodiscard]] std::string safeReturnPath(std::string path)
+        {
+            // 只接受本站绝对路径：协议相对地址与反斜杠会把浏览器带去别的源
+            if (path.empty() || path.front() != '/' || path.starts_with("//") || path.find('\\') != std::string::npos || path.size() > 512)
+            {
+                return {};
+            }
+            return path;
+        }
+    } // namespace
+
+    void registerOidcRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, OidcService &oidc)
+    {
+        router.get("/api/auth/oidc/enabled",
+                   [&oidc](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string traceId = Web::resolveRequestId(request);
+                       Common::writeSuccess(response, ConfigValue::object({{"enabled", oidc.enabled()}, {"label", "企业登录"}}), traceId);
+                       co_return;
+                   });
+
+        router.get("/api/auth/oidc/start",
+                   [&loop, &oidc](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string     traceId    = Web::resolveRequestId(request);
+                       const std::string     returnPath = safeReturnPath(Common::queryText(request.queryParams(), "return"));
+                       const OidcStartResult result     = co_await oidc.start(loop, returnPath);
+                       if (!result.ok)
+                       {
+                           Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, result.error, traceId);
+                           co_return;
+                       }
+                       response.setStatus(302);
+                       response.setHeader("Location", result.redirectUrl);
+                       co_return;
+                   });
+
+        router.get("/api/auth/oidc/callback",
+                   [&loop, &oidc](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const Common::QueryMap   query  = request.queryParams();
+                       const std::string        code   = Common::queryText(query, "code");
+                       const std::string        state  = Common::queryText(query, "state");
+                       const OidcCallbackResult result = co_await oidc.handleCallback(loop, code, state);
+                       response.setStatus(302);
+                       response.setHeader("Location", result.redirectUrl);
+                       co_return;
+                   });
+
+        router.post("/api/auth/oidc/exchange",
+                    [&loop, &oidc](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string traceId = Web::resolveRequestId(request);
+                        const auto        body    = request.jsonBody();
+                        if (!body.has_value() || !body->is_object())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
+                            co_return;
+                        }
+                        const OidcExchangeResult result = co_await oidc.exchange(loop, Json::stringField(*body, "code"), request.remoteIp(), traceId);
+                        if (!result.ok)
+                        {
+                            Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, result.error, traceId);
+                            co_return;
+                        }
+                        Common::writeSuccess(response, ConfigValue::object({{"token", result.token}, {"expiresIn", result.expiresIn}, {"returnPath", result.returnPath}}), traceId);
+                        co_return;
+                    });
+    }
+} // namespace EdgePulse::Auth

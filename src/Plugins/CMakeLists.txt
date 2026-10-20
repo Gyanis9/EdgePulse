@@ -1,6 +1,7 @@
 add_library(edgepulse-plugins STATIC
         AlarmPlugin/AlarmController.cpp
         AuthPlugin/AuthController.cpp
+        AuthPlugin/OidcController.cpp
         CommandPlugin/CommandController.cpp
         DashboardPlugin/DashboardController.cpp
         DevicePlugin/AgentController.cpp

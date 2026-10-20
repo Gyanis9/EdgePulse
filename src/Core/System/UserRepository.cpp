@@ -155,6 +155,22 @@ namespace EdgePulse::System
                 });
     }
 
+    AsynGyanis::Core::Task<std::optional<UserRecord>> UserRepository::findByEmail(AsynGyanis::Core::EventLoop &loop, std::string email)
+    {
+        co_return co_await m_database->withConnection<std::optional<UserRecord>>(
+                loop,
+                [email = std::move(email)](DatabaseConnection &connection) -> std::optional<UserRecord>
+                {
+                    const std::array<DatabaseValue, 1> parameters{email};
+                    const auto                         result = execute(connection, std::string{kSelectUser} + "WHERE u.email = ? AND u.deleted = 0", parameters);
+                    if (!result->next())
+                    {
+                        return std::nullopt;
+                    }
+                    return readUser(*result);
+                });
+    }
+
     AsynGyanis::Core::Task<std::optional<UserRecord>> UserRepository::findById(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
     {
         co_return co_await m_database->withConnection<std::optional<UserRecord>>(loop,
