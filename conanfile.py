@@ -11,7 +11,7 @@ class EdgePulseRecipe(ConanFile):
         "openssl/3.6.5",
         "gtest/1.17.0",
     )
-    default_options = {"gtest/*:shared": False}
+    default_options = {"gtest/*:shared": False, "asyngyanis/*:with_mysql": True}
 
     def layout(self):
         cmake_layout(self)
