@@ -1,0 +1,19 @@
+logging:
+  global_level: info
+  loggers:
+    root:
+      level: info
+      sinks:
+        - type: console
+          color: false
+        - type: async
+          queue_size: 8192
+          overflow_policy: drop
+          wrapped:
+            type: rolling_file
+            base_filename: edgepulse.log
+            directory: var/logs
+            policy: size
+            max_size_mb: 32
+            max_backup: 5
+            formatter: json

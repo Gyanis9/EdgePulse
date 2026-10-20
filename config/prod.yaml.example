@@ -1,0 +1,37 @@
+# 生产配置样例：复制为未跟踪的本地文件后再填值。
+# 秘密项不写在这里，只从环境变量读取：
+#   EDGEPULSE_DB_PASSWORD
+#   EDGEPULSE_OPS_BEARER_TOKEN
+#   EDGEPULSE_AGENT_FINGERPRINT
+edgepulse:
+  listen_address: 0.0.0.0
+  http_port: 8080
+  https_port: 8443
+  agent_port: 9443
+  ops_port: 9100
+  ops_address: 127.0.0.1
+  web_root: web
+  cert_dir: /etc/edgepulse/tls
+  database:
+    driver: mysql
+    path: ""
+  captcha:
+    ttl_seconds: 120
+    expose_code: false
+  session:
+    ttl_seconds: 7200
+  security:
+    allowed_origins: https://console.example.com
+  agent:
+    fingerprint: ""
+
+server:
+  limits:
+    idle_timeout_ms: 75000
+    read_timeout_ms: 60000
+    write_timeout_ms: 60000
+  parser_limits:
+    maximum_body_size: 16777216
+  rate_limit:
+    requests_per_second: 0.0
+    burst_capacity: 1.0

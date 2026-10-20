@@ -1,0 +1,13 @@
+/build/
+/var/
+/frontend/node_modules/
+/frontend/.npm-cache/
+/frontend/dist/
+/frontend/test-results/
+/frontend/playwright-report/
+*.log
+*.pdb
+*.ilk
+.env
+.DS_Store
+Thumbs.db
