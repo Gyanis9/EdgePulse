@@ -50,6 +50,7 @@ edgepulse:
     auto_provision: false
     default_role_id: 0
     default_dept_id: 101
+    tenant_code: default
   reverse_proxy:
     enabled: false
     prefix: /edge

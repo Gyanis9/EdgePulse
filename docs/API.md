@@ -14,9 +14,9 @@
 |---|---|---|---|
 | GET | `/api/health` | 匿名 | `{status:"UP",time}` |
 | GET | `/api/auth/captcha` | 匿名 | `{uuid,imageSvg,code?}`；开发档带 code |
-| POST | `/api/auth/login` | 匿名 | `{username,password,captcha,captchaUuid}` → `{token,expiresIn}` |
+| POST | `/api/auth/login` | 匿名 | `{username,password,captcha,captchaUuid,tenantCode?}` → `{token,expiresIn}`；tenantCode 缺省 `default` |
 | POST | `/api/auth/logout` | 登录 | 删除当前会话 |
-| GET | `/api/auth/me` | 登录 | `{id,userId,username,nickname,deptId,deptName,roles,permissions}` |
+| GET | `/api/auth/me` | 登录 | `{id,userId,username,nickname,deptId,deptName,tenantId,tenantCode,tenantName,platformAdmin,roles,permissions}` |
 | GET | `/api/auth/routes` | 登录 | 动态菜单树；节点形状 `{id,parentId,name,type,path,component,icon,permission,children}` |
 | PUT | `/api/auth/password` | 登录 | `{oldPassword,newPassword}` |
 | GET | `/api/auth/oidc/enabled` | 匿名 | `{enabled,label}` |
@@ -62,8 +62,14 @@
 | GET/POST | `/api/system/configs` | `system:config:list` / `system:config:add` |
 | PUT/DELETE | `/api/system/configs/{id}` | `system:config:edit` / `system:config:remove` |
 | GET | `/api/system/configs/export` | `system:config:export` |
+| GET/POST | `/api/system/tenants` | `system:tenant:list` / `system:tenant:add`，仅平台管理员 |
+| PUT | `/api/system/tenants/{id}` | `system:tenant:edit`，仅平台管理员；停用用 `{status:0}`，默认租户不可停用 |
 
-用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds,deptIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`；取 `CUSTOM` 时必须给出非空 `deptIds`。
+用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`；平台管理员创建时可用 `tenantId` 指定归属，租户管理员固定落在本租户。用户列表项带 `tenantId/tenantCode/tenantName/platformAdmin`。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds,deptIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`；取 `CUSTOM` 时必须给出非空 `deptIds`。
+
+租户写入字段：创建 `{code,name,remark?,adminUsername,adminNickname?,adminPassword}`，同时创建租户管理员；更新 `{name?,status?,remark?}`。租户编码为小写字母开头、仅含小写字母/数字/下划线，最长 32 位且全局唯一。
+
+租户隔离范围：用户、节点、节点分组、遥测、告警、固件与任务、命令、操作/登录日志、运维总览。角色、菜单、部门、岗位、字典与参数为平台级共享配置。平台管理员跨租户读写；租户管理员只能访问本租户业务数据，不能管理租户或平台级配置。
 
 ## 2.1 边缘反向代理
 
@@ -134,9 +140,16 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?}` |
+| POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?,tenantCode?}`；tenantCode 缺省 `default` |
 | POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}` |
 | POST | `/api/agent/telemetry` | `{nodeId,samples:[{metric,value,unit?,collectedAt?,labels?}]}`，1–500 条 |
+| GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
+| POST | `/api/agent/commands/{id}/result` | `{nodeId,status,result,message}` |
+| GET | `/api/agent/firmware/{id}/download` | 支持 `ETag`/`If-None-Match` 与单段 `Range` |
+| POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message}` |
+| GET | `/api/agent/ws` | WebSocket；首条 `{"type":"hello","nodeId":...}`；接收 `command.result` |
+
+Agent 请求没有会话：命令、固件任务、遥测都按目标节点/固件的租户归属落库，跨租户标识会被拒绝。
 
 ### UDP 遥测数据报
 
@@ -151,11 +164,6 @@
 <timestamp>
 <nonce>
 <body.dump()>`，密钥为环境变量 `EDGEPULSE_UDP_TELEMETRY_SECRET`，算法 HMAC-SHA256。时间戳与服务器相差超过 120 秒、同一节点同一随机串重复、或样本不合法（1–500 条）都会被拒。应答是 `{"accepted":N,"alarms":M}` 或 `{"error":"..."}`。
-| GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
-| POST | `/api/agent/commands/{id}/result` | `{nodeId,status,result,message}` |
-| GET | `/api/agent/firmware/{id}/download` | 支持 `ETag`/`If-None-Match` 与单段 `Range` |
-| POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message}` |
-| GET | `/api/agent/ws` | WebSocket；首条 `{"type":"hello","nodeId":...}`；接收 `command.result` |
 
 ## 7. WebSocket、SSE 与运维端点
 

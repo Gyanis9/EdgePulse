@@ -2,10 +2,11 @@
 
 EdgePulse 是面向边缘节点与设备的运维平台：控制面是 Vue 3 管理后台，数据面是运行在边缘节点上的 `edgepulse-agent`。后端是 C++23 + AsynGyanis 异步引擎，前后端通过统一的 `/api` 契约分离。
 
-当前状态：P0–P3 已落地并通过验收（2026-10-20）。
+当前状态：P0–P4 已落地并通过验收（2026-10-21）。
 
 - 认证与权限：验证码、PBKDF2 登录、OIDC 授权码登录、不透明会话、动态菜单、权限码、数据范围、操作审计。
-- 系统管理：用户、角色、菜单、部门、岗位、字典、参数、操作日志、登录日志、CSV 导出。
+- 多租户：租户编码登录、平台管理员跨租户、租户管理员本租户隔离；用户、节点、分组、遥测、告警、固件、命令与日志按租户隔离，实时 WebSocket/SSE 按租户分区；角色/菜单/部门/字典/参数保持平台级共享。
+- 系统管理：用户、角色、菜单、部门、岗位、字典、参数、租户、操作日志、登录日志、CSV 导出。
 - 设备域：节点、节点分组、Agent mTLS 注册/心跳、遥测、告警规则与告警生命周期、固件上传/下载/下发、命令下发。
 - 实时：浏览器 WebSocket（节点、告警、命令主题）、告警 SSE、Agent 命令长连接与轮询兜底、HMAC 签名的 UDP 遥测入口。
 - 边缘入口：可选的 HTTP 反向代理前缀，把受控请求转发到上游服务。
@@ -24,7 +25,7 @@ src/
 └─ Main/       进程入口
 frontend/      Vue 3 + Vite 管理后台
 third_party/AsynGyanis/  引擎 git submodule，只读
-migrations/    SQL 迁移 V1–V7
+migrations/    SQL 迁移 V1–V8
 config/        非敏感配置样例
 deploy/        Docker、systemd、Prometheus
 scripts/       证书、开发运行、验收
@@ -120,8 +121,8 @@ python scripts/check-docker-stack.py --build
 ## 测试
 
 - 后端单元：密码、验证码、会话、CSV、KV、分页、时间。
-- 后端集成：迁移 V1–V7、认证、用户/角色/菜单/组织/字典/参数、日志与节点的数据范围、遥测、告警、命令、固件、节点分组、真机 MySQL/Redis（环境变量门控）。
-- 协议：401/403 矩阵、管理端 CRUD、数据范围、遥测告警、命令往返与 Agent WebSocket 推送、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
+- 后端集成：迁移 V1–V8、认证、租户隔离、用户/角色/菜单/组织/字典/参数、日志与节点的数据范围、遥测、告警、命令、固件、节点分组、真机 MySQL/Redis（环境变量门控）。
+- 协议：401/403 矩阵、租户生命周期与跨租户隔离、管理端 CRUD、数据范围、遥测告警、命令往返与 Agent WebSocket 推送、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
 - 前端：API 契约单测；Playwright 用系统 Edge（`channel: 'msedge'`），不下载浏览器。
 - `ExternalStores.*` 需要真实 MySQL/Redis：设置 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 后运行；缺变量时用例 SKIP，不伪造通过。本机已用临时容器跑绿。
 - Docker：`scripts/check-docker-stack.py` 起 MySQL 8.4、Redis 7、Prometheus 与真实 OTel collector，验证登录、自定义角色、节点、审计落库、会话跨重启、指标抓取与 SIGTERM 优雅停机。
@@ -129,7 +130,10 @@ python scripts/check-docker-stack.py --build
 
 ## 已知边界
 
-- P4 中的多租户仍按原设计另行设计；UDP 遥测、边缘反向代理与 OIDC 已落地。反代当前只做 HTTP 转发（不代理 WebSocket 升级与流式大响应）。
+- 多租户采用混合模型：业务数据（用户、节点、分组、遥测、告警、固件、命令、日志）按租户隔离；角色、菜单、部门、岗位、字典与参数是平台级共享配置。租户管理员使用全局 `tenant_admin` 角色，不能管理租户或平台级配置。
+- 平台管理员手动创建节点或上传固件时默认落在自己的租户；目标租户的节点应由该租户管理员创建，或在 Agent 注册时用 `tenantCode` 声明归属。平台管理员可通过固件上传的 `tenantId` 查询参数指定归属。
+- 停用租户会立即阻止新登录；已签发会话在 TTL 内仍有效，需强制下线时应缩短会话有效期或清理会话存储。
+- P4 其余能力（UDP 遥测、边缘反向代理、OIDC）均已落地。反代当前只做 HTTP 转发（不代理 WebSocket 升级与流式大响应）。
 - 监听器目前统一绑定事件循环 0；`edgepulse.threads` 只创建额外循环，不会分担监听。多 worker 监听分发与多进程编排未作为本次交付形态。
 - mTLS 指纹白名单在 Agent 注册时按自报值校验；逐请求身份绑定需要引擎开放对端证书接口或每节点独立 CA。
 - WebSocket 首条认证的 5 秒兜底仍用计时线程（实现标注了 `shortcut`），等引擎提供带超时接收后替换。
