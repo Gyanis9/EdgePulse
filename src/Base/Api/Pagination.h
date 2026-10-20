@@ -3,7 +3,7 @@
  * @brief 分页参数归一化与分页载荷构造
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "Base/Config/ConfigValue.h"
 
@@ -20,6 +21,17 @@ namespace EdgePulse::Common
 {
     inline constexpr int kDefaultPageSize = 10;
     inline constexpr int kMaximumPageSize = 100;
+
+    /**
+     * @brief 一页查询结果
+     * @tparam Row 行类型
+     */
+    template<typename Row>
+    struct PageRows
+    {
+        std::int64_t     total{0}; ///< 满足条件的总行数
+        std::vector<Row> rows;     ///< 当前页行
+    };
 
     /**
      * @brief 已归一化的分页参数

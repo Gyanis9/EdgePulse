@@ -3,16 +3,36 @@ add_library(edgepulse-core STATIC
         Auth/CaptchaService.cpp
         Auth/LoginAudit.cpp
         Auth/SessionStore.cpp
+        Auth/DataScopeService.cpp
+        Cache/MemoryKeyValueStore.cpp
+        Cache/RedisKeyValueStore.cpp
+        Alarm/AlarmRepository.cpp
+        Alarm/AlarmService.cpp
+        Command/AgentChannelRegistry.cpp
+        Command/CommandRepository.cpp
         Device/AgentRegistry.cpp
+        Device/NodeGroupRepository.cpp
         Device/NodeRepository.cpp
         Device/NodeService.cpp
+        Firmware/FirmwareFileWriter.cpp
+        Firmware/FirmwareRepository.cpp
+        Http/AgentWebSocket.cpp
+        Http/AlarmEventStream.cpp
+        Http/AuditMiddleware.cpp
         Http/Authorization.cpp
         Http/MiddlewareSetup.cpp
         Http/RequestId.cpp
+        Http/SseBroadcaster.cpp
         Http/WebSocketEndpoints.cpp
+        Ops/OpsRepository.cpp
+        System/DictionaryRepository.cpp
+        System/LogRepository.cpp
         System/MenuRepository.cpp
         System/MigrationRunner.cpp
-        System/UserRepository.cpp)
+        System/OrgRepository.cpp
+        System/RoleRepository.cpp
+        System/UserRepository.cpp
+        Telemetry/TelemetryRepository.cpp)
 add_library(EdgePulse::Core ALIAS edgepulse-core)
 
 target_include_directories(edgepulse-core PUBLIC ${PROJECT_SOURCE_DIR}/src)

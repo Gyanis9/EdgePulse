@@ -57,12 +57,14 @@ namespace EdgePulse::Device
     {
     }
 
-    AsynGyanis::Core::Task<NodePage> NodeService::list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status)
+    AsynGyanis::Core::Task<NodePage> NodeService::list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status,
+                                                       const std::int64_t groupId)
     {
-        co_return co_await m_repository->list(loop, parameters, std::move(keyword), std::move(status));
+        co_return co_await m_repository->list(loop, parameters, std::move(keyword), std::move(status), groupId);
     }
 
-    AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> NodeService::create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson)
+    AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> NodeService::create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson,
+                                                                                            const std::int64_t groupId, const std::int64_t ownerDeptId)
     {
         if (const std::string nameError = validateName(name); !nameError.empty())
         {
@@ -79,18 +81,18 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(NodeServiceError{NodeServiceError::Reason::Conflict, "节点名已存在"});
         }
-        co_return co_await m_repository->create(loop, std::move(name), *normalizedLabels);
+        co_return co_await m_repository->create(loop, std::move(name), *normalizedLabels, groupId, ownerDeptId);
     }
 
     AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> NodeService::update(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
                                                                                             std::optional<std::string> name, std::optional<std::string> labelsJson,
-                                                                                            const std::int64_t expectedVersion)
+                                                                                            std::optional<std::int64_t> groupId, const std::int64_t expectedVersion)
     {
         if (expectedVersion <= 0)
         {
             co_return std::unexpected(NodeServiceError{NodeServiceError::Reason::Invalid, "version 必须是正整数"});
         }
-        if (!name.has_value() && !labelsJson.has_value())
+        if (!name.has_value() && !labelsJson.has_value() && !groupId.has_value())
         {
             co_return std::unexpected(NodeServiceError{NodeServiceError::Reason::Invalid, "name 与 labels 至少给一个"});
         }
@@ -112,7 +114,7 @@ namespace EdgePulse::Device
             labelsJson = std::move(normalized);
         }
 
-        const std::expected<NodeRecord, NodeMutationFailure> result = co_await m_repository->update(loop, nodeId, std::move(name), std::move(labelsJson), expectedVersion);
+        const std::expected<NodeRecord, NodeMutationFailure> result = co_await m_repository->update(loop, nodeId, std::move(name), std::move(labelsJson), groupId, expectedVersion);
         if (!result.has_value())
         {
             if (result.error() == NodeMutationFailure::NotFound)

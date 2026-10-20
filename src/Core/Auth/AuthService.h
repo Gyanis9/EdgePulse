@@ -3,7 +3,7 @@
  * @brief 登录、会话、路由生成与改密的应用服务
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
@@ -12,6 +12,7 @@
 #include "Core/Auth/CaptchaService.h"
 #include "Core/Auth/LoginAudit.h"
 #include "Core/Auth/SessionStore.h"
+#include "Core/Cache/KeyValueStore.h"
 #include "Base/Database/Database.h"
 #include "Core/System/MenuRepository.h"
 #include "Core/System/UserRepository.h"
@@ -73,8 +74,10 @@ namespace EdgePulse::Auth
          * @param sessions 会话表
          * @param captcha 验证码服务
          * @param audit 登录审计
+         * @param cache 登录失败计数使用的键值存储
          */
-        AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha, std::shared_ptr<LoginAudit> audit);
+        AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha, std::shared_ptr<LoginAudit> audit,
+                    std::shared_ptr<Cache::KeyValueStore> cache);
 
         /**
          * @brief 验证码 + 口令登录
@@ -86,16 +89,19 @@ namespace EdgePulse::Auth
 
         /**
          * @brief 校验令牌并滑动续期
+         * @param loop 恢复协程用的事件循环
          * @param token 会话令牌
          * @return 命中且未过期时返回身份快照
          */
-        [[nodiscard]] std::optional<SessionRecord> authenticate(std::string_view token);
+        [[nodiscard]] AsynGyanis::Core::Task<std::optional<SessionRecord>> authenticate(AsynGyanis::Core::EventLoop &loop, std::string_view token);
 
         /**
          * @brief 删除会话
+         * @param loop 恢复协程用的事件循环
          * @param token 会话令牌
+         * @return bool 是否删除成功
          */
-        void logout(std::string_view token);
+        AsynGyanis::Core::Task<bool> logout(AsynGyanis::Core::EventLoop &loop, std::string_view token);
 
         /**
          * @brief 取用户可见的菜单树
@@ -135,10 +141,11 @@ namespace EdgePulse::Auth
          */
         AsynGyanis::Core::Task<> recordAudit(AsynGyanis::Core::EventLoop &loop, LoginAuditEntry entry);
 
-        std::shared_ptr<SessionStore>   m_sessions;   ///< 会话表
-        std::shared_ptr<CaptchaService> m_captcha;    ///< 验证码
-        std::shared_ptr<LoginAudit>     m_loginAudit; ///< 登录审计
-        System::UserRepository          m_users;      ///< 用户仓储
-        System::MenuRepository          m_menus;      ///< 菜单仓储
+        std::shared_ptr<SessionStore>         m_sessions;   ///< 会话表
+        std::shared_ptr<CaptchaService>       m_captcha;    ///< 验证码
+        std::shared_ptr<LoginAudit>           m_loginAudit; ///< 登录审计
+        std::shared_ptr<Cache::KeyValueStore> m_cache;      ///< 登录失败计数
+        System::UserRepository                m_users;      ///< 用户仓储
+        System::MenuRepository                m_menus;      ///< 菜单仓储
     };
 } // namespace EdgePulse::Auth

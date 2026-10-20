@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(EdgePulse
-        VERSION 0.1.0
+        VERSION 1.0.0
         DESCRIPTION "边缘节点与设备运维平台"
         LANGUAGES CXX)
 

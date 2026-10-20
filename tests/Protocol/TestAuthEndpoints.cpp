@@ -1,11 +1,12 @@
-#include "Auth/AuthController.h"
+#include "Plugins/AuthPlugin/AuthController.h"
 #include "Base/Config/ConfigValue.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
-#include "Web/MiddlewareSetup.h"
+#include "Core/Http/MiddlewareSetup.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -127,9 +128,14 @@ TEST_F(AuthEndpointsTest, CaptchaLoginMeRoutesLogout)
     ASSERT_EQ(200, routes.status) << routes.body;
     const auto routesJson = routes.json();
     ASSERT_TRUE(routesJson.has_value());
-    ASSERT_EQ(1U, (*routesJson)["data"]["routes"].size());
-    EXPECT_EQ("/device", (*routesJson)["data"]["routes"][0]["path"].get<std::string>());
-    EXPECT_EQ("device/Nodes", (*routesJson)["data"]["routes"][0]["children"][0]["component"].get<std::string>());
+    const auto &routeList = (*routesJson)["data"]["routes"];
+    const auto  deviceRoute =
+            std::find_if(routeList.begin(), routeList.end(), [](const AsynGyanis::Base::ConfigValue &route) { return route.value("path", std::string{}) == "/device"; });
+    ASSERT_NE(routeList.end(), deviceRoute);
+    const auto &deviceChildren = (*deviceRoute)["children"];
+    const auto  nodeRoute      = std::find_if(deviceChildren.begin(), deviceChildren.end(),
+                                              [](const AsynGyanis::Base::ConfigValue &route) { return route.value("component", std::string{}) == "device/Nodes"; });
+    ASSERT_NE(deviceChildren.end(), nodeRoute);
 
     const auto logout = m_server->post("/api/auth/logout", "", "application/json", bearer(token));
     ASSERT_TRUE(logout.transportOk);

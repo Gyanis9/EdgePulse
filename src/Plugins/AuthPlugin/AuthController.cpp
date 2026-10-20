@@ -95,10 +95,10 @@ namespace EdgePulse::Auth
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AuthService &authService, CaptchaService &captchaService, const bool exposeCaptchaCode)
     {
         router.get("/api/auth/captcha",
-                   [&captchaService, exposeCaptchaCode](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&captchaService, &loop, exposeCaptchaCode](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId   = Web::resolveRequestId(request);
-                       const auto        challenge = captchaService.issue(request.remoteIp());
+                       const auto        challenge = co_await captchaService.issue(loop, request.remoteIp());
                        if (!challenge.has_value())
                        {
                            // 限流是唯一可恢复失败；失败文案里不解释内部计数
@@ -151,12 +151,12 @@ namespace EdgePulse::Auth
                     {
                         const std::string                traceId = Web::resolveRequestId(request);
                         const std::optional<std::string> token   = Web::bearerToken(request);
-                        if (!token.has_value() || !authService.authenticate(*token).has_value())
+                        if (!token.has_value() || !(co_await authService.authenticate(loop, *token)).has_value())
                         {
                             writeUnauthorized(response, traceId);
                             co_return;
                         }
-                        authService.logout(*token);
+                        static_cast<void>(co_await authService.logout(loop, *token));
                         Common::writeSuccess(response, nullptr, traceId);
                         co_return;
                     });
@@ -164,9 +164,13 @@ namespace EdgePulse::Auth
         router.get("/api/auth/me",
                    [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
-                       const std::string                  traceId = Web::resolveRequestId(request);
-                       const std::optional<std::string>   token   = Web::bearerToken(request);
-                       const std::optional<SessionRecord> session = token.has_value() ? authService.authenticate(*token) : std::nullopt;
+                       const std::string                traceId = Web::resolveRequestId(request);
+                       const std::optional<std::string> token   = Web::bearerToken(request);
+                       std::optional<SessionRecord>     session;
+                       if (token.has_value())
+                       {
+                           session = co_await authService.authenticate(loop, *token);
+                       }
                        if (!session.has_value())
                        {
                            writeUnauthorized(response, traceId);
@@ -187,9 +191,13 @@ namespace EdgePulse::Auth
         router.get("/api/auth/routes",
                    [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
-                       const std::string                  traceId = Web::resolveRequestId(request);
-                       const std::optional<std::string>   token   = Web::bearerToken(request);
-                       const std::optional<SessionRecord> session = token.has_value() ? authService.authenticate(*token) : std::nullopt;
+                       const std::string                traceId = Web::resolveRequestId(request);
+                       const std::optional<std::string> token   = Web::bearerToken(request);
+                       std::optional<SessionRecord>     session;
+                       if (token.has_value())
+                       {
+                           session = co_await authService.authenticate(loop, *token);
+                       }
                        if (!session.has_value())
                        {
                            writeUnauthorized(response, traceId);
@@ -208,9 +216,13 @@ namespace EdgePulse::Auth
         router.put("/api/auth/password",
                    [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
-                       const std::string                  traceId = Web::resolveRequestId(request);
-                       const std::optional<std::string>   token   = Web::bearerToken(request);
-                       const std::optional<SessionRecord> session = token.has_value() ? authService.authenticate(*token) : std::nullopt;
+                       const std::string                traceId = Web::resolveRequestId(request);
+                       const std::optional<std::string> token   = Web::bearerToken(request);
+                       std::optional<SessionRecord>     session;
+                       if (token.has_value())
+                       {
+                           session = co_await authService.authenticate(loop, *token);
+                       }
                        if (!session.has_value())
                        {
                            writeUnauthorized(response, traceId);

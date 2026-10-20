@@ -1,10 +1,16 @@
 #include "Core/System/MenuRepository.h"
 
-#include "Database/Common/DatabaseResult.h"
-#include "Database/Common/DatabaseValue.h"
+#include "Base/Database/SqlExecution.h"
+#include "Base/Database/SqlHelpers.h"
+#include "Base/Runtime/IdGenerator.h"
+#include "Base/Runtime/TimeFormat.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <functional>
+#include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -14,28 +20,85 @@ namespace EdgePulse::System
 {
     namespace
     {
-        /**
-         * @brief 读一列文本；NULL 或非文本时交回空串
-         */
-        [[nodiscard]] std::string readText(const AsynGyanis::Database::DatabaseValue &value)
+        using AsynGyanis::Database::DatabaseConnection;
+        using AsynGyanis::Database::DatabaseResult;
+        using AsynGyanis::Database::DatabaseValue;
+
+        [[nodiscard]] MenuNode readMenu(const DatabaseResult &result)
         {
-            if (const auto *text = std::get_if<std::string>(&value); text != nullptr)
+            MenuNode node;
+            node.id         = Sql::integer(result, "id");
+            node.parentId   = Sql::integer(result, "parent_id");
+            node.name       = Sql::text(result, "menu_name");
+            node.type       = Sql::text(result, "menu_type");
+            node.icon       = Sql::text(result, "icon");
+            node.path       = Sql::text(result, "path");
+            node.component  = Sql::text(result, "component");
+            node.permission = Sql::text(result, "permission");
+            node.sort       = static_cast<int>(Sql::integer(result, "sort"));
+            node.visible    = static_cast<int>(Sql::integer(result, "visible"));
+            node.status     = static_cast<int>(Sql::integer(result, "status"));
+            return node;
+        }
+
+        constexpr std::string_view kSelectMenu = "SELECT id, parent_id, menu_name, menu_type, icon, path, component, permission, sort, visible, status FROM sys_menu ";
+
+        [[nodiscard]] std::vector<MenuNode> buildTree(std::vector<MenuNode> nodes)
+        {
+            std::unordered_map<std::int64_t, MenuNode>                  byId;
+            std::unordered_map<std::int64_t, std::vector<std::int64_t>> childrenByParent;
+            for (MenuNode &node: nodes)
             {
-                return *text;
+                const std::int64_t id = node.id;
+                childrenByParent[node.parentId].push_back(id);
+                byId.emplace(id, std::move(node));
             }
-            return {};
+            std::function<MenuNode(std::int64_t)> build = [&](const std::int64_t id) -> MenuNode
+            {
+                MenuNode node = byId.at(id);
+                if (const auto children = childrenByParent.find(id); children != childrenByParent.end())
+                {
+                    for (const std::int64_t childId: children->second)
+                    {
+                        node.children.push_back(build(childId));
+                    }
+                }
+                return node;
+            };
+            std::vector<MenuNode> roots;
+            if (const auto rootChildren = childrenByParent.find(0); rootChildren != childrenByParent.end())
+            {
+                for (const std::int64_t id: rootChildren->second)
+                {
+                    roots.push_back(build(id));
+                }
+            }
+            return roots;
+        }
+
+        [[nodiscard]] bool matches(const MenuNode &node, const std::string &keyword)
+        {
+            return keyword.empty() || node.name.find(keyword) != std::string::npos || node.path.find(keyword) != std::string::npos ||
+                   node.permission.find(keyword) != std::string::npos || node.component.find(keyword) != std::string::npos;
         }
 
         /**
-         * @brief 读一列整数；NULL 或非整数时交回 0
+         * @brief 过滤管理树：命中节点连同后代保留，未命中但后代命中时保留祖先
          */
-        [[nodiscard]] std::int64_t readInteger(const AsynGyanis::Database::DatabaseValue &value)
+        [[nodiscard]] bool filterMenu(MenuNode &node, const std::string &keyword, const std::string &status)
         {
-            if (const auto *number = std::get_if<std::int64_t>(&value); number != nullptr)
+            const bool            statusOk = status.empty() || std::to_string(node.status) == status;
+            std::vector<MenuNode> keptChildren;
+            for (MenuNode &child: node.children)
             {
-                return *number;
+                if (filterMenu(child, keyword, status))
+                {
+                    keptChildren.push_back(std::move(child));
+                }
             }
-            return 0;
+            node.children     = std::move(keptChildren);
+            const bool selfOk = statusOk && matches(node, keyword);
+            return selfOk || !node.children.empty();
         }
     } // namespace
 
@@ -47,66 +110,161 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<MenuNode>>(
                 loop,
-                [userId](AsynGyanis::Database::DatabaseConnection &connection) -> std::vector<MenuNode>
+                [userId](DatabaseConnection &connection) -> std::vector<MenuNode>
                 {
-                    const std::array<AsynGyanis::Database::DatabaseValue, 1>    parameters{userId};
-                    const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
-                            "SELECT DISTINCT m.id, m.parent_id, m.menu_name, m.menu_type, m.icon, m.path, m.component, m.permission, m.sort, m.visible, m.status "
-                            "FROM sys_menu m "
-                            "JOIN sys_role_menu rm ON rm.menu_id = m.id "
-                            "JOIN sys_user_role ur ON ur.role_id = rm.role_id "
-                            "WHERE ur.user_id = ? AND m.menu_type IN ('dir', 'menu') AND m.visible = 1 AND m.status = 1 "
-                            "ORDER BY m.sort, m.id",
-                            parameters);
-                    if (!result)
+                    const std::array<DatabaseValue, 1> parameters{userId};
+                    const auto            rows = Sql::executeOrThrow(connection,
+                                                                     "SELECT DISTINCT m.id, m.parent_id, m.menu_name, m.menu_type, m.icon, m.path, m.component, m.permission, "
+                                                                     "m.sort, m.visible, m.status FROM sys_menu m "
+                                                                     "JOIN sys_role_menu rm ON rm.menu_id = m.id "
+                                                                     "JOIN sys_user_role ur ON ur.role_id = rm.role_id "
+                                                                     "WHERE ur.user_id = ? AND m.menu_type IN ('dir', 'menu') AND m.visible = 1 AND m.status = 1 "
+                                                                     "ORDER BY m.sort, m.id",
+                                                                     parameters);
+                    std::vector<MenuNode> nodes;
+                    while (rows->next())
                     {
-                        throw Common::DatabaseException("查询菜单失败：" + connection.lastError());
+                        nodes.push_back(readMenu(*rows));
                     }
+                    return buildTree(std::move(nodes));
+                });
+    }
 
-                    std::unordered_map<std::int64_t, MenuNode>                  nodesById;
-                    std::unordered_map<std::int64_t, std::vector<std::int64_t>> childrenByParent;
-                    while (result->next())
+    AsynGyanis::Core::Task<std::vector<MenuNode>> MenuRepository::tree(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status)
+    {
+        co_return co_await m_database->withConnection<std::vector<MenuNode>>(
+                loop,
+                [keyword = std::move(keyword), status = std::move(status)](DatabaseConnection &connection) -> std::vector<MenuNode>
+                {
+                    const auto            rows = Sql::executeOrThrow(connection, std::string{kSelectMenu} + "ORDER BY sort, id");
+                    std::vector<MenuNode> nodes;
+                    while (rows->next())
                     {
-                        MenuNode node;
-                        node.id                   = readInteger(result->getValue("id"));
-                        node.parentId             = readInteger(result->getValue("parent_id"));
-                        node.name                 = readText(result->getValue("menu_name"));
-                        node.type                 = readText(result->getValue("menu_type"));
-                        node.icon                 = readText(result->getValue("icon"));
-                        node.path                 = readText(result->getValue("path"));
-                        node.component            = readText(result->getValue("component"));
-                        node.permission           = readText(result->getValue("permission"));
-                        node.sort                 = static_cast<int>(readInteger(result->getValue("sort")));
-                        node.visible              = static_cast<int>(readInteger(result->getValue("visible")));
-                        node.status               = static_cast<int>(readInteger(result->getValue("status")));
-                        const std::int64_t nodeId = node.id;
-                        childrenByParent[node.parentId].push_back(nodeId);
-                        nodesById.emplace(nodeId, std::move(node));
+                        nodes.push_back(readMenu(*rows));
                     }
-
-                    // 递归组装：查询已按 sort、id 排序，子节点顺序随之稳定
-                    std::function<MenuNode(std::int64_t)> buildNode = [&](const std::int64_t nodeId) -> MenuNode
-                    {
-                        MenuNode node = nodesById.at(nodeId);
-                        if (const auto children = childrenByParent.find(nodeId); children != childrenByParent.end())
-                        {
-                            for (const std::int64_t childId: children->second)
-                            {
-                                node.children.push_back(buildNode(childId));
-                            }
-                        }
-                        return node;
-                    };
-
-                    std::vector<MenuNode> roots;
-                    if (const auto rootChildren = childrenByParent.find(0); rootChildren != childrenByParent.end())
-                    {
-                        for (const std::int64_t rootId: rootChildren->second)
-                        {
-                            roots.push_back(buildNode(rootId));
-                        }
-                    }
+                    std::vector<MenuNode> roots = buildTree(std::move(nodes));
+                    roots.erase(std::remove_if(roots.begin(), roots.end(), [&](MenuNode &node) { return !filterMenu(node, keyword, status); }), roots.end());
                     return roots;
                 });
+    }
+
+    AsynGyanis::Core::Task<std::optional<MenuNode>> MenuRepository::findById(AsynGyanis::Core::EventLoop &loop, const std::int64_t menuId)
+    {
+        co_return co_await m_database->withConnection<std::optional<MenuNode>>(loop,
+                                                                               [menuId](DatabaseConnection &connection) -> std::optional<MenuNode>
+                                                                               {
+                                                                                   const std::array<DatabaseValue, 1> parameters{menuId};
+                                                                                   const auto                         rows =
+                                                                                           Sql::executeOrThrow(connection, std::string{kSelectMenu} + "WHERE id = ?", parameters);
+                                                                                   if (!rows->next())
+                                                                                   {
+                                                                                       return std::nullopt;
+                                                                                   }
+                                                                                   return readMenu(*rows);
+                                                                               });
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> MenuRepository::create(AsynGyanis::Core::EventLoop &loop, const MenuWrite &write, const std::int64_t operatorId)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [write, operatorId](DatabaseConnection &connection) -> std::int64_t
+                {
+                    const std::int64_t                  id  = Common::nextIdentifier();
+                    const std::string                   now = Common::nowDateTimeUtc();
+                    const std::array<DatabaseValue, 14> parameters{id,
+                                                                   write.parentId.value_or(0),
+                                                                   write.name.value_or(std::string{}),
+                                                                   write.type.value_or(std::string{"menu"}),
+                                                                   write.icon.value_or(std::string{}),
+                                                                   write.path.value_or(std::string{}),
+                                                                   write.component.value_or(std::string{}),
+                                                                   write.permission.value_or(std::string{}),
+                                                                   static_cast<std::int64_t>(write.sort.value_or(0)),
+                                                                   static_cast<std::int64_t>(write.visible.value_or(1)),
+                                                                   static_cast<std::int64_t>(write.status.value_or(1)),
+                                                                   now,
+                                                                   now,
+                                                                   operatorId};
+                    Sql::executeOrThrowVoid(connection,
+                                            "INSERT INTO sys_menu (id, parent_id, menu_name, menu_type, icon, path, component, permission, sort, visible, status, "
+                                            "created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            parameters);
+                    return id;
+                });
+    }
+
+    AsynGyanis::Core::Task<bool> MenuRepository::update(AsynGyanis::Core::EventLoop &loop, const std::int64_t menuId, const MenuWrite &write, const std::int64_t operatorId)
+    {
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [menuId, write, operatorId](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                std::string                sql = "UPDATE sys_menu SET updated_at = ?, updated_by = ?";
+                                                                std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
+                                                                const auto                 appendText = [&](const std::optional<std::string> &value, const char *column)
+                                                                {
+                                                                    if (value.has_value())
+                                                                    {
+                                                                        sql += ", ";
+                                                                        sql += column;
+                                                                        sql += " = ?";
+                                                                        parameters.emplace_back(*value);
+                                                                    }
+                                                                };
+                                                                appendText(write.name, "menu_name");
+                                                                appendText(write.type, "menu_type");
+                                                                appendText(write.icon, "icon");
+                                                                appendText(write.path, "path");
+                                                                appendText(write.component, "component");
+                                                                appendText(write.permission, "permission");
+                                                                if (write.parentId.has_value())
+                                                                {
+                                                                    sql += ", parent_id = ?";
+                                                                    parameters.emplace_back(*write.parentId);
+                                                                }
+                                                                if (write.sort.has_value())
+                                                                {
+                                                                    sql += ", sort = ?";
+                                                                    parameters.emplace_back(static_cast<std::int64_t>(*write.sort));
+                                                                }
+                                                                if (write.visible.has_value())
+                                                                {
+                                                                    sql += ", visible = ?";
+                                                                    parameters.emplace_back(static_cast<std::int64_t>(*write.visible));
+                                                                }
+                                                                if (write.status.has_value())
+                                                                {
+                                                                    sql += ", status = ?";
+                                                                    parameters.emplace_back(static_cast<std::int64_t>(*write.status));
+                                                                }
+                                                                sql += " WHERE id = ?";
+                                                                parameters.emplace_back(menuId);
+                                                                const auto rows = Sql::executeOrThrow(connection, sql, parameters);
+                                                                return rows->affectedRowCount() > 0;
+                                                            });
+    }
+
+    AsynGyanis::Core::Task<bool> MenuRepository::remove(AsynGyanis::Core::EventLoop &loop, const std::int64_t menuId)
+    {
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [menuId](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                const std::array<DatabaseValue, 1> parameters{menuId};
+                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_role_menu WHERE menu_id = ?", parameters);
+                                                                const auto rows = Sql::executeOrThrow(connection, "DELETE FROM sys_menu WHERE id = ?", parameters);
+                                                                return rows->affectedRowCount() > 0;
+                                                            });
+    }
+
+    AsynGyanis::Core::Task<bool> MenuRepository::hasChildren(AsynGyanis::Core::EventLoop &loop, const std::int64_t menuId)
+    {
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [menuId](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                const std::array<DatabaseValue, 1> parameters{menuId};
+                                                                const auto                         rows =
+                                                                        Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_menu WHERE parent_id = ?", parameters);
+                                                                return rows->next() && Sql::integer(*rows, "total") > 0;
+                                                            });
     }
 } // namespace EdgePulse::System

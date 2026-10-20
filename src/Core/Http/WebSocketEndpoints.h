@@ -3,7 +3,7 @@
  * @brief 浏览器 WebSocket 升级、首条认证与节点状态扇出
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
@@ -62,7 +62,7 @@ namespace EdgePulse::Web
          * @param tokenValidator 校验首条消息里的会话令牌
          * @param allowedOrigins Origin 白名单；空表示只允许同源
          */
-        void registerRoute(AsynGyanis::Net::Router &router, std::function<bool(std::string_view)> tokenValidator, std::vector<std::string> allowedOrigins);
+        void registerRoute(AsynGyanis::Net::Router &router, std::function<AsynGyanis::Core::Task<bool>(std::string_view)> tokenValidator, std::vector<std::string> allowedOrigins);
 
     private:
         /**

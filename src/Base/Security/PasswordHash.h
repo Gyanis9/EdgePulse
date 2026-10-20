@@ -3,7 +3,7 @@
  * @brief PBKDF2-HMAC-SHA256 口令哈希
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 

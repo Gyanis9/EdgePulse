@@ -3,11 +3,13 @@
  * @brief HTTP 路由装配入口
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
 #pragma once
+
+#include <filesystem>
 
 namespace AsynGyanis::Net
 {
@@ -23,9 +25,10 @@ namespace EdgePulse::App
     void registerHealthRoutes(AsynGyanis::Net::Router &router);
 
     /**
-     * @brief 注册兜底路由：未命中的路径回统一 JSON 404
+     * @brief 注册站点兜底：非 API 的 GET 命中构建产物时发文件，否则回 index.html
      * @param router 目标路由器
-     * @note 静态站点接入后由静态站点接管非 /api 路径，本函数只负责 API 的 404 包络
+     * @param webRoot 前端构建产物目录；缺少 index.html 时只回 API 的统一 404
+     * @details 静态文件与 SPA 回退放在同一条兜底路由里，避免两条 any("*") 互相覆盖
      */
-    void registerFallbackRoute(AsynGyanis::Net::Router &router);
+    void registerSiteFallback(AsynGyanis::Net::Router &router, const std::filesystem::path &webRoot);
 } // namespace EdgePulse::App

@@ -1,14 +1,13 @@
 #include "Core/Auth/CaptchaService.h"
 
-#include "Base/Security/RandomToken.h"
+#include "Base/Coding/SecureCompare.h"
 #include "Base/Security/RandomBytes.h"
+#include "Base/Security/RandomToken.h"
 
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,33 +21,30 @@ namespace EdgePulse::Auth
         constexpr std::array<const char *, 5> kTextColors{"#1f3a5f", "#7a3e1d", "#2d5a3d", "#6b2c5a", "#3f3f46"};
         constexpr std::size_t                 kCodeLength = 4;
         constexpr std::chrono::seconds        kRateWindow{60};
-        constexpr std::size_t                 kPruneThreshold = 1024;
+        constexpr std::string_view            kChallengePrefix = "edgepulse:captcha:challenge:";
+        constexpr std::string_view            kRatePrefix      = "edgepulse:captcha:rate:";
 
         /**
-         * @brief ASCII 大小写无关比较
+         * @brief ASCII 大写归一，用于答案比较
+         * @param text 原始文本
+         * @return std::string 大写文本
          */
-        [[nodiscard]] bool equalsIgnoreCase(const std::string_view left, const std::string_view right)
+        [[nodiscard]] std::string upperCopy(const std::string_view text)
         {
-            if (left.size() != right.size())
+            std::string result{text};
+            for (char &character: result)
             {
-                return false;
-            }
-            for (std::size_t index = 0; index < left.size(); ++index)
-            {
-                const auto leftCharacter  = static_cast<unsigned char>(left[index]);
-                const auto rightCharacter = static_cast<unsigned char>(right[index]);
-                const auto leftLower      = leftCharacter >= 'A' && leftCharacter <= 'Z' ? static_cast<unsigned char>(leftCharacter + ('a' - 'A')) : leftCharacter;
-                const auto rightLower     = rightCharacter >= 'A' && rightCharacter <= 'Z' ? static_cast<unsigned char>(rightCharacter + ('a' - 'A')) : rightCharacter;
-                if (leftLower != rightLower)
+                if (character >= 'a' && character <= 'z')
                 {
-                    return false;
+                    character = static_cast<char>(character - ('a' - 'A'));
                 }
             }
-            return true;
+            return result;
         }
 
         /**
          * @brief 生成 4 位答案
+         * @return std::string 答案
          */
         [[nodiscard]] std::string makeCode()
         {
@@ -66,7 +62,7 @@ namespace EdgePulse::Auth
         /**
          * @brief 生成可渲染的验证码 SVG
          * @param code 4 位答案
-         * @return SVG 文本
+         * @return std::string SVG 文本
          */
         [[nodiscard]] std::string makeSvg(const std::string_view code)
         {
@@ -95,81 +91,55 @@ namespace EdgePulse::Auth
         }
     } // namespace
 
-    CaptchaService::CaptchaService(CaptchaOptions options, Clock clock) : m_options(options), m_clock(std::move(clock))
+    CaptchaService::CaptchaService(std::shared_ptr<Cache::KeyValueStore> store, CaptchaOptions options) :
+        m_store(std::move(store)), m_ttlSeconds(options.ttlSeconds), m_requestsPerMinute(options.requestsPerMinute)
     {
     }
 
-    std::chrono::steady_clock::time_point CaptchaService::now() const
+    AsynGyanis::Core::Task<std::expected<CaptchaChallenge, CaptchaError>> CaptchaService::issue(AsynGyanis::Core::EventLoop &loop, std::string clientIp)
     {
-        return m_clock ? m_clock() : std::chrono::steady_clock::now();
-    }
-
-    void CaptchaService::pruneExpired(const std::chrono::steady_clock::time_point moment)
-    {
-        // 调用方已持锁；只清过期项，避免缓存被一次性验证码与限流窗口无界撑大
-        for (auto iterator = m_challenges.begin(); iterator != m_challenges.end();)
-        {
-            iterator = iterator->second.expiresAt <= moment ? m_challenges.erase(iterator) : std::next(iterator);
-        }
-        for (auto iterator = m_rateWindows.begin(); iterator != m_rateWindows.end();)
-        {
-            const bool isOld = moment - iterator->second.windowStart >= kRateWindow && iterator->second.count == 0;
-            iterator         = isOld ? m_rateWindows.erase(iterator) : std::next(iterator);
-        }
-    }
-
-    std::expected<CaptchaChallenge, CaptchaError> CaptchaService::issue(const std::string &clientIp)
-    {
-        const std::chrono::steady_clock::time_point moment = now();
-        std::lock_guard<std::mutex>                 lock(m_mutex);
-        if (m_challenges.size() + m_rateWindows.size() > kPruneThreshold)
-        {
-            pruneExpired(moment);
-        }
-
-        RateWindow &window = m_rateWindows[clientIp];
-        if (window.count == 0 || moment - window.windowStart >= kRateWindow)
-        {
-            window.windowStart = moment;
-            window.count       = 0;
-        }
+        const std::int64_t issued = co_await m_store->increment(loop, std::string{kRatePrefix} + clientIp, kRateWindow);
         // 限流按窗口计数；超限时连答案都不生成，避免给撞库者提供可试的凭据
-        if (window.count >= m_options.requestsPerMinute)
+        if (issued > m_requestsPerMinute.load(std::memory_order_relaxed))
         {
-            return std::unexpected(CaptchaError{CaptchaErrorReason::RateLimited, "验证码请求过于频繁：请稍后再试或更换来源 IP"});
+            co_return std::unexpected(CaptchaError{CaptchaErrorReason::RateLimited, "验证码请求过于频繁：请稍后再试或更换来源 IP"});
         }
-        ++window.count;
 
         CaptchaChallenge challenge;
         challenge.uuid = Common::randomTokenHex(16);
         challenge.code = makeCode();
         challenge.svg  = makeSvg(challenge.code);
-        Entry entry;
-        entry.code      = challenge.code;
-        entry.expiresAt = moment + std::chrono::seconds(m_options.ttlSeconds);
-        m_challenges.emplace(challenge.uuid, std::move(entry));
-        return challenge;
-    }
-
-    bool CaptchaService::consume(const std::string_view uuid, const std::string_view code)
-    {
-        const std::chrono::steady_clock::time_point moment = now();
-        std::lock_guard<std::mutex>                 lock(m_mutex);
-        const auto                                  iterator = m_challenges.find(std::string{uuid});
-        if (iterator == m_challenges.end())
+        const bool stored =
+                co_await m_store->set(loop, std::string{kChallengePrefix} + challenge.uuid, challenge.code, std::chrono::seconds{m_ttlSeconds.load(std::memory_order_relaxed)});
+        if (!stored)
         {
-            return false;
+            co_return std::unexpected(CaptchaError{CaptchaErrorReason::RateLimited, "验证码存储不可用：请检查缓存后端"});
         }
-        const bool isExpired = iterator->second.expiresAt <= moment;
-        const bool isMatch   = !isExpired && equalsIgnoreCase(iterator->second.code, code);
-        // 一次性：无论对错都删掉，避免同一个 uuid 被反复试答案
-        m_challenges.erase(iterator);
-        return isMatch;
+        co_return challenge;
     }
 
-    std::size_t CaptchaService::size() const
+    void CaptchaService::setOptions(const CaptchaOptions options) noexcept
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_challenges.size();
+        if (options.ttlSeconds > 0)
+        {
+            m_ttlSeconds.store(options.ttlSeconds, std::memory_order_relaxed);
+        }
+        if (options.requestsPerMinute > 0)
+        {
+            m_requestsPerMinute.store(options.requestsPerMinute, std::memory_order_relaxed);
+        }
+    }
+
+    AsynGyanis::Core::Task<bool> CaptchaService::consume(AsynGyanis::Core::EventLoop &loop, const std::string_view uuid, const std::string_view code)
+    {
+        const std::string                key    = std::string{kChallengePrefix} + std::string{uuid};
+        const std::optional<std::string> stored = co_await m_store->get(loop, key);
+        if (!stored.has_value())
+        {
+            co_return false;
+        }
+        // 一次性：无论对错都删掉，避免同一个 uuid 被反复试答案
+        static_cast<void>(co_await m_store->erase(loop, key));
+        co_return AsynGyanis::Base::constantTimeEquals(upperCopy(*stored), upperCopy(code));
     }
 } // namespace EdgePulse::Auth

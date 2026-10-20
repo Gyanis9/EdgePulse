@@ -1,11 +1,12 @@
 #include "TestSupport/AuthTestContext.h"
 
-#include "Auth/AuthService.h"
-#include "Auth/CaptchaService.h"
-#include "Auth/LoginAudit.h"
-#include "Auth/SessionStore.h"
-#include "Common/Database.h"
-#include "System/MigrationRunner.h"
+#include "Core/Auth/AuthService.h"
+#include "Core/Auth/CaptchaService.h"
+#include "Core/Auth/LoginAudit.h"
+#include "Core/Auth/SessionStore.h"
+#include "Core/Cache/MemoryKeyValueStore.h"
+#include "Base/Database/Database.h"
+#include "Core/System/MigrationRunner.h"
 
 #include <chrono>
 #include <filesystem>
@@ -30,10 +31,11 @@ namespace EdgePulse::TestSupport
             System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
         }
         database = Common::Database::openSqlite(m_databasePath.string());
-        sessions = std::make_shared<Auth::SessionStore>(7200);
-        captcha  = std::make_shared<Auth::CaptchaService>(Auth::CaptchaOptions{120, 30});
+        cache    = std::make_shared<Cache::MemoryKeyValueStore>();
+        sessions = std::make_shared<Auth::SessionStore>(cache, 7200);
+        captcha  = std::make_shared<Auth::CaptchaService>(cache, Auth::CaptchaOptions{120, 30});
         audit    = std::make_shared<Auth::LoginAudit>(database);
-        auth     = std::make_shared<Auth::AuthService>(database, sessions, captcha, audit);
+        auth     = std::make_shared<Auth::AuthService>(database, sessions, captcha, audit, cache);
     }
 
     AuthTestContext::~AuthTestContext()
@@ -43,6 +45,7 @@ namespace EdgePulse::TestSupport
         audit.reset();
         captcha.reset();
         sessions.reset();
+        cache.reset();
         database.reset();
         std::error_code error;
         std::filesystem::remove(m_databasePath, error);

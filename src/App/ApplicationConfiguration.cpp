@@ -88,14 +88,15 @@ namespace EdgePulse::App
 
     std::expected<ApplicationConfiguration, ConfigurationError> ApplicationConfiguration::load(const std::filesystem::path &configurationPath)
     {
-        std::error_code filesystemError;
-        if (!std::filesystem::exists(configurationPath, filesystemError))
+        std::error_code             filesystemError;
+        const std::filesystem::path absoluteConfigurationPath = std::filesystem::absolute(configurationPath, filesystemError);
+        if (filesystemError || !std::filesystem::exists(absoluteConfigurationPath, filesystemError))
         {
             return std::unexpected(ConfigurationError{"配置文件不存在：" + configurationPath.string()});
         }
 
-        std::vector<std::filesystem::path> configurationFiles{configurationPath};
-        const std::filesystem::path        loggingPath = configurationPath.parent_path() / "logging.yaml";
+        std::vector<std::filesystem::path> configurationFiles{absoluteConfigurationPath};
+        const std::filesystem::path        loggingPath = absoluteConfigurationPath.parent_path() / "logging.yaml";
         if (std::filesystem::exists(loggingPath, filesystemError))
         {
             configurationFiles.push_back(loggingPath);
@@ -115,13 +116,23 @@ namespace EdgePulse::App
         }
 
         ApplicationConfiguration configuration;
-        configuration.configurationFile        = configurationPath;
+        configuration.configurationFile        = absoluteConfigurationPath;
         configuration.listenAddress            = configurationManager.getString("edgepulse.listen_address", configuration.listenAddress);
         configuration.opsAddress               = configurationManager.getString("edgepulse.ops_address", configuration.opsAddress);
         configuration.databaseDriver           = configurationManager.getString("edgepulse.database.driver", configuration.databaseDriver);
         configuration.databasePath             = configurationManager.getString("edgepulse.database.path", configuration.databasePath);
+        configuration.databaseHost             = configurationManager.getString("edgepulse.database.host", configuration.databaseHost);
+        configuration.databaseName             = configurationManager.getString("edgepulse.database.name", configuration.databaseName);
+        configuration.databaseUser             = configurationManager.getString("edgepulse.database.user", configuration.databaseUser);
+        configuration.redisEnabled             = configurationManager.getBool("edgepulse.redis.enabled", configuration.redisEnabled);
+        configuration.redisHost                = configurationManager.getString("edgepulse.redis.host", configuration.redisHost);
+        configuration.redisDatabase            = static_cast<int>(configurationManager.getInt("edgepulse.redis.database", configuration.redisDatabase));
+        configuration.threads                  = static_cast<int>(configurationManager.getInt("edgepulse.threads", configuration.threads));
         configuration.migrationsDirectory      = configurationManager.getString("edgepulse.migrations_dir", configuration.migrationsDirectory);
         configuration.webRoot                  = configurationManager.getString("edgepulse.web_root", configuration.webRoot);
+        configuration.firmwareDirectory        = configurationManager.getString("edgepulse.firmware_dir", configuration.firmwareDirectory);
+        configuration.maximumFirmwareBytes     = configurationManager.getInt("edgepulse.maximum_firmware_bytes", configuration.maximumFirmwareBytes);
+        configuration.telemetryRetentionDays   = static_cast<int>(configurationManager.getInt("edgepulse.telemetry_retention_days", configuration.telemetryRetentionDays));
         configuration.certificateDirectory     = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
         configuration.agentFingerprint         = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
         configuration.captchaTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.captcha.ttl_seconds", configuration.captchaTtlSeconds));
@@ -130,7 +141,14 @@ namespace EdgePulse::App
         configuration.exposeCaptchaCode        = configurationManager.getBool("edgepulse.captcha.expose_code", configuration.exposeCaptchaCode);
         configuration.allowedOrigins           = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
 
-        // P0 只实现 SQLite 快速档；配成 mysql 时明确拒绝，避免带着未接通的驱动上线
+        if (const auto password = Common::environmentValue("EDGEPULSE_DB_PASSWORD"); password.has_value())
+        {
+            configuration.databasePassword = *password;
+        }
+        if (const auto password = Common::environmentValue("EDGEPULSE_REDIS_PASSWORD"); password.has_value())
+        {
+            configuration.redisPassword = *password;
+        }
         // 指纹允许通过环境变量覆盖，run-dev.sh 会在生成证书后导出
         if (configuration.agentFingerprint.empty())
         {
@@ -140,9 +158,13 @@ namespace EdgePulse::App
             }
         }
 
-        if (configuration.databaseDriver != "sqlite")
+        if (configuration.databaseDriver != "sqlite" && configuration.databaseDriver != "mysql")
         {
-            return std::unexpected(ConfigurationError{"P0 只实现了 sqlite 运行时配置，当前 database.driver=" + configuration.databaseDriver});
+            return std::unexpected(ConfigurationError{"database.driver 只能是 sqlite 或 mysql，当前值：" + configuration.databaseDriver});
+        }
+        if (configuration.threads < 1 || configuration.threads > 64)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.threads 必须在 1 到 64 之间"});
         }
         // TTL 参与定时器与过期判定，非正数会让条目永不过期或立即过期
         if (configuration.captchaTtlSeconds < kMinimumTtl || configuration.sessionTtlSeconds < kMinimumTtl)
@@ -177,6 +199,19 @@ namespace EdgePulse::App
             return std::unexpected(opsPort.error());
         }
         configuration.opsPort = *opsPort;
+
+        const auto databasePort = readPort(configurationManager, "edgepulse.database.port", configuration.databasePort);
+        if (!databasePort)
+        {
+            return std::unexpected(databasePort.error());
+        }
+        configuration.databasePort = *databasePort;
+        const auto redisPort       = readPort(configurationManager, "edgepulse.redis.port", configuration.redisPort);
+        if (!redisPort)
+        {
+            return std::unexpected(redisPort.error());
+        }
+        configuration.redisPort = *redisPort;
 
         return configuration;
     }

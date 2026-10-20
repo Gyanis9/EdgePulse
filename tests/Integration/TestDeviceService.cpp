@@ -1,5 +1,5 @@
-#include "Device/AgentRegistry.h"
-#include "Device/NodeService.h"
+#include "Core/Device/AgentRegistry.h"
+#include "Core/Device/NodeService.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 
@@ -29,12 +29,12 @@ TEST(DeviceService, CreatesListsUpdatesAndRemovesNode)
     ASSERT_EQ(1U, page.rows.size());
     EXPECT_EQ(1, page.total);
 
-    const auto updated = runner.run(service.update(runner.loop(), created->id, std::string{"edge-1b"}, std::nullopt, 1));
+    const auto updated = runner.run(service.update(runner.loop(), created->id, std::string{"edge-1b"}, std::nullopt, std::nullopt, 1));
     ASSERT_TRUE(updated.has_value()) << updated.error().message;
     EXPECT_EQ("edge-1b", updated->name);
     EXPECT_EQ(2, updated->version);
 
-    const auto stale = runner.run(service.update(runner.loop(), created->id, std::string{"edge-1c"}, std::nullopt, 1));
+    const auto stale = runner.run(service.update(runner.loop(), created->id, std::string{"edge-1c"}, std::nullopt, std::nullopt, 1));
     ASSERT_FALSE(stale.has_value());
     EXPECT_EQ(EdgePulse::Device::NodeServiceError::Reason::Conflict, stale.error().reason);
 

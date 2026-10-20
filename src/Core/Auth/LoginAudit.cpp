@@ -26,7 +26,7 @@ namespace EdgePulse::Auth
                 {
                     const std::int64_t                                          status = entry.success ? 1 : 0;
                     const std::array<AsynGyanis::Database::DatabaseValue, 7>    parameters{Common::nextIdentifier(), entry.username, entry.ip, status, entry.message, entry.traceId,
-                                                                                           Common::nowIso8601Utc()};
+                                                                                           Common::nowDateTimeUtc()};
                     const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result =
                             connection.execute("INSERT INTO sys_login_log (id, username, ip, status, message, trace_id, login_time) VALUES (?, ?, ?, ?, ?, ?, ?)", parameters);
                     // 审计写不进去是数据库故障，不把“没写”伪装成成功

@@ -1,11 +1,11 @@
 #include "App/ListenerAssembly.h"
-#include "Common/ApiResponse.h"
+#include "Base/Api/ApiResponse.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
 #include "Net/Http/Router.h"
 #include "TestSupport/HttpClientHarness.h"
-#include "Web/MiddlewareSetup.h"
-#include "Web/RequestId.h"
+#include "Core/Http/MiddlewareSetup.h"
+#include "Core/Http/RequestId.h"
 
 #include <gtest/gtest.h>
 

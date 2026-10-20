@@ -1,5 +1,7 @@
 edgepulse:
   listen_address: 127.0.0.1
+  threads: 1
+  hot_reload: true
   http_port: 8080
   https_port: 8443
   agent_port: 9443
@@ -7,9 +9,21 @@ edgepulse:
   ops_address: 127.0.0.1
   web_root: web
   cert_dir: var/certs
+  firmware_dir: var/firmware
+  maximum_firmware_bytes: 268435456
+  telemetry_retention_days: 30
   database:
     driver: sqlite
     path: var/edgepulse.db
+    host: 127.0.0.1
+    port: 3306
+    name: edgepulse
+    user: edgepulse
+  redis:
+    enabled: false
+    host: 127.0.0.1
+    port: 6379
+    database: 0
   migrations_dir: migrations
   captcha:
     ttl_seconds: 120
@@ -32,3 +46,12 @@ server:
   rate_limit:
     requests_per_second: 0.0
     burst_capacity: 1.0
+
+metrics:
+  enabled: false
+  service_name: EdgePulse
+  service_version: 1.0.0
+  export_interval_ms: 15000
+  otlp:
+    endpoint: http://127.0.0.1:4318/v1/metrics
+    timeout_ms: 3000

@@ -3,7 +3,7 @@
  * @brief 认证测试共用的临时数据库与服务集合
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
@@ -15,6 +15,10 @@
 namespace EdgePulse::Common
 {
     class Database;
+}
+namespace EdgePulse::Cache
+{
+    class MemoryKeyValueStore;
 }
 namespace EdgePulse::Auth
 {
@@ -39,11 +43,12 @@ namespace EdgePulse::TestSupport
         AuthTestContext(const AuthTestContext &)            = delete;
         AuthTestContext &operator=(const AuthTestContext &) = delete;
 
-        std::shared_ptr<Common::Database>     database; ///< 已应用迁移的数据库
-        std::shared_ptr<Auth::SessionStore>   sessions; ///< 会话表
-        std::shared_ptr<Auth::CaptchaService> captcha;  ///< 验证码
-        std::shared_ptr<Auth::LoginAudit>     audit;    ///< 登录审计
-        std::shared_ptr<Auth::AuthService>    auth;     ///< 认证服务
+        std::shared_ptr<Common::Database>           database; ///< 已应用迁移的数据库
+        std::shared_ptr<Cache::MemoryKeyValueStore> cache;    ///< 会话与验证码存储
+        std::shared_ptr<Auth::SessionStore>         sessions; ///< 会话表
+        std::shared_ptr<Auth::CaptchaService>       captcha;  ///< 验证码
+        std::shared_ptr<Auth::LoginAudit>           audit;    ///< 登录审计
+        std::shared_ptr<Auth::AuthService>          auth;     ///< 认证服务
 
         /// 临时数据库文件路径
         [[nodiscard]] const std::filesystem::path &databasePath() const noexcept

@@ -1,4 +1,4 @@
-#include "Common/PasswordHash.h"
+#include "Base/Security/PasswordHash.h"
 
 #include <gtest/gtest.h>
 

@@ -3,7 +3,7 @@
  * @brief 在测试线程外驱动事件循环并等待协程结果
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 

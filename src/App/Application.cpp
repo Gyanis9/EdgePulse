@@ -7,7 +7,17 @@
 #include "Core/Auth/CaptchaService.h"
 #include "Core/Auth/LoginAudit.h"
 #include "Core/Auth/SessionStore.h"
+#include "Core/Auth/DataScopeService.h"
+#include "Core/Cache/MemoryKeyValueStore.h"
+#include "Core/Cache/RedisKeyValueStore.h"
+#include "Core/Http/AuditMiddleware.h"
 #include "Base/Api/ApiResponse.h"
+#include "Base/Config/ConfigManager.h"
+#include "Base/Log/LogMacros.h"
+#include "Core/Metrics/ProcessMetricsRegistry.h"
+#include "Net/Metrics/MetricsExportConfiguration.h"
+#include "Core/Coroutine/Scheduler.h"
+#include "Net/Http/ReadinessCheck.h"
 #include "Base/Database/Database.h"
 #include "Base/Runtime/Environment.h"
 #include "Plugins/DevicePlugin/AgentController.h"
@@ -16,10 +26,37 @@
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
 #include "Core/System/MigrationRunner.h"
+#include "Core/System/DictionaryRepository.h"
+#include "Core/System/LogRepository.h"
+#include "Core/System/MenuRepository.h"
+#include "Core/System/OrgRepository.h"
+#include "Core/System/RoleRepository.h"
+#include "Core/System/UserRepository.h"
+#include "Core/Device/NodeGroupRepository.h"
+#include "Core/Telemetry/TelemetryRepository.h"
+#include "Core/Alarm/AlarmRepository.h"
+#include "Core/Alarm/AlarmService.h"
+#include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Command/CommandRepository.h"
+#include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Ops/OpsRepository.h"
+#include "Core/Http/SseBroadcaster.h"
+#include "Core/Http/AlarmEventStream.h"
+#include "Core/Http/AgentWebSocket.h"
+#include "Plugins/DevicePlugin/NodeGroupController.h"
+#include "Plugins/TelemetryPlugin/TelemetryController.h"
+#include "Plugins/AlarmPlugin/AlarmController.h"
+#include "Plugins/FirmwarePlugin/FirmwareController.h"
+#include "Plugins/CommandPlugin/CommandController.h"
+#include "Plugins/OpsPlugin/OpsController.h"
+#include "Plugins/DashboardPlugin/DashboardController.h"
+#include "Plugins/MonitorPlugin/MonitorController.h"
+#include "Plugins/SystemPlugin/SystemController.h"
 #include "Core/Http/MiddlewareSetup.h"
 
 #include "Core/EventLoop/IoContext.h"
 #include "Core/Socket/InetAddress.h"
+#include "Net/Http/HttpParserLimits.h"
 #include "Net/Http/HttpServer.h"
 #include "Net/Http/HttpServerAssembly.h"
 #include "Net/Http/HttpsServer.h"
@@ -72,26 +109,69 @@ namespace EdgePulse::App
     {
     }
 
-    Application::~Application() = default;
+    Application::~Application()
+    {
+        m_ready.store(false);
+        AsynGyanis::Base::ConfigManager::instance().disableHotReload();
+        if (m_healthProbe.joinable())
+        {
+            m_healthProbe.request_stop();
+            m_healthProbe.join();
+        }
+        if (m_metricsExporter)
+        {
+            m_metricsExporter->shutdown();
+        }
+        m_shutdownTask.reset();
+        if (m_stopThread.has_value() && m_stopThread->joinable())
+        {
+            m_stopThread->join();
+        }
+    }
 
     bool Application::start(std::string &error)
     {
         // P0 单进程单循环：所有监听器共享同一条事件循环，跨线程投递与锁的开销都不发生
-        m_ioContext                       = std::make_unique<AsynGyanis::Core::IoContext>(1);
+        m_ioContext                       = std::make_unique<AsynGyanis::Core::IoContext>(static_cast<std::size_t>(m_configuration.threads));
         AsynGyanis::Core::EventLoop &loop = m_ioContext->threadPool().eventLoop(0);
 
         try
         {
             // 启动期在独立连接上应用迁移；失败原因带文件名与语句序号，直接拒绝启动
             {
-                const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirectSqlite(m_configuration.databasePath);
+                Common::DatabaseOptions options;
+                options.driver                                                             = m_configuration.databaseDriver;
+                options.path                                                               = m_configuration.databasePath;
+                options.host                                                               = m_configuration.databaseHost;
+                options.port                                                               = m_configuration.databasePort;
+                options.userName                                                           = m_configuration.databaseUser;
+                options.password                                                           = m_configuration.databasePassword;
+                options.database                                                           = m_configuration.databaseName;
+                const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirect(options);
                 System::MigrationRunner::apply(*connection, m_configuration.migrationsDirectory);
             }
-            m_database         = Common::Database::openSqlite(m_configuration.databasePath);
-            m_sessionStore     = std::make_shared<Auth::SessionStore>(m_configuration.sessionTtlSeconds);
-            m_captchaService   = std::make_shared<Auth::CaptchaService>(Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
+            Common::DatabaseOptions databaseOptions;
+            databaseOptions.driver          = m_configuration.databaseDriver;
+            databaseOptions.path            = m_configuration.databasePath;
+            databaseOptions.host            = m_configuration.databaseHost;
+            databaseOptions.port            = m_configuration.databasePort;
+            databaseOptions.userName        = m_configuration.databaseUser;
+            databaseOptions.password        = m_configuration.databasePassword;
+            databaseOptions.database        = m_configuration.databaseName;
+            databaseOptions.maximumPoolSize = 8;
+            m_database                      = Common::Database::open(databaseOptions);
+            if (m_configuration.redisEnabled)
+            {
+                m_cache = std::make_shared<Cache::RedisKeyValueStore>(m_configuration.redisHost, m_configuration.redisPort, m_configuration.redisPassword,
+                                                                      m_configuration.redisDatabase);
+            } else
+            {
+                m_cache = std::make_shared<Cache::MemoryKeyValueStore>();
+            }
+            m_sessionStore     = std::make_shared<Auth::SessionStore>(m_cache, m_configuration.sessionTtlSeconds);
+            m_captchaService   = std::make_shared<Auth::CaptchaService>(m_cache, Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
             m_loginAudit       = std::make_shared<Auth::LoginAudit>(m_database);
-            m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit);
+            m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache);
             m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>(loop);
             m_nodeRepository   = std::make_shared<Device::NodeRepository>(m_database);
             m_nodeService      = std::make_shared<Device::NodeService>(m_nodeRepository);
@@ -105,13 +185,107 @@ namespace EdgePulse::App
                 const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "node.status"}, {"data", Device::nodeToJson(node)}}).dump();
                 co_await webSocket->hub().publish("nodes", payload);
             };
-            m_agentRegistry = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
+            m_agentRegistry        = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
+            m_userRepository       = std::make_shared<System::UserRepository>(m_database);
+            m_roleRepository       = std::make_shared<System::RoleRepository>(m_database);
+            m_menuRepository       = std::make_shared<System::MenuRepository>(m_database);
+            m_orgRepository        = std::make_shared<System::OrgRepository>(m_database);
+            m_dictionaryRepository = std::make_shared<System::DictionaryRepository>(m_database);
+            m_logRepository        = std::make_shared<System::LogRepository>(m_database);
+            m_dataScopeService     = std::make_shared<Auth::DataScopeService>(m_database);
+            m_nodeGroupRepository  = std::make_shared<Device::NodeGroupRepository>(m_database);
+            m_telemetryRepository  = std::make_shared<Telemetry::TelemetryRepository>(m_database);
+            m_alarmRepository      = std::make_shared<Alarm::AlarmRepository>(m_database);
+            m_sseBroadcaster       = std::make_shared<Web::SseBroadcaster>();
+            m_alarmService         = std::make_shared<Alarm::AlarmService>(
+                    m_alarmRepository,
+                    [webSocket = m_browserWebSocket, broadcaster = m_sseBroadcaster](const Alarm::AlarmRecord &alarm) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "alarm"},
+                                                                                           {"data", AsynGyanis::Base::ConfigValue::object({{"id", alarm.id},
+                                                                                                                                           {"ruleId", alarm.ruleId},
+                                                                                                                                           {"nodeId", alarm.nodeId},
+                                                                                                                                           {"nodeName", alarm.nodeName},
+                                                                                                                                           {"level", alarm.level},
+                                                                                                                                           {"metric", alarm.metric},
+                                                                                                                                           {"value", alarm.value},
+                                                                                                                                           {"threshold", alarm.threshold},
+                                                                                                                                           {"status", alarm.status},
+                                                                                                                                           {"message", alarm.message},
+                                                                                                                                           {"triggeredAt", alarm.triggeredAt},
+                                                                                                                                           {"resolvedAt", alarm.resolvedAt}})}})
+                                                            .dump();
+                        broadcaster->publish(payload);
+                        co_await webSocket->hub().publish("alarms", payload);
+                        co_return;
+                    });
+            m_firmwareRepository = std::make_shared<Firmware::FirmwareRepository>(m_database);
+            m_commandRepository  = std::make_shared<Command::CommandRepository>(m_database);
+            m_agentChannels      = std::make_shared<Command::AgentChannelRegistry>();
+            m_opsRepository      = std::make_shared<Ops::OpsRepository>(m_database);
+
+            m_databaseReady.store(m_database->probe(), std::memory_order_release);
+            m_healthProbe = std::jthread(
+                    [this](const std::stop_token stopToken)
+                    {
+                        while (!stopToken.stop_requested())
+                        {
+                            m_databaseReady.store(m_database->probe(), std::memory_order_release);
+                            for (int tick = 0; tick < 20 && !stopToken.stop_requested(); ++tick)
+                            {
+                                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                            }
+                        }
+                    });
+
+            auto &configurationManager = AsynGyanis::Base::ConfigManager::instance();
+            if (configurationManager.getBool("edgepulse.hot_reload", true))
+            {
+                configurationManager.enableHotReload(
+                        [this](const AsynGyanis::Base::ConfigLoadResult &result)
+                        {
+                            if (!result)
+                            {
+                                LOG_WARN("配置热重载失败：保留上一版配置");
+                                return;
+                            }
+                            auto &manager = AsynGyanis::Base::ConfigManager::instance();
+                            m_sessionStore->setTtlSeconds(static_cast<int>(manager.getInt("edgepulse.session.ttl_seconds", m_sessionStore->ttlSeconds())));
+                            m_captchaService->setOptions(Auth::CaptchaOptions{static_cast<int>(manager.getInt("edgepulse.captcha.ttl_seconds", 120)),
+                                                                              static_cast<int>(manager.getInt("edgepulse.captcha.requests_per_minute", 30))});
+                            LOG_INFO("配置已热重载：会话与验证码参数生效；监听地址与端口需要重启");
+                        });
+            }
+
+            m_buildInfoMetric =
+                    AsynGyanis::Core::ProcessMetricsRegistry::registerMetric("edgepulse_build_info", "EdgePulse 构建信息（恒为 1）", AsynGyanis::Core::ProcessMetricKind::Gauge,
+                                                                             AsynGyanis::Core::ProcessMetricMerge::Sum, [] { return std::uint64_t{1}; });
+
+            if (configurationManager.getBool("metrics.enabled", false))
+            {
+                AsynGyanis::Net::MetricsExportConfiguration metricsConfiguration;
+                metricsConfiguration.enabled            = true;
+                metricsConfiguration.serviceName        = configurationManager.getString("metrics.service_name", "EdgePulse");
+                metricsConfiguration.serviceVersion     = configurationManager.getString("metrics.service_version", "1.0.0");
+                metricsConfiguration.otlpEndpoint       = configurationManager.getString("metrics.otlp.endpoint", "");
+                metricsConfiguration.exportInterval     = std::chrono::milliseconds{configurationManager.getInt("metrics.export_interval_ms", 15000)};
+                metricsConfiguration.otlpRequestTimeout = std::chrono::milliseconds{configurationManager.getInt("metrics.otlp.timeout_ms", 3000)};
+                m_metricsExporter                       = AsynGyanis::Net::buildMetricsExporter(metricsConfiguration);
+            }
         } catch (const std::exception &failure)
         {
             // 数据库或迁移不可用时没有可服务的业务，直接把原因交给进程入口
             error = std::string{"数据库初始化失败："} + failure.what();
             return false;
         }
+
+        // 固件上传走流式正文，解析器仍按正文总量累计；默认 8 MiB 会把 100 MiB 固件挡在门口
+        const auto applyUploadLimits = [](auto &server)
+        {
+            AsynGyanis::Net::HttpParserLimits limits = server.parserLimits();
+            limits.maximumBodySize                   = 256ULL * 1024ULL * 1024ULL;
+            server.setParserLimits(limits);
+        };
 
         const auto resolveAddress = [&error](const std::string &host, const std::uint16_t port, const std::string_view label) -> std::optional<AsynGyanis::Core::InetAddress>
         {
@@ -132,7 +306,10 @@ namespace EdgePulse::App
             }
 
             // 8080：开发档明文口，Vite 代理目标
+            std::error_code webRootError;
+            m_webRoot    = std::filesystem::path(m_configuration.webRoot);
             m_httpServer = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *httpAddress);
+            applyUploadLimits(*m_httpServer);
             registerPublicRoutes(m_httpServer->router(), loop);
             m_acceptTask.emplace(m_httpServer->start());
             loop.scheduler().schedule(m_acceptTask->handle());
@@ -165,6 +342,7 @@ namespace EdgePulse::App
 
                 // 8443/TCP：HTTP/2 控制台，Alt-Svc 通告同端口 UDP 上的 h3
                 m_httpsServer = std::make_unique<AsynGyanis::Net::HttpsServer>(loop, *httpsAddress, serverCertificate.string(), serverKey.string());
+                applyUploadLimits(*m_httpsServer);
                 m_httpsServer->router().addMiddleware(AsynGyanis::Net::altSvcMiddleware(m_configuration.httpsPort));
                 registerPublicRoutes(m_httpsServer->router(), loop);
                 m_httpsAccept.emplace(m_httpsServer->start());
@@ -209,6 +387,27 @@ namespace EdgePulse::App
                 m_agentServer->setClientCertificateRequired(true);
                 Web::applySecurityHeaders(m_agentServer->router());
                 Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry);
+                Telemetry::TelemetryDependencies telemetryAgentDependencies;
+                telemetryAgentDependencies.auth      = m_authService.get();
+                telemetryAgentDependencies.nodes     = m_nodeRepository.get();
+                telemetryAgentDependencies.telemetry = m_telemetryRepository.get();
+                telemetryAgentDependencies.alarms    = m_alarmService.get();
+                Telemetry::registerTelemetryAgentRoutes(m_agentServer->router(), loop, telemetryAgentDependencies);
+                Command::CommandDependencies commandAgentDependencies;
+                commandAgentDependencies.auth     = m_authService.get();
+                commandAgentDependencies.commands = m_commandRepository.get();
+                commandAgentDependencies.channels = m_agentChannels.get();
+                Command::registerCommandAgentRoutes(m_agentServer->router(), loop, commandAgentDependencies);
+                Firmware::FirmwareDependencies firmwareAgentDependencies;
+                firmwareAgentDependencies.auth               = m_authService.get();
+                firmwareAgentDependencies.firmware           = m_firmwareRepository.get();
+                firmwareAgentDependencies.nodes              = m_nodeRepository.get();
+                firmwareAgentDependencies.commands           = m_commandRepository.get();
+                firmwareAgentDependencies.channels           = m_agentChannels.get();
+                firmwareAgentDependencies.storageDirectory   = m_configuration.firmwareDirectory;
+                firmwareAgentDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
+                Firmware::registerFirmwareAgentRoutes(m_agentServer->router(), loop, firmwareAgentDependencies);
+                Web::registerAgentWebSocket(m_agentServer->router(), loop, *m_nodeRepository, *m_commandRepository, *m_agentChannels);
                 m_agentAccept.emplace(m_agentServer->start());
                 loop.scheduler().schedule(m_agentAccept->handle());
             }
@@ -227,10 +426,22 @@ namespace EdgePulse::App
                     return false;
                 }
                 AsynGyanis::Net::HttpServerConfiguration opsConfiguration;
-                opsConfiguration.exposeMetrics  = true;
-                opsConfiguration.opsBearerToken = opsToken;
-                m_opsServer                     = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *opsAddress);
-                AsynGyanis::Net::registerOperationEndpoints(*m_opsServer, opsConfiguration);
+                opsConfiguration.exposeMetrics                  = true;
+                opsConfiguration.opsBearerToken                 = opsToken;
+                const AsynGyanis::Net::ReadinessCheck readiness = [this]() -> AsynGyanis::Net::ReadinessCheckResult
+                {
+                    if (!m_databaseReady.load(std::memory_order_acquire))
+                    {
+                        return {false, "数据库探针失败"};
+                    }
+                    if (!m_ready.load(std::memory_order_acquire))
+                    {
+                        return {false, "服务正在停机或尚未就绪"};
+                    }
+                    return {true, ""};
+                };
+                m_opsServer = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *opsAddress);
+                AsynGyanis::Net::registerOperationEndpoints(*m_opsServer, opsConfiguration, readiness);
                 m_opsAccept.emplace(m_opsServer->start());
                 loop.scheduler().schedule(m_opsAccept->handle());
             }
@@ -239,6 +450,7 @@ namespace EdgePulse::App
             error = std::string{"监听器启动失败："} + failure.what();
             return false;
         }
+        m_ready.store(true, std::memory_order_release);
         return true;
     }
 
@@ -246,26 +458,104 @@ namespace EdgePulse::App
     {
         // 中间件必须先于业务路由注册，异常兜底才能包住所有处理器
         Web::applySecurityHeaders(router);
+        Web::registerAuditMiddleware(router, loop, *m_authService, *m_logRepository);
         registerHealthRoutes(router);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
-        const auto accessResolver = [auth = m_authService](const AsynGyanis::Net::HttpRequest &request) -> std::optional<Device::AccessContext>
+        System::SystemDependencies systemDependencies;
+        systemDependencies.auth         = m_authService.get();
+        systemDependencies.dataScopes   = m_dataScopeService.get();
+        systemDependencies.users        = m_userRepository.get();
+        systemDependencies.roles        = m_roleRepository.get();
+        systemDependencies.menus        = m_menuRepository.get();
+        systemDependencies.org          = m_orgRepository.get();
+        systemDependencies.dictionaries = m_dictionaryRepository.get();
+        System::registerSystemRoutes(router, loop, systemDependencies);
+        Monitor::MonitorDependencies monitorDependencies;
+        monitorDependencies.auth = m_authService.get();
+        monitorDependencies.logs = m_logRepository.get();
+        Monitor::registerMonitorRoutes(router, loop, monitorDependencies);
+        Dashboard::DashboardDependencies dashboardDependencies;
+        dashboardDependencies.auth  = m_authService.get();
+        dashboardDependencies.logs  = m_logRepository.get();
+        dashboardDependencies.roles = m_roleRepository.get();
+        Dashboard::registerDashboardRoutes(router, loop, dashboardDependencies);
+
+        Device::NodeGroupDependencies groupDependencies;
+        groupDependencies.auth   = m_authService.get();
+        groupDependencies.groups = m_nodeGroupRepository.get();
+        Device::registerNodeGroupRoutes(router, loop, groupDependencies);
+
+        Telemetry::TelemetryDependencies telemetryDependencies;
+        telemetryDependencies.auth      = m_authService.get();
+        telemetryDependencies.nodes     = m_nodeRepository.get();
+        telemetryDependencies.telemetry = m_telemetryRepository.get();
+        telemetryDependencies.alarms    = m_alarmService.get();
+        Telemetry::registerTelemetryBrowserRoutes(router, loop, telemetryDependencies);
+
+        Alarm::AlarmDependencies alarmDependencies;
+        alarmDependencies.auth   = m_authService.get();
+        alarmDependencies.alarms = m_alarmService.get();
+        Alarm::registerAlarmRoutes(router, loop, alarmDependencies);
+        Web::registerAlarmEventStream(router, loop, *m_authService, *m_sseBroadcaster);
+
+        const auto commandNotifier = [webSocket = m_browserWebSocket](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
+        {
+            const std::string payload =
+                    AsynGyanis::Base::ConfigValue::object(
+                            {{"type", "command.status"},
+                             {"data", AsynGyanis::Base::ConfigValue::object(
+                                              {{"id", command.id}, {"nodeId", command.nodeId}, {"type", command.type}, {"status", command.status}, {"message", command.message}})}})
+                            .dump();
+            co_await webSocket->hub().publish("commands", payload);
+            co_return;
+        };
+        Command::CommandDependencies commandDependencies;
+        commandDependencies.auth     = m_authService.get();
+        commandDependencies.commands = m_commandRepository.get();
+        commandDependencies.channels = m_agentChannels.get();
+        commandDependencies.notifier = commandNotifier;
+        Command::registerCommandRoutes(router, loop, commandDependencies);
+
+        Firmware::FirmwareDependencies firmwareDependencies;
+        firmwareDependencies.auth               = m_authService.get();
+        firmwareDependencies.firmware           = m_firmwareRepository.get();
+        firmwareDependencies.nodes              = m_nodeRepository.get();
+        firmwareDependencies.commands           = m_commandRepository.get();
+        firmwareDependencies.channels           = m_agentChannels.get();
+        firmwareDependencies.notifier           = commandNotifier;
+        firmwareDependencies.storageDirectory   = m_configuration.firmwareDirectory;
+        firmwareDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
+        Firmware::registerFirmwareRoutes(router, loop, firmwareDependencies);
+
+        Ops::OpsDependencies opsDependencies;
+        opsDependencies.auth       = m_authService.get();
+        opsDependencies.repository = m_opsRepository.get();
+        opsDependencies.httpPort   = m_configuration.httpPort;
+        opsDependencies.httpsPort  = m_configuration.httpsPort;
+        opsDependencies.agentPort  = m_configuration.agentPort;
+        opsDependencies.opsPort    = m_configuration.opsPort;
+        Ops::registerOpsRoutes(router, loop, opsDependencies);
+        const auto accessResolver = [auth = m_authService, &loop](AsynGyanis::Core::EventLoop  &resolverLoop,
+                                                                  AsynGyanis::Net::HttpRequest &request) -> AsynGyanis::Core::Task<std::optional<Device::AccessContext>>
         {
             const std::optional<std::string> token = Web::bearerToken(request);
             if (!token.has_value())
             {
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            const std::optional<Auth::SessionRecord> session = auth->authenticate(*token);
+            const std::optional<Auth::SessionRecord> session = co_await auth->authenticate(resolverLoop, *token);
             if (!session.has_value())
             {
-                return std::nullopt;
+                co_return std::nullopt;
             }
-            return Device::AccessContext{session->permissions};
+            co_return Device::AccessContext{session->userId, session->username, session->departmentId, session->roles, session->permissions};
         };
         Device::registerRoutes(router, loop, *m_nodeService, accessResolver);
         m_browserWebSocket->registerRoute(
-                router, [auth = m_authService](const std::string_view token) { return auth->authenticate(token).has_value(); }, m_configuration.allowedOrigins);
-        registerFallbackRoute(router);
+                router, [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<bool>
+                { co_return (co_await auth->authenticate(loop, token)).has_value(); }, m_configuration.allowedOrigins);
+        // 站点兜底必须是最后一条通配路由：注册早了会吞掉所有参数化路由（如 /api/firmware/:id/deploy）
+        registerSiteFallback(router, m_webRoot);
     }
 
     int Application::run()
@@ -286,10 +576,46 @@ namespace EdgePulse::App
         {
             return;
         }
-        if (m_ioContext)
+        // 先让 /readyz 变 503，再停止接新连接并排空在途请求
+        m_ready.store(false, std::memory_order_release);
+        if (!m_ioContext)
         {
-            m_ioContext->stop();
+            return;
         }
+        AsynGyanis::Core::EventLoop &loop = m_ioContext->threadPool().eventLoop(0);
+        loop.scheduler().postRemote(
+                [this, &loop]
+                {
+                    AsynGyanis::Core::Task<> shutdown = [](Application *application, AsynGyanis::Core::EventLoop *eventLoop) -> AsynGyanis::Core::Task<>
+                    {
+                        constexpr std::chrono::milliseconds drainBudget{5000};
+                        if (application->m_httpServer)
+                        {
+                            co_await application->m_httpServer->drain(drainBudget);
+                        }
+                        if (application->m_httpsServer)
+                        {
+                            co_await application->m_httpsServer->drain(drainBudget);
+                        }
+                        if (application->m_agentServer)
+                        {
+                            co_await application->m_agentServer->drain(drainBudget);
+                        }
+                        if (application->m_quicServer)
+                        {
+                            co_await application->m_quicServer->drain(drainBudget);
+                        }
+                        if (application->m_opsServer)
+                        {
+                            co_await application->m_opsServer->drain(drainBudget);
+                        }
+                        application->m_stopThread = std::jthread([application] { application->m_ioContext->stop(); });
+                        static_cast<void>(eventLoop);
+                        co_return;
+                    }(this, &loop);
+                    m_shutdownTask.emplace(std::move(shutdown));
+                    loop.scheduler().schedule(m_shutdownTask->handle());
+                });
     }
 
     std::uint16_t Application::httpPort() const noexcept

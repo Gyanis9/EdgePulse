@@ -3,6 +3,7 @@
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
 #include "Base/Api/Pagination.h"
+#include "Base/Api/QueryParameters.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
 #include "Net/Http/HttpRequest.h"
@@ -108,22 +109,22 @@ namespace EdgePulse::Device
         /**
          * @brief 解析身份与权限；失败时已经写好响应，调用方直接返回
          */
-        [[nodiscard]] bool requirePermission(const AccessResolver &resolver, AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response,
-                                             const std::string_view permission, const std::string_view traceId)
+        [[nodiscard]] AsynGyanis::Core::Task<bool> requirePermission(const AccessResolver &resolver, AsynGyanis::Core::EventLoop &loop, AsynGyanis::Net::HttpRequest &request,
+                                                                     AsynGyanis::Net::HttpResponse &response, const std::string_view permission, const std::string_view traceId)
         {
-            const std::optional<AccessContext> access = resolver(request);
+            const std::optional<AccessContext> access = co_await resolver(loop, request);
             // 未认证与无权限是两件事：401 让前端回登录页，403 让前端提示无权访问
             if (!access.has_value())
             {
                 Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, "未登录或会话已过期", traceId);
-                return false;
+                co_return false;
             }
             if (!hasPermission(*access, permission))
             {
                 Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "无权执行该操作", traceId);
-                return false;
+                co_return false;
             }
-            return true;
+            co_return true;
         }
     } // namespace
 
@@ -133,14 +134,15 @@ namespace EdgePulse::Device
                    [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       if (!requirePermission(accessResolver, request, response, kListPermission, traceId))
+                       if (!co_await requirePermission(accessResolver, loop, request, response, kListPermission, traceId))
                        {
                            co_return;
                        }
                        const std::unordered_map<std::string, std::string> query   = request.queryParams();
                        const std::string                                  keyword = query.contains("keyword") ? query.at("keyword") : std::string{};
                        const std::string                                  status  = query.contains("status") ? query.at("status") : std::string{};
-                       const NodePage                                     page    = co_await nodeService.list(loop, Common::parsePageParameters(query), keyword, status);
+                       const std::int64_t                                 groupId = Common::queryInteger(query, "groupId").value_or(0);
+                       const NodePage                                     page    = co_await nodeService.list(loop, Common::parsePageParameters(query), keyword, status, groupId);
                        AsynGyanis::Base::ConfigValue                      rows    = AsynGyanis::Base::ConfigValue::array();
                        for (const NodeRecord &node: page.rows)
                        {
@@ -155,7 +157,7 @@ namespace EdgePulse::Device
                     [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string traceId = Web::resolveRequestId(request);
-                        if (!requirePermission(accessResolver, request, response, kWritePermission, traceId))
+                        if (!co_await requirePermission(accessResolver, loop, request, response, kWritePermission, traceId))
                         {
                             co_return;
                         }
@@ -172,7 +174,8 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少 name，或 labels 既不是对象也不是字符串", traceId);
                             co_return;
                         }
-                        const auto result = co_await nodeService.create(loop, *name, *labels);
+                        const std::int64_t groupId = body->contains("groupId") ? body->value("groupId", std::int64_t{200}) : 200;
+                        const auto         result  = co_await nodeService.create(loop, *name, *labels, groupId);
                         if (!result.has_value())
                         {
                             writeNodeError(response, result.error(), traceId);
@@ -186,7 +189,7 @@ namespace EdgePulse::Device
                    [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       if (!requirePermission(accessResolver, request, response, kWritePermission, traceId))
+                       if (!co_await requirePermission(accessResolver, loop, request, response, kWritePermission, traceId))
                        {
                            co_return;
                        }
@@ -208,8 +211,13 @@ namespace EdgePulse::Device
                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少整数 version", traceId);
                            co_return;
                        }
-                       const std::int64_t         version = versionIterator->get<std::int64_t>();
-                       std::optional<std::string> name    = stringField(*body, "name");
+                       const std::int64_t          version = versionIterator->get<std::int64_t>();
+                       std::optional<std::string>  name    = stringField(*body, "name");
+                       std::optional<std::int64_t> groupId;
+                       if (body->is_object() && body->contains("groupId") && (*body)["groupId"].is_number_integer())
+                       {
+                           groupId = (*body)["groupId"].get<std::int64_t>();
+                       }
                        std::optional<std::string> labels;
                        if (body->is_object() && body->contains("labels"))
                        {
@@ -221,12 +229,12 @@ namespace EdgePulse::Device
                                co_return;
                            }
                        }
-                       if (!name.has_value() && !labels.has_value())
+                       if (!name.has_value() && !labels.has_value() && !groupId.has_value())
                        {
-                           Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "name 与 labels 至少给一个", traceId);
+                           Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "name、labels 与 groupId 至少给一个", traceId);
                            co_return;
                        }
-                       const auto result = co_await nodeService.update(loop, *nodeId, std::move(name), labels, version);
+                       const auto result = co_await nodeService.update(loop, *nodeId, std::move(name), labels, groupId, version);
                        if (!result.has_value())
                        {
                            writeNodeError(response, result.error(), traceId);
@@ -240,7 +248,7 @@ namespace EdgePulse::Device
                    [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       if (!requirePermission(accessResolver, request, response, kWritePermission, traceId))
+                       if (!co_await requirePermission(accessResolver, loop, request, response, kWritePermission, traceId))
                        {
                            co_return;
                        }

@@ -1,8 +1,8 @@
-#include "Common/Database.h"
-#include "Common/EdgePulseException.h"
-#include "System/MenuRepository.h"
-#include "System/MigrationRunner.h"
-#include "System/UserRepository.h"
+#include "Base/Database/Database.h"
+#include "Base/Exception/EdgePulseException.h"
+#include "Core/System/MenuRepository.h"
+#include "Core/System/MigrationRunner.h"
+#include "Core/System/UserRepository.h"
 #include "TestSupport/EventLoopRunner.h"
 
 #include <gtest/gtest.h>
@@ -67,7 +67,7 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         applyMigrations(databasePath);
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_user"));
-        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_menu"));
+        EXPECT_GE(querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_menu"), 30);
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 1"));
 
         const std::unique_ptr<AsynGyanis::Database::DatabaseResult> hashResult = connection->execute("SELECT password FROM sys_user WHERE username = 'admin'");
@@ -83,7 +83,7 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_user"));
-        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(6, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }
@@ -129,12 +129,12 @@ TEST(Migrations, RepositoriesReadSeedData)
         EXPECT_NE(permissions.end(), std::find(permissions.begin(), permissions.end(), "device:node:write"));
 
         const std::vector<EdgePulse::System::MenuNode> tree = runner.run(menus.treeForUser(runner.loop(), admin->id));
-        ASSERT_EQ(1U, tree.size());
-        EXPECT_EQ("边缘运维", tree[0].name);
-        ASSERT_EQ(1U, tree[0].children.size());
-        EXPECT_EQ("节点", tree[0].children[0].name);
-        EXPECT_EQ("device/Nodes", tree[0].children[0].component);
-        EXPECT_EQ("/device/nodes", tree[0].children[0].path);
+        const auto group = std::find_if(tree.begin(), tree.end(), [](const EdgePulse::System::MenuNode &node) { return node.name == "边缘运维"; });
+        ASSERT_NE(tree.end(), group);
+        const auto node = std::find_if(group->children.begin(), group->children.end(), [](const EdgePulse::System::MenuNode &child) { return child.name == "节点"; });
+        ASSERT_NE(group->children.end(), node);
+        EXPECT_EQ("device/Nodes", node->component);
+        EXPECT_EQ("/device/nodes", node->path);
     }
     std::filesystem::remove(databasePath);
 }

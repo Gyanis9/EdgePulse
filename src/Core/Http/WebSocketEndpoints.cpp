@@ -5,6 +5,7 @@
 #include "Net/Http/HttpResponse.h"
 #include "Net/Http/Router.h"
 #include "Net/WebSocket/WebSocketPeer.h"
+#include "Net/WebSocket/WebSocketUpgradePolicy.h"
 
 #include <algorithm>
 #include <cctype>
@@ -160,7 +161,8 @@ namespace EdgePulse::Web
         m_authThreads.push_back(std::move(timer));
     }
 
-    void BrowserWebSocket::registerRoute(AsynGyanis::Net::Router &router, std::function<bool(std::string_view)> tokenValidator, std::vector<std::string> allowedOrigins)
+    void BrowserWebSocket::registerRoute(AsynGyanis::Net::Router &router, std::function<AsynGyanis::Core::Task<bool>(std::string_view)> tokenValidator,
+                                         std::vector<std::string> allowedOrigins)
     {
         router.get("/api/ws",
                    [this, tokenValidator = std::move(tokenValidator),
@@ -173,6 +175,9 @@ namespace EdgePulse::Web
                            response.setBody("origin rejected");
                            co_return;
                        }
+                       AsynGyanis::Net::WebSocketUpgradePolicy policy;
+                       policy.originMode     = allowedOrigins.empty() ? AsynGyanis::Net::WebSocketOriginMode::SameOriginOnly : AsynGyanis::Net::WebSocketOriginMode::AllowList;
+                       policy.allowedOrigins = allowedOrigins;
                        response.upgradeToWebSocket(
                                [this, tokenValidator](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
                                {
@@ -195,8 +200,13 @@ namespace EdgePulse::Web
                                        finished->store(true);
                                        co_return;
                                    }
-                                   const std::optional<std::string> token = parseAuthToken(first->payload);
-                                   if (!token.has_value() || !tokenValidator(*token))
+                                   const std::optional<std::string> token              = parseAuthToken(first->payload);
+                                   bool                             authenticatedToken = false;
+                                   if (token.has_value())
+                                   {
+                                       authenticatedToken = co_await tokenValidator(*token);
+                                   }
+                                   if (!authenticatedToken)
                                    {
                                        // 明确的策略拒绝：先关 1008，再让会话收口
                                        co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unauthorized");
@@ -210,8 +220,10 @@ namespace EdgePulse::Web
                                        finished->store(true);
                                        co_return;
                                    }
-                                   // 认证回执之后所有出站都走集线器，处理器只读入站帧
-                                   AsynGyanis::Net::WebSocketSubscription subscription = m_hub.subscribe(kNodeTopic, peer);
+                                   // 认证回执之后所有出站都走集线器，处理器只读入站帧；三类主题共用同一条连接
+                                   AsynGyanis::Net::WebSocketSubscription nodeSubscription    = m_hub.subscribe(kNodeTopic, peer);
+                                   AsynGyanis::Net::WebSocketSubscription alarmSubscription   = m_hub.subscribe("alarms", peer);
+                                   AsynGyanis::Net::WebSocketSubscription commandSubscription = m_hub.subscribe("commands", peer);
                                    while (const auto message = co_await peer.receive())
                                    {
                                        // 客户端保活文本只用于续上连接的空闲计时，内容不参与业务
@@ -219,7 +231,8 @@ namespace EdgePulse::Web
                                    }
                                    finished->store(true);
                                    co_return;
-                               });
+                               },
+                               std::move(policy));
                        co_return;
                    });
     }

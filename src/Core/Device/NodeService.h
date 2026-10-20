@@ -3,7 +3,7 @@
  * @brief 节点写操作的校验与错误归一
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
@@ -54,7 +54,8 @@ namespace EdgePulse::Device
         /**
          * @brief 分页查询
          */
-        AsynGyanis::Core::Task<NodePage> list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status);
+        AsynGyanis::Core::Task<NodePage> list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status,
+                                              std::int64_t groupId = 0);
 
         /**
          * @brief 创建节点
@@ -63,7 +64,8 @@ namespace EdgePulse::Device
          * @param labelsJson 标签 JSON 对象文本，可空
          * @return 成功返回节点；失败返回可恢复错误
          */
-        AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson);
+        AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson,
+                                                                                   std::int64_t groupId = 200, std::int64_t ownerDeptId = 0);
 
         /**
          * @brief 乐观锁更新
@@ -75,7 +77,8 @@ namespace EdgePulse::Device
          * @return 成功返回更新后的节点；失败返回可恢复错误
          */
         AsynGyanis::Core::Task<std::expected<NodeRecord, NodeServiceError>> update(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::optional<std::string> name,
-                                                                                   std::optional<std::string> labelsJson, std::int64_t expectedVersion);
+                                                                                   std::optional<std::string> labelsJson, std::optional<std::int64_t> groupId,
+                                                                                   std::int64_t expectedVersion);
 
         /**
          * @brief 软删除

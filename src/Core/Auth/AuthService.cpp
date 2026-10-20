@@ -7,6 +7,7 @@
 #include "Core/Coroutine/AsyncExecutor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <string>
 #include <utility>
@@ -16,13 +17,21 @@ namespace EdgePulse::Auth
 {
     namespace
     {
-        constexpr std::size_t kMinimumPasswordLength = 6;  ///< 新口令最短长度
-        constexpr std::size_t kMaximumPasswordLength = 64; ///< 新口令最长长度
+        constexpr std::size_t          kMinimumPasswordLength = 6;                    ///< 新口令最短长度
+        constexpr std::size_t          kMaximumPasswordLength = 64;                   ///< 新口令最长长度
+        constexpr int                  kMaximumLoginFailures  = 10;                   ///< 单 IP 每分钟失败上限
+        constexpr std::chrono::seconds kLoginFailureWindow{60};                       ///< 失败计数窗口
+        constexpr std::string_view     kLoginFailurePrefix = "edgepulse:login:fail:"; ///< 失败计数键前缀
+
+        [[nodiscard]] std::string ipFailureKey(const std::string &clientIp)
+        {
+            return std::string{kLoginFailurePrefix} + clientIp;
+        }
     } // namespace
 
     AuthService::AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha,
-                             std::shared_ptr<LoginAudit> audit) :
-        m_sessions(std::move(sessions)), m_captcha(std::move(captcha)), m_loginAudit(std::move(audit)), m_users(database), m_menus(std::move(database))
+                             std::shared_ptr<LoginAudit> audit, std::shared_ptr<Cache::KeyValueStore> cache) :
+        m_sessions(std::move(sessions)), m_captcha(std::move(captcha)), m_loginAudit(std::move(audit)), m_cache(std::move(cache)), m_users(database), m_menus(std::move(database))
     {
     }
 
@@ -49,8 +58,17 @@ namespace EdgePulse::Auth
             co_return std::unexpected(AuthError{Common::kCodeBadRequest, Common::kCodeBadRequest, "用户名和密码不能为空"});
         }
 
+        // 失败计数放在最前：超过阈值时连验证码与口令校验都不做，避免把 PBKDF2 变成撞库加速器
+        const std::string  failureKey = ipFailureKey(credentials.clientIp);
+        const std::int64_t failures   = co_await m_cache->increment(loop, failureKey, kLoginFailureWindow);
+        if (failures > kMaximumLoginFailures)
+        {
+            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "登录尝试过于频繁", credentials.traceId});
+            co_return std::unexpected(AuthError{Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "登录尝试过于频繁：请一分钟后再试"});
+        }
+
         // 验证码一次性消费：失败时也写审计，便于排查撞库与过期页面
-        if (!m_captcha->consume(credentials.captchaUuid, credentials.captcha))
+        if (!co_await m_captcha->consume(loop, credentials.captchaUuid, credentials.captcha))
         {
             co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "验证码错误或已过期", credentials.traceId});
             co_return std::unexpected(AuthError{Common::kCodeBadRequest, Common::kCodeBadRequest, "验证码错误或已过期"});
@@ -82,13 +100,16 @@ namespace EdgePulse::Auth
         record.username             = user->username;
         record.nickname             = user->nickname;
         record.departmentId         = user->departmentId;
-        record.departmentName       = "";
+        record.departmentName       = user->departmentName;
         record.roles                = roles;
         record.permissions          = permissions;
-        const SessionRecord session = m_sessions->create(std::move(record));
+        const SessionRecord session = co_await m_sessions->create(loop, std::move(record));
+
+        // 成功登录清空该来源的失败计数，避免此前几次输错影响后续正常使用
+        static_cast<void>(co_await m_cache->erase(loop, failureKey));
 
         // 登录时间更新失败不影响本次登录，但必须在日志里留下原因
-        if (!co_await m_users.touchLastLogin(loop, user->id, Common::nowIso8601Utc()))
+        if (!co_await m_users.touchLastLogin(loop, user->id, Common::nowDateTimeUtc()))
         {
             LOG_WARN_FMT("登录时间未更新：user={}", user->username);
         }
@@ -97,18 +118,18 @@ namespace EdgePulse::Auth
         co_return LoginResult{session.token, m_sessions->ttlSeconds()};
     }
 
-    std::optional<SessionRecord> AuthService::authenticate(const std::string_view token)
+    AsynGyanis::Core::Task<std::optional<SessionRecord>> AuthService::authenticate(AsynGyanis::Core::EventLoop &loop, const std::string_view token)
     {
         if (token.empty())
         {
-            return std::nullopt;
+            co_return std::nullopt;
         }
-        return m_sessions->validateAndTouch(token);
+        co_return co_await m_sessions->validateAndTouch(loop, token);
     }
 
-    void AuthService::logout(const std::string_view token)
+    AsynGyanis::Core::Task<bool> AuthService::logout(AsynGyanis::Core::EventLoop &loop, const std::string_view token)
     {
-        m_sessions->remove(token);
+        co_return co_await m_sessions->remove(loop, token);
     }
 
     AsynGyanis::Core::Task<std::vector<System::MenuNode>> AuthService::routes(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session)

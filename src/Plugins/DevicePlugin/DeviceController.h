@@ -3,12 +3,15 @@
  * @brief 浏览器侧节点管理路由
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
 #pragma once
 
+#include <Core/Coroutine/Task.h>
+
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -33,11 +36,15 @@ namespace EdgePulse::Device
      */
     struct AccessContext
     {
-        std::vector<std::string> permissions; ///< 当前会话的权限码
+        std::int64_t             userId{0};       ///< 用户标识
+        std::string              username;        ///< 登录名
+        std::int64_t             departmentId{0}; ///< 部门标识
+        std::vector<std::string> roles;           ///< 角色码
+        std::vector<std::string> permissions;     ///< 当前会话的权限码
     };
 
-    /// 从请求解析身份；未认证返回空
-    using AccessResolver = std::function<std::optional<AccessContext>(const AsynGyanis::Net::HttpRequest &)>;
+    /// 从请求异步解析身份；未认证返回空
+    using AccessResolver = std::function<AsynGyanis::Core::Task<std::optional<AccessContext>>(AsynGyanis::Core::EventLoop &, AsynGyanis::Net::HttpRequest &)>;
 
     /**
      * @brief 注册 /api/nodes 的读写路由

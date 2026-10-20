@@ -1,5 +1,5 @@
-#include "Auth/AuthService.h"
-#include "Common/Database.h"
+#include "Core/Auth/AuthService.h"
+#include "Base/Database/Database.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 
@@ -31,7 +31,7 @@ namespace
     [[nodiscard]] std::expected<EdgePulse::Auth::LoginResult, EdgePulse::Auth::AuthError>
     loginWithCaptcha(EdgePulse::TestSupport::AuthTestContext &context, EdgePulse::TestSupport::EventLoopRunner &runner, const std::string &password)
     {
-        const auto challenge = context.captcha->issue("127.0.0.1");
+        const auto challenge = runner.run(context.captcha->issue(runner.loop(), "127.0.0.1"));
         if (!challenge.has_value())
         {
             return std::unexpected(EdgePulse::Auth::AuthError{429, 429, "测试验证码签发失败"});
@@ -51,20 +51,22 @@ TEST(AuthService, LogsInAndExposesIdentityRoutesAndAudit)
     EXPECT_EQ(64U, result->token.size());
     EXPECT_EQ(7200, result->expiresIn);
 
-    const std::optional<EdgePulse::Auth::SessionRecord> session = context.auth->authenticate(result->token);
+    const std::optional<EdgePulse::Auth::SessionRecord> session = runner.run(context.auth->authenticate(runner.loop(), result->token));
     ASSERT_TRUE(session.has_value());
     EXPECT_EQ("admin", session->username);
     EXPECT_NE(session->permissions.end(), std::find(session->permissions.begin(), session->permissions.end(), "device:node:list"));
     EXPECT_NE(session->permissions.end(), std::find(session->permissions.begin(), session->permissions.end(), "device:node:write"));
 
     const std::vector<EdgePulse::System::MenuNode> tree = runner.run(context.auth->routes(runner.loop(), *session));
-    ASSERT_EQ(1U, tree.size());
-    ASSERT_EQ(1U, tree[0].children.size());
-    EXPECT_EQ("device/Nodes", tree[0].children[0].component);
+    const auto deviceGroup                              = std::find_if(tree.begin(), tree.end(), [](const EdgePulse::System::MenuNode &node) { return node.name == "边缘运维"; });
+    ASSERT_NE(tree.end(), deviceGroup);
+    const auto node = std::find_if(deviceGroup->children.begin(), deviceGroup->children.end(), [](const EdgePulse::System::MenuNode &child) { return child.name == "节点"; });
+    ASSERT_NE(deviceGroup->children.end(), node);
+    EXPECT_EQ("device/Nodes", node->component);
 
     EXPECT_EQ(1, countLoginLogs(context.databasePath(), 1));
-    context.auth->logout(result->token);
-    EXPECT_FALSE(context.auth->authenticate(result->token).has_value());
+    runner.run(context.auth->logout(runner.loop(), result->token));
+    EXPECT_FALSE(runner.run(context.auth->authenticate(runner.loop(), result->token)).has_value());
 }
 
 // 钉住：错误口令与错误验证码都按可恢复错误返回，正确凭据随后仍能登录
@@ -74,7 +76,7 @@ TEST(AuthService, RejectsWrongCaptchaAndWrongPassword)
     EdgePulse::TestSupport::EventLoopRunner runner;
 
     // 先消费一条验证码，再用同一个 uuid 登录：必须被拒
-    const auto firstChallenge = context.captcha->issue("127.0.0.1");
+    const auto firstChallenge = runner.run(context.captcha->issue(runner.loop(), "127.0.0.1"));
     ASSERT_TRUE(firstChallenge.has_value());
     const auto wrongCaptcha =
             runner.run(context.auth->login(runner.loop(), EdgePulse::Auth::LoginCredentials{"admin", "admin123", "XXXX", firstChallenge->uuid, "127.0.0.1", "trace"}));
@@ -97,14 +99,14 @@ TEST(AuthService, ChangesPasswordAndInvalidatesOldCredential)
 
     const auto firstLogin = loginWithCaptcha(context, runner, "admin123");
     ASSERT_TRUE(firstLogin.has_value()) << firstLogin.error().message;
-    const std::optional<EdgePulse::Auth::SessionRecord> session = context.auth->authenticate(firstLogin->token);
+    const std::optional<EdgePulse::Auth::SessionRecord> session = runner.run(context.auth->authenticate(runner.loop(), firstLogin->token));
     ASSERT_TRUE(session.has_value());
 
     const auto changed = runner.run(context.auth->changePassword(runner.loop(), *session, "admin123", "new-pass-123"));
     ASSERT_TRUE(changed.has_value()) << changed.error().message;
 
-    context.auth->logout(firstLogin->token);
-    EXPECT_FALSE(context.auth->authenticate(firstLogin->token).has_value());
+    runner.run(context.auth->logout(runner.loop(), firstLogin->token));
+    EXPECT_FALSE(runner.run(context.auth->authenticate(runner.loop(), firstLogin->token)).has_value());
 
     const auto oldCredential = loginWithCaptcha(context, runner, "admin123");
     ASSERT_FALSE(oldCredential.has_value());

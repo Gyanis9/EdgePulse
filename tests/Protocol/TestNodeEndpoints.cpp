@@ -1,12 +1,12 @@
-#include "Auth/AuthController.h"
-#include "Auth/AuthService.h"
+#include "Plugins/AuthPlugin/AuthController.h"
+#include "Core/Auth/AuthService.h"
 #include "Base/Config/ConfigValue.h"
-#include "Device/DeviceController.h"
-#include "Device/NodeService.h"
+#include "Plugins/DevicePlugin/DeviceController.h"
+#include "Core/Device/NodeService.h"
 #include "Net/Http/HttpRequest.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
-#include "Web/MiddlewareSetup.h"
+#include "Core/Http/MiddlewareSetup.h"
 
 #include <gtest/gtest.h>
 
@@ -63,7 +63,8 @@ protected:
                 {
                     EdgePulse::Web::applySecurityHeaders(router);
                     EdgePulse::Auth::registerRoutes(router, loop, *m_context->auth, *m_context->captcha, true);
-                    EdgePulse::Device::registerRoutes(router, loop, *m_nodes, [this](const AsynGyanis::Net::HttpRequest &request) { return resolveAccess(request); });
+                    EdgePulse::Device::registerRoutes(router, loop, *m_nodes, [this](AsynGyanis::Core::EventLoop &accessLoop, AsynGyanis::Net::HttpRequest &request)
+                                                      { return resolveAccess(accessLoop, request); });
                 });
     }
 
@@ -75,24 +76,24 @@ protected:
         m_context.reset();
     }
 
-    std::optional<EdgePulse::Device::AccessContext> resolveAccess(const AsynGyanis::Net::HttpRequest &request)
+    AsynGyanis::Core::Task<std::optional<EdgePulse::Device::AccessContext>> resolveAccess(AsynGyanis::Core::EventLoop &loop, AsynGyanis::Net::HttpRequest &request)
     {
         // 测试专用：只给列表权限，用来验证写接口的 403 闸门
         if (const auto testHeader = request.getHeader("x-test-permissions"); testHeader == "list-only")
         {
-            return EdgePulse::Device::AccessContext{{"device:node:list"}};
+            co_return EdgePulse::Device::AccessContext{0, "tester", 0, {}, {"device:node:list"}};
         }
         const std::optional<std::string> token = bearerToken(request);
         if (!token.has_value())
         {
-            return std::nullopt;
+            co_return std::nullopt;
         }
-        const auto session = m_context->auth->authenticate(*token);
+        const auto session = co_await m_context->auth->authenticate(loop, *token);
         if (!session.has_value())
         {
-            return std::nullopt;
+            co_return std::nullopt;
         }
-        return EdgePulse::Device::AccessContext{session->permissions};
+        co_return EdgePulse::Device::AccessContext{session->userId, session->username, session->departmentId, session->roles, session->permissions};
     }
 
     std::string login()

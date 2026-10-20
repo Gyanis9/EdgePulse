@@ -23,6 +23,8 @@ namespace EdgePulse::Device
                                                       {"certFingerprint", node.certFingerprint},
                                                       {"labels", std::move(labels)},
                                                       {"lastSeen", node.lastSeen},
+                                                      {"groupId", node.groupId},
+                                                      {"groupName", node.groupName},
                                                       {"version", node.version}});
     }
 } // namespace EdgePulse::Device

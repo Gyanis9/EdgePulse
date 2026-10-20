@@ -1,5 +1,6 @@
 add_library(edgepulse-base STATIC
         Api/ApiResponse.cpp
+        Api/CsvWriter.cpp
         Api/Pagination.cpp
         Database/Database.cpp
         Runtime/Environment.cpp

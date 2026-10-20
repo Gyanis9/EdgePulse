@@ -1,0 +1,75 @@
+/**
+ * @file FirmwareController.h
+ * @brief 固件上传、下载与下发 HTTP 路由
+ * @author Gyanis
+ * @date 2026-10-20
+ * @version 1.0.0
+ * @copyright Copyright (c) . All rights reserved.
+ */
+
+#pragma once
+
+#include "Plugins/CommandPlugin/CommandController.h"
+
+#include <cstddef>
+#include <string>
+
+namespace AsynGyanis::Core
+{
+    class EventLoop;
+}
+namespace AsynGyanis::Net
+{
+    class Router;
+}
+namespace EdgePulse::Auth
+{
+    class AuthService;
+}
+namespace EdgePulse::Command
+{
+    class AgentChannelRegistry;
+    class CommandRepository;
+} // namespace EdgePulse::Command
+namespace EdgePulse::Device
+{
+    class NodeRepository;
+}
+namespace EdgePulse::Firmware
+{
+    class FirmwareRepository;
+}
+
+namespace EdgePulse::Firmware
+{
+    /**
+     * @brief 固件路由依赖
+     */
+    struct FirmwareDependencies
+    {
+        Auth::AuthService             *auth{nullptr};                            ///< 认证
+        FirmwareRepository            *firmware{nullptr};                        ///< 固件元数据
+        Device::NodeRepository        *nodes{nullptr};                           ///< 节点
+        Command::CommandRepository    *commands{nullptr};                        ///< 命令
+        Command::AgentChannelRegistry *channels{nullptr};                        ///< Agent 通道
+        Command::CommandNotifier       notifier;                                 ///< 浏览器通知
+        std::string                    storageDirectory{"var/firmware"};         ///< 落盘目录
+        std::size_t                    maximumUploadBytes{256U * 1024U * 1024U}; ///< 上传上限
+    };
+
+    /**
+     * @brief 注册浏览器固件路由
+     * @param router 目标路由器
+     * @param loop 服务器所属事件循环
+     * @param dependencies 依赖
+     */
+    void registerFirmwareRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const FirmwareDependencies &dependencies);
+
+    /**
+     * @brief 注册 Agent 固件下载与状态路由
+     * @param router mTLS 路由器
+     * @param loop 服务器所属事件循环
+     * @param dependencies 依赖
+     */
+    void registerFirmwareAgentRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const FirmwareDependencies &dependencies);
+} // namespace EdgePulse::Firmware

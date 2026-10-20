@@ -1,5 +1,5 @@
-#include "Common/EdgePulseException.h"
-#include "System/MigrationRunner.h"
+#include "Base/Exception/EdgePulseException.h"
+#include "Core/System/MigrationRunner.h"
 
 #include <gtest/gtest.h>
 

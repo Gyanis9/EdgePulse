@@ -1,10 +1,14 @@
-# 生产配置样例：复制为未跟踪的本地文件后再填值。
+# 生产配置样例：复制为未跟踪的本地文件（例如 config/prod.yaml）后再填值。
 # 秘密项不写在这里，只从环境变量读取：
 #   EDGEPULSE_DB_PASSWORD
+#   EDGEPULSE_REDIS_PASSWORD
 #   EDGEPULSE_OPS_BEARER_TOKEN
 #   EDGEPULSE_AGENT_FINGERPRINT
+#   EDGEPULSE_INITIAL_PASSWORD
 edgepulse:
   listen_address: 0.0.0.0
+  threads: 1
+  hot_reload: true
   http_port: 8080
   https_port: 8443
   agent_port: 9443
@@ -12,12 +16,25 @@ edgepulse:
   ops_address: 127.0.0.1
   web_root: web
   cert_dir: /etc/edgepulse/tls
+  firmware_dir: /var/lib/edgepulse/firmware
+  maximum_firmware_bytes: 268435456
+  telemetry_retention_days: 30
   database:
     driver: mysql
-    path: ""
+    host: mysql
+    port: 3306
+    name: edgepulse
+    user: edgepulse
+  redis:
+    enabled: true
+    host: redis
+    port: 6379
+    database: 0
+  migrations_dir: migrations
   captcha:
     ttl_seconds: 120
     expose_code: false
+    requests_per_minute: 30
   session:
     ttl_seconds: 7200
   security:
@@ -31,7 +48,16 @@ server:
     read_timeout_ms: 60000
     write_timeout_ms: 60000
   parser_limits:
-    maximum_body_size: 16777216
+    maximum_body_size: 268435456
   rate_limit:
     requests_per_second: 0.0
     burst_capacity: 1.0
+
+metrics:
+  enabled: false
+  service_name: EdgePulse
+  service_version: 1.0.0
+  export_interval_ms: 15000
+  otlp:
+    endpoint: http://otel-collector:4318/v1/metrics
+    timeout_ms: 3000

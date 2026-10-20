@@ -1,8 +1,12 @@
 #include "App/ListenerAssembly.h"
 #include "TestSupport/HttpClientHarness.h"
-#include "Web/MiddlewareSetup.h"
+#include "Core/Http/MiddlewareSetup.h"
 
 #include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 using EdgePulse::TestSupport::ServerHarness;
 
@@ -15,7 +19,7 @@ namespace
                 {
                     EdgePulse::Web::applySecurityHeaders(router);
                     EdgePulse::App::registerHealthRoutes(router);
-                    EdgePulse::App::registerFallbackRoute(router);
+                    EdgePulse::App::registerSiteFallback(router, std::filesystem::path{"build/gate/no-such-web"});
                 });
     }
 } // namespace
@@ -52,4 +56,31 @@ TEST(HealthServer, UnknownPathReturnsJson404)
     EXPECT_EQ(404, (*json)["code"].get<int>());
     EXPECT_TRUE((*json)["data"].is_null());
     EXPECT_FALSE((*json)["traceId"].get<std::string>().empty());
+}
+
+// 钉住：非 API 深链回 SPA 入口，API 未命中仍是 JSON 404
+TEST(HealthServer, ServesSpaFallbackAndKeepsApi404)
+{
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / ("edgepulse-spa-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root / "assets");
+    {
+        std::ofstream index(root / "index.html");
+        index << "<html><body>EdgePulse SPA</body></html>";
+    }
+    ServerHarness server(
+            [root](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+            {
+                EdgePulse::Web::applySecurityHeaders(router);
+                EdgePulse::App::registerSiteFallback(router, root);
+            });
+    const auto deepLink = server.get("/device/nodes");
+    ASSERT_TRUE(deepLink.transportOk) << deepLink.error;
+    EXPECT_EQ(200, deepLink.status);
+    EXPECT_NE(std::string::npos, deepLink.body.find("EdgePulse SPA"));
+
+    const auto apiMissing = server.get("/api/does-not-exist");
+    EXPECT_EQ(404, apiMissing.status);
+    EXPECT_TRUE(apiMissing.json().has_value());
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
 }

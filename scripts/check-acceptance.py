@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""P0 验收：启动开发服务，逐项验证认证、节点、h3、mTLS 与运维口。"""
+"""全量验收：启动开发服务，逐项验证认证、系统管理、节点、遥测告警、固件、命令、h3、mTLS 与运维口。"""
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import ssl
@@ -13,6 +14,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 ROOT = Path(__file__).resolve().parents[1]
 CERTS = ROOT / "var" / "certs"
 OPS_TOKEN_FILE = ROOT / "var" / "ops-token"
@@ -20,7 +25,7 @@ HTTP_BASE = "http://127.0.0.1:8080"
 HTTPS_BASE = "https://127.0.0.1:8443"
 AGENT_BASE = "https://127.0.0.1:9443"
 OPS_BASE = "http://127.0.0.1:9100"
-
+RUN_ID = str(time.time_ns())[-8:]
 failures: list[str] = []
 
 
@@ -31,9 +36,10 @@ def report(name: str, ok: bool, detail: str = "") -> None:
 
 
 def request_json(method: str, url: str, payload: dict | None = None, token: str | None = None, context: ssl.SSLContext | None = None,
-                 timeout: float = 10.0) -> tuple[int, dict, dict]:
+                 timeout: float = 30.0, headers_extra: dict | None = None) -> tuple[int, dict, dict]:
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
+    headers.update(headers_extra or {})
     if token:
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -43,7 +49,6 @@ def request_json(method: str, url: str, payload: dict | None = None, token: str 
             try:
                 parsed = json.loads(body) if body else {}
             except json.JSONDecodeError:
-                # /metrics 是 Prometheus 文本；调用方只看状态码
                 parsed = {}
             return response.status, parsed, dict(response.headers)
     except urllib.error.HTTPError as failure:
@@ -60,6 +65,10 @@ def client_context(client_cert: Path | None = None, client_key: Path | None = No
     if client_cert is not None and client_key is not None:
         context.load_cert_chain(certfile=str(client_cert), keyfile=str(client_key))
     return context
+
+
+def agent_context() -> ssl.SSLContext:
+    return client_context(CERTS / "agent.pem", CERTS / "agent-key.pem")
 
 
 def wait_for_health(process: subprocess.Popen[bytes] | None, timeout_seconds: float = 40.0) -> bool:
@@ -98,14 +107,12 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
 def check_authentication() -> str | None:
     status, captcha, _ = request_json("GET", HTTP_BASE + "/api/auth/captcha")
     code = captcha.get("data", {}).get("code")
-    report("8080 验证码签发", status == 200 and bool(captcha.get("data", {}).get("uuid")) and bool(captcha.get("data", {}).get("imageSvg")),
-           f"HTTP {status}")
+    report("8080 验证码签发", status == 200 and bool(captcha.get("data", {}).get("uuid")) and bool(captcha.get("data", {}).get("imageSvg")), f"HTTP {status}")
     if not code:
-        report("开发档验证码暴露 code", False, "缺少 code，Playwright 无法登录")
+        report("开发档验证码暴露 code", False, "缺少 code")
         return None
     status, login, headers = request_json(
-        "POST",
-        HTTP_BASE + "/api/auth/login",
+        "POST", HTTP_BASE + "/api/auth/login",
         {"username": "admin", "password": "admin123", "captcha": code, "captchaUuid": captcha["data"]["uuid"]},
     )
     token = login.get("data", {}).get("token", "")
@@ -118,16 +125,176 @@ def check_authentication() -> str | None:
     report("me 返回角色与权限", status == 200 and "device:node:list" in permissions and "device:node:write" in permissions, f"HTTP {status}")
     status, routes, _ = request_json("GET", HTTP_BASE + "/api/auth/routes", token=token)
     tree = routes.get("data", {}).get("routes", [])
-    component = tree[0]["children"][0]["component"] if tree and tree[0].get("children") else ""
-    report("routes 返回节点菜单", status == 200 and component == "device/Nodes", component)
+    device = next((node for node in tree if node.get("path") == "/device"), None)
+    component = ""
+    if device and device.get("children"):
+        component = device["children"][0].get("component", "")
+    report("routes 返回设备菜单", status == 200 and component == "device/Nodes", component)
     return token
 
 
+def check_system(token: str) -> None:
+    for path, label in [("/api/system/users?pageNum=1&pageSize=10", "用户"), ("/api/system/roles", "角色"),
+                        ("/api/system/menus/tree", "菜单"), ("/api/system/depts/tree", "部门"),
+                        ("/api/system/posts", "岗位"), ("/api/system/dict/types", "字典"),
+                        ("/api/system/configs", "参数"), ("/api/monitor/oper-logs/stats", "操作统计"),
+                        ("/api/monitor/login-logs/stats", "登录统计"), ("/api/dashboard/summary?range=24h", "工作台")]:
+        status, payload, _ = request_json("GET", HTTP_BASE + path, token=token)
+        report(f"系统管理：{label}接口", status == 200 and payload.get("code") == 200, f"HTTP {status}")
+
+    role_code = f"accept_role_{RUN_ID}"
+    status, role, _ = request_json("POST", HTTP_BASE + "/api/system/roles",
+                                   {"name": "验收只读角色", "code": role_code, "dataScope": "SELF", "sort": 99, "status": 1}, token=token)
+    role_id = role.get("data", {}).get("id")
+    username = f"accept_user_{RUN_ID}"
+    status_user, user, _ = request_json("POST", HTTP_BASE + "/api/system/users",
+                                        {"username": username, "password": "accept123", "nickname": "验收用户", "deptId": 101, "status": 1,
+                                         "roleIds": [role_id] if role_id else [], "postIds": [101]}, token=token)
+    report("系统管理：创建角色与用户", status == 200 and status_user == 200 and bool(user.get("data", {}).get("id")), f"HTTP {status}/{status_user}")
+    if user.get("data", {}).get("id"):
+        low = login_user(username, "accept123")
+        if low:
+            denied = request_json("GET", HTTP_BASE + "/api/system/users", token=low)[0]
+            report("低权限账号访问用户管理返回 403", denied == 403, f"HTTP {denied}")
+        request_json("DELETE", HTTP_BASE + f"/api/system/users/{user['data']['id']}", token=token)
+    if role_id:
+        request_json("DELETE", HTTP_BASE + f"/api/system/roles/{role_id}", token=token)
+
+
+def login_user(username: str, password: str) -> str | None:
+    status, captcha, _ = request_json("GET", HTTP_BASE + "/api/auth/captcha")
+    code = captcha.get("data", {}).get("code")
+    if status != 200 or not code:
+        return None
+    status, login, _ = request_json("POST", HTTP_BASE + "/api/auth/login",
+                                    {"username": username, "password": password, "captcha": code, "captchaUuid": captcha["data"]["uuid"]})
+    return login.get("data", {}).get("token") if status == 200 else None
+
+
+def create_node(token: str, name: str) -> int | None:
+    status, node, _ = request_json("POST", HTTP_BASE + "/api/nodes", {"name": name, "labels": {"acceptance": "true"}, "groupId": 200}, token=token)
+    return node.get("data", {}).get("id") if status == 200 else None
+
+
 def check_nodes(token: str) -> None:
-    status, listing, _ = request_json("GET", HTTP_BASE + "/api/nodes?pageNum=1&pageSize=50", token=token)
+    node_name = f"accept-node-{RUN_ID}"
+    node_id = create_node(token, node_name)
+    report("节点创建", node_id is not None, str(node_id))
+    status, listing, _ = request_json("GET", HTTP_BASE + "/api/nodes?pageNum=1&pageSize=100", token=token)
     names = [row.get("name") for row in listing.get("data", {}).get("rows", [])]
-    report("节点列表可读", status == 200 and isinstance(names, list), f"HTTP {status}")
-    report("Agent 注册的节点出现在列表", "edgepulse-agent" in names, ", ".join(str(name) for name in names))
+    report("节点列表包含新节点", status == 200 and node_name in names, f"HTTP {status}")
+    status, groups, _ = request_json("GET", HTTP_BASE + "/api/node-groups", token=token)
+    report("节点分组可读", status == 200 and isinstance(groups.get("data"), list), f"HTTP {status}")
+    return node_id
+
+
+def check_telemetry_alarm(token: str, node_id: int) -> None:
+    body = {"nodeId": node_id, "samples": [{"metric": "cpu.usage", "value": 99, "unit": "%"}, {"metric": "memory.usage", "value": 20, "unit": "%"}]}
+    status, payload, _ = request_json("POST", AGENT_BASE + "/api/agent/telemetry", body, context=agent_context())
+    report("Agent 遥测上报", status == 200 and payload.get("data", {}).get("accepted") == 2, f"HTTP {status}")
+    started = time.time()
+    observed = False
+    while time.time() - started < 2.0:
+        status, alarms, _ = request_json("GET", HTTP_BASE + f"/api/alarms?pageNum=1&pageSize=20&nodeId={node_id}", token=token)
+        if status == 200 and any(row.get("metric") == "cpu.usage" and row.get("status") == "open" for row in alarms.get("data", {}).get("rows", [])):
+            observed = True
+            break
+        time.sleep(0.1)
+    report("告警 2 秒内可见", observed, f"{time.time() - started:.2f}s")
+
+    status, latest, _ = request_json("GET", HTTP_BASE + f"/api/telemetry/latest?nodeId={node_id}", token=token)
+    report("遥测最新值可读", status == 200 and any(point.get("metric") == "cpu.usage" for point in latest.get("data", [])), f"HTTP {status}")
+    status, series, _ = request_json("GET", HTTP_BASE + f"/api/telemetry/series?nodeId={node_id}&metric=cpu.usage", token=token)
+    report("遥测时间序列可读", status == 200 and len(series.get("data", [])) >= 1, f"HTTP {status}")
+
+
+def check_sse_alarm(token: str, node_id: int) -> None:
+    connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=6)
+    try:
+        connection.request("GET", "/api/events/alarms", headers={"Authorization": "Bearer " + token})
+        response = connection.getresponse()
+        if response.status != 200:
+            report("告警 SSE 建立", False, f"HTTP {response.status}")
+            return
+        report("告警 SSE 建立", True)
+        trigger = {"nodeId": node_id, "samples": [{"metric": "memory.usage", "value": 99, "unit": "%"}]}
+        request_json("POST", AGENT_BASE + "/api/agent/telemetry", trigger, context=agent_context())
+        deadline = time.time() + 3
+        received = False
+        while time.time() < deadline:
+            line = response.readline().decode("utf-8", "replace")
+            if line.startswith("event: alarm"):
+                received = True
+                break
+        report("告警 SSE 3 秒内收到事件", received)
+    except Exception as failure:  # noqa: BLE001
+        report("告警 SSE 建立", False, str(failure))
+    finally:
+        connection.close()
+
+
+def check_commands(token: str, node_id: int) -> None:
+    status, command, _ = request_json("POST", HTTP_BASE + "/api/commands",
+                                      {"nodeId": node_id, "type": "diagnostics.collect", "payload": "{}", "timeoutSeconds": 30}, token=token)
+    command_id = command.get("data", {}).get("id")
+    report("命令创建", status == 200 and bool(command_id), f"HTTP {status}")
+    if not command_id:
+        return
+    status, next_command, _ = request_json("GET", AGENT_BASE + f"/api/agent/commands/next?nodeId={node_id}", context=agent_context())
+    report("Agent 轮询到命令", status == 200 and next_command.get("data", {}).get("id") == command_id, f"HTTP {status}")
+    status, finished, _ = request_json("POST", AGENT_BASE + f"/api/agent/commands/{command_id}/result",
+                                       {"nodeId": node_id, "status": "succeeded", "result": "{\"ok\":true}", "message": "acceptance"}, context=agent_context())
+    report("Agent 回传命令结果", status == 200 and finished.get("data", {}).get("status") == "succeeded", f"HTTP {status}")
+
+
+def check_firmware(token: str, node_id: int) -> None:
+    size = 100 * 1024 * 1024
+    chunk = b"EdgePulseFirmware-" * 65536
+    chunk = chunk[:1024 * 1024]
+    connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=300)
+    connection.putrequest("POST", f"/api/firmware?name=EdgePulse+OS&version=9.{RUN_ID}&fileName=edge-os.bin")
+    connection.putheader("Authorization", "Bearer " + token)
+    connection.putheader("Content-Type", "application/octet-stream")
+    connection.putheader("Content-Length", str(size))
+    connection.endheaders()
+    import hashlib
+
+    digest = hashlib.sha256()
+    for _ in range(100):
+        connection.send(chunk)
+        digest.update(chunk)
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+    try:
+        firmware = json.loads(body)["data"]
+    except Exception:  # noqa: BLE001
+        report("100 MiB 固件上传", False, body[:200].decode("utf-8", "replace"))
+        return
+    report("100 MiB 固件上传", response.status == 200 and firmware.get("sizeBytes") == size and firmware.get("sha256") == digest.hexdigest(), f"HTTP {response.status}")
+    firmware_id = firmware["id"]
+
+    connection = http.client.HTTPSConnection("127.0.0.1", 9443, context=agent_context(), timeout=300)
+    connection.request("GET", f"/api/agent/firmware/{firmware_id}/download", headers={"Range": "bytes=0-1023"})
+    range_response = connection.getresponse()
+    range_body = range_response.read()
+    headers = {key.lower(): value for key, value in range_response.getheaders()}
+    connection.close()
+    report("固件 Range 下载 206", range_response.status == 206 and len(range_body) == 1024 and headers.get("content-range") == f"bytes 0-1023/{size}",
+           f"HTTP {range_response.status}")
+
+    connection = http.client.HTTPSConnection("127.0.0.1", 9443, context=agent_context(), timeout=60)
+    connection.request("GET", f"/api/agent/firmware/{firmware_id}/download", headers={"If-None-Match": headers.get("etag", "")})
+    cached = connection.getresponse()
+    cached.read()
+    connection.close()
+    report("固件 ETag 命中 304", cached.status == 304, f"HTTP {cached.status}")
+
+    status, deployed, _ = request_json("POST", HTTP_BASE + f"/api/firmware/{firmware_id}/deploy", {"nodeIds": [node_id]}, token=token)
+    report("固件下发任务创建", status == 200 and len(deployed.get("data", [])) == 1, f"HTTP {status}")
+    status, tasks, _ = request_json("GET", HTTP_BASE + f"/api/firmware/{firmware_id}/tasks", token=token)
+    report("固件任务可读", status == 200 and len(tasks.get("data", [])) == 1, f"HTTP {status}")
+    request_json("DELETE", HTTP_BASE + f"/api/firmware/{firmware_id}", token=token)
 
 
 def check_h3() -> None:
@@ -137,7 +304,6 @@ def check_h3() -> None:
         report("8443 HTTPS 健康检查", status == 200 and payload.get("data", {}).get("status") == "UP", f"HTTP {status}")
     except Exception as failure:  # noqa: BLE001
         report("8443 HTTPS 健康检查", False, str(failure))
-
     try:
         status, _, _ = request_json("GET", HTTPS_BASE + "/api/probe/h3", context=context)
         tcp_status = status
@@ -147,7 +313,6 @@ def check_h3() -> None:
         report("TCP 侧不存在 h3 专属路径", False, str(failure))
     else:
         report("TCP 侧不存在 h3 专属路径", tcp_status == 404, f"HTTP {tcp_status}")
-
     probe = executable(ROOT / "build" / "debug" / "samples" / "H3Probe")
     result = subprocess.run([str(probe), "--ca", str(CERTS / "ca.pem")], capture_output=True, text=True, timeout=60, check=False)
     report("H3Probe 真实 h3", result.returncode == 0 and "h3" in result.stdout, result.stdout.strip() or result.stderr.strip())
@@ -159,22 +324,15 @@ def check_mtls() -> None:
         report("9443 无客户端证书被拒", False, "请求意外成功")
     except Exception:  # noqa: BLE001
         report("9443 无客户端证书被拒", True)
-
     fingerprint = (CERTS / "agent-fingerprint.txt").read_text(encoding="utf-8").strip()
     probe = executable(ROOT / "build" / "debug" / "samples" / "edgepulse-agent")
     result = subprocess.run(
-        [str(probe), "--ca", str(CERTS / "ca.pem"), "--cert", str(CERTS / "agent.pem"), "--key", str(CERTS / "agent-key.pem"),
-         "--fingerprint", fingerprint],
+        [str(probe), "--ca", str(CERTS / "ca.pem"), "--cert", str(CERTS / "agent.pem"), "--key", str(CERTS / "agent-key.pem"), "--fingerprint", fingerprint],
         capture_output=True, text=True, timeout=60, check=False,
     )
     report("9443 正确证书注册并心跳", result.returncode == 0 and "heartbeats=3" in result.stdout, result.stdout.strip() or result.stderr.strip())
-
-    status, register, _ = request_json(
-        "POST",
-        AGENT_BASE + "/api/agent/register",
-        {"name": "edgepulse-agent-http", "agentVersion": "0.1.0", "certFingerprint": fingerprint},
-        context=client_context(CERTS / "agent.pem", CERTS / "agent-key.pem"),
-    )
+    status, _, _ = request_json("POST", AGENT_BASE + "/api/agent/register",
+                                {"name": "edgepulse-agent-http", "agentVersion": "0.1.0", "certFingerprint": fingerprint}, context=agent_context())
     report("9443 正确证书走 HTTP 注册", status == 200, f"HTTP {status}")
 
 
@@ -187,6 +345,8 @@ def check_ops() -> None:
     token = OPS_TOKEN_FILE.read_text(encoding="utf-8").strip()
     status, _, _ = request_json("GET", OPS_BASE + "/metrics", token=token)
     report("9100 /metrics 带令牌可读", status == 200, f"HTTP {status}")
+    status, ready, _ = request_json("GET", OPS_BASE + "/readyz")
+    report("9100 /readyz 就绪", status == 200 and ready.get("status") == "ready", f"HTTP {status}")
     status, payload, _ = request_json("GET", OPS_BASE + "/healthz")
     report("9100 /healthz", status == 200, f"HTTP {status}")
 
@@ -238,14 +398,19 @@ def main() -> int:
     try:
         token = check_authentication()
         check_h3()
-        # Agent 探针会注册 edgepulse-agent，节点列表检查放在它之后
         check_mtls()
-        if token:
-            check_nodes(token)
-            check_websocket(token)
-        else:
-            report("节点与 WebSocket 检查", False, "登录失败，无法继续")
         check_ops()
+        if token:
+            check_system(token)
+            node_id = check_nodes(token)
+            check_websocket(token)
+            if node_id:
+                check_telemetry_alarm(token, node_id)
+                check_sse_alarm(token, node_id)
+                check_commands(token, node_id)
+                check_firmware(token, node_id)
+        else:
+            report("系统、节点与设备域检查", False, "登录失败，无法继续")
     finally:
         if process is not None and not already_running:
             stop_process(process)
@@ -253,7 +418,7 @@ def main() -> int:
     if failures:
         print(f"验收失败：{len(failures)} 项 -> " + ", ".join(failures))
         return 1
-    print("P0 验收全部通过")
+    print("全量验收全部通过")
     return 0
 
 

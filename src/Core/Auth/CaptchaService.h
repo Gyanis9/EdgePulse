@@ -1,22 +1,29 @@
 /**
  * @file CaptchaService.h
- * @brief 进程内一次性验证码的签发与消费
+ * @brief 一次性验证码的签发与消费
  * @author Gyanis
  * @date 2026-10-20
- * @version 0.1.0
+ * @version 1.0.0
  * @copyright Copyright (c) . All rights reserved.
  */
 
 #pragma once
 
-#include <chrono>
+#include "Core/Cache/KeyValueStore.h"
+
+#include <Core/Coroutine/Task.h>
+
+#include <atomic>
 #include <cstddef>
 #include <expected>
-#include <functional>
-#include <mutex>
+#include <memory>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+
+namespace AsynGyanis::Core
+{
+    class EventLoop;
+}
 
 namespace EdgePulse::Auth
 {
@@ -57,68 +64,46 @@ namespace EdgePulse::Auth
     };
 
     /**
-     * @brief 进程内验证码存储
-     * @note P0 单进程有效；P1 迁移到 Redis 后本类由同一接口替换
+     * @brief 验证码服务
+     * @details 验证码与限流计数都放键值存储，内存与 Redis 后端行为一致；
+     *          本对象不持有时钟，过期由存储后端的 TTL 负责。
      */
     class CaptchaService
     {
     public:
-        using Clock = std::function<std::chrono::steady_clock::time_point()>;
-
         /**
          * @brief 构造
+         * @param store 键值存储
          * @param options 有效期与限流参数
-         * @param clock 时钟注入；留空使用 steady_clock
          */
-        explicit CaptchaService(CaptchaOptions options, Clock clock = {});
+        CaptchaService(std::shared_ptr<Cache::KeyValueStore> store, CaptchaOptions options);
 
         /**
          * @brief 签发一条验证码
+         * @param loop 恢复协程用的事件循环
          * @param clientIp 来源 IP，用于限流
-         * @return 成功返回 uuid、答案与 SVG；超限返回 CaptchaError
+         * @return std::expected<CaptchaChallenge, CaptchaError> 挑战或限流原因
          */
-        [[nodiscard]] std::expected<CaptchaChallenge, CaptchaError> issue(const std::string &clientIp);
+        [[nodiscard]] AsynGyanis::Core::Task<std::expected<CaptchaChallenge, CaptchaError>> issue(AsynGyanis::Core::EventLoop &loop, std::string clientIp);
 
         /**
          * @brief 消费一条验证码
+         * @param loop 恢复协程用的事件循环
          * @param uuid 签发时给出的标识
          * @param code 调用方提交的答案
-         * @return true 答案正确且未过期
-         * @note 无论对错都会删除该 uuid，防止同一验证码被反复试
+         * @return bool 答案正确且未过期；无论对错该 uuid 都会被删除
          */
-        [[nodiscard]] bool consume(std::string_view uuid, std::string_view code);
+        [[nodiscard]] AsynGyanis::Core::Task<bool> consume(AsynGyanis::Core::EventLoop &loop, std::string_view uuid, std::string_view code);
 
         /**
-         * @brief 当前缓存条数，主要用于测试与诊断
+         * @brief 运行期更新验证码配置
+         * @param options 新配置；非正数字段被忽略
          */
-        [[nodiscard]] std::size_t size() const;
+        void setOptions(CaptchaOptions options) noexcept;
 
     private:
-        struct Entry
-        {
-            std::string                           code;      ///< 答案
-            std::chrono::steady_clock::time_point expiresAt; ///< 过期时刻
-        };
-
-        struct RateWindow
-        {
-            std::chrono::steady_clock::time_point windowStart; ///< 当前窗口起点
-            int                                   count{0};    ///< 窗口内已签发数
-        };
-
-        [[nodiscard]] std::chrono::steady_clock::time_point now() const;
-
-        /**
-         * @brief 清掉过期验证码与旧限流窗口
-         * @param moment 当前时刻
-         * @note 只在缓存变大时调用，避免每次签发都扫全表
-         */
-        void pruneExpired(const std::chrono::steady_clock::time_point moment);
-
-        CaptchaOptions                              m_options;     ///< 配置
-        Clock                                       m_clock;       ///< 时钟
-        mutable std::mutex                          m_mutex;       ///< 保护两张表
-        std::unordered_map<std::string, Entry>      m_challenges;  ///< uuid -> 验证码
-        std::unordered_map<std::string, RateWindow> m_rateWindows; ///< IP -> 限流窗口
+        std::shared_ptr<Cache::KeyValueStore> m_store;             ///< 键值存储
+        std::atomic<int>                      m_ttlSeconds;        ///< 有效期
+        std::atomic<int>                      m_requestsPerMinute; ///< 单 IP 每分钟上限
     };
 } // namespace EdgePulse::Auth
