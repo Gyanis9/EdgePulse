@@ -218,6 +218,7 @@ const permTab = ref<'menu' | 'data'>('menu')
 const menuTree = ref<Menu[]>([])
 const checked = ref<number[]>([])
 const scope = ref('SELF')
+const permDeptIds = ref<number[]>([])
 const permSaving = ref(false)
 const permLoading = ref(false)
 const permBody = ref<HTMLElement | null>(null)
@@ -244,9 +245,14 @@ async function openPermission(row: RoleRow) {
   scope.value = scopeCodeOf(row.dataScope)
   permLoading.value = true
   try {
-    const [tree, assigned] = await Promise.all([systemApi.menus.tree(), systemApi.roles.menus(row.id)])
+    const [tree, assigned, assignedDepts] = await Promise.all([
+      systemApi.menus.tree(),
+      systemApi.roles.menus(row.id),
+      scope.value === 'CUSTOM' ? systemApi.roles.depts(row.id) : Promise.resolve({ deptIds: [] as number[] }),
+    ])
     menuTree.value = tree as unknown as Menu[]
     checked.value = (assigned.menuIds ?? []).map(Number)
+    permDeptIds.value = (assignedDepts.deptIds ?? []).map(Number)
   } catch (error) {
     toastError(error, '权限数据加载失败')
   } finally {
@@ -256,9 +262,17 @@ async function openPermission(row: RoleRow) {
 
 async function savePermission() {
   if (!permRole.value) return
+  if (scope.value === 'CUSTOM' && permDeptIds.value.length === 0) {
+    pushToast('自定义数据范围至少要选择一个部门')
+    return
+  }
   permSaving.value = true
   try {
-    await systemApi.roles.update(permRole.value.id, { menuIds: checked.value, dataScope: scope.value })
+    await systemApi.roles.update(permRole.value.id, {
+      menuIds: checked.value,
+      dataScope: scope.value,
+      deptIds: scope.value === 'CUSTOM' ? permDeptIds.value : [],
+    })
     invalidatePermissionGraph()
     pushToast('权限已保存，相关用户重新登录后生效')
     permRole.value = null
@@ -370,23 +384,28 @@ async function savePermission() {
         <PermissionTree v-else v-model="checked" :menus="menuTree" />
       </template>
 
-      <div v-else class="scope-list" role="radiogroup" aria-label="数据范围">
-        <button
-          v-for="s in SCOPES"
-          :key="s.code"
-          type="button"
-          role="radio"
-          :aria-checked="scope === s.code"
-          :class="['scope-option', scope === s.code && 'is-on m-pill']"
-          @click="scope = s.code"
-        >
-          <span class="scope-radio" aria-hidden="true"><Icon v-if="scope === s.code" name="check" :size="12" :stroke="2.6" /></span>
-          <span>
-            <span class="scope-name">{{ s.name }}</span>
-            <span class="scope-desc">{{ s.desc }}</span>
-          </span>
-        </button>
-      </div>
+      <template v-else>
+        <div class="scope-list" role="radiogroup" aria-label="数据范围">
+          <button
+            v-for="s in SCOPES"
+            :key="s.code"
+            type="button"
+            role="radio"
+            :aria-checked="scope === s.code"
+            :class="['scope-option', scope === s.code && 'is-on m-pill']"
+            @click="scope = s.code"
+          >
+            <span class="scope-radio" aria-hidden="true"><Icon v-if="scope === s.code" name="check" :size="12" :stroke="2.6" /></span>
+            <span>
+              <span class="scope-name">{{ s.name }}</span>
+              <span class="scope-desc">{{ s.desc }}</span>
+            </span>
+          </button>
+        </div>
+        <Field v-if="scope === 'CUSTOM'" label="自定义部门" required>
+          <DeptMultiSelect v-model="permDeptIds" :invalid="permDeptIds.length === 0" />
+        </Field>
+      </template>
       </div>
 
       <template #footer>
