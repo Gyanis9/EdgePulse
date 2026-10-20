@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""全量验收：启动开发服务，逐项验证认证、系统管理、节点、遥测告警、固件、命令、h3、mTLS 与运维口。"""
+"""全量验收：启动开发服务，逐项验证认证、系统管理、节点、遥测告警、固件、命令、WebSocket、h3、mTLS 与运维口。"""
 
 from __future__ import annotations
 
 import http.client
 import json
 import os
+import queue
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -233,6 +235,77 @@ def check_sse_alarm(token: str, node_id: int) -> None:
         connection.close()
 
 
+def check_agent_websocket(token: str) -> None:
+    """启动带 --ws 的 Agent 示例，断言命令经长连接推送并由示例回写结果。"""
+    fingerprint = (CERTS / "agent-fingerprint.txt").read_text(encoding="utf-8").strip()
+    agent = executable(ROOT / "build" / "debug" / "samples" / "edgepulse-agent")
+    process = subprocess.Popen(
+        [str(agent), "--ca", str(CERTS / "ca.pem"), "--cert", str(CERTS / "agent.pem"), "--key", str(CERTS / "agent-key.pem"),
+         "--fingerprint", fingerprint, "--name", f"ws-agent-{RUN_ID}", "--ws"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    lines: queue.Queue[str | None] = queue.Queue()
+    collected: list[str] = []
+
+    def pump() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            text = line.rstrip()
+            collected.append(text)
+            lines.put(text)
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+    node_id = 0
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        try:
+            line = lines.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if line is None:
+            break
+        if line.startswith("ws-ready nodeId="):
+            try:
+                node_id = int(line.split("=", 1)[1])
+            except ValueError:
+                node_id = 0
+            break
+    report("Agent WebSocket 完成 hello", node_id > 0, f"nodeId={node_id}")
+    if node_id <= 0:
+        stop_process(process)
+        return
+
+    status, command, _ = request_json("POST", HTTP_BASE + "/api/commands",
+                                      {"nodeId": node_id, "type": "ws.echo", "payload": "{}", "timeoutSeconds": 30}, token=token)
+    command_id = command.get("data", {}).get("id")
+    report("WS 命令创建", status == 200 and bool(command_id), f"HTTP {status}")
+
+    try:
+        process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        stop_process(process)
+    while True:
+        try:
+            if lines.get(timeout=0.2) is None:
+                break
+        except queue.Empty:
+            break
+    output = "\n".join(collected)
+    report("WS Agent 收到命令并回写", process.returncode == 0 and "ws=ok" in output and "commands=1" in output, output.strip() or "无输出")
+
+    status_text = ""
+    for _ in range(100):
+        status, listing, _ = request_json("GET", HTTP_BASE + f"/api/commands?pageNum=1&pageSize=10&nodeId={node_id}", token=token)
+        rows = listing.get("data", {}).get("rows", [])
+        if rows:
+            status_text = rows[0].get("status", "")
+        if status_text == "succeeded":
+            break
+        time.sleep(0.1)
+    report("WS 命令状态为 succeeded", status_text == "succeeded", status_text or f"HTTP {status}")
+
+
 def check_commands(token: str, node_id: int) -> None:
     status, command, _ = request_json("POST", HTTP_BASE + "/api/commands",
                                       {"nodeId": node_id, "type": "diagnostics.collect", "payload": "{}", "timeoutSeconds": 30}, token=token)
@@ -351,6 +424,13 @@ def check_ops() -> None:
     report("9100 /healthz", status == 200, f"HTTP {status}")
 
 
+def check_otlp() -> None:
+    result = subprocess.run([sys.executable, str(ROOT / "scripts" / "check-otlp.py")], capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=120, check=False)
+    detail = (result.stdout or result.stderr).strip().replace("\n", "；")
+    report("OTLP mock 收到指标导出", result.returncode == 0, detail)
+
+
 def check_websocket(token: str) -> None:
     script = ROOT / "build" / "gate" / "ws-check.mjs"
     script.parent.mkdir(parents=True, exist_ok=True)
@@ -400,6 +480,7 @@ def main() -> int:
         check_h3()
         check_mtls()
         check_ops()
+        check_otlp()
         if token:
             check_system(token)
             node_id = check_nodes(token)
@@ -408,6 +489,7 @@ def main() -> int:
                 check_telemetry_alarm(token, node_id)
                 check_sse_alarm(token, node_id)
                 check_commands(token, node_id)
+                check_agent_websocket(token)
                 check_firmware(token, node_id)
         else:
             report("系统、节点与设备域检查", False, "登录失败，无法继续")
