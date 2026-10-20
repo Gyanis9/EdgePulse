@@ -9,6 +9,7 @@
 #include "Core/Device/NodeRepository.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Http/AgentWebSocket.h"
 #include "Core/Http/Authorization.h"
 #include "Core/Http/MiddlewareSetup.h"
 #include "Core/System/LogRepository.h"
@@ -23,14 +24,19 @@
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
 
+#include <Net/Http/Client/HttpClient.h>
+#include <Net/WebSocket/WebSocketClient.h>
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -39,6 +45,103 @@ namespace
     std::vector<std::pair<std::string, std::string>> bearer(const std::string &token)
     {
         return {{"Authorization", "Bearer " + token}};
+    }
+
+    struct WebSocketProbeResult
+    {
+        bool        connected{false}; ///< 升级与 hello 都成功
+        std::string commandPayload;   ///< 服务端推送的命令原文
+        std::string error;            ///< 失败原因
+    };
+
+    AsynGyanis::Core::Task<> performWebSocketProbe(AsynGyanis::Core::EventLoop &loop, std::uint16_t port, std::string token, std::int64_t nodeId,
+                                                   std::shared_ptr<std::promise<WebSocketProbeResult>> completion)
+    {
+        WebSocketProbeResult result;
+        try
+        {
+            AsynGyanis::Net::WebSocketClient::Configuration configuration;
+            configuration.hostName      = "127.0.0.1";
+            configuration.port          = port;
+            configuration.requestTarget = "/api/agent/ws";
+            auto connection             = co_await AsynGyanis::Net::WebSocketClient::connect(loop, configuration);
+            if (!connection)
+            {
+                result.error = "升级失败：" + connection.error().message;
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            std::unique_ptr<AsynGyanis::Net::WebSocketClient> client = std::move(*connection);
+
+            const AsynGyanis::Base::ConfigValue hello = AsynGyanis::Base::ConfigValue::object({{"type", "hello"}, {"nodeId", nodeId}, {"agentVersion", "protocol-test"}});
+            if (!co_await client->sendText(hello.dump()))
+            {
+                result.error = "hello 发送失败";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            const auto reply = co_await client->receive();
+            if (!reply || reply->opCode != AsynGyanis::Net::WebSocketOpCode::Text || reply->payload.find("\"ok\":true") == std::string::npos)
+            {
+                result.error = "未收到 hello 确认";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            result.connected = true;
+
+            AsynGyanis::Net::HttpClientRequest request;
+            request.method      = "POST";
+            request.contentType = "application/json";
+            request.headers     = bearer(token);
+            request.body        = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"type", "ws-echo"}, {"payload", "{}"}, {"timeoutSeconds", 30}}).dump();
+            const auto created  = co_await AsynGyanis::Net::HttpClient::send(loop, "http://127.0.0.1:" + std::to_string(port) + "/api/commands", request, std::chrono::seconds{5});
+            if (!created || created->statusCode != 200)
+            {
+                result.error = "命令创建失败";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+
+            const auto frame = co_await client->receive();
+            if (!frame || frame->opCode != AsynGyanis::Net::WebSocketOpCode::Text)
+            {
+                result.error = "未收到推送的命令";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            result.commandPayload = frame->payload;
+
+            const auto value = AsynGyanis::Base::parseConfigValue(frame->payload);
+            if (!value.has_value())
+            {
+                result.error = "命令推送不是 JSON";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            const auto command = value->find("command");
+            if (command == value->end())
+            {
+                result.error = "命令推送缺少 command";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            const auto identifier = command->find("id");
+            if (identifier == command->end() || !identifier->is_number_integer())
+            {
+                result.error = "命令推送缺少 command.id";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            const AsynGyanis::Base::ConfigValue acknowledgement = AsynGyanis::Base::ConfigValue::object(
+                    {{"type", "command.result"}, {"commandId", identifier->get<std::int64_t>()}, {"status", "succeeded"}, {"result", R"({"ok":true})"}, {"message", "ws"}});
+            static_cast<void>(co_await client->sendText(acknowledgement.dump()));
+            static_cast<void>(co_await client->close(1000, "done"));
+        } catch (const std::exception &failure)
+        {
+            result.error = failure.what();
+        }
+        completion->set_value(std::move(result));
+        co_return;
     }
 } // namespace
 
@@ -104,6 +207,7 @@ protected:
                     commands.channels = m_channels.get();
                     EdgePulse::Command::registerCommandRoutes(router, loop, commands);
                     EdgePulse::Command::registerCommandAgentRoutes(router, loop, commands);
+                    EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels);
 
                     EdgePulse::Firmware::FirmwareDependencies firmware;
                     firmware.auth               = m_context->auth.get();
@@ -166,6 +270,7 @@ protected:
     std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>  m_channels;
     std::shared_ptr<EdgePulse::Firmware::FirmwareRepository>   m_firmware;
     std::unique_ptr<EdgePulse::TestSupport::ServerHarness>     m_server;
+    std::vector<AsynGyanis::Core::Task<>>                      m_probeTasks; ///< WebSocket 探针帧，活到夹具析构
     std::filesystem::path                                      m_storage;
 };
 
@@ -221,6 +326,41 @@ TEST_F(FleetEndpointsTest, CommandRoundTrip)
                            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "succeeded"}, {"result", R"({"ok":true})"}, {"message", "done"}}).dump());
     ASSERT_EQ(200, result.status) << result.body;
     EXPECT_EQ("succeeded", (*result.json())["data"]["status"].get<std::string>());
+}
+
+// 钉住：Agent 走 WebSocket 时 hello 注册成功，命令由长连接推送、结果回写为 succeeded
+TEST_F(FleetEndpointsTest, CommandOverAgentWebSocket)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "ws-command-node");
+
+    auto                              promise = std::make_shared<std::promise<WebSocketProbeResult>>();
+    std::future<WebSocketProbeResult> future  = promise->get_future();
+    AsynGyanis::Core::Task<>          probe   = performWebSocketProbe(m_server->loop(), m_server->port(), token, nodeId, promise);
+    m_server->loop().scheduler().scheduleRemote(probe.handle());
+    m_probeTasks.push_back(std::move(probe));
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{10})) << "WebSocket 探针未在时限内完成";
+    const WebSocketProbeResult result = future.get();
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.connected);
+    EXPECT_NE(std::string::npos, result.commandPayload.find("\"type\":\"command\""));
+
+    std::string status;
+    for (int attempt = 0; attempt < 100 && status != "succeeded"; ++attempt)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        const auto list = m_server->get("/api/commands?pageNum=1&pageSize=10&nodeId=" + std::to_string(nodeId), bearer(token));
+        ASSERT_EQ(200, list.status) << list.body;
+        const auto json = list.json();
+        ASSERT_TRUE(json.has_value());
+        if ((*json)["data"]["rows"].empty())
+        {
+            continue;
+        }
+        status = (*json)["data"]["rows"][0]["status"].get<std::string>();
+    }
+    EXPECT_EQ("succeeded", status);
 }
 
 // 钉住：固件流式上传、Range 下载、ETag 304 与下发任务
