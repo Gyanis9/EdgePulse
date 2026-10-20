@@ -54,6 +54,7 @@
 #include "Plugins/MonitorPlugin/MonitorController.h"
 #include "Plugins/SystemPlugin/SystemController.h"
 #include "Core/Http/MiddlewareSetup.h"
+#include "Core/Http/ReverseProxy.h"
 
 #include "Core/EventLoop/IoContext.h"
 #include "Core/Socket/InetAddress.h"
@@ -569,6 +570,19 @@ namespace EdgePulse::App
         m_browserWebSocket->registerRoute(
                 router, [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<bool>
                 { co_return (co_await auth->authenticate(loop, token)).has_value(); }, m_configuration.allowedOrigins);
+        if (m_configuration.reverseProxyEnabled)
+        {
+            Web::ReverseProxyConfiguration proxyConfiguration;
+            proxyConfiguration.prefix                   = m_configuration.reverseProxyPrefix;
+            proxyConfiguration.upstream                 = m_configuration.reverseProxyUpstream;
+            proxyConfiguration.stripPrefix              = m_configuration.reverseProxyStripPrefix;
+            proxyConfiguration.requireSession           = m_configuration.reverseProxyRequireSession;
+            proxyConfiguration.permission               = m_configuration.reverseProxyPermission;
+            proxyConfiguration.timeoutMilliseconds      = m_configuration.reverseProxyTimeoutMs;
+            proxyConfiguration.maximumRequestBodyBytes  = static_cast<std::size_t>(m_configuration.reverseProxyMaximumRequestBytes);
+            proxyConfiguration.maximumResponseBodyBytes = static_cast<std::size_t>(m_configuration.reverseProxyMaximumResponseBytes);
+            Web::registerReverseProxy(router, loop, std::move(proxyConfiguration), m_authService.get());
+        }
         // 站点兜底必须是最后一条通配路由：注册早了会吞掉所有参数化路由（如 /api/firmware/:id/deploy）
         registerSiteFallback(router, m_webRoot);
     }

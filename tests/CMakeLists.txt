@@ -52,6 +52,7 @@ add_executable(edgepulse-protocol-tests
         Protocol/TestHealthServer.cpp
         Protocol/TestFleetEndpoints.cpp
         Protocol/TestNodeEndpoints.cpp
+        Protocol/TestReverseProxy.cpp
         Protocol/TestSystemEndpoints.cpp)
 target_link_libraries(edgepulse-protocol-tests PRIVATE EdgePulse::App edgepulse-test-support GTest::gtest_main)
 edgepulse_enable_warnings(edgepulse-protocol-tests)

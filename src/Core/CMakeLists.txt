@@ -21,6 +21,7 @@ add_library(edgepulse-core STATIC
         Http/AuditMiddleware.cpp
         Http/Authorization.cpp
         Http/MiddlewareSetup.cpp
+        Http/ReverseProxy.cpp
         Http/RequestId.cpp
         Http/SseBroadcaster.cpp
         Http/WebSocketEndpoints.cpp

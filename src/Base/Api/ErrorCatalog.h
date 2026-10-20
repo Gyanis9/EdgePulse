@@ -17,7 +17,9 @@ namespace EdgePulse::Common
     inline constexpr int kCodeForbidden           = 403;
     inline constexpr int kCodeNotFound            = 404;
     inline constexpr int kCodeConflict            = 409;
+    inline constexpr int kCodePayloadTooLarge     = 413;
     inline constexpr int kCodeTooManyRequests     = 429;
     inline constexpr int kCodeInternalServerError = 500;
+    inline constexpr int kCodeBadGateway          = 502;
     inline constexpr int kCodeServiceUnavailable  = 503;
 } // namespace EdgePulse::Common

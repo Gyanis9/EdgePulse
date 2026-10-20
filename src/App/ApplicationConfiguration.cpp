@@ -116,27 +116,37 @@ namespace EdgePulse::App
         }
 
         ApplicationConfiguration configuration;
-        configuration.configurationFile        = absoluteConfigurationPath;
-        configuration.listenAddress            = configurationManager.getString("edgepulse.listen_address", configuration.listenAddress);
-        configuration.opsAddress               = configurationManager.getString("edgepulse.ops_address", configuration.opsAddress);
-        configuration.databaseDriver           = configurationManager.getString("edgepulse.database.driver", configuration.databaseDriver);
-        configuration.databasePath             = configurationManager.getString("edgepulse.database.path", configuration.databasePath);
-        configuration.databaseHost             = configurationManager.getString("edgepulse.database.host", configuration.databaseHost);
-        configuration.databaseName             = configurationManager.getString("edgepulse.database.name", configuration.databaseName);
-        configuration.databaseUser             = configurationManager.getString("edgepulse.database.user", configuration.databaseUser);
-        configuration.redisEnabled             = configurationManager.getBool("edgepulse.redis.enabled", configuration.redisEnabled);
-        configuration.redisHost                = configurationManager.getString("edgepulse.redis.host", configuration.redisHost);
-        configuration.redisDatabase            = static_cast<int>(configurationManager.getInt("edgepulse.redis.database", configuration.redisDatabase));
-        configuration.threads                  = static_cast<int>(configurationManager.getInt("edgepulse.threads", configuration.threads));
-        configuration.migrationsDirectory      = configurationManager.getString("edgepulse.migrations_dir", configuration.migrationsDirectory);
-        configuration.webRoot                  = configurationManager.getString("edgepulse.web_root", configuration.webRoot);
-        configuration.firmwareDirectory        = configurationManager.getString("edgepulse.firmware_dir", configuration.firmwareDirectory);
-        configuration.maximumFirmwareBytes     = configurationManager.getInt("edgepulse.maximum_firmware_bytes", configuration.maximumFirmwareBytes);
-        configuration.telemetryRetentionDays   = static_cast<int>(configurationManager.getInt("edgepulse.telemetry_retention_days", configuration.telemetryRetentionDays));
-        configuration.certificateDirectory     = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
-        configuration.agentFingerprint         = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
-        configuration.udpTelemetryEnabled      = configurationManager.getBool("edgepulse.udp_telemetry.enabled", configuration.udpTelemetryEnabled);
-        configuration.udpTelemetryAddress      = configurationManager.getString("edgepulse.udp_telemetry.address", configuration.udpTelemetryAddress);
+        configuration.configurationFile               = absoluteConfigurationPath;
+        configuration.listenAddress                   = configurationManager.getString("edgepulse.listen_address", configuration.listenAddress);
+        configuration.opsAddress                      = configurationManager.getString("edgepulse.ops_address", configuration.opsAddress);
+        configuration.databaseDriver                  = configurationManager.getString("edgepulse.database.driver", configuration.databaseDriver);
+        configuration.databasePath                    = configurationManager.getString("edgepulse.database.path", configuration.databasePath);
+        configuration.databaseHost                    = configurationManager.getString("edgepulse.database.host", configuration.databaseHost);
+        configuration.databaseName                    = configurationManager.getString("edgepulse.database.name", configuration.databaseName);
+        configuration.databaseUser                    = configurationManager.getString("edgepulse.database.user", configuration.databaseUser);
+        configuration.redisEnabled                    = configurationManager.getBool("edgepulse.redis.enabled", configuration.redisEnabled);
+        configuration.redisHost                       = configurationManager.getString("edgepulse.redis.host", configuration.redisHost);
+        configuration.redisDatabase                   = static_cast<int>(configurationManager.getInt("edgepulse.redis.database", configuration.redisDatabase));
+        configuration.threads                         = static_cast<int>(configurationManager.getInt("edgepulse.threads", configuration.threads));
+        configuration.migrationsDirectory             = configurationManager.getString("edgepulse.migrations_dir", configuration.migrationsDirectory);
+        configuration.webRoot                         = configurationManager.getString("edgepulse.web_root", configuration.webRoot);
+        configuration.firmwareDirectory               = configurationManager.getString("edgepulse.firmware_dir", configuration.firmwareDirectory);
+        configuration.maximumFirmwareBytes            = configurationManager.getInt("edgepulse.maximum_firmware_bytes", configuration.maximumFirmwareBytes);
+        configuration.telemetryRetentionDays          = static_cast<int>(configurationManager.getInt("edgepulse.telemetry_retention_days", configuration.telemetryRetentionDays));
+        configuration.certificateDirectory            = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
+        configuration.agentFingerprint                = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
+        configuration.udpTelemetryEnabled             = configurationManager.getBool("edgepulse.udp_telemetry.enabled", configuration.udpTelemetryEnabled);
+        configuration.udpTelemetryAddress             = configurationManager.getString("edgepulse.udp_telemetry.address", configuration.udpTelemetryAddress);
+        configuration.reverseProxyEnabled             = configurationManager.getBool("edgepulse.reverse_proxy.enabled", configuration.reverseProxyEnabled);
+        configuration.reverseProxyPrefix              = configurationManager.getString("edgepulse.reverse_proxy.prefix", configuration.reverseProxyPrefix);
+        configuration.reverseProxyUpstream            = configurationManager.getString("edgepulse.reverse_proxy.upstream", configuration.reverseProxyUpstream);
+        configuration.reverseProxyStripPrefix         = configurationManager.getBool("edgepulse.reverse_proxy.strip_prefix", configuration.reverseProxyStripPrefix);
+        configuration.reverseProxyRequireSession      = configurationManager.getBool("edgepulse.reverse_proxy.require_session", configuration.reverseProxyRequireSession);
+        configuration.reverseProxyPermission          = configurationManager.getString("edgepulse.reverse_proxy.permission", configuration.reverseProxyPermission);
+        configuration.reverseProxyTimeoutMs           = configurationManager.getInt("edgepulse.reverse_proxy.timeout_ms", configuration.reverseProxyTimeoutMs);
+        configuration.reverseProxyMaximumRequestBytes = configurationManager.getInt("edgepulse.reverse_proxy.maximum_request_bytes", configuration.reverseProxyMaximumRequestBytes);
+        configuration.reverseProxyMaximumResponseBytes =
+                configurationManager.getInt("edgepulse.reverse_proxy.maximum_response_bytes", configuration.reverseProxyMaximumResponseBytes);
         configuration.captchaTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.captcha.ttl_seconds", configuration.captchaTtlSeconds));
         configuration.captchaRequestsPerMinute = static_cast<int>(configurationManager.getInt("edgepulse.captcha.requests_per_minute", configuration.captchaRequestsPerMinute));
         configuration.sessionTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.session.ttl_seconds", configuration.sessionTtlSeconds));
@@ -175,6 +185,22 @@ namespace EdgePulse::App
         if (configuration.udpTelemetryEnabled && configuration.udpTelemetrySecret.size() < 16)
         {
             return std::unexpected(ConfigurationError{"启用 UDP 遥测时必须在 EDGEPULSE_UDP_TELEMETRY_SECRET 中配置至少 16 字节的共享密钥"});
+        }
+        if (configuration.reverseProxyEnabled)
+        {
+            if (configuration.reverseProxyUpstream.empty())
+            {
+                return std::unexpected(ConfigurationError{"启用反向代理时必须配置 edgepulse.reverse_proxy.upstream"});
+            }
+            if (configuration.reverseProxyPrefix.empty() || configuration.reverseProxyPrefix.front() != '/' || configuration.reverseProxyPrefix == "/" ||
+                configuration.reverseProxyPrefix == "/api")
+            {
+                return std::unexpected(ConfigurationError{"反向代理 prefix 必须以 / 开头，且不能是 / 或 /api"});
+            }
+            if (configuration.reverseProxyTimeoutMs <= 0 || configuration.reverseProxyMaximumRequestBytes <= 0 || configuration.reverseProxyMaximumResponseBytes <= 0)
+            {
+                return std::unexpected(ConfigurationError{"反向代理的超时与正文上限必须是正数"});
+            }
         }
         // TTL 参与定时器与过期判定，非正数会让条目永不过期或立即过期
         if (configuration.captchaTtlSeconds < kMinimumTtl || configuration.sessionTtlSeconds < kMinimumTtl)

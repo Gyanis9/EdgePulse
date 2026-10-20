@@ -46,6 +46,16 @@ edgepulse:
     enabled: false
     address: 0.0.0.0
     port: 9555
+  reverse_proxy:
+    enabled: false
+    prefix: /edge
+    upstream: http://127.0.0.1:9000
+    strip_prefix: true
+    require_session: true
+    permission: ""
+    timeout_ms: 15000
+    maximum_request_bytes: 8388608
+    maximum_response_bytes: 8388608
 
 server:
   limits:

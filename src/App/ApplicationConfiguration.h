@@ -30,43 +30,52 @@ namespace EdgePulse::App
      */
     struct ApplicationConfiguration
     {
-        std::filesystem::path    configurationFile;                         ///< 主配置路径
-        std::string              listenAddress{"127.0.0.1"};                ///< 控制面与开发口的监听地址
-        std::uint16_t            httpPort{8080};                            ///< 开发档明文 HTTP
-        std::uint16_t            httpsPort{8443};                           ///< 控制台 HTTPS/h2 与 h3
-        std::uint16_t            agentPort{9443};                           ///< Agent mTLS
-        std::uint16_t            opsPort{9100};                             ///< 运维口
-        std::string              opsAddress{"127.0.0.1"};                   ///< 运维口监听地址
-        std::string              databaseDriver{"sqlite"};                  ///< sqlite 或 mysql
-        std::string              databasePath{"var/edgepulse.db"};          ///< SQLite 文件路径
-        std::string              databaseHost{"127.0.0.1"};                 ///< MySQL 主机
-        std::uint16_t            databasePort{3306};                        ///< MySQL 端口
-        std::string              databaseName{"edgepulse"};                 ///< MySQL 库名
-        std::string              databaseUser{"edgepulse"};                 ///< MySQL 用户
-        std::string              databasePassword;                          ///< MySQL 口令，只从环境变量读取
-        bool                     redisEnabled{false};                       ///< 是否使用 Redis 会话
-        std::string              redisHost{"127.0.0.1"};                    ///< Redis 主机
-        std::uint16_t            redisPort{6379};                           ///< Redis 端口
-        int                      redisDatabase{0};                          ///< Redis 键空间
-        std::string              redisPassword;                             ///< Redis 口令，只从环境变量读取
-        int                      threads{1};                                ///< 事件循环线程数
-        std::string              migrationsDirectory{"migrations"};         ///< SQL 迁移目录
-        std::string              webRoot{"web"};                            ///< 静态站点根目录
-        std::string              firmwareDirectory{"var/firmware"};         ///< 固件落盘目录
-        std::int64_t             maximumFirmwareBytes{256LL * 1024 * 1024}; ///< 单份固件上限
-        int                      telemetryRetentionDays{30};                ///< 遥测保留天数
-        std::string              certificateDirectory{"var/certs"};         ///< 开发证书目录
-        std::string              opsTokenFile{"var/ops-token"};             ///< 运维口令牌文件
-        int                      captchaTtlSeconds{120};                    ///< 验证码有效期，单位秒
-        int                      captchaRequestsPerMinute{30};              ///< 单 IP 每分钟签发上限
-        int                      sessionTtlSeconds{7200};                   ///< 会话有效期，单位秒
-        bool                     exposeCaptchaCode{false};                  ///< 开发档在响应里带验证码答案
-        std::vector<std::string> allowedOrigins;                            ///< 浏览器 WebSocket 的 Origin 白名单
-        std::string              agentFingerprint;                          ///< 允许的 Agent 证书 SHA-256 指纹，空表示只校验 CA
-        bool                     udpTelemetryEnabled{false};                ///< 是否启用 UDP 遥测监听
-        std::string              udpTelemetryAddress{"0.0.0.0"};            ///< UDP 遥测监听地址
-        std::uint16_t            udpTelemetryPort{9555};                    ///< UDP 遥测端口
-        std::string              udpTelemetrySecret;                        ///< HMAC 共享密钥，只从环境变量读取
+        std::filesystem::path    configurationFile;                                   ///< 主配置路径
+        std::string              listenAddress{"127.0.0.1"};                          ///< 控制面与开发口的监听地址
+        std::uint16_t            httpPort{8080};                                      ///< 开发档明文 HTTP
+        std::uint16_t            httpsPort{8443};                                     ///< 控制台 HTTPS/h2 与 h3
+        std::uint16_t            agentPort{9443};                                     ///< Agent mTLS
+        std::uint16_t            opsPort{9100};                                       ///< 运维口
+        std::string              opsAddress{"127.0.0.1"};                             ///< 运维口监听地址
+        std::string              databaseDriver{"sqlite"};                            ///< sqlite 或 mysql
+        std::string              databasePath{"var/edgepulse.db"};                    ///< SQLite 文件路径
+        std::string              databaseHost{"127.0.0.1"};                           ///< MySQL 主机
+        std::uint16_t            databasePort{3306};                                  ///< MySQL 端口
+        std::string              databaseName{"edgepulse"};                           ///< MySQL 库名
+        std::string              databaseUser{"edgepulse"};                           ///< MySQL 用户
+        std::string              databasePassword;                                    ///< MySQL 口令，只从环境变量读取
+        bool                     redisEnabled{false};                                 ///< 是否使用 Redis 会话
+        std::string              redisHost{"127.0.0.1"};                              ///< Redis 主机
+        std::uint16_t            redisPort{6379};                                     ///< Redis 端口
+        int                      redisDatabase{0};                                    ///< Redis 键空间
+        std::string              redisPassword;                                       ///< Redis 口令，只从环境变量读取
+        int                      threads{1};                                          ///< 事件循环线程数
+        std::string              migrationsDirectory{"migrations"};                   ///< SQL 迁移目录
+        std::string              webRoot{"web"};                                      ///< 静态站点根目录
+        std::string              firmwareDirectory{"var/firmware"};                   ///< 固件落盘目录
+        std::int64_t             maximumFirmwareBytes{256LL * 1024 * 1024};           ///< 单份固件上限
+        int                      telemetryRetentionDays{30};                          ///< 遥测保留天数
+        std::string              certificateDirectory{"var/certs"};                   ///< 开发证书目录
+        std::string              opsTokenFile{"var/ops-token"};                       ///< 运维口令牌文件
+        int                      captchaTtlSeconds{120};                              ///< 验证码有效期，单位秒
+        int                      captchaRequestsPerMinute{30};                        ///< 单 IP 每分钟签发上限
+        int                      sessionTtlSeconds{7200};                             ///< 会话有效期，单位秒
+        bool                     exposeCaptchaCode{false};                            ///< 开发档在响应里带验证码答案
+        std::vector<std::string> allowedOrigins;                                      ///< 浏览器 WebSocket 的 Origin 白名单
+        std::string              agentFingerprint;                                    ///< 允许的 Agent 证书 SHA-256 指纹，空表示只校验 CA
+        bool                     udpTelemetryEnabled{false};                          ///< 是否启用 UDP 遥测监听
+        std::string              udpTelemetryAddress{"0.0.0.0"};                      ///< UDP 遥测监听地址
+        std::uint16_t            udpTelemetryPort{9555};                              ///< UDP 遥测端口
+        std::string              udpTelemetrySecret;                                  ///< HMAC 共享密钥，只从环境变量读取
+        bool                     reverseProxyEnabled{false};                          ///< 是否启用边缘反向代理
+        std::string              reverseProxyPrefix{"/edge"};                         ///< 对外路径前缀
+        std::string              reverseProxyUpstream;                                ///< 上游基地址
+        bool                     reverseProxyStripPrefix{true};                       ///< 转发时去掉前缀
+        bool                     reverseProxyRequireSession{true};                    ///< 是否要求登录
+        std::string              reverseProxyPermission;                              ///< 需要的权限码
+        std::int64_t             reverseProxyTimeoutMs{15000};                        ///< 单次转发时限
+        std::int64_t             reverseProxyMaximumRequestBytes{8LL * 1024 * 1024};  ///< 请求正文上限
+        std::int64_t             reverseProxyMaximumResponseBytes{8LL * 1024 * 1024}; ///< 响应正文上限
 
         /**
          * @brief 读取 YAML 并组装配置；同目录存在 logging.yaml 时一并载入
