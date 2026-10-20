@@ -7,6 +7,7 @@
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
 #include "Net/Http/Router.h"
+#include "Web/Authorization.h"
 #include "Web/RequestId.h"
 
 #include <Core/EventLoop/EventLoop.h>
@@ -22,33 +23,6 @@ namespace EdgePulse::Auth
 {
     namespace
     {
-        constexpr std::string_view kBearerPrefix = "Bearer ";
-
-        /**
-         * @brief 从 Authorization 取 Bearer 令牌
-         * @param request 当前请求
-         * @return 令牌文本；头缺失或格式不符时为空
-         */
-        [[nodiscard]] std::optional<std::string> bearerToken(const AsynGyanis::Net::HttpRequest &request)
-        {
-            const std::optional<std::string> header = request.getHeader("authorization");
-            if (!header.has_value() || header->size() <= kBearerPrefix.size())
-            {
-                return std::nullopt;
-            }
-            // 前缀按大小写不敏感比对；令牌本体原样保留
-            for (std::size_t index = 0; index < kBearerPrefix.size(); ++index)
-            {
-                const auto left  = static_cast<unsigned char>((*header)[index]);
-                const auto right = static_cast<unsigned char>(kBearerPrefix[index]);
-                if (std::tolower(left) != std::tolower(right))
-                {
-                    return std::nullopt;
-                }
-            }
-            return header->substr(kBearerPrefix.size());
-        }
-
         /**
          * @brief 取请求 JSON 对象里的字符串字段
          */
@@ -176,7 +150,7 @@ namespace EdgePulse::Auth
                     [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string                traceId = Web::resolveRequestId(request);
-                        const std::optional<std::string> token   = bearerToken(request);
+                        const std::optional<std::string> token   = Web::bearerToken(request);
                         if (!token.has_value() || !authService.authenticate(*token).has_value())
                         {
                             writeUnauthorized(response, traceId);
@@ -191,7 +165,7 @@ namespace EdgePulse::Auth
                    [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string                  traceId = Web::resolveRequestId(request);
-                       const std::optional<std::string>   token   = bearerToken(request);
+                       const std::optional<std::string>   token   = Web::bearerToken(request);
                        const std::optional<SessionRecord> session = token.has_value() ? authService.authenticate(*token) : std::nullopt;
                        if (!session.has_value())
                        {
@@ -214,7 +188,7 @@ namespace EdgePulse::Auth
                    [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string                  traceId = Web::resolveRequestId(request);
-                       const std::optional<std::string>   token   = bearerToken(request);
+                       const std::optional<std::string>   token   = Web::bearerToken(request);
                        const std::optional<SessionRecord> session = token.has_value() ? authService.authenticate(*token) : std::nullopt;
                        if (!session.has_value())
                        {
@@ -235,7 +209,7 @@ namespace EdgePulse::Auth
                    [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string                  traceId = Web::resolveRequestId(request);
-                       const std::optional<std::string>   token   = bearerToken(request);
+                       const std::optional<std::string>   token   = Web::bearerToken(request);
                        const std::optional<SessionRecord> session = token.has_value() ? authService.authenticate(*token) : std::nullopt;
                        if (!session.has_value())
                        {

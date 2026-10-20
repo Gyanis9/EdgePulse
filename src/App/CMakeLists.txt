@@ -10,6 +10,7 @@ target_link_libraries(edgepulse-app
                EdgePulse::Web
                EdgePulse::System
                EdgePulse::Auth
+               EdgePulse::Device
                AsynGyanis::Net
                AsynGyanis::Base
                AsynGyanis::Core)

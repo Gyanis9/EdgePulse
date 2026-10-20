@@ -7,12 +7,17 @@
 #include "Auth/LoginAudit.h"
 #include "Auth/SessionStore.h"
 #include "Common/Database.h"
+#include "Device/AgentController.h"
+#include "Device/AgentRegistry.h"
+#include "Device/DeviceController.h"
+#include "Device/NodeService.h"
 #include "System/MigrationRunner.h"
 #include "Web/MiddlewareSetup.h"
 
 #include "Core/EventLoop/IoContext.h"
 #include "Core/Socket/InetAddress.h"
 #include "Net/Http/HttpServer.h"
+#include "Web/Authorization.h"
 
 #include <exception>
 #include <string>
@@ -43,6 +48,14 @@ namespace EdgePulse::App
             m_captchaService = std::make_shared<Auth::CaptchaService>(Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
             m_loginAudit     = std::make_shared<Auth::LoginAudit>(m_database);
             m_authService    = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit);
+            m_nodeRepository = std::make_shared<Device::NodeRepository>(m_database);
+            m_nodeService    = std::make_shared<Device::NodeService>(m_nodeRepository);
+            Device::AgentRegistry::Options agentOptions;
+            if (!m_configuration.agentFingerprint.empty())
+            {
+                agentOptions.allowedFingerprints.push_back(m_configuration.agentFingerprint);
+            }
+            m_agentRegistry = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
         } catch (const std::exception &failure)
         {
             // 数据库或迁移不可用时没有可服务的业务，直接把原因交给进程入口
@@ -64,6 +77,21 @@ namespace EdgePulse::App
         Web::applySecurityHeaders(router);
         registerHealthRoutes(router);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
+        const auto accessResolver = [auth = m_authService](const AsynGyanis::Net::HttpRequest &request) -> std::optional<Device::AccessContext>
+        {
+            const std::optional<std::string> token = Web::bearerToken(request);
+            if (!token.has_value())
+            {
+                return std::nullopt;
+            }
+            const std::optional<Auth::SessionRecord> session = auth->authenticate(*token);
+            if (!session.has_value())
+            {
+                return std::nullopt;
+            }
+            return Device::AccessContext{session->permissions};
+        };
+        Device::registerRoutes(router, loop, *m_nodeService, accessResolver);
         registerFallbackRoute(router);
 
         m_acceptTask.emplace(m_httpServer->start());

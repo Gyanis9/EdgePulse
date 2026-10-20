@@ -31,10 +31,11 @@ gtest_discover_tests(edgepulse-unit-tests DISCOVERY_MODE PRE_TEST)
 
 add_executable(edgepulse-integration-tests
         Integration/TestAuthService.cpp
+        Integration/TestDeviceService.cpp
         Integration/TestMigrations.cpp)
 target_include_directories(edgepulse-integration-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(edgepulse-integration-tests PRIVATE EDGEPULSE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-target_link_libraries(edgepulse-integration-tests PRIVATE EdgePulse::System EdgePulse::Auth edgepulse-test-support GTest::gtest_main)
+target_link_libraries(edgepulse-integration-tests PRIVATE EdgePulse::System EdgePulse::Auth EdgePulse::Device edgepulse-test-support GTest::gtest_main)
 edgepulse_enable_warnings(edgepulse-integration-tests)
 set_target_properties(edgepulse-integration-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 gtest_discover_tests(edgepulse-integration-tests DISCOVERY_MODE PRE_TEST)
@@ -42,8 +43,9 @@ gtest_discover_tests(edgepulse-integration-tests DISCOVERY_MODE PRE_TEST)
 add_executable(edgepulse-protocol-tests
         Protocol/TestApiResponse.cpp
         Protocol/TestAuthEndpoints.cpp
-        Protocol/TestHealthServer.cpp)
-target_link_libraries(edgepulse-protocol-tests PRIVATE EdgePulse::App EdgePulse::Auth edgepulse-test-support GTest::gtest_main)
+        Protocol/TestHealthServer.cpp
+        Protocol/TestNodeEndpoints.cpp)
+target_link_libraries(edgepulse-protocol-tests PRIVATE EdgePulse::App EdgePulse::Auth EdgePulse::Device edgepulse-test-support GTest::gtest_main)
 edgepulse_enable_warnings(edgepulse-protocol-tests)
 set_target_properties(edgepulse-protocol-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 gtest_discover_tests(edgepulse-protocol-tests DISCOVERY_MODE PRE_TEST)

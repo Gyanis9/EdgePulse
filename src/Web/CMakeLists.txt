@@ -1,4 +1,5 @@
 add_library(edgepulse-web STATIC
+        Authorization.cpp
         MiddlewareSetup.cpp
         RequestId.cpp)
 add_library(EdgePulse::Web ALIAS edgepulse-web)

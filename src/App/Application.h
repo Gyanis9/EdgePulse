@@ -42,6 +42,13 @@ namespace EdgePulse::Common
     class Database;
 }
 
+namespace EdgePulse::Device
+{
+    class AgentRegistry;
+    class NodeRepository;
+    class NodeService;
+} // namespace EdgePulse::Device
+
 namespace EdgePulse::App
 {
     /**
@@ -94,6 +101,9 @@ namespace EdgePulse::App
         std::shared_ptr<Auth::CaptchaService>        m_captchaService; ///< 验证码
         std::shared_ptr<Auth::LoginAudit>            m_loginAudit;     ///< 登录审计
         std::shared_ptr<Auth::AuthService>           m_authService;    ///< 认证服务
+        std::shared_ptr<Device::NodeRepository>      m_nodeRepository; ///< 节点仓储
+        std::shared_ptr<Device::NodeService>         m_nodeService;    ///< 节点服务
+        std::shared_ptr<Device::AgentRegistry>       m_agentRegistry;  ///< Agent 注册表
         std::unique_ptr<AsynGyanis::Net::HttpServer> m_httpServer;
         std::optional<AsynGyanis::Core::Task<>>      m_acceptTask;
         std::atomic<bool>                            m_stopRequested{false};

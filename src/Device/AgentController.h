@@ -1,0 +1,32 @@
+/**
+ * @file AgentController.h
+ * @brief Agent mTLS 路由
+ * @author Gyanis
+ * @date 2026-10-20
+ * @version 0.1.0
+ * @copyright Copyright (c) . All rights reserved.
+ */
+
+#pragma once
+
+namespace AsynGyanis::Core
+{
+    class EventLoop;
+}
+namespace AsynGyanis::Net
+{
+    class Router;
+}
+
+namespace EdgePulse::Device
+{
+    class AgentRegistry;
+
+    /**
+     * @brief 注册 Agent 的注册与心跳路由
+     * @param router 目标路由器；调用方必须只在 mTLS 监听器上挂载
+     * @param loop 服务器所属事件循环
+     * @param registry Agent 注册表
+     */
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry);
+} // namespace EdgePulse::Device
