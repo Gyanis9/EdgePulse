@@ -37,6 +37,7 @@
 | GET/POST | `/api/system/roles` | `system:role:list` / `system:role:add` |
 | PUT/DELETE | `/api/system/roles/{id}` | `system:role:edit` / `system:role:remove` |
 | GET | `/api/system/roles/{id}/menus` | `system:role:list` |
+| GET | `/api/system/roles/{id}/depts` | `system:role:list`，自定义数据范围的部门 |
 | GET | `/api/system/roles/export` | `system:role:export` |
 | GET | `/api/system/permissions/graph` | `system:role:list` |
 | GET/POST | `/api/system/menus/tree`、`/api/system/menus` | `system:menu:list` / `system:menu:add` |
@@ -58,7 +59,7 @@
 | PUT/DELETE | `/api/system/configs/{id}` | `system:config:edit` / `system:config:remove` |
 | GET | `/api/system/configs/export` | `system:config:export` |
 
-用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`。
+用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds,deptIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`；取 `CUSTOM` 时必须给出非空 `deptIds`。
 
 ## 3. 监控与工作台
 

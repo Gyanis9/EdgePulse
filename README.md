@@ -92,10 +92,10 @@ npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ## 验收
 
 ```bash
-# 后端：61 条用例（真机存储 2 条按环境变量门控）
+# 后端：63 条用例（真机存储 2 条按环境变量门控）
 ctest --preset debug --output-on-failure
 
-# 前端：23 条单测 + 类型检查/构建 + 3 条 Playwright
+# 前端：23 条单测 + 类型检查/构建 + 4 条 Playwright
 cd frontend && npm run test:unit && npm run build && npm run test:e2e
 
 # 全量协议与安全验收：认证、系统管理、节点、遥测告警、SSE、命令、100 MiB 固件、h3、mTLS、metrics、readyz
