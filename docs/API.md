@@ -19,6 +19,10 @@
 | GET | `/api/auth/me` | 登录 | `{id,userId,username,nickname,deptId,deptName,roles,permissions}` |
 | GET | `/api/auth/routes` | 登录 | 动态菜单树；节点形状 `{id,parentId,name,type,path,component,icon,permission,children}` |
 | PUT | `/api/auth/password` | 登录 | `{oldPassword,newPassword}` |
+| GET | `/api/auth/oidc/enabled` | 匿名 | `{enabled,label}` |
+| GET | `/api/auth/oidc/start?return=/path` | 匿名 | 302 到 IdP；return 只接受本站绝对路径 |
+| GET | `/api/auth/oidc/callback?code=&state=` | 匿名 | 302 回前端，带一次性 `oidcCode` 或 `oidcError` |
+| POST | `/api/auth/oidc/exchange` | 匿名 | `{code}` → `{token,expiresIn,returnPath}`；code 一次性 |
 
 登录失败按 IP 计数，超过 10 次/分钟返回 429；验证码一次性、2 分钟过期。
 

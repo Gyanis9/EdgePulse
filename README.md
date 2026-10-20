@@ -4,7 +4,7 @@ EdgePulse 是面向边缘节点与设备的运维平台：控制面是 Vue 3 管
 
 当前状态：P0–P3 已落地并通过验收（2026-10-20）。
 
-- 认证与权限：验证码、PBKDF2 登录、不透明会话、动态菜单、权限码、数据范围、操作审计。
+- 认证与权限：验证码、PBKDF2 登录、OIDC 授权码登录、不透明会话、动态菜单、权限码、数据范围、操作审计。
 - 系统管理：用户、角色、菜单、部门、岗位、字典、参数、操作日志、登录日志、CSV 导出。
 - 设备域：节点、节点分组、Agent mTLS 注册/心跳、遥测、告警规则与告警生命周期、固件上传/下载/下发、命令下发。
 - 实时：浏览器 WebSocket（节点、告警、命令主题）、告警 SSE、Agent 命令长连接与轮询兜底、HMAC 签名的 UDP 遥测入口。
@@ -93,10 +93,10 @@ npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ## 验收
 
 ```bash
-# 后端：63 条用例（真机存储 2 条按环境变量门控）
+# 后端：74 条用例（真机存储 2 条按环境变量门控）
 ctest --preset debug --output-on-failure
 
-# 前端：23 条单测 + 类型检查/构建 + 4 条 Playwright
+# 前端：23 条单测 + 类型检查/构建 + 5 条 Playwright
 cd frontend && npm run test:unit && npm run build && npm run test:e2e
 
 # 全量协议与安全验收：认证、系统管理、节点、遥测告警、SSE、命令、100 MiB 固件、h3、mTLS、metrics、readyz
@@ -113,7 +113,7 @@ python scripts/check-docker-stack.py --build
 - `config/dev.yaml` 只放非敏感项；生产从 `config/prod.yaml.example` 复制一份未跟踪的配置。
 - 数据库/Redis 口令、运维令牌、Agent 指纹、初始口令提示只从环境变量读取：
   `EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、
-  `EDGEPULSE_AGENT_FINGERPRINT`、`EDGEPULSE_INITIAL_PASSWORD`、`EDGEPULSE_UDP_TELEMETRY_SECRET`。
+  `EDGEPULSE_AGENT_FINGERPRINT`、`EDGEPULSE_INITIAL_PASSWORD`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`。
 - 开发脚本把运维令牌写进 `var/ops-token`，证书写进 `var/certs`，两者都在 `.gitignore` 中。
 - 仓库零明文凭据；日志不回显 Authorization、Cookie、口令与 token。
 
@@ -129,7 +129,7 @@ python scripts/check-docker-stack.py --build
 
 ## 已知边界
 
-- P4 中的 OIDC 与多租户仍按原设计另行设计；UDP 遥测与边缘反向代理已落地，反代当前只做 HTTP 转发（不代理 WebSocket 升级与流式大响应）。
+- P4 中的多租户仍按原设计另行设计；UDP 遥测、边缘反向代理与 OIDC 已落地。反代当前只做 HTTP 转发（不代理 WebSocket 升级与流式大响应）。
 - 监听器目前统一绑定事件循环 0；`edgepulse.threads` 只创建额外循环，不会分担监听。多 worker 监听分发与多进程编排未作为本次交付形态。
 - mTLS 指纹白名单在 Agent 注册时按自报值校验；逐请求身份绑定需要引擎开放对端证书接口或每节点独立 CA。
 - WebSocket 首条认证的 5 秒兜底仍用计时线程（实现标注了 `shortcut`），等引擎提供带超时接收后替换。
