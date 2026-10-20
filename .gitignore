@@ -14,3 +14,4 @@ Thumbs.db
 /web/
 /deploy/prometheus/ops-token
 /deploy/docker/.env
+.idea/
