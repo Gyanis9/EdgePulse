@@ -163,14 +163,50 @@ def check_system(token: str) -> None:
         request_json("DELETE", HTTP_BASE + f"/api/system/roles/{role_id}", token=token)
 
 
-def login_user(username: str, password: str) -> str | None:
+def login_user(username: str, password: str, tenant_code: str | None = None) -> str | None:
     status, captcha, _ = request_json("GET", HTTP_BASE + "/api/auth/captcha")
     code = captcha.get("data", {}).get("code")
     if status != 200 or not code:
         return None
-    status, login, _ = request_json("POST", HTTP_BASE + "/api/auth/login",
-                                    {"username": username, "password": password, "captcha": code, "captchaUuid": captcha["data"]["uuid"]})
+    payload = {"username": username, "password": password, "captcha": code, "captchaUuid": captcha["data"]["uuid"]}
+    if tenant_code:
+        payload["tenantCode"] = tenant_code
+    status, login, _ = request_json("POST", HTTP_BASE + "/api/auth/login", payload)
     return login.get("data", {}).get("token") if status == 200 else None
+
+
+def check_tenancy(token: str) -> None:
+    tenant_code = f"accept{RUN_ID}"
+    admin_name = f"tenant_admin_{RUN_ID}"
+    status, created, _ = request_json("POST", HTTP_BASE + "/api/system/tenants",
+                                      {"code": tenant_code, "name": f"验收租户{RUN_ID}", "remark": "验收脚本",
+                                       "adminUsername": admin_name, "adminNickname": "验收租户管理员", "adminPassword": "tenant123"}, token=token)
+    tenant_id = created.get("data", {}).get("tenantId")
+    report("租户创建", status == 200 and bool(tenant_id), f"HTTP {status}")
+    if not tenant_id:
+        return
+    status, tenants, _ = request_json("GET", HTTP_BASE + f"/api/system/tenants?pageNum=1&pageSize=10&keyword={tenant_code}", token=token)
+    report("租户列表包含新租户", status == 200 and tenants.get("data", {}).get("total") == 1, f"HTTP {status}")
+
+    tenant_token = login_user(admin_name, "tenant123", tenant_code)
+    report("租户管理员按租户编码登录", bool(tenant_token))
+    if not tenant_token:
+        return
+    status, me, _ = request_json("GET", HTTP_BASE + "/api/auth/me", token=tenant_token)
+    identity = me.get("data", {})
+    report("会话携带租户身份", status == 200 and identity.get("tenantCode") == tenant_code and identity.get("platformAdmin") is False, f"HTTP {status}")
+    status, users, _ = request_json("GET", HTTP_BASE + f"/api/system/users?pageNum=1&pageSize=10&keyword={admin_name}", token=tenant_token)
+    rows = users.get("data", {}).get("rows", [])
+    report("租户管理员只见本租户账号", status == 200 and users.get("data", {}).get("total") == 1 and rows and rows[0].get("tenantCode") == tenant_code,
+           f"HTTP {status}")
+    denied = request_json("POST", HTTP_BASE + "/api/system/tenants", {"code": "nope", "name": "无权限", "adminUsername": "nope", "adminPassword": "nope123"}, token=tenant_token)[0]
+    report("租户管理员不能管理租户", denied == 403, f"HTTP {denied}")
+    status, global_users, _ = request_json("GET", HTTP_BASE + f"/api/system/users?pageNum=1&pageSize=10&keyword={admin_name}", token=token)
+    report("平台管理员可跨租户查账号", status == 200 and global_users.get("data", {}).get("total") == 1, f"HTTP {status}")
+
+    status, _, _ = request_json("PUT", HTTP_BASE + f"/api/system/tenants/{tenant_id}", {"status": 0}, token=token)
+    report("租户停用", status == 200, f"HTTP {status}")
+    report("停用租户拒绝新登录", login_user(admin_name, "tenant123", tenant_code) is None)
 
 
 def create_node(token: str, name: str) -> int | None:
@@ -499,6 +535,7 @@ def main() -> int:
         check_oidc()
         if token:
             check_system(token)
+            check_tenancy(token)
             node_id = check_nodes(token)
             check_websocket(token)
             if node_id:

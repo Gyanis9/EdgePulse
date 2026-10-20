@@ -42,6 +42,9 @@ test('custom data scope requires a department and persists it', async ({ page })
   await dialog.getByRole('button', { name: '保存' }).click()
   await expect(page.getByText('角色已新增')).toBeVisible()
 
+  // 开发库会累积历史角色：先按唯一名称过滤，避免被分页挤到第二页
+  await page.getByPlaceholder('角色名称 / 编码').fill(roleName)
+  await page.getByPlaceholder('角色名称 / 编码').press('Enter')
   const row = page.getByRole('row', { name: new RegExp(roleName) })
   await expect(row).toBeVisible()
   await row.getByRole('button', { name: '编辑' }).click()

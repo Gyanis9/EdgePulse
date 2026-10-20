@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import subprocess
 import sys
@@ -236,7 +237,15 @@ def main() -> int:
     values = prepare()
 
     if arguments.build:
-        result = subprocess.run(["docker", "build", "-f", "deploy/docker/Dockerfile", "-t", "edgepulse:ci", "."], cwd=ROOT, check=False)
+        build_command = ["docker", "build", "-f", "deploy/docker/Dockerfile", "-t", "edgepulse:ci"]
+        node_image  = os.environ.get("EDGEPULSE_DOCKER_NODE_IMAGE")
+        apt_mirror  = os.environ.get("EDGEPULSE_DOCKER_APT_MIRROR")
+        if node_image:
+            build_command += ["--build-arg", f"NODE_IMAGE={node_image}"]
+        if apt_mirror:
+            build_command += ["--build-arg", f"APT_MIRROR={apt_mirror}"]
+        build_command.append(".")
+        result = subprocess.run(build_command, cwd=ROOT, check=False)
         report("构建 edgepulse:ci 镜像", result.returncode == 0)
         if result.returncode != 0:
             return 1
@@ -296,10 +305,11 @@ def main() -> int:
             "\"SELECT CONCAT((SELECT COUNT(*) FROM schema_migrations),'|',"
             "(SELECT COUNT(*) FROM sys_user WHERE username='admin'),'|',"
             f"(SELECT COUNT(*) FROM sys_role_dept WHERE role_id={role_id}),'|',"
-            f"(SELECT COUNT(*) FROM biz_node WHERE name='{node_name}'));\"",
+            f"(SELECT COUNT(*) FROM biz_node WHERE name='{node_name}'),'|',"
+            "(SELECT COUNT(*) FROM sys_tenant));\"",
         )
         stored = mysql_check.stdout.strip().split("|")
-        report("MySQL 迁移、种子、角色部门与节点落库", stored == ["7", "1", "2", "1"], mysql_check.stdout.strip() or mysql_check.stderr.strip())
+        report("MySQL 迁移、种子、角色部门、节点与租户落库", stored == ["8", "1", "2", "1", "1"], mysql_check.stdout.strip() or mysql_check.stderr.strip())
 
         redis_check = compose("exec", "-T", "redis", "redis-cli", "--no-auth-warning", "-a", values["EDGEPULSE_REDIS_PASSWORD"], "KEYS", "edgepulse:session:*")
         session_keys = [line for line in redis_check.stdout.splitlines() if line.strip()]
