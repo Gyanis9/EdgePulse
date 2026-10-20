@@ -42,6 +42,7 @@ namespace EdgePulse::App
         std::string              migrationsDirectory{"migrations"}; ///< SQL 迁移目录
         std::string              webRoot{"web"};                    ///< 静态站点根目录
         std::string              certificateDirectory{"var/certs"}; ///< 开发证书目录
+        std::string              opsTokenFile{"var/ops-token"};     ///< 运维口令牌文件
         int                      captchaTtlSeconds{120};            ///< 验证码有效期，单位秒
         int                      captchaRequestsPerMinute{30};      ///< 单 IP 每分钟签发上限
         int                      sessionTtlSeconds{7200};           ///< 会话有效期，单位秒

@@ -21,13 +21,17 @@
 
 namespace AsynGyanis::Core
 {
+    class EventLoop;
     class IoContext;
-}
+} // namespace AsynGyanis::Core
 
 namespace AsynGyanis::Net
 {
     class HttpServer;
-}
+    class HttpsServer;
+    class QuicServer;
+    class Router;
+} // namespace AsynGyanis::Net
 
 namespace EdgePulse::Auth
 {
@@ -48,6 +52,11 @@ namespace EdgePulse::Device
     class NodeRepository;
     class NodeService;
 } // namespace EdgePulse::Device
+
+namespace EdgePulse::Web
+{
+    class BrowserWebSocket;
+} // namespace EdgePulse::Web
 
 namespace EdgePulse::App
 {
@@ -94,18 +103,36 @@ namespace EdgePulse::App
         [[nodiscard]] std::uint16_t httpPort() const noexcept;
 
     private:
-        ApplicationConfiguration                     m_configuration;
-        std::unique_ptr<AsynGyanis::Core::IoContext> m_ioContext;
-        std::shared_ptr<Common::Database>            m_database;       ///< 进程级数据库
-        std::shared_ptr<Auth::SessionStore>          m_sessionStore;   ///< 会话表
-        std::shared_ptr<Auth::CaptchaService>        m_captchaService; ///< 验证码
-        std::shared_ptr<Auth::LoginAudit>            m_loginAudit;     ///< 登录审计
-        std::shared_ptr<Auth::AuthService>           m_authService;    ///< 认证服务
-        std::shared_ptr<Device::NodeRepository>      m_nodeRepository; ///< 节点仓储
-        std::shared_ptr<Device::NodeService>         m_nodeService;    ///< 节点服务
-        std::shared_ptr<Device::AgentRegistry>       m_agentRegistry;  ///< Agent 注册表
-        std::unique_ptr<AsynGyanis::Net::HttpServer> m_httpServer;
-        std::optional<AsynGyanis::Core::Task<>>      m_acceptTask;
-        std::atomic<bool>                            m_stopRequested{false};
+        /**
+         * @brief 把健康、认证、节点、WebSocket 与兜底路由挂到一台公开监听器上
+         * @param router 目标路由器
+         * @param loop 服务器所属事件循环
+         */
+        void registerPublicRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop);
+
+    private:
+        ApplicationConfiguration                      m_configuration;
+        std::unique_ptr<AsynGyanis::Core::IoContext>  m_ioContext;
+        std::shared_ptr<Common::Database>             m_database;         ///< 进程级数据库
+        std::shared_ptr<Auth::SessionStore>           m_sessionStore;     ///< 会话表
+        std::shared_ptr<Auth::CaptchaService>         m_captchaService;   ///< 验证码
+        std::shared_ptr<Auth::LoginAudit>             m_loginAudit;       ///< 登录审计
+        std::shared_ptr<Auth::AuthService>            m_authService;      ///< 认证服务
+        std::shared_ptr<Web::BrowserWebSocket>        m_browserWebSocket; ///< 浏览器 WebSocket 与节点扇出
+        std::shared_ptr<Device::NodeRepository>       m_nodeRepository;   ///< 节点仓储
+        std::shared_ptr<Device::NodeService>          m_nodeService;      ///< 节点服务
+        std::shared_ptr<Device::AgentRegistry>        m_agentRegistry;    ///< Agent 注册表
+        std::unique_ptr<AsynGyanis::Net::Router>      m_h3Router;         ///< h3 专属路由器
+        std::unique_ptr<AsynGyanis::Net::HttpServer>  m_httpServer;       ///< 8080 开发口
+        std::optional<AsynGyanis::Core::Task<>>       m_acceptTask;       ///< 8080 接受协程
+        std::unique_ptr<AsynGyanis::Net::HttpsServer> m_httpsServer;      ///< 8443 控制台
+        std::optional<AsynGyanis::Core::Task<>>       m_httpsAccept;      ///< 8443 接受协程
+        std::unique_ptr<AsynGyanis::Net::QuicServer>  m_quicServer;       ///< 8443/UDP h3
+        std::optional<AsynGyanis::Core::Task<>>       m_quicListen;       ///< h3 监听协程
+        std::unique_ptr<AsynGyanis::Net::HttpsServer> m_agentServer;      ///< 9443 mTLS
+        std::optional<AsynGyanis::Core::Task<>>       m_agentAccept;      ///< 9443 接受协程
+        std::unique_ptr<AsynGyanis::Net::HttpServer>  m_opsServer;        ///< 9100 运维口
+        std::optional<AsynGyanis::Core::Task<>>       m_opsAccept;        ///< 9100 接受协程
+        std::atomic<bool>                             m_stopRequested{false};
     };
 } // namespace EdgePulse::App

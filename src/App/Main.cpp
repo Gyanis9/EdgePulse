@@ -52,7 +52,7 @@ int main(const int argc, char **argv)
             std::cerr << error << '\n';
             return 1;
         }
-        LOG_INFO_FMT("EdgePulse 已启动，HTTP 端口 {}", application.httpPort());
+        LOG_INFO_FMT("EdgePulse 已启动，HTTP 端口 {}", configuration->httpPort);
 
         static_cast<void>(AsynGyanis::Core::GracefulShutdown::blockStopSignals());
         AsynGyanis::Core::GracefulShutdown shutdown;

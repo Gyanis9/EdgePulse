@@ -1,15 +1,19 @@
 #include "App/Application.h"
 
 #include "App/ListenerAssembly.h"
+#include "Base/Config/ConfigValue.h"
 #include "Auth/AuthController.h"
 #include "Auth/AuthService.h"
 #include "Auth/CaptchaService.h"
 #include "Auth/LoginAudit.h"
 #include "Auth/SessionStore.h"
+#include "Common/ApiResponse.h"
 #include "Common/Database.h"
+#include "Common/Environment.h"
 #include "Device/AgentController.h"
 #include "Device/AgentRegistry.h"
 #include "Device/DeviceController.h"
+#include "Device/NodeJson.h"
 #include "Device/NodeService.h"
 #include "System/MigrationRunner.h"
 #include "Web/MiddlewareSetup.h"
@@ -17,13 +21,53 @@
 #include "Core/EventLoop/IoContext.h"
 #include "Core/Socket/InetAddress.h"
 #include "Net/Http/HttpServer.h"
+#include "Net/Http/HttpServerAssembly.h"
+#include "Net/Http/HttpsServer.h"
+#include "Net/Http/Middleware.h"
+#include "Net/Http/Router.h"
+#include "Net/Quic/QuicServer.h"
 #include "Web/Authorization.h"
+#include "Web/RequestId.h"
+#include "Web/WebSocketEndpoints.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace EdgePulse::App
 {
+    namespace
+    {
+        /**
+         * @brief 取运维口 Bearer 令牌：环境变量优先，其次读未跟踪文件
+         * @param tokenFile 令牌文件路径
+         * @return 令牌文本；两处都没有时为空
+         */
+        [[nodiscard]] std::string readOpsToken(const std::string &tokenFile)
+        {
+            if (const std::optional<std::string> environmentToken = Common::environmentValue("EDGEPULSE_OPS_BEARER_TOKEN"); environmentToken.has_value())
+            {
+                return *environmentToken;
+            }
+            std::ifstream file(tokenFile);
+            if (!file)
+            {
+                return {};
+            }
+            std::string token;
+            std::getline(file, token);
+            // 去掉行尾空白（含 Windows CRLF）
+            while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back())) != 0)
+            {
+                token.pop_back();
+            }
+            return token;
+        }
+    } // namespace
+
     Application::Application(ApplicationConfiguration configuration) : m_configuration(std::move(configuration))
     {
     }
@@ -43,18 +87,24 @@ namespace EdgePulse::App
                 const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirectSqlite(m_configuration.databasePath);
                 System::MigrationRunner::apply(*connection, m_configuration.migrationsDirectory);
             }
-            m_database       = Common::Database::openSqlite(m_configuration.databasePath);
-            m_sessionStore   = std::make_shared<Auth::SessionStore>(m_configuration.sessionTtlSeconds);
-            m_captchaService = std::make_shared<Auth::CaptchaService>(Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
-            m_loginAudit     = std::make_shared<Auth::LoginAudit>(m_database);
-            m_authService    = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit);
-            m_nodeRepository = std::make_shared<Device::NodeRepository>(m_database);
-            m_nodeService    = std::make_shared<Device::NodeService>(m_nodeRepository);
+            m_database         = Common::Database::openSqlite(m_configuration.databasePath);
+            m_sessionStore     = std::make_shared<Auth::SessionStore>(m_configuration.sessionTtlSeconds);
+            m_captchaService   = std::make_shared<Auth::CaptchaService>(Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
+            m_loginAudit       = std::make_shared<Auth::LoginAudit>(m_database);
+            m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit);
+            m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>(loop);
+            m_nodeRepository   = std::make_shared<Device::NodeRepository>(m_database);
+            m_nodeService      = std::make_shared<Device::NodeService>(m_nodeRepository);
             Device::AgentRegistry::Options agentOptions;
             if (!m_configuration.agentFingerprint.empty())
             {
                 agentOptions.allowedFingerprints.push_back(m_configuration.agentFingerprint);
             }
+            agentOptions.publisher = [webSocket = m_browserWebSocket](const Device::NodeRecord &node) -> AsynGyanis::Core::Task<>
+            {
+                const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "node.status"}, {"data", Device::nodeToJson(node)}}).dump();
+                co_await webSocket->hub().publish("nodes", payload);
+            };
             m_agentRegistry = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
         } catch (const std::exception &failure)
         {
@@ -63,16 +113,137 @@ namespace EdgePulse::App
             return false;
         }
 
-        const std::optional<AsynGyanis::Core::InetAddress> address = AsynGyanis::Core::InetAddress::resolve(m_configuration.listenAddress, m_configuration.httpPort);
-        // 地址解析失败属于启动期配置错误：写清主机与端口后直接失败，不带着空监听继续
-        if (!address.has_value())
+        const auto resolveAddress = [&error](const std::string &host, const std::uint16_t port, const std::string_view label) -> std::optional<AsynGyanis::Core::InetAddress>
         {
-            error = "无法解析监听地址：" + m_configuration.listenAddress + ":" + std::to_string(m_configuration.httpPort);
+            const std::optional<AsynGyanis::Core::InetAddress> address = AsynGyanis::Core::InetAddress::resolve(host, port);
+            if (!address.has_value())
+            {
+                error = "无法解析" + std::string{label} + "监听地址：" + host + ":" + std::to_string(port);
+            }
+            return address;
+        };
+
+        try
+        {
+            const std::optional<AsynGyanis::Core::InetAddress> httpAddress = resolveAddress(m_configuration.listenAddress, m_configuration.httpPort, "HTTP");
+            if (!httpAddress.has_value())
+            {
+                return false;
+            }
+
+            // 8080：开发档明文口，Vite 代理目标
+            m_httpServer = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *httpAddress);
+            registerPublicRoutes(m_httpServer->router(), loop);
+            m_acceptTask.emplace(m_httpServer->start());
+            loop.scheduler().schedule(m_acceptTask->handle());
+
+            const std::filesystem::path certificateDirectory = m_configuration.certificateDirectory;
+            const std::filesystem::path serverCertificate    = certificateDirectory / "server.pem";
+            const std::filesystem::path serverKey            = certificateDirectory / "server-key.pem";
+            const std::filesystem::path caCertificate        = certificateDirectory / "ca.pem";
+            const auto                  requireCertificate   = [&error](const std::filesystem::path &path, const std::string_view label)
+            {
+                if (!std::filesystem::exists(path))
+                {
+                    error = "缺少" + std::string{label} + "：" + path.string() + "；请先运行 scripts/dev-certs.sh";
+                    return false;
+                }
+                return true;
+            };
+
+            if (m_configuration.httpsPort != 0)
+            {
+                if (!requireCertificate(serverCertificate, "服务器证书") || !requireCertificate(serverKey, "服务器私钥"))
+                {
+                    return false;
+                }
+                const std::optional<AsynGyanis::Core::InetAddress> httpsAddress = resolveAddress(m_configuration.listenAddress, m_configuration.httpsPort, "HTTPS");
+                if (!httpsAddress.has_value())
+                {
+                    return false;
+                }
+
+                // 8443/TCP：HTTP/2 控制台，Alt-Svc 通告同端口 UDP 上的 h3
+                m_httpsServer = std::make_unique<AsynGyanis::Net::HttpsServer>(loop, *httpsAddress, serverCertificate.string(), serverKey.string());
+                m_httpsServer->router().addMiddleware(AsynGyanis::Net::altSvcMiddleware(m_configuration.httpsPort));
+                registerPublicRoutes(m_httpsServer->router(), loop);
+                m_httpsAccept.emplace(m_httpsServer->start());
+                loop.scheduler().schedule(m_httpsAccept->handle());
+
+                // 8443/UDP：独立 QUIC 路由器；/api/probe/h3 只在这里存在，TCP 回落必然 404
+                AsynGyanis::Net::QuicServer::Configuration quicConfiguration;
+                quicConfiguration.certificateFile = serverCertificate.string();
+                quicConfiguration.privateKeyFile  = serverKey.string();
+                m_h3Router                        = std::make_unique<AsynGyanis::Net::Router>();
+                m_h3Router->get("/api/probe/h3",
+                                [](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    Common::writeSuccess(response, AsynGyanis::Base::ConfigValue::object({{"proto", "h3"}}), Web::resolveRequestId(request));
+                                    co_return;
+                                });
+                registerPublicRoutes(*m_h3Router, loop);
+                m_quicServer = std::make_unique<AsynGyanis::Net::QuicServer>(loop, quicConfiguration);
+                m_quicServer->setRouter(*m_h3Router);
+                m_quicListen.emplace(m_quicServer->listen(*httpsAddress));
+                loop.scheduler().schedule(m_quicListen->handle());
+            }
+
+            if (m_configuration.agentPort != 0)
+            {
+                if (!requireCertificate(serverCertificate, "服务器证书") || !requireCertificate(serverKey, "服务器私钥") || !requireCertificate(caCertificate, "客户端 CA"))
+                {
+                    return false;
+                }
+                const std::optional<AsynGyanis::Core::InetAddress> agentAddress = resolveAddress(m_configuration.listenAddress, m_configuration.agentPort, "Agent mTLS");
+                if (!agentAddress.has_value())
+                {
+                    return false;
+                }
+                // 9443：只挂 Agent 路由；要求客户端证书，公共浏览器路由不得出现在这里
+                m_agentServer = std::make_unique<AsynGyanis::Net::HttpsServer>(loop, *agentAddress, serverCertificate.string(), serverKey.string());
+                if (!m_agentServer->loadClientCertificateAuthority(caCertificate.string()))
+                {
+                    error = "加载客户端 CA 失败：" + caCertificate.string();
+                    return false;
+                }
+                m_agentServer->setClientCertificateRequired(true);
+                Web::applySecurityHeaders(m_agentServer->router());
+                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry);
+                m_agentAccept.emplace(m_agentServer->start());
+                loop.scheduler().schedule(m_agentAccept->handle());
+            }
+
+            if (m_configuration.opsPort != 0)
+            {
+                const std::optional<AsynGyanis::Core::InetAddress> opsAddress = resolveAddress(m_configuration.opsAddress, m_configuration.opsPort, "运维");
+                if (!opsAddress.has_value())
+                {
+                    return false;
+                }
+                const std::string opsToken = readOpsToken(m_configuration.opsTokenFile);
+                if (opsToken.empty())
+                {
+                    error = "缺少运维口 Bearer 令牌：请设置 EDGEPULSE_OPS_BEARER_TOKEN 或写入 " + m_configuration.opsTokenFile;
+                    return false;
+                }
+                AsynGyanis::Net::HttpServerConfiguration opsConfiguration;
+                opsConfiguration.exposeMetrics  = true;
+                opsConfiguration.opsBearerToken = opsToken;
+                m_opsServer                     = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *opsAddress);
+                AsynGyanis::Net::registerOperationEndpoints(*m_opsServer, opsConfiguration);
+                m_opsAccept.emplace(m_opsServer->start());
+                loop.scheduler().schedule(m_opsAccept->handle());
+            }
+        } catch (const std::exception &failure)
+        {
+            error = std::string{"监听器启动失败："} + failure.what();
             return false;
         }
+        return true;
+    }
 
-        m_httpServer                    = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *address);
-        AsynGyanis::Net::Router &router = m_httpServer->router();
+    void Application::registerPublicRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+    {
         // 中间件必须先于业务路由注册，异常兜底才能包住所有处理器
         Web::applySecurityHeaders(router);
         registerHealthRoutes(router);
@@ -92,12 +263,9 @@ namespace EdgePulse::App
             return Device::AccessContext{session->permissions};
         };
         Device::registerRoutes(router, loop, *m_nodeService, accessResolver);
+        m_browserWebSocket->registerRoute(
+                router, [auth = m_authService](const std::string_view token) { return auth->authenticate(token).has_value(); }, m_configuration.allowedOrigins);
         registerFallbackRoute(router);
-
-        m_acceptTask.emplace(m_httpServer->start());
-        // 循环尚未开始运行，本线程可安全地把接受协程放进本地就绪队列
-        loop.scheduler().schedule(m_acceptTask->handle());
-        return true;
     }
 
     int Application::run()

@@ -1,6 +1,7 @@
 #include "App/ApplicationConfiguration.h"
 
 #include "Base/Config/ConfigManager.h"
+#include "Common/Environment.h"
 
 #include <algorithm>
 #include <cctype>
@@ -130,6 +131,15 @@ namespace EdgePulse::App
         configuration.allowedOrigins           = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
 
         // P0 只实现 SQLite 快速档；配成 mysql 时明确拒绝，避免带着未接通的驱动上线
+        // 指纹允许通过环境变量覆盖，run-dev.sh 会在生成证书后导出
+        if (configuration.agentFingerprint.empty())
+        {
+            if (const std::optional<std::string> fingerprint = Common::environmentValue("EDGEPULSE_AGENT_FINGERPRINT"); fingerprint.has_value())
+            {
+                configuration.agentFingerprint = *fingerprint;
+            }
+        }
+
         if (configuration.databaseDriver != "sqlite")
         {
             return std::unexpected(ConfigurationError{"P0 只实现了 sqlite 运行时配置，当前 database.driver=" + configuration.databaseDriver});

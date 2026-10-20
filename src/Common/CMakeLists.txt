@@ -1,6 +1,7 @@
 add_library(edgepulse-common STATIC
         ApiResponse.cpp
         Database.cpp
+        Environment.cpp
         IdGenerator.cpp
         Pagination.cpp
         PasswordHash.cpp

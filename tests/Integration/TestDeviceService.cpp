@@ -55,7 +55,11 @@ TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
     int                                       publishCount = 0;
     EdgePulse::Device::AgentRegistry::Options options;
     options.allowedFingerprints = {fingerprint};
-    options.publisher           = [&publishCount](const EdgePulse::Device::NodeRecord &) { ++publishCount; };
+    options.publisher           = [&publishCount](const EdgePulse::Device::NodeRecord &) -> AsynGyanis::Core::Task<>
+    {
+        ++publishCount;
+        co_return;
+    };
     EdgePulse::Device::AgentRegistry registry(repository, options);
 
     const auto rejected = runner.run(registry.registerAgent(runner.loop(), EdgePulse::Device::AgentRegistration{"edge-a", "1.0.0", std::string(64, 'b'), ""}));

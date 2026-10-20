@@ -50,8 +50,8 @@ namespace EdgePulse::Device
         std::string labelsJson;      ///< 标签 JSON，可空
     };
 
-    /// 节点状态变化后的发布回调（在线程池线程上被调用）
-    using NodeStatusPublisher = std::function<void(const NodeRecord &)>;
+    /// 节点状态变化后的发布回调；在服务器循环线程上 co_await
+    using NodeStatusPublisher = std::function<AsynGyanis::Core::Task<>(const NodeRecord &)>;
 
     /**
      * @brief Agent 注册表
@@ -96,7 +96,7 @@ namespace EdgePulse::Device
         /**
          * @brief 通知发布回调；回调异常只记日志，不推翻已经落库的状态
          */
-        void publish(const NodeRecord &node);
+        AsynGyanis::Core::Task<> publish(const NodeRecord &node);
 
         std::shared_ptr<NodeRepository> m_repository; ///< 节点仓储
         Options                         m_options;    ///< 选项

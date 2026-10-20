@@ -1,7 +1,8 @@
 add_library(edgepulse-web STATIC
         Authorization.cpp
         MiddlewareSetup.cpp
-        RequestId.cpp)
+        RequestId.cpp
+        WebSocketEndpoints.cpp)
 add_library(EdgePulse::Web ALIAS edgepulse-web)
 
 target_include_directories(edgepulse-web PUBLIC ${PROJECT_SOURCE_DIR}/src)

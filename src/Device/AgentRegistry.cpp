@@ -97,7 +97,7 @@ namespace EdgePulse::Device
         upsert.certFingerprint = *fingerprint;
         upsert.labelsJson      = *labels;
         const NodeRecord node  = co_await m_repository->upsertAgent(loop, std::move(upsert));
-        publish(node);
+        co_await publish(node);
         co_return node;
     }
 
@@ -112,23 +112,24 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(AgentError{AgentError::Reason::NotFound, "节点不存在或已删除"});
         }
-        publish(*node);
+        co_await publish(*node);
         co_return *node;
     }
 
-    void AgentRegistry::publish(const NodeRecord &node)
+    AsynGyanis::Core::Task<> AgentRegistry::publish(const NodeRecord &node)
     {
         if (!m_options.publisher)
         {
-            return;
+            co_return;
         }
         try
         {
-            m_options.publisher(node);
+            co_await m_options.publisher(node);
         } catch (const std::exception &failure)
         {
             // 状态已经落库；推送失败只影响实时界面，不能在注册/心跳路径上放大成 500
             LOG_ERROR_FMT("节点状态发布失败：{}", failure.what());
         }
+        co_return;
     }
 } // namespace EdgePulse::Device
