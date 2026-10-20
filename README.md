@@ -100,6 +100,9 @@ cd frontend && npm run test:unit && npm run build && npm run test:e2e
 
 # 全量协议与安全验收：认证、系统管理、节点、遥测告警、SSE、命令、100 MiB 固件、h3、mTLS、metrics、readyz
 python scripts/check-acceptance.py
+
+# Docker 全栈：镜像 + MySQL/Redis + Prometheus + 真实 OTel collector + 优雅停机
+python scripts/check-docker-stack.py --build
 ```
 
 结果与证据见 [docs/验收.md](docs/验收.md)。
@@ -120,6 +123,7 @@ python scripts/check-acceptance.py
 - 协议：401/403 矩阵、管理端 CRUD、数据范围、遥测告警、命令往返与 Agent WebSocket 推送、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
 - 前端：API 契约单测；Playwright 用系统 Edge（`channel: 'msedge'`），不下载浏览器。
 - `ExternalStores.*` 需要真实 MySQL/Redis：设置 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 后运行；缺变量时用例 SKIP，不伪造通过。本机已用临时容器跑绿。
+- Docker：`scripts/check-docker-stack.py` 起 MySQL 8.4、Redis 7、Prometheus 与真实 OTel collector，验证登录、自定义角色、节点、审计落库、会话跨重启、指标抓取与 SIGTERM 优雅停机。
 
 ## 已知边界
 
@@ -127,8 +131,8 @@ python scripts/check-acceptance.py
 - 监听器目前统一绑定事件循环 0；`edgepulse.threads` 只创建额外循环，不会分担监听。多 worker 监听分发与多进程编排未作为本次交付形态。
 - mTLS 指纹白名单在 Agent 注册时按自报值校验；逐请求身份绑定需要引擎开放对端证书接口或每节点独立 CA。
 - WebSocket 首条认证的 5 秒兜底仍用计时线程（实现标注了 `shortcut`），等引擎提供带超时接收后替换。
-- OTLP 出口已用 `scripts/check-otlp.py` 的 mock collector 验证真实 POST；未对接外部生产采集端。
-- Docker Compose 与 systemd 产物已提供；本机用 Docker 起过临时 MySQL/Redis 跑集成与验收，未构建应用镜像，也未启动 systemd 服务。
+- OTLP 出口已用 mock collector 与真实 OTel collector 容器验证；外部生产采集端的网络与鉴权仍需部署环境复核。
+- Docker 镜像、Compose 全栈与 systemd 服务已在本机 Docker 中真机启动验证；systemd 验证使用特权容器，未覆盖真实主机的内核与 cgroup 差异。
 
 ## 编码与提交
 
