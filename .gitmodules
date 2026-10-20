@@ -1,0 +1,3 @@
+[submodule "third_party/AsynGyanis"]
+	path = third_party/AsynGyanis
+	url = https://github.com/Gyanis9/AsynGyanis.git
