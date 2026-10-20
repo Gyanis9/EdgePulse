@@ -7,12 +7,14 @@
 #include "Core/System/LogRepository.h"
 #include "Core/System/MenuRepository.h"
 #include "Core/System/OrgRepository.h"
+#include "Core/System/TenantRepository.h"
 #include "Core/System/RoleRepository.h"
 #include "Core/System/UserRepository.h"
 #include "Plugins/AuthPlugin/AuthController.h"
 #include "Plugins/DashboardPlugin/DashboardController.h"
 #include "Plugins/MonitorPlugin/MonitorController.h"
 #include "Plugins/SystemPlugin/SystemController.h"
+#include "Plugins/SystemPlugin/TenantController.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
 
@@ -29,11 +31,6 @@ namespace
     {
         return {{"Authorization", "Bearer " + token}};
     }
-
-    std::string loginBody(const std::string &username, const std::string &password, const std::string &code, const std::string &uuid)
-    {
-        return AsynGyanis::Base::ConfigValue::object({{"username", username}, {"password", password}, {"captcha", code}, {"captchaUuid", uuid}}).dump();
-    }
 } // namespace
 
 class SystemEndpointsTest : public ::testing::Test
@@ -49,6 +46,7 @@ protected:
         m_dictionary = std::make_shared<EdgePulse::System::DictionaryRepository>(m_context->database);
         m_logs       = std::make_shared<EdgePulse::System::LogRepository>(m_context->database);
         m_dataScopes = std::make_shared<EdgePulse::Auth::DataScopeService>(m_context->database);
+        m_tenants    = std::make_shared<EdgePulse::System::TenantRepository>(m_context->database);
         m_server     = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
@@ -63,7 +61,12 @@ protected:
                     systemDependencies.menus        = m_menus.get();
                     systemDependencies.org          = m_org.get();
                     systemDependencies.dictionaries = m_dictionary.get();
+                    systemDependencies.tenants      = m_tenants.get();
                     EdgePulse::System::registerSystemRoutes(router, loop, systemDependencies);
+                    EdgePulse::System::TenantDependencies tenantDependencies;
+                    tenantDependencies.auth    = m_context->auth.get();
+                    tenantDependencies.tenants = m_tenants.get();
+                    EdgePulse::System::registerTenantRoutes(router, loop, tenantDependencies);
                     EdgePulse::Monitor::MonitorDependencies monitorDependencies;
                     monitorDependencies.auth       = m_context->auth.get();
                     monitorDependencies.dataScopes = m_dataScopes.get();
@@ -92,13 +95,23 @@ protected:
 
     std::string login(const std::string &username, const std::string &password)
     {
+        return loginInTenant(username, password, "");
+    }
+
+    std::string loginInTenant(const std::string &username, const std::string &password, const std::string &tenantCode)
+    {
         const auto captcha = m_server->get("/api/auth/captcha");
         EXPECT_EQ(200, captcha.status) << captcha.body;
         const auto json = captcha.json();
         EXPECT_TRUE(json.has_value());
-        const std::string uuid     = (*json)["data"]["uuid"].get<std::string>();
-        const std::string code     = (*json)["data"]["code"].get<std::string>();
-        const auto        response = m_server->post("/api/auth/login", loginBody(username, password, code, uuid));
+        const std::string             uuid      = (*json)["data"]["uuid"].get<std::string>();
+        const std::string             code      = (*json)["data"]["code"].get<std::string>();
+        AsynGyanis::Base::ConfigValue bodyValue = AsynGyanis::Base::ConfigValue::object({{"username", username}, {"password", password}, {"captcha", code}, {"captchaUuid", uuid}});
+        if (!tenantCode.empty())
+        {
+            bodyValue["tenantCode"] = tenantCode;
+        }
+        const auto response = m_server->post("/api/auth/login", bodyValue.dump());
         EXPECT_EQ(200, response.status) << response.body;
         const auto loginJson = response.json();
         EXPECT_TRUE(loginJson.has_value());
@@ -137,6 +150,7 @@ protected:
     std::shared_ptr<EdgePulse::System::DictionaryRepository> m_dictionary;
     std::shared_ptr<EdgePulse::System::LogRepository>        m_logs;
     std::shared_ptr<EdgePulse::Auth::DataScopeService>       m_dataScopes;
+    std::shared_ptr<EdgePulse::System::TenantRepository>     m_tenants;
     std::unique_ptr<EdgePulse::TestSupport::ServerHarness>   m_server;
 };
 
@@ -260,4 +274,79 @@ TEST_F(SystemEndpointsTest, ExportsCsvWithBom)
         EXPECT_EQ(200, response.status) << path << " " << response.body;
         EXPECT_EQ(0, response.body.rfind("\xEF\xBB\xBF", 0)) << path;
     }
+}
+
+// 钉住：平台管理员建租户后，租户管理员只看本租户账号；租户管理只对平台管理员开放；停用租户阻断登录
+TEST_F(SystemEndpointsTest, TenantAdminIsIsolatedAndTenantLifecycle)
+{
+    const std::string platformToken    = login("admin", "admin123");
+    const std::string createTenantBody = AsynGyanis::Base::ConfigValue::object({{"code", "acme"},
+                                                                                {"name", "示范租户"},
+                                                                                {"remark", "协议用例"},
+                                                                                {"adminUsername", "acme-admin"},
+                                                                                {"adminNickname", "示范管理员"},
+                                                                                {"adminPassword", "acme-pass-1"}})
+                                                 .dump();
+    const auto        createdTenant    = m_server->post("/api/system/tenants", createTenantBody, "application/json", bearer(platformToken));
+    ASSERT_EQ(200, createdTenant.status) << createdTenant.body;
+    const auto createdJson = createdTenant.json();
+    ASSERT_TRUE(createdJson.has_value());
+    const std::int64_t tenantId = (*createdJson)["data"]["tenantId"].get<std::int64_t>();
+    EXPECT_GT(tenantId, 1);
+
+    const auto tenantList = m_server->get("/api/system/tenants?pageNum=1&pageSize=10&keyword=acme", bearer(platformToken));
+    ASSERT_EQ(200, tenantList.status) << tenantList.body;
+    EXPECT_EQ(1, (*tenantList.json())["data"]["total"].get<std::int64_t>());
+
+    const std::string tenantToken = loginInTenant("acme-admin", "acme-pass-1", "acme");
+    const auto        me          = m_server->get("/api/auth/me", bearer(tenantToken));
+    ASSERT_EQ(200, me.status) << me.body;
+    EXPECT_EQ(tenantId, (*me.json())["data"]["tenantId"].get<std::int64_t>());
+    EXPECT_EQ("acme", (*me.json())["data"]["tenantCode"].get<std::string>());
+    EXPECT_FALSE((*me.json())["data"]["platformAdmin"].get<bool>());
+
+    // 租户管理员只看到自己；平台管理员既能跨租户看到，也能看到默认租户
+    const auto ownUsers = m_server->get("/api/system/users?pageNum=1&pageSize=10&keyword=acme", bearer(tenantToken));
+    ASSERT_EQ(200, ownUsers.status) << ownUsers.body;
+    EXPECT_EQ(1, (*ownUsers.json())["data"]["total"].get<std::int64_t>());
+    const auto defaultAdmin = m_server->get("/api/system/users?pageNum=1&pageSize=10&keyword=admin", bearer(tenantToken));
+    ASSERT_EQ(200, defaultAdmin.status) << defaultAdmin.body;
+    // 关键词会命中租户自己的 acme-admin，但平台内置 admin 不应出现在结果里
+    EXPECT_EQ(1, (*defaultAdmin.json())["data"]["total"].get<std::int64_t>());
+    EXPECT_EQ("acme", (*defaultAdmin.json())["data"]["rows"][0]["tenantCode"].get<std::string>());
+    const auto platformUsers = m_server->get("/api/system/users?pageNum=1&pageSize=10&keyword=acme", bearer(platformToken));
+    ASSERT_EQ(200, platformUsers.status) << platformUsers.body;
+    EXPECT_EQ(1, (*platformUsers.json())["data"]["total"].get<std::int64_t>());
+    EXPECT_EQ("acme", (*platformUsers.json())["data"]["rows"][0]["tenantCode"].get<std::string>());
+
+    // 租户管理员不得管理租户
+    EXPECT_EQ(403, m_server->post("/api/system/tenants", createTenantBody, "application/json", bearer(tenantToken)).status);
+
+    // 租户管理员建的用户落在本租户；平台管理员按关键字能看到，默认租户管理员看不到
+    const std::int64_t tenantUserId = createUser(tenantToken, "acme-ops", "租户运维", 3);
+    EXPECT_GT(tenantUserId, 0);
+    const std::int64_t defaultAdminRole = 3;
+    static_cast<void>(createUser(platformToken, "default-ops", "默认运维", defaultAdminRole));
+    const std::string defaultToken = login("default-ops", "userpass1");
+    const auto        leaked       = m_server->get("/api/system/users?pageNum=1&pageSize=10&keyword=acme-ops", bearer(defaultToken));
+    ASSERT_EQ(200, leaked.status) << leaked.body;
+    EXPECT_EQ(0, (*leaked.json())["data"]["total"].get<std::int64_t>());
+    const auto visible = m_server->get("/api/system/users?pageNum=1&pageSize=10&keyword=acme-ops", bearer(platformToken));
+    ASSERT_EQ(200, visible.status) << visible.body;
+    EXPECT_EQ(1, (*visible.json())["data"]["total"].get<std::int64_t>());
+    EXPECT_EQ("acme", (*visible.json())["data"]["rows"][0]["tenantCode"].get<std::string>());
+
+    // 停用租户后新登录被拒绝
+    const std::string disableBody = R"({"status":0})";
+    ASSERT_EQ(200, m_server->send("PUT", "/api/system/tenants/" + std::to_string(tenantId), disableBody, "application/json", bearer(platformToken)).status);
+    const auto captcha = m_server->get("/api/auth/captcha");
+    ASSERT_EQ(200, captcha.status);
+    const auto        captchaJson       = captcha.json();
+    const std::string disabledLoginBody = AsynGyanis::Base::ConfigValue::object({{"username", "acme-admin"},
+                                                                                 {"password", "acme-pass-1"},
+                                                                                 {"captcha", (*captchaJson)["data"]["code"].get<std::string>()},
+                                                                                 {"captchaUuid", (*captchaJson)["data"]["uuid"].get<std::string>()},
+                                                                                 {"tenantCode", "acme"}})
+                                                  .dump();
+    EXPECT_EQ(401, m_server->post("/api/auth/login", disabledLoginBody).status);
 }

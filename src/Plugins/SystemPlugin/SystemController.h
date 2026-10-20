@@ -26,6 +26,7 @@ namespace EdgePulse::Auth
 namespace EdgePulse::System
 {
     class DictionaryRepository;
+    class TenantRepository;
     class MenuRepository;
     class OrgRepository;
     class RoleRepository;
@@ -47,6 +48,7 @@ namespace EdgePulse::System
         MenuRepository         *menus{nullptr};        ///< 菜单
         OrgRepository          *org{nullptr};          ///< 部门与岗位
         DictionaryRepository   *dictionaries{nullptr}; ///< 字典与参数
+        TenantRepository       *tenants{nullptr};      ///< 租户
     };
 
     /**

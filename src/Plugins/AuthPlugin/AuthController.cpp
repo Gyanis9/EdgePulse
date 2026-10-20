@@ -125,17 +125,18 @@ namespace EdgePulse::Auth
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
                             co_return;
                         }
-                        std::optional<std::string> username  = stringField(*body, "username");
-                        std::optional<std::string> password  = stringField(*body, "password");
-                        std::optional<std::string> captcha   = stringField(*body, "captcha");
-                        std::optional<std::string> captchaId = stringField(*body, "captchaUuid");
+                        std::optional<std::string> username   = stringField(*body, "username");
+                        std::optional<std::string> password   = stringField(*body, "password");
+                        std::optional<std::string> captcha    = stringField(*body, "captcha");
+                        std::optional<std::string> captchaId  = stringField(*body, "captchaUuid");
+                        const std::string          tenantCode = stringField(*body, "tenantCode").value_or("default");
                         // 缺字段是调用方错误：一次性说清缺哪几项，不把空串当有效输入
                         if (!username || !password || !captcha || !captchaId)
                         {
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少 username、password、captcha 或 captchaUuid", traceId);
                             co_return;
                         }
-                        const auto result = co_await authService.login(loop, LoginCredentials{*username, *password, *captcha, *captchaId, request.remoteIp(), traceId});
+                        const auto result = co_await authService.login(loop, LoginCredentials{*username, *password, *captcha, *captchaId, request.remoteIp(), traceId, tenantCode});
                         if (!result.has_value())
                         {
                             writeAuthError(response, result.error(), traceId);
@@ -182,6 +183,10 @@ namespace EdgePulse::Auth
                                                                                                    {"nickname", session->nickname},
                                                                                                    {"deptId", session->departmentId},
                                                                                                    {"deptName", session->departmentName},
+                                                                                                   {"tenantId", session->tenantId},
+                                                                                                   {"tenantCode", session->tenantCode},
+                                                                                                   {"tenantName", session->tenantName},
+                                                                                                   {"platformAdmin", session->platformAdmin},
                                                                                                    {"roles", toJsonArray(session->roles)},
                                                                                                    {"permissions", toJsonArray(session->permissions)}});
                        Common::writeSuccess(response, std::move(data), traceId);

@@ -64,9 +64,10 @@ namespace EdgePulse::Command
                        {
                            co_return;
                        }
-                       const Common::QueryMap       query = request.queryParams();
-                       const Common::PageParameters page  = Common::parsePageParameters(query);
-                       const auto  result = co_await deps->commands->list(loop, Common::queryText(query, "status"), Common::queryInteger(query, "nodeId").value_or(0), page);
+                       const Common::QueryMap       query    = request.queryParams();
+                       const Common::PageParameters page     = Common::parsePageParameters(query);
+                       const auto                   commands = deps->commands->scoped(session->tenantScope());
+                       const auto  result = co_await commands->list(loop, Common::queryText(query, "status"), Common::queryInteger(query, "nodeId").value_or(0), page);
                        ConfigValue rows   = ConfigValue::array();
                        for (const CommandRecord &command: result.rows)
                        {
@@ -100,7 +101,8 @@ namespace EdgePulse::Command
                             fail(response, Common::kCodeBadRequest, "nodeId、type 或 timeoutSeconds 不合法", traceId);
                             co_return;
                         }
-                        auto created = co_await deps->commands->create(loop, *nodeId, type, payload, session->userId, timeoutSeconds);
+                        const auto commands = deps->commands->scoped(session->tenantScope());
+                        auto       created  = co_await commands->create(loop, *nodeId, type, payload, session->userId, timeoutSeconds);
                         if (!created.has_value())
                         {
                             fail(response, Common::kCodeNotFound, "目标节点不存在", traceId);
@@ -116,9 +118,9 @@ namespace EdgePulse::Command
                             const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
                             if (co_await deps->channels->send(*nodeId, message))
                             {
-                                if (co_await deps->commands->markDispatched(loop, created->id))
+                                if (co_await commands->markDispatched(loop, created->id))
                                 {
-                                    created = co_await deps->commands->find(loop, created->id);
+                                    created = co_await commands->find(loop, created->id);
                                 }
                             }
                         }
@@ -145,7 +147,7 @@ namespace EdgePulse::Command
                            fail(response, Common::kCodeBadRequest, "命令标识不合法", traceId);
                            co_return;
                        }
-                       const auto command = co_await deps->commands->cancel(loop, *id);
+                       const auto command = co_await deps->commands->scoped(session->tenantScope())->cancel(loop, *id);
                        if (!command.has_value())
                        {
                            fail(response, Common::kCodeConflict, "命令不存在或已结束", traceId);
@@ -163,9 +165,11 @@ namespace EdgePulse::Command
     void registerCommandAgentRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const CommandDependencies &dependencyInput)
     {
         const auto deps = std::make_shared<CommandDependencies>(dependencyInput);
+        // Agent 没有会话：按全租户视图操作，归属由节点自身决定
+        const auto allCommands = deps->commands->scoped(System::TenantScope{0, true});
 
         router.get("/api/agent/commands/next",
-                   [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, deps, allCommands](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
                        const auto        nodeId  = Common::queryInteger(request.queryParams(), "nodeId");
@@ -174,7 +178,7 @@ namespace EdgePulse::Command
                            fail(response, Common::kCodeBadRequest, "缺少 nodeId", traceId);
                            co_return;
                        }
-                       const auto command = co_await deps->commands->takeNext(loop, *nodeId);
+                       const auto command = co_await allCommands->takeNext(loop, *nodeId);
                        if (!command.has_value())
                        {
                            Common::writeSuccess(response, nullptr, traceId);
@@ -189,7 +193,7 @@ namespace EdgePulse::Command
                    });
 
         router.post("/api/agent/commands/:id/result",
-                    [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, deps, allCommands](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string traceId = Web::resolveRequestId(request);
                         const auto        id      = Common::parsePositiveIdentifier(request.param("id"));
@@ -208,13 +212,13 @@ namespace EdgePulse::Command
                             fail(response, Common::kCodeBadRequest, "缺少 nodeId", traceId);
                             co_return;
                         }
-                        const auto existing = co_await deps->commands->find(loop, *id);
+                        const auto existing = co_await allCommands->find(loop, *id);
                         if (!existing.has_value() || existing->nodeId != *nodeId)
                         {
                             fail(response, Common::kCodeForbidden, "命令不属于该节点", traceId);
                             co_return;
                         }
-                        const auto finished = co_await deps->commands->finish(loop, *id, status, result, message);
+                        const auto finished = co_await allCommands->finish(loop, *id, status, result, message);
                         if (!finished.has_value())
                         {
                             fail(response, Common::kCodeConflict, "命令不存在或已结束", traceId);

@@ -6,6 +6,7 @@
 #include "Base/Security/RandomToken.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Cache/KeyValueStore.h"
+#include "Core/System/TenantRepository.h"
 #include "Core/System/UserRepository.h"
 #include "Net/Http/Client/HttpClient.h"
 
@@ -120,8 +121,8 @@ namespace EdgePulse::Auth
         }
     } // namespace
 
-    OidcService::OidcService(OidcConfiguration configuration, System::UserRepository &users, Cache::KeyValueStore &cache, AuthService &auth) :
-        m_configuration(std::move(configuration)), m_users(users), m_cache(cache), m_auth(auth)
+    OidcService::OidcService(OidcConfiguration configuration, System::UserRepository &users, System::TenantRepository &tenants, Cache::KeyValueStore &cache, AuthService &auth) :
+        m_configuration(std::move(configuration)), m_users(users), m_tenants(tenants), m_cache(cache), m_auth(auth)
     {
     }
 
@@ -442,7 +443,19 @@ namespace EdgePulse::Auth
             error = "该邮箱域不允许登录";
             co_return std::nullopt;
         }
-        const auto existing = co_await m_users.findByEmail(loop, email);
+        const auto tenant = co_await m_tenants.findByCode(loop, m_configuration.tenantCode);
+        if (!tenant.has_value())
+        {
+            error = "OIDC 绑定的租户不存在";
+            co_return std::nullopt;
+        }
+        if (tenant->status != 1)
+        {
+            error = "OIDC 绑定的租户已停用";
+            co_return std::nullopt;
+        }
+        const auto users    = m_users.scoped(System::TenantScope{tenant->id, false});
+        const auto existing = co_await users->findByEmail(loop, email);
         if (existing.has_value())
         {
             if (existing->status != 1)
@@ -458,10 +471,10 @@ namespace EdgePulse::Auth
             co_return std::nullopt;
         }
         std::string username = sanitizeUsername(claims.preferredUsername.empty() ? localPart(email) : claims.preferredUsername);
-        if (co_await m_users.usernameExists(loop, username))
+        if (co_await users->usernameExists(loop, username))
         {
             username += "_oidc";
-            if (co_await m_users.usernameExists(loop, username))
+            if (co_await users->usernameExists(loop, username))
             {
                 username += "_" + Common::randomTokenHex(2);
             }
@@ -478,7 +491,7 @@ namespace EdgePulse::Auth
         }
         // 外部身份不走口令登录：随机口令哈希后即弃，数据库里不存在可用的明文口令
         const std::string  passwordHash = Common::hashPassword(Common::randomTokenHex(32));
-        const std::int64_t userId       = co_await m_users.create(loop, write, passwordHash, 0);
+        const std::int64_t userId       = co_await users->create(loop, write, passwordHash, 0);
         if (userId <= 0)
         {
             error = "自动创建本地账号失败";

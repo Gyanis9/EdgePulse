@@ -172,7 +172,7 @@ namespace EdgePulse::Monitor
                 co_return System::LogScope{};
             }
             const EdgePulse::Auth::DataScope scope = co_await dataScopes->resolve(loop, session.userId);
-            co_return System::LogScope{scope.all, scope.selfOnly, scope.userId, scope.deptIds};
+            co_return System::LogScope{scope.all, scope.selfOnly, scope.userId, scope.deptIds, session.tenantId, session.platformAdmin};
         }
 
         void fail(AsynGyanis::Net::HttpResponse &response, const int status, const std::string &message, const std::string_view traceId)
@@ -281,7 +281,8 @@ namespace EdgePulse::Monitor
                            fail(response, Common::kCodeBadRequest, "日志标识不合法", traceId);
                            co_return;
                        }
-                       if (!co_await deps->logs->removeOperLog(loop, *id))
+                       const auto scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       if (!co_await deps->logs->removeOperLog(loop, *id, scope))
                        {
                            fail(response, Common::kCodeNotFound, "日志不存在", traceId);
                            co_return;
@@ -299,7 +300,8 @@ namespace EdgePulse::Monitor
                        {
                            co_return;
                        }
-                       static_cast<void>(co_await deps->logs->clearOperLogs(loop));
+                       const auto scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       static_cast<void>(co_await deps->logs->clearOperLogs(loop, scope));
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;
                    });
@@ -400,7 +402,8 @@ namespace EdgePulse::Monitor
                            fail(response, Common::kCodeBadRequest, "日志标识不合法", traceId);
                            co_return;
                        }
-                       if (!co_await deps->logs->removeLoginLog(loop, *id))
+                       const auto scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       if (!co_await deps->logs->removeLoginLog(loop, *id, scope))
                        {
                            fail(response, Common::kCodeNotFound, "日志不存在", traceId);
                            co_return;
@@ -418,7 +421,8 @@ namespace EdgePulse::Monitor
                        {
                            co_return;
                        }
-                       static_cast<void>(co_await deps->logs->clearLoginLogs(loop));
+                       const auto scope = co_await resolveLogScope(deps->dataScopes, loop, *session);
+                       static_cast<void>(co_await deps->logs->clearLoginLogs(loop, scope));
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;
                    });

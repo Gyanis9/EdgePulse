@@ -59,15 +59,20 @@ namespace EdgePulse::Firmware
         }
     } // namespace
 
-    FirmwareRepository::FirmwareRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    FirmwareRepository::FirmwareRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
+    }
+
+    std::shared_ptr<FirmwareRepository> FirmwareRepository::scoped(const System::TenantScope tenant) const
+    {
+        return std::make_shared<FirmwareRepository>(m_database, tenant);
     }
 
     AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::create(AsynGyanis::Core::EventLoop &loop, FirmwareRecord record)
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [record = std::move(record)](DatabaseConnection &connection) mutable -> std::int64_t
+                [record = std::move(record), tenant = m_tenant](DatabaseConnection &connection) mutable -> std::int64_t
                 {
                     if (record.id == 0)
                     {
@@ -77,12 +82,13 @@ namespace EdgePulse::Firmware
                     {
                         record.createdAt = Common::nowDateTimeUtc();
                     }
-                    const std::array<DatabaseValue, 11> parameters{record.id,     record.name,        record.version,   record.fileName,  record.contentType, record.sizeBytes,
-                                                                   record.sha256, record.storagePath, record.createdBy, record.createdAt, std::int64_t{0}};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO biz_firmware (id, name, version, file_name, content_type, size_bytes, sha256, storage_path, created_by, created_at, "
-                                            "deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    const std::array<DatabaseValue, 12> parameters{record.id,        tenant.tenantId, record.name,        record.version,   record.fileName,  record.contentType,
+                                                                   record.sizeBytes, record.sha256,   record.storagePath, record.createdBy, record.createdAt, std::int64_t{0}};
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO biz_firmware (id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, storage_path, created_by, created_at, "
+                            "deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     return record.id;
                 });
     }
@@ -91,10 +97,15 @@ namespace EdgePulse::Firmware
     {
         co_return co_await m_database->withConnection<Common::PageRows<FirmwareRecord>>(
                 loop,
-                [keyword = std::move(keyword), page](DatabaseConnection &connection) -> Common::PageRows<FirmwareRecord>
+                [keyword = std::move(keyword), page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<FirmwareRecord>
                 {
                     std::string                filter = "WHERE deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -127,10 +138,16 @@ namespace EdgePulse::Firmware
     {
         co_return co_await m_database->withConnection<std::optional<FirmwareRecord>>(
                 loop,
-                [firmwareId](DatabaseConnection &connection) -> std::optional<FirmwareRecord>
+                [firmwareId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{firmwareId};
-                    const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectFirmware} + "WHERE id = ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{firmwareId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectFirmware} + "WHERE id = ? AND deleted = 0" + clause, parameters);
                     if (!rows->next())
                     {
                         return std::nullopt;
@@ -143,16 +160,29 @@ namespace EdgePulse::Firmware
     {
         co_return co_await m_database->withConnection<std::optional<FirmwareRecord>>(
                 loop,
-                [firmwareId](DatabaseConnection &connection) -> std::optional<FirmwareRecord>
+                [firmwareId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{firmwareId};
-                    const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectFirmware} + "WHERE id = ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{firmwareId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectFirmware} + "WHERE id = ? AND deleted = 0" + clause, parameters);
                     if (!rows->next())
                     {
                         return std::nullopt;
                     }
-                    FirmwareRecord record = readFirmware(*rows);
-                    Sql::executeOrThrowVoid(connection, "UPDATE biz_firmware SET deleted = 1 WHERE id = ?", parameters);
+                    FirmwareRecord             record = readFirmware(*rows);
+                    std::vector<DatabaseValue> deleteParameters{firmwareId};
+                    std::string                deleteClause;
+                    if (!tenant.allTenants)
+                    {
+                        deleteClause = " AND tenant_id = ?";
+                        deleteParameters.emplace_back(tenant.tenantId);
+                    }
+                    Sql::executeOrThrowVoid(connection, "UPDATE biz_firmware SET deleted = 1 WHERE id = ?" + deleteClause, deleteParameters);
                     return record;
                 });
     }
@@ -161,11 +191,26 @@ namespace EdgePulse::Firmware
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [firmwareId, nodeId](DatabaseConnection &connection) -> std::int64_t
+                [firmwareId, nodeId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
-                    const std::array<DatabaseValue, 2> parameters{firmwareId, nodeId};
-                    const auto                         existing = Sql::executeOrThrow(
-                            connection, "SELECT COUNT(*) AS total FROM biz_firmware_task WHERE firmware_id = ? AND node_id = ? AND status IN ('pending', 'downloading')",
+                    // 任务与固件同租户：平台管理员跨租户下发时不能落到自身默认租户
+                    std::vector<DatabaseValue> firmwareParameters{firmwareId};
+                    std::string                firmwareClause;
+                    if (!tenant.allTenants)
+                    {
+                        firmwareClause = " AND tenant_id = ?";
+                        firmwareParameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto firmware = Sql::executeOrThrow(connection, "SELECT tenant_id FROM biz_firmware WHERE id = ? AND deleted = 0" + firmwareClause, firmwareParameters);
+                    if (!firmware->next())
+                    {
+                        return 0;
+                    }
+                    const std::int64_t         ownerTenantId = Sql::integer(*firmware, "tenant_id");
+                    std::vector<DatabaseValue> parameters{firmwareId, nodeId, ownerTenantId};
+                    const auto                 existing = Sql::executeOrThrow(
+                            connection,
+                            "SELECT COUNT(*) AS total FROM biz_firmware_task WHERE firmware_id = ? AND node_id = ? AND tenant_id = ? AND status IN ('pending', 'downloading')",
                             parameters);
                     if (existing->next() && Sql::integer(*existing, "total") > 0)
                     {
@@ -173,10 +218,10 @@ namespace EdgePulse::Firmware
                     }
                     const std::int64_t                 id  = Common::nextIdentifier();
                     const std::string                  now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 8> insertParameters{id, firmwareId, nodeId, std::string{"pending"}, std::int64_t{0}, std::string{}, now, now};
+                    const std::array<DatabaseValue, 9> insertParameters{id, ownerTenantId, firmwareId, nodeId, std::string{"pending"}, std::int64_t{0}, std::string{}, now, now};
                     Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO biz_firmware_task (id, firmware_id, node_id, status, progress, message, created_at, updated_at) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                            "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at) "
+                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             insertParameters);
                     return id;
                 });
@@ -186,11 +231,17 @@ namespace EdgePulse::Firmware
     {
         co_return co_await m_database->withConnection<std::vector<FirmwareTaskRecord>>(
                 loop,
-                [firmwareId](DatabaseConnection &connection) -> std::vector<FirmwareTaskRecord>
+                [firmwareId, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<FirmwareTaskRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{firmwareId};
-                    const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectTask} + "WHERE t.firmware_id = ? ORDER BY t.id", parameters);
-                    std::vector<FirmwareTaskRecord>    tasks;
+                    std::vector<DatabaseValue> parameters{firmwareId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND t.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectTask} + "WHERE t.firmware_id = ?" + clause + " ORDER BY t.id", parameters);
+                    std::vector<FirmwareTaskRecord> tasks;
                     while (rows->next())
                     {
                         tasks.push_back(readTask(*rows));
@@ -204,18 +255,32 @@ namespace EdgePulse::Firmware
     {
         co_return co_await m_database->withConnection<std::optional<FirmwareTaskRecord>>(
                 loop,
-                [firmwareId, nodeId, status = std::move(status), progress, message = std::move(message)](DatabaseConnection &connection) -> std::optional<FirmwareTaskRecord>
+                [firmwareId, nodeId, status = std::move(status), progress, message = std::move(message),
+                 tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareTaskRecord>
                 {
+                    std::vector<DatabaseValue> updateParameters{status, static_cast<std::int64_t>(progress), message, Common::nowDateTimeUtc(), firmwareId, nodeId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        updateParameters.emplace_back(tenant.tenantId);
+                    }
                     const auto update = Sql::executeOrThrow(
-                            connection, "UPDATE biz_firmware_task SET status = ?, progress = ?, message = ?, updated_at = ? WHERE firmware_id = ? AND node_id = ?",
-                            std::array<DatabaseValue, 6>{status, static_cast<std::int64_t>(progress), message, Common::nowDateTimeUtc(), firmwareId, nodeId});
+                            connection, "UPDATE biz_firmware_task SET status = ?, progress = ?, message = ?, updated_at = ? WHERE firmware_id = ? AND node_id = ?" + clause,
+                            updateParameters);
                     if (update->affectedRowCount() == 0)
                     {
                         return std::nullopt;
                     }
-                    const std::array<DatabaseValue, 2> queryParameters{firmwareId, nodeId};
-                    const auto                         rows =
-                            Sql::executeOrThrow(connection, std::string{kSelectTask} + "WHERE t.firmware_id = ? AND t.node_id = ? ORDER BY t.id DESC LIMIT 1", queryParameters);
+                    std::vector<DatabaseValue> queryParameters{firmwareId, nodeId};
+                    std::string                queryClause;
+                    if (!tenant.allTenants)
+                    {
+                        queryClause = " AND t.tenant_id = ?";
+                        queryParameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(
+                            connection, std::string{kSelectTask} + "WHERE t.firmware_id = ? AND t.node_id = ?" + queryClause + " ORDER BY t.id DESC LIMIT 1", queryParameters);
                     if (!rows->next())
                     {
                         return std::nullopt;

@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -33,9 +34,18 @@ namespace AsynGyanis::Net
 namespace EdgePulse::Web
 {
     /**
+     * @brief 认证后的实时订阅范围
+     */
+    struct BrowserSubscriptionScope
+    {
+        std::int64_t tenantId{0};          ///< 会话租户
+        bool         platformAdmin{false}; ///< 平台管理员订阅跨租户主题
+    };
+
+    /**
      * @brief 浏览器 WebSocket 端点
      * @details 升级后 5 秒内必须发来 {"type":"auth","token":"..."}，否则按 1008 关闭；
-     *          认证成功后订阅 nodes 主题，节点状态由集线器扇出。
+     *          认证成功后按会话租户订阅 nodes/alarms/commands 主题，平台管理员订阅跨租户主题。
      */
     class BrowserWebSocket
     {
@@ -59,10 +69,11 @@ namespace EdgePulse::Web
         /**
          * @brief 注册 /api/ws 路由
          * @param router 目标路由器
-         * @param tokenValidator 校验首条消息里的会话令牌
+         * @param tokenValidator 校验首条消息里的会话令牌并给出租户订阅范围
          * @param allowedOrigins Origin 白名单；空表示只允许同源
          */
-        void registerRoute(AsynGyanis::Net::Router &router, std::function<AsynGyanis::Core::Task<bool>(std::string_view)> tokenValidator, std::vector<std::string> allowedOrigins);
+        void registerRoute(AsynGyanis::Net::Router &router, std::function<AsynGyanis::Core::Task<std::optional<BrowserSubscriptionScope>>(std::string_view)> tokenValidator,
+                           std::vector<std::string> allowedOrigins);
 
     private:
         /**

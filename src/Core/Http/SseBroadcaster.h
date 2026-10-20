@@ -27,9 +27,11 @@ namespace EdgePulse::Web
     public:
         /**
          * @brief 登记一个订阅者
+         * @param tenantId 订阅者归属租户
+         * @param platformAdmin 是否跨租户接收
          * @return std::uint64_t 订阅标识
          */
-        std::uint64_t subscribe();
+        std::uint64_t subscribe(std::int64_t tenantId = 0, bool platformAdmin = false);
 
         /**
          * @brief 注销订阅者
@@ -40,8 +42,9 @@ namespace EdgePulse::Web
         /**
          * @brief 广播一条事件
          * @param event 已格式化的事件文本，调用方负责 SSE 字段格式
+         * @param tenantId 事件归属租户；只投递给同租户或跨租户订阅者
          */
-        void publish(std::string event);
+        void publish(std::string event, std::int64_t tenantId);
 
         /**
          * @brief 取走订阅者当前积压的事件
@@ -60,7 +63,9 @@ namespace EdgePulse::Web
     private:
         struct Subscriber
         {
-            std::vector<std::string> pending; ///< 待发事件
+            std::int64_t             tenantId{0};          ///< 订阅者租户
+            bool                     platformAdmin{false}; ///< 是否跨租户接收
+            std::vector<std::string> pending;              ///< 待发事件
         };
 
         mutable std::mutex                            m_mutex;               ///< 保护订阅表

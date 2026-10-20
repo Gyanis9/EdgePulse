@@ -61,7 +61,7 @@ namespace EdgePulse::Device
                        {
                            co_return;
                        }
-                       const auto  tree = co_await deps->groups->tree(loop);
+                       const auto  tree = co_await deps->groups->scoped(session->tenantScope())->tree(loop);
                        ConfigValue rows = ConfigValue::array();
                        for (const NodeGroupRecord &group: tree)
                        {
@@ -92,14 +92,22 @@ namespace EdgePulse::Device
                             fail(response, Common::kCodeBadRequest, "分组名称长度必须是 1 到 64 个字符", traceId);
                             co_return;
                         }
-                        const std::int64_t parentId = Json::integerField(*body, "parentId", 0);
-                        if (parentId != 0 && !(co_await deps->groups->exists(loop, parentId)))
+                        const std::int64_t  parentId = Json::integerField(*body, "parentId", 0);
+                        System::TenantScope scope    = session->tenantScope();
+                        if (session->platformAdmin)
+                        {
+                            // 平台管理员建组必须落在具体租户下，缺省为默认租户
+                            const auto requestedTenant = Json::optionalInteger(*body, "tenantId");
+                            scope                      = System::TenantScope{requestedTenant.value_or(session->tenantId), false};
+                        }
+                        const auto groups = deps->groups->scoped(scope);
+                        if (parentId != 0 && !(co_await groups->exists(loop, parentId)))
                         {
                             fail(response, Common::kCodeBadRequest, "上级分组不存在", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->groups->create(loop, parentId, name, static_cast<int>(Json::integerField(*body, "sort", 0)),
-                                                                              Json::stringField(*body, "remark"), session->userId);
+                        const std::int64_t id = co_await groups->create(loop, parentId, name, static_cast<int>(Json::integerField(*body, "sort", 0)),
+                                                                        Json::stringField(*body, "remark"), session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -126,7 +134,8 @@ namespace EdgePulse::Device
                            co_return;
                        }
                        std::optional<std::int64_t> parentId = Json::optionalInteger(*body, "parentId");
-                       if (parentId.has_value() && (*parentId == *groupId || (*parentId != 0 && !(co_await deps->groups->exists(loop, *parentId)))))
+                       const auto                  groups   = deps->groups->scoped(session->tenantScope());
+                       if (parentId.has_value() && (*parentId == *groupId || (*parentId != 0 && !(co_await groups->exists(loop, *parentId)))))
                        {
                            fail(response, Common::kCodeBadRequest, "上级分组不合法", traceId);
                            co_return;
@@ -146,7 +155,7 @@ namespace EdgePulse::Device
                        {
                            remark = Json::stringField(*body, "remark");
                        }
-                       if (!co_await deps->groups->update(loop, *groupId, parentId, std::move(name), sort, std::move(remark), session->userId))
+                       if (!co_await groups->update(loop, *groupId, parentId, std::move(name), sort, std::move(remark), session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "分组不存在", traceId);
                            co_return;
@@ -170,12 +179,12 @@ namespace EdgePulse::Device
                            fail(response, Common::kCodeBadRequest, "分组标识不合法", traceId);
                            co_return;
                        }
-                       if (co_await deps->groups->isInUse(loop, *groupId))
+                       if (co_await deps->groups->scoped(session->tenantScope())->isInUse(loop, *groupId))
                        {
                            fail(response, Common::kCodeConflict, "分组下仍有子分组或节点，不能删除", traceId);
                            co_return;
                        }
-                       if (!co_await deps->groups->remove(loop, *groupId))
+                       if (!co_await deps->groups->scoped(session->tenantScope())->remove(loop, *groupId))
                        {
                            fail(response, Common::kCodeNotFound, "分组不存在", traceId);
                            co_return;

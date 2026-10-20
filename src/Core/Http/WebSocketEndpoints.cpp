@@ -1,5 +1,7 @@
 #include "Core/Http/WebSocketEndpoints.h"
 
+#include "Core/Http/RealtimeTopics.h"
+
 #include "Base/Config/ConfigValue.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
@@ -161,8 +163,9 @@ namespace EdgePulse::Web
         m_authThreads.push_back(std::move(timer));
     }
 
-    void BrowserWebSocket::registerRoute(AsynGyanis::Net::Router &router, std::function<AsynGyanis::Core::Task<bool>(std::string_view)> tokenValidator,
-                                         std::vector<std::string> allowedOrigins)
+    void BrowserWebSocket::registerRoute(AsynGyanis::Net::Router                                                                         &router,
+                                         std::function<AsynGyanis::Core::Task<std::optional<BrowserSubscriptionScope>>(std::string_view)> tokenValidator,
+                                         std::vector<std::string>                                                                         allowedOrigins)
     {
         router.get("/api/ws",
                    [this, tokenValidator = std::move(tokenValidator),
@@ -200,13 +203,13 @@ namespace EdgePulse::Web
                                        finished->store(true);
                                        co_return;
                                    }
-                                   const std::optional<std::string> token              = parseAuthToken(first->payload);
-                                   bool                             authenticatedToken = false;
+                                   const std::optional<std::string>        token = parseAuthToken(first->payload);
+                                   std::optional<BrowserSubscriptionScope> scope;
                                    if (token.has_value())
                                    {
-                                       authenticatedToken = co_await tokenValidator(*token);
+                                       scope = co_await tokenValidator(*token);
                                    }
-                                   if (!authenticatedToken)
+                                   if (!scope.has_value())
                                    {
                                        // 明确的策略拒绝：先关 1008，再让会话收口
                                        co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unauthorized");
@@ -220,10 +223,14 @@ namespace EdgePulse::Web
                                        finished->store(true);
                                        co_return;
                                    }
-                                   // 认证回执之后所有出站都走集线器，处理器只读入站帧；三类主题共用同一条连接
-                                   AsynGyanis::Net::WebSocketSubscription nodeSubscription    = m_hub.subscribe(kNodeTopic, peer);
-                                   AsynGyanis::Net::WebSocketSubscription alarmSubscription   = m_hub.subscribe("alarms", peer);
-                                   AsynGyanis::Net::WebSocketSubscription commandSubscription = m_hub.subscribe("commands", peer);
+                                   // 认证回执之后所有出站都走集线器，处理器只读入站帧；三类主题共用同一条连接。
+                                   // 平台管理员订阅跨租户主题，其余账号只订阅本租户主题，避免实时推送越权。
+                                   const std::string                      nodeTopic    = scope->platformAdmin ? std::string{kNodeTopic} : tenantTopic(kNodeTopic, scope->tenantId);
+                                   const std::string                      alarmTopic   = scope->platformAdmin ? std::string{"alarms"} : tenantTopic("alarms", scope->tenantId);
+                                   const std::string                      commandTopic = scope->platformAdmin ? std::string{"commands"} : tenantTopic("commands", scope->tenantId);
+                                   AsynGyanis::Net::WebSocketSubscription nodeSubscription    = m_hub.subscribe(nodeTopic, peer);
+                                   AsynGyanis::Net::WebSocketSubscription alarmSubscription   = m_hub.subscribe(alarmTopic, peer);
+                                   AsynGyanis::Net::WebSocketSubscription commandSubscription = m_hub.subscribe(commandTopic, peer);
                                    while (const auto message = co_await peer.receive())
                                    {
                                        // 客户端保活文本只用于续上连接的空闲计时，内容不参与业务

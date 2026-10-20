@@ -92,6 +92,7 @@ namespace EdgePulse::Device
         }
 
         AgentUpsert upsert;
+        upsert.tenantId        = registration.tenantId;
         upsert.name            = registration.name;
         upsert.agentVersion    = registration.agentVersion;
         upsert.certFingerprint = *fingerprint;
@@ -107,7 +108,8 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "nodeId 必须是正整数"});
         }
-        const std::optional<NodeRecord> node = co_await m_repository->heartbeat(loop, nodeId, std::move(agentVersion));
+        // Agent 侧没有会话，节点标识全局唯一；按全租户视图查节点，避免只认默认租户
+        const std::optional<NodeRecord> node = co_await m_repository->scoped(System::TenantScope{0, true})->heartbeat(loop, nodeId, std::move(agentVersion));
         if (!node.has_value())
         {
             co_return std::unexpected(AgentError{AgentError::Reason::NotFound, "节点不存在或已删除"});

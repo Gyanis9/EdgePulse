@@ -70,7 +70,7 @@ namespace EdgePulse::Dashboard
                 co_return System::LogScope{};
             }
             const EdgePulse::Auth::DataScope scope = co_await dataScopes->resolve(loop, session.userId);
-            co_return System::LogScope{scope.all, scope.selfOnly, scope.userId, scope.deptIds};
+            co_return System::LogScope{scope.all, scope.selfOnly, scope.userId, scope.deptIds, session.tenantId, session.platformAdmin};
         }
     } // namespace
 

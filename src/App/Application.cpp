@@ -34,6 +34,7 @@
 #include "Core/System/OrgRepository.h"
 #include "Core/System/RoleRepository.h"
 #include "Core/System/UserRepository.h"
+#include "Core/System/TenantRepository.h"
 #include "Core/Device/NodeGroupRepository.h"
 #include "Core/Telemetry/TelemetryRepository.h"
 #include "Core/Telemetry/UdpTelemetryEndpoint.h"
@@ -55,7 +56,9 @@
 #include "Plugins/DashboardPlugin/DashboardController.h"
 #include "Plugins/MonitorPlugin/MonitorController.h"
 #include "Plugins/SystemPlugin/SystemController.h"
+#include "Plugins/SystemPlugin/TenantController.h"
 #include "Core/Http/MiddlewareSetup.h"
+#include "Core/Http/RealtimeTopics.h"
 #include "Core/Http/ReverseProxy.h"
 
 #include "Core/EventLoop/IoContext.h"
@@ -172,10 +175,11 @@ namespace EdgePulse::App
             {
                 m_cache = std::make_shared<Cache::MemoryKeyValueStore>();
             }
+            m_tenantRepository = std::make_shared<System::TenantRepository>(m_database);
             m_sessionStore     = std::make_shared<Auth::SessionStore>(m_cache, m_configuration.sessionTtlSeconds);
             m_captchaService   = std::make_shared<Auth::CaptchaService>(m_cache, Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
             m_loginAudit       = std::make_shared<Auth::LoginAudit>(m_database);
-            m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache);
+            m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache, m_tenantRepository);
             m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>(loop);
             m_nodeRepository   = std::make_shared<Device::NodeRepository>(m_database);
             m_nodeService      = std::make_shared<Device::NodeService>(m_nodeRepository);
@@ -187,7 +191,10 @@ namespace EdgePulse::App
             agentOptions.publisher = [webSocket = m_browserWebSocket](const Device::NodeRecord &node) -> AsynGyanis::Core::Task<>
             {
                 const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "node.status"}, {"data", Device::nodeToJson(node)}}).dump();
+                // 跨租户主题给平台管理员，租户主题给本租户账号；两份内容相同
                 co_await webSocket->hub().publish("nodes", payload);
+                co_await webSocket->hub().publish(Web::tenantTopic("nodes", node.tenantId), payload);
+                co_return;
             };
             m_agentRegistry  = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
             m_userRepository = std::make_shared<System::UserRepository>(m_database);
@@ -205,7 +212,8 @@ namespace EdgePulse::App
                 oidcConfiguration.defaultRoleId       = m_configuration.oidcDefaultRoleId;
                 oidcConfiguration.defaultDepartmentId = m_configuration.oidcDefaultDepartmentId;
                 oidcConfiguration.allowedEmailDomains = m_configuration.oidcAllowedEmailDomains;
-                m_oidcService                         = std::make_unique<Auth::OidcService>(oidcConfiguration, *m_userRepository, *m_cache, *m_authService);
+                oidcConfiguration.tenantCode          = m_configuration.oidcTenantCode;
+                m_oidcService                         = std::make_unique<Auth::OidcService>(oidcConfiguration, *m_userRepository, *m_tenantRepository, *m_cache, *m_authService);
             }
             m_roleRepository       = std::make_shared<System::RoleRepository>(m_database);
             m_menuRepository       = std::make_shared<System::MenuRepository>(m_database);
@@ -235,8 +243,9 @@ namespace EdgePulse::App
                                                                                                                                            {"triggeredAt", alarm.triggeredAt},
                                                                                                                                            {"resolvedAt", alarm.resolvedAt}})}})
                                                             .dump();
-                        broadcaster->publish(payload);
+                        broadcaster->publish(payload, alarm.tenantId);
                         co_await webSocket->hub().publish("alarms", payload);
+                        co_await webSocket->hub().publish(Web::tenantTopic("alarms", alarm.tenantId), payload);
                         co_return;
                     });
             m_firmwareRepository = std::make_shared<Firmware::FirmwareRepository>(m_database);
@@ -418,7 +427,7 @@ namespace EdgePulse::App
                 }
                 m_agentServer->setClientCertificateRequired(true);
                 Web::applySecurityHeaders(m_agentServer->router());
-                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry);
+                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_tenantRepository);
                 Telemetry::TelemetryDependencies telemetryAgentDependencies;
                 telemetryAgentDependencies.auth      = m_authService.get();
                 telemetryAgentDependencies.nodes     = m_nodeRepository.get();
@@ -505,7 +514,12 @@ namespace EdgePulse::App
         systemDependencies.menus        = m_menuRepository.get();
         systemDependencies.org          = m_orgRepository.get();
         systemDependencies.dictionaries = m_dictionaryRepository.get();
+        systemDependencies.tenants      = m_tenantRepository.get();
         System::registerSystemRoutes(router, loop, systemDependencies);
+        System::TenantDependencies tenantDependencies;
+        tenantDependencies.auth    = m_authService.get();
+        tenantDependencies.tenants = m_tenantRepository.get();
+        System::registerTenantRoutes(router, loop, tenantDependencies);
         Monitor::MonitorDependencies monitorDependencies;
         monitorDependencies.auth       = m_authService.get();
         monitorDependencies.dataScopes = m_dataScopeService.get();
@@ -545,6 +559,7 @@ namespace EdgePulse::App
                                               {{"id", command.id}, {"nodeId", command.nodeId}, {"type", command.type}, {"status", command.status}, {"message", command.message}})}})
                             .dump();
             co_await webSocket->hub().publish("commands", payload);
+            co_await webSocket->hub().publish(Web::tenantTopic("commands", command.tenantId), payload);
             co_return;
         };
         Command::CommandDependencies commandDependencies;
@@ -586,12 +601,22 @@ namespace EdgePulse::App
             {
                 co_return std::nullopt;
             }
-            co_return Device::AccessContext{session->userId, session->username, session->departmentId, session->roles, session->permissions};
+            co_return Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
+                                            session->departmentId, session->roles,    session->permissions};
         };
         Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get());
         m_browserWebSocket->registerRoute(
-                router, [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<bool>
-                { co_return (co_await auth->authenticate(loop, token)).has_value(); }, m_configuration.allowedOrigins);
+                router,
+                [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<std::optional<Web::BrowserSubscriptionScope>>
+                {
+                    const auto session = co_await auth->authenticate(loop, token);
+                    if (!session.has_value())
+                    {
+                        co_return std::nullopt;
+                    }
+                    co_return Web::BrowserSubscriptionScope{session->tenantId, session->platformAdmin};
+                },
+                m_configuration.allowedOrigins);
         if (m_configuration.reverseProxyEnabled)
         {
             Web::ReverseProxyConfiguration proxyConfiguration;

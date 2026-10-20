@@ -20,6 +20,10 @@ namespace EdgePulse::Cache
 {
     class MemoryKeyValueStore;
 }
+namespace EdgePulse::System
+{
+    class TenantRepository;
+}
 namespace EdgePulse::Auth
 {
     class AuthService;
@@ -49,6 +53,7 @@ namespace EdgePulse::TestSupport
         std::shared_ptr<Auth::CaptchaService>       captcha;  ///< 验证码
         std::shared_ptr<Auth::LoginAudit>           audit;    ///< 登录审计
         std::shared_ptr<Auth::AuthService>          auth;     ///< 认证服务
+        std::shared_ptr<System::TenantRepository>   tenants;  ///< 租户
 
         /// 临时数据库文件路径
         [[nodiscard]] const std::filesystem::path &databasePath() const noexcept

@@ -33,6 +33,10 @@ namespace EdgePulse::Auth
                 permissions.push_back(permission);
             }
             return AsynGyanis::Base::ConfigValue::object({{"userId", record.userId},
+                                                          {"tenantId", record.tenantId},
+                                                          {"tenantCode", record.tenantCode},
+                                                          {"tenantName", record.tenantName},
+                                                          {"platformAdmin", record.platformAdmin},
                                                           {"username", record.username},
                                                           {"nickname", record.nickname},
                                                           {"departmentId", record.departmentId},
@@ -52,6 +56,10 @@ namespace EdgePulse::Auth
             SessionRecord record;
             record.token          = std::string{token};
             record.userId         = value->value("userId", std::int64_t{0});
+            record.tenantId       = value->value("tenantId", std::int64_t{1});
+            record.tenantCode     = value->value("tenantCode", std::string{"default"});
+            record.tenantName     = value->value("tenantName", std::string{});
+            record.platformAdmin  = value->value("platformAdmin", false);
             record.username       = value->value("username", std::string{});
             record.nickname       = value->value("nickname", std::string{});
             record.departmentId   = value->value("departmentId", std::int64_t{0});

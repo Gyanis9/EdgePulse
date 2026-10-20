@@ -181,7 +181,7 @@ namespace EdgePulse::Firmware
                        }
                        const Common::QueryMap       query  = request.queryParams();
                        const Common::PageParameters page   = Common::parsePageParameters(query);
-                       const auto                   result = co_await deps->firmware->list(loop, Common::queryText(query, "keyword"), page);
+                       const auto                   result = co_await deps->firmware->scoped(session->tenantScope())->list(loop, Common::queryText(query, "keyword"), page);
                        ConfigValue                  rows   = ConfigValue::array();
                        for (const FirmwareRecord &record: result.rows)
                        {
@@ -206,7 +206,7 @@ namespace EdgePulse::Firmware
                            fail(response, Common::kCodeBadRequest, "固件标识不合法", traceId);
                            co_return;
                        }
-                       const auto  tasks = co_await deps->firmware->tasks(loop, *id);
+                       const auto  tasks = co_await deps->firmware->scoped(session->tenantScope())->tasks(loop, *id);
                        ConfigValue rows  = ConfigValue::array();
                        for (const FirmwareTaskRecord &task: tasks)
                        {
@@ -238,6 +238,16 @@ namespace EdgePulse::Firmware
                                      fail(response, Common::kCodeBadRequest, "缺少 name 或 version", traceId);
                                      co_return;
                                  }
+                                 std::int64_t targetTenantId = session->tenantId;
+                                 if (session->platformAdmin)
+                                 {
+                                     const auto requestedTenant = Common::queryInteger(query, "tenantId");
+                                     if (requestedTenant.has_value() && *requestedTenant > 0)
+                                     {
+                                         targetTenantId = *requestedTenant;
+                                     }
+                                 }
+                                 const auto                        firmware   = deps->firmware->scoped(System::TenantScope{targetTenantId, false});
                                  AsynGyanis::Net::HttpRequestBody *bodyStream = request.bodyStream();
                                  if (bodyStream == nullptr)
                                  {
@@ -301,7 +311,7 @@ namespace EdgePulse::Firmware
                                  record.createdAt   = Common::nowDateTimeUtc();
                                  try
                                  {
-                                     static_cast<void>(co_await deps->firmware->create(loop, record));
+                                     static_cast<void>(co_await firmware->create(loop, record));
                                  } catch (const std::exception &failure)
                                  {
                                      std::error_code error;
@@ -329,7 +339,7 @@ namespace EdgePulse::Firmware
                             fail(response, Common::kCodeBadRequest, "固件标识或请求正文不合法", traceId);
                             co_return;
                         }
-                        const auto firmware = co_await deps->firmware->find(loop, *id);
+                        const auto firmware = co_await deps->firmware->scoped(session->tenantScope())->find(loop, *id);
                         if (!firmware.has_value())
                         {
                             fail(response, Common::kCodeNotFound, "固件不存在", traceId);
@@ -341,15 +351,17 @@ namespace EdgePulse::Firmware
                             fail(response, Common::kCodeBadRequest, "nodeIds 不能为空", traceId);
                             co_return;
                         }
-                        ConfigValue results = ConfigValue::array();
+                        const auto  firmwareRepo = deps->firmware->scoped(session->tenantScope());
+                        const auto  commandRepo  = deps->commands->scoped(session->tenantScope());
+                        ConfigValue results      = ConfigValue::array();
                         for (const std::int64_t nodeId: nodeIds)
                         {
-                            const std::int64_t taskId = co_await deps->firmware->createTask(loop, *id, nodeId);
+                            const std::int64_t taskId = co_await firmwareRepo->createTask(loop, *id, nodeId);
                             if (taskId == 0)
                             {
                                 continue;
                             }
-                            const auto command = co_await deps->commands->create(loop, nodeId, "firmware.update", downloadPayload(*firmware), session->userId, 600);
+                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(*firmware), session->userId, 600);
                             if (!command.has_value())
                             {
                                 continue;
@@ -364,7 +376,7 @@ namespace EdgePulse::Firmware
                                 const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
                                 if (co_await deps->channels->send(nodeId, message))
                                 {
-                                    static_cast<void>(co_await deps->commands->markDispatched(loop, command->id));
+                                    static_cast<void>(co_await commandRepo->markDispatched(loop, command->id));
                                 }
                             }
                             if (deps->notifier)
@@ -392,7 +404,7 @@ namespace EdgePulse::Firmware
                            fail(response, Common::kCodeBadRequest, "固件标识不合法", traceId);
                            co_return;
                        }
-                       const auto removed = co_await deps->firmware->remove(loop, *id);
+                       const auto removed = co_await deps->firmware->scoped(session->tenantScope())->remove(loop, *id);
                        if (!removed.has_value())
                        {
                            fail(response, Common::kCodeNotFound, "固件不存在", traceId);
@@ -408,9 +420,11 @@ namespace EdgePulse::Firmware
     void registerFirmwareAgentRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const FirmwareDependencies &dependencyInput)
     {
         const auto deps = std::make_shared<FirmwareDependencies>(dependencyInput);
+        // Agent 没有会话：固件下载与任务回写按全租户视图查找，归属由固件自身决定
+        const auto allFirmware = deps->firmware->scoped(System::TenantScope{0, true});
 
         router.get("/api/agent/firmware/:id/download",
-                   [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, deps, allFirmware](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
                        const auto        id      = Common::parsePositiveIdentifier(request.param("id"));
@@ -419,7 +433,7 @@ namespace EdgePulse::Firmware
                            fail(response, Common::kCodeBadRequest, "固件标识不合法", traceId);
                            co_return;
                        }
-                       const auto firmware = co_await deps->firmware->find(loop, *id);
+                       const auto firmware = co_await allFirmware->find(loop, *id);
                        if (!firmware.has_value())
                        {
                            fail(response, Common::kCodeNotFound, "固件不存在", traceId);
@@ -466,7 +480,7 @@ namespace EdgePulse::Firmware
                    });
 
         router.post("/api/agent/firmware/:id/status",
-                    [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, deps, allFirmware](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string traceId = Web::resolveRequestId(request);
                         const auto        id      = Common::parsePositiveIdentifier(request.param("id"));
@@ -485,7 +499,7 @@ namespace EdgePulse::Firmware
                             fail(response, Common::kCodeBadRequest, "nodeId 或状态不合法", traceId);
                             co_return;
                         }
-                        const auto task = co_await deps->firmware->updateTask(loop, *id, *nodeId, status, progress, message);
+                        const auto task = co_await allFirmware->updateTask(loop, *id, *nodeId, status, progress, message);
                         if (!task.has_value())
                         {
                             fail(response, Common::kCodeNotFound, "固件任务不存在", traceId);

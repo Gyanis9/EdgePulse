@@ -19,7 +19,7 @@ namespace EdgePulse::Device
 {
     namespace
     {
-        constexpr const char *kNodeColumns = "id, name, status, agent_version, cert_fingerprint, labels, last_seen, version, group_id, owner_dept_id, created_by, "
+        constexpr const char *kNodeColumns = "id, tenant_id, name, status, agent_version, cert_fingerprint, labels, last_seen, version, group_id, owner_dept_id, created_by, "
                                              "(SELECT name FROM biz_node_group g WHERE g.id = biz_node.group_id AND g.deleted = 0) AS group_name";
 
         [[nodiscard]] std::string readText(const AsynGyanis::Database::DatabaseValue &value)
@@ -50,6 +50,7 @@ namespace EdgePulse::Device
         {
             NodeRecord node;
             node.id              = readInteger(result.getValue("id"));
+            node.tenantId        = readInteger(result.getValue("tenant_id"));
             node.name            = readText(result.getValue("name"));
             node.status          = readText(result.getValue("status"));
             node.agentVersion    = readText(result.getValue("agent_version"));
@@ -64,11 +65,18 @@ namespace EdgePulse::Device
             return node;
         }
 
-        [[nodiscard]] std::optional<NodeRecord> findByIdOnConnection(AsynGyanis::Database::DatabaseConnection &connection, const std::int64_t nodeId)
+        [[nodiscard]] std::optional<NodeRecord> findByIdOnConnection(AsynGyanis::Database::DatabaseConnection &connection, const std::int64_t nodeId,
+                                                                     const System::TenantScope &tenant)
         {
-            const std::array<AsynGyanis::Database::DatabaseValue, 1>    parameters{nodeId};
+            std::vector<AsynGyanis::Database::DatabaseValue> parameters{nodeId};
+            std::string                                      clause;
+            if (!tenant.allTenants)
+            {
+                clause = " AND tenant_id = ?";
+                parameters.emplace_back(tenant.tenantId);
+            }
             const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result =
-                    connection.execute(std::string{"SELECT "} + kNodeColumns + " FROM biz_node WHERE id = ? AND deleted = 0", parameters);
+                    connection.execute(std::string{"SELECT "} + kNodeColumns + " FROM biz_node WHERE id = ? AND deleted = 0" + clause, parameters);
             if (!result)
             {
                 throw Common::DatabaseException("查询节点失败：" + connection.lastError());
@@ -80,11 +88,18 @@ namespace EdgePulse::Device
             return readNode(*result);
         }
 
-        [[nodiscard]] std::optional<NodeRecord> findByNameOnConnection(AsynGyanis::Database::DatabaseConnection &connection, const std::string &name)
+        [[nodiscard]] std::optional<NodeRecord> findByNameOnConnection(AsynGyanis::Database::DatabaseConnection &connection, const std::string &name,
+                                                                       const System::TenantScope &tenant)
         {
-            const std::array<AsynGyanis::Database::DatabaseValue, 1>    parameters{name};
+            std::vector<AsynGyanis::Database::DatabaseValue> parameters{name};
+            std::string                                      clause;
+            if (!tenant.allTenants)
+            {
+                clause = " AND tenant_id = ?";
+                parameters.emplace_back(tenant.tenantId);
+            }
             const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result =
-                    connection.execute(std::string{"SELECT "} + kNodeColumns + " FROM biz_node WHERE name = ? AND deleted = 0", parameters);
+                    connection.execute(std::string{"SELECT "} + kNodeColumns + " FROM biz_node WHERE name = ? AND deleted = 0" + clause, parameters);
             if (!result)
             {
                 throw Common::DatabaseException("按名称查询节点失败：" + connection.lastError());
@@ -99,13 +114,14 @@ namespace EdgePulse::Device
         /**
          * @brief 写一条新节点；调用方保证名称未占用
          */
-        [[nodiscard]] NodeRecord insertNode(AsynGyanis::Database::DatabaseConnection &connection, const std::string &name, const std::string &labelsJson, const std::string &status,
-                                            const std::string &agentVersion, const std::string &certFingerprint, const std::string &lastSeen, const std::int64_t groupId = 200,
-                                            const std::int64_t ownerDeptId = 0, const std::int64_t createdBy = 0)
+        [[nodiscard]] NodeRecord insertNode(AsynGyanis::Database::DatabaseConnection &connection, const std::int64_t tenantId, const std::string &name,
+                                            const std::string &labelsJson, const std::string &status, const std::string &agentVersion, const std::string &certFingerprint,
+                                            const std::string &lastSeen, const std::int64_t groupId = 200, const std::int64_t ownerDeptId = 0, const std::int64_t createdBy = 0)
         {
             const std::int64_t                                          id  = Common::nextIdentifier();
             const std::string                                           now = Common::nowDateTimeUtc();
             std::vector<AsynGyanis::Database::DatabaseValue>            parameters{id,
+                                                                                   tenantId,
                                                                                    name,
                                                                                    status,
                                                                                    agentVersion,
@@ -119,8 +135,8 @@ namespace EdgePulse::Device
                                                                                    groupId,
                                                                                    ownerDeptId};
             const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
-                    "INSERT INTO biz_node (id, name, status, agent_version, cert_fingerprint, labels, last_seen, version, deleted, created_at, updated_at, created_by, "
-                    "updated_by, group_id, owner_dept_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, 0, ?, ?)",
+                    "INSERT INTO biz_node (id, tenant_id, name, status, agent_version, cert_fingerprint, labels, last_seen, version, deleted, created_at, updated_at, created_by, "
+                    "updated_by, group_id, owner_dept_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, 0, ?, ?)",
                     parameters);
             if (!result)
             {
@@ -128,6 +144,7 @@ namespace EdgePulse::Device
             }
             NodeRecord node;
             node.id              = id;
+            node.tenantId        = tenantId;
             node.name            = name;
             node.status          = status;
             node.agentVersion    = agentVersion;
@@ -142,8 +159,13 @@ namespace EdgePulse::Device
         }
     } // namespace
 
-    NodeRepository::NodeRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    NodeRepository::NodeRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
+    }
+
+    std::shared_ptr<NodeRepository> NodeRepository::scoped(const System::TenantScope tenant) const
+    {
+        return std::make_shared<NodeRepository>(m_database, tenant);
     }
 
     AsynGyanis::Core::Task<NodePage> NodeRepository::list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status,
@@ -151,11 +173,17 @@ namespace EdgePulse::Device
     {
         co_return co_await m_database->withConnection<NodePage>(
                 loop,
-                [parameters, keyword = std::move(keyword), status = std::move(status), groupId, scope](AsynGyanis::Database::DatabaseConnection &connection) -> NodePage
+                [parameters, keyword = std::move(keyword), status = std::move(status), groupId, scope,
+                 tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> NodePage
                 {
                     const std::string keywordPattern = "%" + keyword + "%";
                     std::string       filter         = " FROM biz_node WHERE deleted = 0 AND (? = '' OR name LIKE ?) AND (? = '' OR status = ?) AND (? = 0 OR group_id = ?)";
                     std::vector<AsynGyanis::Database::DatabaseValue> countParameters{keyword, keywordPattern, status, status, groupId, groupId};
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        countParameters.emplace_back(tenant.tenantId);
+                    }
                     if (!scope.all)
                     {
                         if (scope.selfOnly)
@@ -207,22 +235,24 @@ namespace EdgePulse::Device
 
     AsynGyanis::Core::Task<std::optional<NodeRecord>> NodeRepository::findById(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
     {
-        co_return co_await m_database->withConnection<std::optional<NodeRecord>>(loop, [nodeId](AsynGyanis::Database::DatabaseConnection &connection)
-                                                                                 { return findByIdOnConnection(connection, nodeId); });
+        co_return co_await m_database->withConnection<std::optional<NodeRecord>>(loop, [nodeId, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection)
+                                                                                 { return findByIdOnConnection(connection, nodeId, tenant); });
     }
 
     AsynGyanis::Core::Task<std::optional<NodeRecord>> NodeRepository::findByName(AsynGyanis::Core::EventLoop &loop, std::string name)
     {
-        co_return co_await m_database->withConnection<std::optional<NodeRecord>>(loop, [name = std::move(name)](AsynGyanis::Database::DatabaseConnection &connection)
-                                                                                 { return findByNameOnConnection(connection, name); });
+        co_return co_await m_database->withConnection<std::optional<NodeRecord>>(loop,
+                                                                                 [name = std::move(name), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection)
+                                                                                 { return findByNameOnConnection(connection, name, tenant); });
     }
 
     AsynGyanis::Core::Task<NodeRecord> NodeRepository::create(AsynGyanis::Core::EventLoop &loop, std::string name, std::string labelsJson, const std::int64_t groupId,
                                                               const std::int64_t ownerDeptId, const std::int64_t createdBy)
     {
         co_return co_await m_database->withConnection<NodeRecord>(
-                loop, [name = std::move(name), labelsJson = std::move(labelsJson), groupId, ownerDeptId, createdBy](AsynGyanis::Database::DatabaseConnection &connection)
-                { return insertNode(connection, name, labelsJson, "offline", "", "", "", groupId, ownerDeptId, createdBy); });
+                loop, [name = std::move(name), labelsJson = std::move(labelsJson), groupId, ownerDeptId, createdBy,
+                       tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection)
+                { return insertNode(connection, tenant.tenantId, name, labelsJson, "offline", "", "", "", groupId, ownerDeptId, createdBy); });
     }
 
     AsynGyanis::Core::Task<std::expected<NodeRecord, NodeMutationFailure>> NodeRepository::update(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
@@ -231,21 +261,27 @@ namespace EdgePulse::Device
     {
         co_return co_await m_database->withConnection<std::expected<NodeRecord, NodeMutationFailure>>(
                 loop,
-                [nodeId, name = std::move(name), labelsJson = std::move(labelsJson), groupId,
-                 expectedVersion](AsynGyanis::Database::DatabaseConnection &connection) -> std::expected<NodeRecord, NodeMutationFailure>
+                [nodeId, name = std::move(name), labelsJson = std::move(labelsJson), groupId, expectedVersion,
+                 tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::expected<NodeRecord, NodeMutationFailure>
                 {
-                    const std::optional<NodeRecord> current = findByIdOnConnection(connection, nodeId);
+                    const std::optional<NodeRecord> current = findByIdOnConnection(connection, nodeId, tenant);
                     if (!current.has_value())
                     {
                         return std::unexpected(NodeMutationFailure::NotFound);
                     }
-                    const std::string                                           newName   = name.value_or(current->name);
-                    const std::string                                           newLabels = labelsJson.value_or(current->labelsJson);
-                    const std::int64_t                                          newGroup  = groupId.value_or(current->groupId);
-                    const std::string                                           now       = Common::nowDateTimeUtc();
-                    const std::array<AsynGyanis::Database::DatabaseValue, 6>    parameters{newName, nullableText(newLabels), newGroup, now, nodeId, expectedVersion};
+                    const std::string                                newName   = name.value_or(current->name);
+                    const std::string                                newLabels = labelsJson.value_or(current->labelsJson);
+                    const std::int64_t                               newGroup  = groupId.value_or(current->groupId);
+                    const std::string                                now       = Common::nowDateTimeUtc();
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{newName, nullableText(newLabels), newGroup, now, nodeId, expectedVersion};
+                    std::string                                      clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
                     const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
-                            "UPDATE biz_node SET name = ?, labels = ?, group_id = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0",
+                            "UPDATE biz_node SET name = ?, labels = ?, group_id = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0" + clause,
                             parameters);
                     if (!result)
                     {
@@ -254,8 +290,8 @@ namespace EdgePulse::Device
                     // 影响行数为 0：节点在读取之后被删除或版本已变
                     if (result->affectedRowCount() == 0)
                     {
-                        return findByIdOnConnection(connection, nodeId).has_value() ? std::unexpected(NodeMutationFailure::Conflict)
-                                                                                    : std::unexpected(NodeMutationFailure::NotFound);
+                        return findByIdOnConnection(connection, nodeId, tenant).has_value() ? std::unexpected(NodeMutationFailure::Conflict)
+                                                                                            : std::unexpected(NodeMutationFailure::NotFound);
                     }
                     NodeRecord updated = *current;
                     updated.name       = newName;
@@ -269,11 +305,17 @@ namespace EdgePulse::Device
     AsynGyanis::Core::Task<bool> NodeRepository::remove(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [nodeId](AsynGyanis::Database::DatabaseConnection &connection) -> bool
+                                                            [nodeId, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> bool
                                                             {
-                                                                const std::array<AsynGyanis::Database::DatabaseValue, 2>    parameters{Common::nowDateTimeUtc(), nodeId};
+                                                                std::vector<AsynGyanis::Database::DatabaseValue> parameters{Common::nowDateTimeUtc(), nodeId};
+                                                                std::string                                      clause;
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    clause = " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
                                                                 const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
-                                                                        "UPDATE biz_node SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
+                                                                        "UPDATE biz_node SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
                                                                 if (!result)
                                                                 {
                                                                     throw Common::DatabaseException("删除节点失败：" + connection.lastError());
@@ -288,11 +330,13 @@ namespace EdgePulse::Device
                 loop,
                 [registration = std::move(registration)](AsynGyanis::Database::DatabaseConnection &connection) -> NodeRecord
                 {
-                    const std::string               now     = Common::nowDateTimeUtc();
-                    const std::optional<NodeRecord> current = findByNameOnConnection(connection, registration.name);
+                    const std::string               now = Common::nowDateTimeUtc();
+                    const System::TenantScope       tenant{registration.tenantId, false};
+                    const std::optional<NodeRecord> current = findByNameOnConnection(connection, registration.name, tenant);
                     if (!current.has_value())
                     {
-                        return insertNode(connection, registration.name, registration.labelsJson, "online", registration.agentVersion, registration.certFingerprint, now);
+                        return insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
+                                          registration.certFingerprint, now);
                     }
                     const std::array<AsynGyanis::Database::DatabaseValue, 6> parameters{
                             registration.agentVersion, registration.certFingerprint, nullableText(registration.labelsJson), now, now, current->id};
@@ -319,18 +363,26 @@ namespace EdgePulse::Device
     {
         co_return co_await m_database->withConnection<std::optional<NodeRecord>>(
                 loop,
-                [nodeId, agentVersion = std::move(agentVersion)](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<NodeRecord>
+                [nodeId, agentVersion = std::move(agentVersion), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<NodeRecord>
                 {
-                    const std::string                                           now    = Common::nowDateTimeUtc();
+                    const std::string                                now = Common::nowDateTimeUtc();
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{now, agentVersion, agentVersion, now, nodeId};
+                    std::string                                      clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
                     const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
                             "UPDATE biz_node SET status = 'online', last_seen = ?, agent_version = CASE WHEN ? = '' THEN agent_version ELSE ? END, version = version + 1, "
-                            "updated_at = ? WHERE id = ? AND deleted = 0",
-                            std::array<AsynGyanis::Database::DatabaseValue, 5>{now, agentVersion, agentVersion, now, nodeId});
+                            "updated_at = ? WHERE id = ? AND deleted = 0" +
+                                    clause,
+                            parameters);
                     if (!result)
                     {
                         throw Common::DatabaseException("更新节点心跳失败：" + connection.lastError());
                     }
-                    return findByIdOnConnection(connection, nodeId);
+                    return findByIdOnConnection(connection, nodeId, tenant);
                 });
     }
 } // namespace EdgePulse::Device

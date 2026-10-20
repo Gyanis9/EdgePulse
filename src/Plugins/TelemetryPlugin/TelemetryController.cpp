@@ -64,12 +64,14 @@ namespace EdgePulse::Telemetry
                            fail(response, Common::kCodeBadRequest, "缺少 nodeId", traceId);
                            co_return;
                        }
-                       if (!(co_await deps->nodes->findById(loop, *nodeId)).has_value())
+                       const auto nodes = deps->nodes->scoped(session->tenantScope());
+                       if (!(co_await nodes->findById(loop, *nodeId)).has_value())
                        {
                            fail(response, Common::kCodeNotFound, "节点不存在", traceId);
                            co_return;
                        }
-                       const auto  points = co_await deps->telemetry->latest(loop, *nodeId);
+                       const auto telemetry = deps->telemetry->scoped(session->tenantScope());
+                       const auto points    = co_await telemetry->latest(loop, *nodeId);
                        ConfigValue rows   = ConfigValue::array();
                        for (const TelemetryPoint &point: points)
                        {
@@ -106,7 +108,14 @@ namespace EdgePulse::Telemetry
                        {
                            to = Common::nowDateTimeUtc();
                        }
-                       const auto  points = co_await deps->telemetry->series(loop, *nodeId, metric, from, to, 2000);
+                       const auto nodes = deps->nodes->scoped(session->tenantScope());
+                       if (!(co_await nodes->findById(loop, *nodeId)).has_value())
+                       {
+                           fail(response, Common::kCodeNotFound, "节点不存在", traceId);
+                           co_return;
+                       }
+                       const auto telemetry = deps->telemetry->scoped(session->tenantScope());
+                       const auto points    = co_await telemetry->series(loop, *nodeId, metric, from, to, 2000);
                        ConfigValue rows   = ConfigValue::array();
                        for (const TelemetryPoint &point: points)
                        {

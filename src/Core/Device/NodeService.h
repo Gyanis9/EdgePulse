@@ -11,6 +11,7 @@
 
 #include "Base/Api/Pagination.h"
 #include "Core/Device/NodeRepository.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 #include <Core/EventLoop/EventLoop.h>
@@ -50,6 +51,9 @@ namespace EdgePulse::Device
          * @param repository 节点仓储
          */
         explicit NodeService(std::shared_ptr<NodeRepository> repository);
+
+        /// 按租户边界派生服务视图
+        [[nodiscard]] std::shared_ptr<NodeService> scoped(System::TenantScope tenant) const;
 
         /**
          * @brief 分页查询

@@ -10,6 +10,7 @@
 #pragma once
 
 #include "Core/Cache/KeyValueStore.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 
@@ -34,14 +35,24 @@ namespace EdgePulse::Auth
      */
     struct SessionRecord
     {
-        std::string              token;           ///< 会话令牌
-        std::int64_t             userId{0};       ///< 用户标识
-        std::string              username;        ///< 登录名
-        std::string              nickname;        ///< 显示名
-        std::int64_t             departmentId{0}; ///< 部门标识
-        std::string              departmentName;  ///< 部门名
-        std::vector<std::string> roles;           ///< 角色码
-        std::vector<std::string> permissions;     ///< 权限码
+        std::string              token;                 ///< 会话令牌
+        std::int64_t             userId{0};             ///< 用户标识
+        std::int64_t             tenantId{1};           ///< 归属租户
+        std::string              tenantCode{"default"}; ///< 租户编码
+        std::string              tenantName;            ///< 租户名称
+        bool                     platformAdmin{false};  ///< 是否平台管理员
+        std::string              username;              ///< 登录名
+        std::string              nickname;              ///< 显示名
+        std::int64_t             departmentId{0};       ///< 部门标识
+        std::string              departmentName;        ///< 部门名
+        std::vector<std::string> roles;                 ///< 角色码
+        std::vector<std::string> permissions;           ///< 权限码
+
+        /// 本次会话的租户边界
+        [[nodiscard]] System::TenantScope tenantScope() const noexcept
+        {
+            return System::TenantScope{tenantId, platformAdmin};
+        }
     };
 
     /**

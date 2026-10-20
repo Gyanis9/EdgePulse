@@ -3,6 +3,7 @@
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
 #include "Core/Device/AgentRegistry.h"
+#include "Core/System/TenantRepository.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
@@ -74,10 +75,10 @@ namespace EdgePulse::Device
         }
     } // namespace
 
-    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry)
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, System::TenantRepository &tenants)
     {
         router.post("/api/agent/register",
-                    [&loop, &registry](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, &registry, &tenants](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string                                  traceId = Web::resolveRequestId(request);
                         const std::optional<AsynGyanis::Base::ConfigValue> body    = request.jsonBody();
@@ -96,7 +97,20 @@ namespace EdgePulse::Device
                                                  traceId);
                             co_return;
                         }
-                        const auto result = co_await registry.registerAgent(loop, AgentRegistration{*name, *version, *fingerprint, *labels});
+                        // 注册请求用租户编码声明归属；缺省落在默认租户
+                        const std::string tenantCode = stringField(*body, "tenantCode").value_or("default");
+                        const auto        tenant     = co_await tenants.findByCode(loop, tenantCode);
+                        if (!tenant.has_value())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "租户编码不存在", traceId);
+                            co_return;
+                        }
+                        if (tenant->status != 1)
+                        {
+                            Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "租户已停用", traceId);
+                            co_return;
+                        }
+                        const auto result = co_await registry.registerAgent(loop, AgentRegistration{*name, *version, *fingerprint, *labels, tenant->id});
                         if (!result.has_value())
                         {
                             writeAgentError(response, result.error(), traceId);

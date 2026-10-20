@@ -26,13 +26,14 @@ namespace EdgePulse::System
         using AsynGyanis::Database::DatabaseResult;
         using AsynGyanis::Database::DatabaseValue;
 
-        constexpr std::string_view kSelectUser = "SELECT u.id, u.username, u.password, u.nickname, u.phone, u.email, u.dept_id, u.status, u.last_login_time, u.created_at, "
+        constexpr std::string_view kSelectUser = "SELECT u.id, u.tenant_id, u.platform_admin, u.username, u.password, u.nickname, u.phone, u.email, u.dept_id, u.status, "
+                                                 "u.last_login_time, u.created_at, COALESCE(t.tenant_code, '') AS tenant_code, COALESCE(t.tenant_name, '') AS tenant_name, "
                                                  "COALESCE(d.name, '') AS dept_name, "
                                                  "COALESCE((SELECT GROUP_CONCAT(DISTINCT r.role_name) FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id "
                                                  "WHERE ur.user_id = u.id AND r.deleted = 0), '') AS role_names, "
                                                  "COALESCE((SELECT GROUP_CONCAT(DISTINCT p.post_name) FROM sys_user_post up JOIN sys_post p ON p.id = up.post_id "
                                                  "WHERE up.user_id = u.id AND p.deleted = 0), '') AS post_names "
-                                                 "FROM sys_user u LEFT JOIN sys_dept d ON d.id = u.dept_id ";
+                                                 "FROM sys_user u LEFT JOIN sys_tenant t ON t.id = u.tenant_id LEFT JOIN sys_dept d ON d.id = u.dept_id ";
 
         [[nodiscard]] std::unique_ptr<DatabaseResult> execute(DatabaseConnection &connection, const std::string &sql, std::span<const DatabaseValue> parameters)
         {
@@ -53,6 +54,10 @@ namespace EdgePulse::System
         {
             UserRecord user;
             user.id             = Sql::integer(result, "id");
+            user.tenantId       = Sql::integer(result, "tenant_id");
+            user.platformAdmin  = Sql::boolean(result, "platform_admin");
+            user.tenantCode     = Sql::text(result, "tenant_code");
+            user.tenantName     = Sql::text(result, "tenant_name");
             user.username       = Sql::text(result, "username");
             user.passwordHash   = Sql::text(result, "password");
             user.nickname       = Sql::text(result, "nickname");
@@ -74,9 +79,14 @@ namespace EdgePulse::System
          * @param parameters 输出参数
          * @return std::string WHERE 子句
          */
-        [[nodiscard]] std::string buildFilter(const UserQuery &query, std::vector<DatabaseValue> &parameters)
+        [[nodiscard]] std::string buildFilter(const UserQuery &query, std::vector<DatabaseValue> &parameters, const TenantScope &tenant)
         {
             std::string filter = " WHERE u.deleted = 0";
+            if (!tenant.allTenants)
+            {
+                filter += " AND u.tenant_id = ?";
+                parameters.emplace_back(tenant.tenantId);
+            }
             if (!query.keyword.empty())
             {
                 const std::string pattern = "%" + query.keyword + "%";
@@ -135,18 +145,29 @@ namespace EdgePulse::System
         }
     } // namespace
 
-    UserRepository::UserRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    UserRepository::UserRepository(std::shared_ptr<Common::Database> database, TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
+    }
+
+    std::shared_ptr<UserRepository> UserRepository::scoped(const TenantScope tenant) const
+    {
+        return std::make_shared<UserRepository>(m_database, tenant);
     }
 
     AsynGyanis::Core::Task<std::optional<UserRecord>> UserRepository::findByUsername(AsynGyanis::Core::EventLoop &loop, std::string username)
     {
         co_return co_await m_database->withConnection<std::optional<UserRecord>>(
                 loop,
-                [username = std::move(username)](DatabaseConnection &connection) -> std::optional<UserRecord>
+                [username = std::move(username), tenant = m_tenant](DatabaseConnection &connection) -> std::optional<UserRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{username};
-                    const auto                         result = execute(connection, std::string{kSelectUser} + "WHERE u.username = ? AND u.deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{username};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND u.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto result = execute(connection, std::string{kSelectUser} + "WHERE u.username = ? AND u.deleted = 0" + clause, parameters);
                     if (!result->next())
                     {
                         return std::nullopt;
@@ -159,10 +180,16 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::optional<UserRecord>>(
                 loop,
-                [email = std::move(email)](DatabaseConnection &connection) -> std::optional<UserRecord>
+                [email = std::move(email), tenant = m_tenant](DatabaseConnection &connection) -> std::optional<UserRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{email};
-                    const auto                         result = execute(connection, std::string{kSelectUser} + "WHERE u.email = ? AND u.deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{email};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND u.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto result = execute(connection, std::string{kSelectUser} + "WHERE u.email = ? AND u.deleted = 0" + clause, parameters);
                     if (!result->next())
                     {
                         return std::nullopt;
@@ -173,28 +200,34 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<std::optional<UserRecord>> UserRepository::findById(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
     {
-        co_return co_await m_database->withConnection<std::optional<UserRecord>>(loop,
-                                                                                 [userId](DatabaseConnection &connection) -> std::optional<UserRecord>
-                                                                                 {
-                                                                                     const std::array<DatabaseValue, 1> parameters{userId};
-                                                                                     const auto                         result = execute(
-                                                                                             connection, std::string{kSelectUser} + "WHERE u.id = ? AND u.deleted = 0", parameters);
-                                                                                     if (!result->next())
-                                                                                     {
-                                                                                         return std::nullopt;
-                                                                                     }
-                                                                                     return readUser(*result);
-                                                                                 });
+        co_return co_await m_database->withConnection<std::optional<UserRecord>>(
+                loop,
+                [userId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<UserRecord>
+                {
+                    std::vector<DatabaseValue> parameters{userId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND u.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto result = execute(connection, std::string{kSelectUser} + "WHERE u.id = ? AND u.deleted = 0" + clause, parameters);
+                    if (!result->next())
+                    {
+                        return std::nullopt;
+                    }
+                    return readUser(*result);
+                });
     }
 
     AsynGyanis::Core::Task<Common::PageRows<UserRecord>> UserRepository::list(AsynGyanis::Core::EventLoop &loop, const UserQuery &query, const Common::PageParameters &page)
     {
         co_return co_await m_database->withConnection<Common::PageRows<UserRecord>>(
                 loop,
-                [query, page](DatabaseConnection &connection) -> Common::PageRows<UserRecord>
+                [query, page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<UserRecord>
                 {
                     std::vector<DatabaseValue>   filterParameters;
-                    const std::string            filter      = buildFilter(query, filterParameters);
+                    const std::string            filter      = buildFilter(query, filterParameters, tenant);
                     const auto                   countResult = execute(connection, "SELECT COUNT(*) AS total FROM sys_user u" + filter, filterParameters);
                     Common::PageRows<UserRecord> pageRows;
                     if (countResult->next())
@@ -222,10 +255,10 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<UserRecord>>(
                 loop,
-                [query](DatabaseConnection &connection) -> std::vector<UserRecord>
+                [query, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<UserRecord>
                 {
                     std::vector<DatabaseValue> parameters;
-                    const std::string          filter = buildFilter(query, parameters);
+                    const std::string          filter = buildFilter(query, parameters, tenant);
                     parameters.emplace_back(std::int64_t{10000});
                     const auto              result = execute(connection, std::string{kSelectUser} + filter + " ORDER BY u.id DESC LIMIT ?", parameters);
                     std::vector<UserRecord> rows;
@@ -241,10 +274,16 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [username = std::move(username), excludeUserId](DatabaseConnection &connection) -> bool
+                [username = std::move(username), excludeUserId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 2> parameters{username, excludeUserId};
-                    const auto result = execute(connection, "SELECT COUNT(*) AS total FROM sys_user WHERE username = ? AND deleted = 0 AND id <> ?", parameters);
+                    std::vector<DatabaseValue> parameters{username, excludeUserId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto result = execute(connection, "SELECT COUNT(*) AS total FROM sys_user WHERE username = ? AND deleted = 0 AND id <> ?" + clause, parameters);
                     return result->next() && Sql::integer(*result, "total") > 0;
                 });
     }
@@ -253,13 +292,18 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [write, passwordHash = std::move(passwordHash), operatorId](DatabaseConnection &connection) -> std::int64_t
+                [write, passwordHash = std::move(passwordHash), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
+                    if (tenant.allTenants)
+                    {
+                        return 0;
+                    }
                     const std::int64_t                  userId   = Common::nextIdentifier();
                     const std::string                   now      = Common::nowDateTimeUtc();
                     const std::string                   username = write.username.value_or(std::string{});
                     const std::string                   nickname = write.nickname.value_or(username);
-                    const std::array<DatabaseValue, 13> parameters{userId,
+                    const std::array<DatabaseValue, 14> parameters{userId,
+                                                                   tenant.tenantId,
                                                                    username,
                                                                    passwordHash,
                                                                    nickname,
@@ -273,8 +317,8 @@ namespace EdgePulse::System
                                                                    operatorId,
                                                                    std::int64_t{0}};
                     executeStatement(connection,
-                                     "INSERT INTO sys_user (id, username, password, nickname, phone, email, dept_id, status, created_at, updated_at, created_by, "
-                                     "updated_by, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                     "INSERT INTO sys_user (id, tenant_id, username, password, nickname, phone, email, dept_id, status, created_at, updated_at, created_by, "
+                                     "updated_by, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                      parameters);
                     replaceRoleRelations(connection, userId, write.roleIds.value_or(std::vector<std::int64_t>{}));
                     replacePostRelations(connection, userId, write.postIds.value_or(std::vector<std::int64_t>{}));
@@ -285,7 +329,7 @@ namespace EdgePulse::System
     AsynGyanis::Core::Task<bool> UserRepository::update(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, const UserWrite &write, const std::int64_t operatorId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [userId, write, operatorId](DatabaseConnection &connection) -> bool
+                                                            [userId, write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
                                                                 std::string                sql = "UPDATE sys_user SET updated_at = ?, updated_by = ?";
                                                                 std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
@@ -321,6 +365,11 @@ namespace EdgePulse::System
                                                                 }
                                                                 sql += " WHERE id = ? AND deleted = 0";
                                                                 parameters.emplace_back(userId);
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    sql += " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
                                                                 const auto updateResult = execute(connection, sql, parameters);
                                                                 if (updateResult->affectedRowCount() == 0)
                                                                 {
@@ -341,11 +390,16 @@ namespace EdgePulse::System
     AsynGyanis::Core::Task<bool> UserRepository::remove(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [userId](DatabaseConnection &connection) -> bool
+                                                            [userId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
-                                                                const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), userId};
-                                                                const auto                         result = execute(
-                                                                        connection, "UPDATE sys_user SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
+                                                                std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), userId};
+                                                                std::string                sql = "UPDATE sys_user SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0";
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    sql += " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
+                                                                const auto result = execute(connection, sql, parameters);
                                                                 if (result->affectedRowCount() == 0)
                                                                 {
                                                                     return false;
@@ -359,27 +413,38 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<bool> UserRepository::updateStatus(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, const int status, const std::int64_t operatorId)
     {
-        co_return co_await m_database->withConnection<bool>(
-                loop,
-                [userId, status, operatorId](DatabaseConnection &connection) -> bool
-                {
-                    const std::array<DatabaseValue, 4> parameters{static_cast<std::int64_t>(status), Common::nowDateTimeUtc(), operatorId, userId};
-                    const auto result = execute(connection, "UPDATE sys_user SET status = ?, updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0", parameters);
-                    return result->affectedRowCount() > 0;
-                });
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [userId, status, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                std::vector<DatabaseValue> parameters{static_cast<std::int64_t>(status), Common::nowDateTimeUtc(), operatorId,
+                                                                                                      userId};
+                                                                std::string sql = "UPDATE sys_user SET status = ?, updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0";
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    sql += " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
+                                                                const auto result = execute(connection, sql, parameters);
+                                                                return result->affectedRowCount() > 0;
+                                                            });
     }
 
     AsynGyanis::Core::Task<bool> UserRepository::resetPassword(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string passwordHash,
                                                                const std::int64_t operatorId)
     {
-        co_return co_await m_database->withConnection<bool>(
-                loop,
-                [userId, passwordHash = std::move(passwordHash), operatorId](DatabaseConnection &connection) -> bool
-                {
-                    const std::array<DatabaseValue, 4> parameters{passwordHash, Common::nowDateTimeUtc(), operatorId, userId};
-                    const auto result = execute(connection, "UPDATE sys_user SET password = ?, updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0", parameters);
-                    return result->affectedRowCount() > 0;
-                });
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [userId, passwordHash = std::move(passwordHash), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                std::vector<DatabaseValue> parameters{passwordHash, Common::nowDateTimeUtc(), operatorId, userId};
+                                                                std::string sql = "UPDATE sys_user SET password = ?, updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0";
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    sql += " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
+                                                                const auto result = execute(connection, sql, parameters);
+                                                                return result->affectedRowCount() > 0;
+                                                            });
     }
 
     AsynGyanis::Core::Task<std::vector<std::int64_t>> UserRepository::roleIdsFor(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
@@ -420,13 +485,20 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<std::pair<std::int64_t, std::int64_t>>>(
                 loop,
-                [limit](DatabaseConnection &connection) -> std::vector<std::pair<std::int64_t, std::int64_t>>
+                [limit, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<std::pair<std::int64_t, std::int64_t>>
                 {
-                    const std::array<DatabaseValue, 1> parameters{static_cast<std::int64_t>(limit)};
-                    const auto                         rows = execute(connection,
-                                                                      "SELECT ur.user_id, ur.role_id FROM sys_user_role ur JOIN sys_user u ON u.id = ur.user_id AND u.deleted = 0 "
-                                                                      "JOIN sys_role r ON r.id = ur.role_id AND r.deleted = 0 ORDER BY ur.user_id, ur.role_id LIMIT ?",
-                                                                      parameters);
+                    std::vector<DatabaseValue> parameters;
+                    std::string                tenantClause;
+                    if (!tenant.allTenants)
+                    {
+                        tenantClause = " AND u.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    parameters.emplace_back(static_cast<std::int64_t>(limit));
+                    const auto rows = execute(connection,
+                                              "SELECT ur.user_id, ur.role_id FROM sys_user_role ur JOIN sys_user u ON u.id = ur.user_id AND u.deleted = 0" + tenantClause +
+                                                      " JOIN sys_role r ON r.id = ur.role_id AND r.deleted = 0 ORDER BY ur.user_id, ur.role_id LIMIT ?",
+                                              parameters);
                     std::vector<std::pair<std::int64_t, std::int64_t>> pairs;
                     while (rows->next())
                     {

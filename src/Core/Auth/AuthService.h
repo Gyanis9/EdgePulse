@@ -27,6 +27,11 @@
 #include <string_view>
 #include <vector>
 
+namespace EdgePulse::System
+{
+    class TenantRepository;
+}
+
 namespace EdgePulse::Auth
 {
     /**
@@ -44,12 +49,13 @@ namespace EdgePulse::Auth
      */
     struct LoginCredentials
     {
-        std::string username;    ///< 登录名
-        std::string password;    ///< 明文口令
-        std::string captcha;     ///< 验证码答案
-        std::string captchaUuid; ///< 验证码标识
-        std::string clientIp;    ///< 来源 IP
-        std::string traceId;     ///< 请求标识
+        std::string username;              ///< 登录名
+        std::string password;              ///< 明文口令
+        std::string captcha;               ///< 验证码答案
+        std::string captchaUuid;           ///< 验证码标识
+        std::string clientIp;              ///< 来源 IP
+        std::string traceId;               ///< 请求标识
+        std::string tenantCode{"default"}; ///< 租户编码；空表示默认租户
     };
 
     /**
@@ -77,7 +83,7 @@ namespace EdgePulse::Auth
          * @param cache 登录失败计数使用的键值存储
          */
         AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha, std::shared_ptr<LoginAudit> audit,
-                    std::shared_ptr<Cache::KeyValueStore> cache);
+                    std::shared_ptr<Cache::KeyValueStore> cache, std::shared_ptr<System::TenantRepository> tenants);
 
         /**
          * @brief 验证码 + 口令登录
@@ -167,11 +173,12 @@ namespace EdgePulse::Auth
          */
         AsynGyanis::Core::Task<> recordAudit(AsynGyanis::Core::EventLoop &loop, LoginAuditEntry entry);
 
-        std::shared_ptr<SessionStore>         m_sessions;   ///< 会话表
-        std::shared_ptr<CaptchaService>       m_captcha;    ///< 验证码
-        std::shared_ptr<LoginAudit>           m_loginAudit; ///< 登录审计
-        std::shared_ptr<Cache::KeyValueStore> m_cache;      ///< 登录失败计数
-        System::UserRepository                m_users;      ///< 用户仓储
-        System::MenuRepository                m_menus;      ///< 菜单仓储
+        std::shared_ptr<SessionStore>             m_sessions;   ///< 会话表
+        std::shared_ptr<CaptchaService>           m_captcha;    ///< 验证码
+        std::shared_ptr<LoginAudit>               m_loginAudit; ///< 登录审计
+        std::shared_ptr<Cache::KeyValueStore>     m_cache;      ///< 登录失败计数
+        std::shared_ptr<System::TenantRepository> m_tenants;    ///< 租户注册表
+        System::UserRepository                    m_users;      ///< 用户仓储
+        System::MenuRepository                    m_menus;      ///< 菜单仓储
     };
 } // namespace EdgePulse::Auth

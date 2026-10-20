@@ -50,6 +50,11 @@ namespace EdgePulse::Alarm
     {
     }
 
+    std::shared_ptr<AlarmService> AlarmService::scoped(const System::TenantScope tenant) const
+    {
+        return std::make_shared<AlarmService>(m_repository->scoped(tenant), m_notifier);
+    }
+
     AsynGyanis::Core::Task<std::vector<AlarmRecord>> AlarmService::evaluate(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
                                                                             const std::vector<Telemetry::TelemetrySample> &samples)
     {

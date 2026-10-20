@@ -20,6 +20,7 @@
 #include "Core/System/OrgRepository.h"
 #include "Core/System/RoleRepository.h"
 #include "Core/System/UserRepository.h"
+#include "Core/System/TenantRepository.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
 #include "Net/Http/Router.h"
@@ -116,6 +117,10 @@ namespace EdgePulse::System
         [[nodiscard]] ConfigValue userJson(const UserRecord &user)
         {
             return ConfigValue::object({{"id", user.id},
+                                        {"tenantId", user.tenantId},
+                                        {"tenantCode", user.tenantCode},
+                                        {"tenantName", user.tenantName},
+                                        {"platformAdmin", user.platformAdmin},
                                         {"username", user.username},
                                         {"nickname", user.nickname},
                                         {"phone", user.phone},
@@ -500,7 +505,8 @@ namespace EdgePulse::System
                            userQuery.userId         = session->userId;
                        }
                        const Common::PageParameters page   = Common::parsePageParameters(query);
-                       const auto                   result = co_await deps->users->list(loop, userQuery, page);
+                       const auto                   users  = deps->users->scoped(session->tenantScope());
+                       const auto                   result = co_await users->list(loop, userQuery, page);
                        ConfigValue                  rows   = ConfigValue::array();
                        for (const UserRecord &user: result.rows)
                        {
@@ -518,6 +524,15 @@ namespace EdgePulse::System
                        if (!session.has_value())
                        {
                            co_return;
+                       }
+                       ConfigValue tenantOptions = ConfigValue::array();
+                       if (session->platformAdmin)
+                       {
+                           const auto tenants = co_await deps->tenants->list(loop, "", "", Common::PageParameters{1, 100});
+                           for (const TenantRecord &tenant: tenants.rows)
+                           {
+                               tenantOptions.push_back(ConfigValue::object({{"id", tenant.id}, {"name", tenant.name}, {"code", tenant.code}}));
+                           }
                        }
                        const auto  roles       = co_await deps->roles->listOptions(loop);
                        const auto  posts       = co_await deps->org->postOptions(loop);
@@ -541,7 +556,8 @@ namespace EdgePulse::System
                        Common::writeSuccess(
                                response,
                                ConfigValue::object(
-                                       {{"depts", std::move(deptOptions)}, {"roles", std::move(roleOptions)}, {"posts", std::move(postOptions)}, {"initPassword", initPassword}}),
+                                       {{"depts", std::move(deptOptions)}, {"roles", std::move(roleOptions)}, {"posts", std::move(postOptions)}, {"tenants", std::move(tenantOptions)},
+                                        {"initPassword", initPassword}}),
                                traceId);
                        co_return;
                    });
@@ -567,7 +583,8 @@ namespace EdgePulse::System
                            userQuery.selfOnly       = scope.selfOnly;
                            userQuery.userId         = session->userId;
                        }
-                       const auto        rows = co_await deps->users->exportAll(loop, userQuery);
+                       const auto        users = deps->users->scoped(session->tenantScope());
+                       const auto        rows  = co_await users->exportAll(loop, userQuery);
                        Common::CsvWriter writer;
                        writer.addRow({"用户ID", "登录账号", "姓名", "部门", "岗位", "角色", "手机号", "邮箱", "状态", "创建时间", "最近登录"});
                        for (const UserRecord &user: rows)
@@ -607,14 +624,39 @@ namespace EdgePulse::System
                             fail(response, Common::kCodeBadRequest, "初始密码长度必须是 6 到 64 个字符", traceId);
                             co_return;
                         }
-                        if (co_await deps->users->usernameExists(loop, *write.username))
+                        if (!session->platformAdmin && write.roleIds.has_value() &&
+                            std::find(write.roleIds->begin(), write.roleIds->end(), std::int64_t{1}) != write.roleIds->end())
+                        {
+                            fail(response, Common::kCodeForbidden, "租户账号不能分配平台超级管理员角色", traceId);
+                            co_return;
+                        }
+                        std::int64_t targetTenantId = session->tenantId;
+                        if (session->platformAdmin && body->contains("tenantId"))
+                        {
+                            const auto tenantId = optionalInteger(*body, "tenantId");
+                            if (!tenantId.has_value() || *tenantId <= 0)
+                            {
+                                fail(response, Common::kCodeBadRequest, "tenantId 不合法", traceId);
+                                co_return;
+                            }
+                            const auto tenant = co_await deps->tenants->findById(loop, *tenantId);
+                            if (!tenant.has_value() || tenant->status != 1)
+                            {
+                                fail(response, Common::kCodeBadRequest, "目标租户不存在或已停用", traceId);
+                                co_return;
+                            }
+                            targetTenantId = *tenantId;
+                        }
+                        const auto globalUsers = deps->users->scoped({1, true});
+                        if (co_await globalUsers->usernameExists(loop, *write.username))
                         {
                             fail(response, Common::kCodeConflict, "登录账号已存在", traceId);
                             co_return;
                         }
                         const std::string hash =
                                 co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::string>(loop, [password] { return Common::hashPassword(password); });
-                        const std::int64_t id = co_await deps->users->create(loop, write, hash, session->userId);
+                        const auto         targetUsers = deps->users->scoped({targetTenantId, false});
+                        const std::int64_t id          = co_await targetUsers->create(loop, write, hash, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -647,12 +689,20 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, message, traceId);
                            co_return;
                        }
-                       if (write.username.has_value() && co_await deps->users->usernameExists(loop, *write.username, *userId))
+                       if (!session->platformAdmin && write.roleIds.has_value() &&
+                           std::find(write.roleIds->begin(), write.roleIds->end(), std::int64_t{1}) != write.roleIds->end())
+                       {
+                           fail(response, Common::kCodeForbidden, "租户账号不能分配平台超级管理员角色", traceId);
+                           co_return;
+                       }
+                       const auto globalUsers = deps->users->scoped({1, true});
+                       if (write.username.has_value() && co_await globalUsers->usernameExists(loop, *write.username, *userId))
                        {
                            fail(response, Common::kCodeConflict, "登录账号已存在", traceId);
                            co_return;
                        }
-                       if (!co_await deps->users->update(loop, *userId, write, session->userId))
+                       const auto users = deps->users->scoped(session->tenantScope());
+                       if (!co_await users->update(loop, *userId, write, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "用户不存在或已删除", traceId);
                            co_return;
@@ -683,7 +733,8 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "不能停用当前登录账号", traceId);
                            co_return;
                        }
-                       if (!co_await deps->users->updateStatus(loop, *userId, static_cast<int>(*status), session->userId))
+                       const auto users = deps->users->scoped(session->tenantScope());
+                       if (!co_await users->updateStatus(loop, *userId, static_cast<int>(*status), session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "用户不存在或已删除", traceId);
                            co_return;
@@ -710,7 +761,8 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const std::string hash = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::string>(loop, [password] { return Common::hashPassword(password); });
-                       if (!co_await deps->users->resetPassword(loop, *userId, hash, session->userId))
+                       const auto users = deps->users->scoped(session->tenantScope());
+                       if (!co_await users->resetPassword(loop, *userId, hash, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "用户不存在或已删除", traceId);
                            co_return;
@@ -739,7 +791,8 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "不能删除当前账号或内置管理员", traceId);
                            co_return;
                        }
-                       if (!co_await deps->users->remove(loop, *userId))
+                       const auto users = deps->users->scoped(session->tenantScope());
+                       if (!co_await users->remove(loop, *userId))
                        {
                            fail(response, Common::kCodeNotFound, "用户不存在或已删除", traceId);
                            co_return;

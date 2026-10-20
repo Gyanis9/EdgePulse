@@ -1,6 +1,7 @@
 #include "TestSupport/AuthTestContext.h"
 
 #include "Core/Auth/AuthService.h"
+#include "Core/System/TenantRepository.h"
 #include "Core/Auth/CaptchaService.h"
 #include "Core/Auth/LoginAudit.h"
 #include "Core/Auth/SessionStore.h"
@@ -35,7 +36,8 @@ namespace EdgePulse::TestSupport
         sessions = std::make_shared<Auth::SessionStore>(cache, 7200);
         captcha  = std::make_shared<Auth::CaptchaService>(cache, Auth::CaptchaOptions{120, 30});
         audit    = std::make_shared<Auth::LoginAudit>(database);
-        auth     = std::make_shared<Auth::AuthService>(database, sessions, captcha, audit, cache);
+        tenants  = std::make_shared<System::TenantRepository>(database);
+        auth     = std::make_shared<Auth::AuthService>(database, sessions, captcha, audit, cache, tenants);
     }
 
     AuthTestContext::~AuthTestContext()

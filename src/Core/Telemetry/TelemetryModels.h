@@ -65,6 +65,7 @@ namespace EdgePulse::Alarm
     struct AlarmRecord
     {
         std::int64_t id{0};          ///< 主键
+        std::int64_t tenantId{1};    ///< 归属租户
         std::int64_t ruleId{0};      ///< 规则
         std::int64_t nodeId{0};      ///< 节点
         std::string  nodeName;       ///< 节点名

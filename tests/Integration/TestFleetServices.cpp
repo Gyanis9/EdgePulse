@@ -35,18 +35,20 @@ TEST(FleetServices, TelemetryInsertLatestAndSeries)
     EdgePulse::TestSupport::AuthTestContext   context;
     EdgePulse::TestSupport::EventLoopRunner   runner;
     EdgePulse::Telemetry::TelemetryRepository repository(context.database);
+    EdgePulse::Device::NodeRepository         nodes(context.database);
+    const std::int64_t                        nodeId = runner.run(nodes.create(runner.loop(), "telemetry-node", "{}")).id;
 
     const auto now = EdgePulse::Common::nowDateTimeUtc();
-    ASSERT_TRUE(runner.run(repository.insertBatch(runner.loop(), 1, {sample("cpu.usage", 20), sample("memory.usage", 40)})));
-    ASSERT_TRUE(runner.run(repository.insertBatch(runner.loop(), 1, {sample("cpu.usage", 35)})));
+    ASSERT_TRUE(runner.run(repository.insertBatch(runner.loop(), nodeId, {sample("cpu.usage", 20), sample("memory.usage", 40)})));
+    ASSERT_TRUE(runner.run(repository.insertBatch(runner.loop(), nodeId, {sample("cpu.usage", 35)})));
 
-    const auto latest = runner.run(repository.latest(runner.loop(), 1));
+    const auto latest = runner.run(repository.latest(runner.loop(), nodeId));
     ASSERT_EQ(2U, latest.size());
     const auto cpu = std::find_if(latest.begin(), latest.end(), [](const auto &point) { return point.metric == "cpu.usage"; });
     ASSERT_NE(latest.end(), cpu);
     EXPECT_DOUBLE_EQ(35.0, cpu->value);
 
-    const auto series = runner.run(repository.series(runner.loop(), 1, "cpu.usage", now, EdgePulse::Common::nowDateTimeUtc(), 100));
+    const auto series = runner.run(repository.series(runner.loop(), nodeId, "cpu.usage", now, EdgePulse::Common::nowDateTimeUtc(), 100));
     EXPECT_EQ(2U, series.size());
 }
 

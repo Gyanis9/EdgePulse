@@ -87,6 +87,7 @@ namespace EdgePulse::App
         bool                     oidcAutoProvision{false};                            ///< 首次登录自动建号
         std::int64_t             oidcDefaultRoleId{0};                                ///< 自动建号角色
         std::int64_t             oidcDefaultDepartmentId{101};                        ///< 自动建号部门
+        std::string              oidcTenantCode{"default"};                           ///< 外部身份绑定租户
 
         /**
          * @brief 读取 YAML 并组装配置；同目录存在 logging.yaml 时一并载入

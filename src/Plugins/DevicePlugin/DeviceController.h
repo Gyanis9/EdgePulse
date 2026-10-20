@@ -41,11 +41,13 @@ namespace EdgePulse::Device
      */
     struct AccessContext
     {
-        std::int64_t             userId{0};       ///< 用户标识
-        std::string              username;        ///< 登录名
-        std::int64_t             departmentId{0}; ///< 部门标识
-        std::vector<std::string> roles;           ///< 角色码
-        std::vector<std::string> permissions;     ///< 当前会话的权限码
+        std::int64_t             userId{0};            ///< 用户标识
+        std::int64_t             tenantId{1};          ///< 租户
+        bool                     platformAdmin{false}; ///< 平台管理员
+        std::string              username;             ///< 登录名
+        std::int64_t             departmentId{0};      ///< 部门标识
+        std::vector<std::string> roles;                ///< 角色码
+        std::vector<std::string> permissions;          ///< 当前会话的权限码
     };
 
     /// 从请求异步解析身份；未认证返回空

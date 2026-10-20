@@ -24,6 +24,7 @@ add_executable(edgepulse-unit-tests
         Unit/TestPagination.cpp
         Unit/TestPasswordHash.cpp
         Unit/TestSessionStore.cpp
+        Unit/TestSseBroadcaster.cpp
         Unit/TestTimeFormat.cpp
         Unit/TestUdpTelemetryProtocol.cpp)
 target_include_directories(edgepulse-unit-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -39,6 +40,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestMigrations.cpp
         Integration/TestFleetServices.cpp
         Integration/TestSystemServices.cpp
+        Integration/TestTenantIsolation.cpp
         Integration/TestUdpTelemetry.cpp)
 target_include_directories(edgepulse-integration-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(edgepulse-integration-tests PRIVATE EDGEPULSE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")

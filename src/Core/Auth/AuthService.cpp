@@ -5,6 +5,7 @@
 #include "Base/Security/PasswordHash.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Coroutine/AsyncExecutor.h"
+#include "Core/System/TenantRepository.h"
 
 #include <algorithm>
 #include <chrono>
@@ -30,8 +31,9 @@ namespace EdgePulse::Auth
     } // namespace
 
     AuthService::AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha,
-                             std::shared_ptr<LoginAudit> audit, std::shared_ptr<Cache::KeyValueStore> cache) :
-        m_sessions(std::move(sessions)), m_captcha(std::move(captcha)), m_loginAudit(std::move(audit)), m_cache(std::move(cache)), m_users(database), m_menus(std::move(database))
+                             std::shared_ptr<LoginAudit> audit, std::shared_ptr<Cache::KeyValueStore> cache, std::shared_ptr<System::TenantRepository> tenants) :
+        m_sessions(std::move(sessions)), m_captcha(std::move(captcha)), m_loginAudit(std::move(audit)), m_cache(std::move(cache)), m_tenants(std::move(tenants)), m_users(database),
+        m_menus(std::move(database))
     {
     }
 
@@ -58,27 +60,36 @@ namespace EdgePulse::Auth
             co_return std::unexpected(AuthError{Common::kCodeBadRequest, Common::kCodeBadRequest, "用户名和密码不能为空"});
         }
 
+        const std::string                         tenantCode = credentials.tenantCode.empty() ? std::string{"default"} : credentials.tenantCode;
+        const std::optional<System::TenantRecord> tenant     = co_await m_tenants->findByCode(loop, tenantCode);
+        if (!tenant.has_value() || tenant->status != 1)
+        {
+            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "租户不存在或已停用", credentials.traceId, 0, 0, 0});
+            co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
+        }
+        const std::int64_t tenantId = tenant->id;
+
         // 失败计数放在最前：超过阈值时连验证码与口令校验都不做，避免把 PBKDF2 变成撞库加速器
         const std::string  failureKey = ipFailureKey(credentials.clientIp);
         const std::int64_t failures   = co_await m_cache->increment(loop, failureKey, kLoginFailureWindow);
         if (failures > kMaximumLoginFailures)
         {
-            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "登录尝试过于频繁", credentials.traceId});
+            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "登录尝试过于频繁", credentials.traceId, 0, 0, tenantId});
             co_return std::unexpected(AuthError{Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "登录尝试过于频繁：请一分钟后再试"});
         }
 
         // 验证码一次性消费：失败时也写审计，便于排查撞库与过期页面
         if (!co_await m_captcha->consume(loop, credentials.captchaUuid, credentials.captcha))
         {
-            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "验证码错误或已过期", credentials.traceId});
+            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "验证码错误或已过期", credentials.traceId, 0, 0, tenantId});
             co_return std::unexpected(AuthError{Common::kCodeBadRequest, Common::kCodeBadRequest, "验证码错误或已过期"});
         }
 
-        const std::optional<System::UserRecord> user = co_await m_users.findByUsername(loop, credentials.username);
+        const std::optional<System::UserRecord> user = co_await m_users.scoped({tenantId, false})->findByUsername(loop, credentials.username);
         // 用户不存在与口令错误对客户端使用同一条文案，避免账号枚举
         if (!user.has_value() || user->status != 1)
         {
-            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "用户不存在或已停用", credentials.traceId});
+            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "用户不存在或已停用", credentials.traceId, 0, 0, tenantId});
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
         }
 
@@ -88,7 +99,8 @@ namespace EdgePulse::Auth
         const bool isMatch = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop, [storedHash, password] { return Common::verifyPassword(storedHash, password); });
         if (!isMatch)
         {
-            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "口令不匹配", credentials.traceId, user->id, user->departmentId});
+            co_await recordAudit(loop,
+                                 LoginAuditEntry{credentials.username, credentials.clientIp, false, "口令不匹配", credentials.traceId, user->id, user->departmentId, tenantId});
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
         }
 
@@ -104,7 +116,7 @@ namespace EdgePulse::Auth
     AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> AuthService::issueSessionForUser(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId,
                                                                                                    std::string clientIp, std::string traceId, std::string auditMessage)
     {
-        const std::optional<System::UserRecord> user = co_await m_users.findById(loop, userId);
+        const std::optional<System::UserRecord> user = co_await m_users.scoped({1, true})->findById(loop, userId);
         if (!user.has_value() || user->status != 1)
         {
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "账号不存在或已停用"});
@@ -121,6 +133,10 @@ namespace EdgePulse::Auth
 
         SessionRecord record;
         record.userId               = user.id;
+        record.tenantId             = user.tenantId;
+        record.tenantCode           = user.tenantCode;
+        record.tenantName           = user.tenantName;
+        record.platformAdmin        = user.platformAdmin;
         record.username             = user.username;
         record.nickname             = user.nickname;
         record.departmentId         = user.departmentId;
@@ -130,11 +146,11 @@ namespace EdgePulse::Auth
         const SessionRecord session = co_await m_sessions->create(loop, std::move(record));
 
         // 登录时间更新失败不影响本次登录，但必须在日志里留下原因
-        if (!co_await m_users.touchLastLogin(loop, user.id, Common::nowDateTimeUtc()))
+        if (!co_await m_users.scoped({user.tenantId, false})->touchLastLogin(loop, user.id, Common::nowDateTimeUtc()))
         {
             LOG_WARN_FMT("登录时间未更新：user={}", user.username);
         }
-        co_await recordAudit(loop, LoginAuditEntry{user.username, clientIp, true, auditMessage, traceId, user.id, user.departmentId});
+        co_await recordAudit(loop, LoginAuditEntry{user.username, clientIp, true, auditMessage, traceId, user.id, user.departmentId, user.tenantId});
         co_return LoginResult{session.token, m_sessions->ttlSeconds()};
     }
 

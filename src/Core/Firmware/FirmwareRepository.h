@@ -11,6 +11,7 @@
 
 #include "Base/Api/Pagination.h"
 #include "Base/Database/Database.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 
@@ -70,7 +71,10 @@ namespace EdgePulse::Firmware
          * @brief 构造
          * @param database 数据库封装
          */
-        explicit FirmwareRepository(std::shared_ptr<Common::Database> database);
+        explicit FirmwareRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant = {});
+
+        /// 按租户边界派生仓储视图
+        [[nodiscard]] std::shared_ptr<FirmwareRepository> scoped(System::TenantScope tenant) const;
 
         /**
          * @brief 写入固件元数据
@@ -137,5 +141,6 @@ namespace EdgePulse::Firmware
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
+        System::TenantScope               m_tenant;   ///< 租户边界
     };
 } // namespace EdgePulse::Firmware

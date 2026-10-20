@@ -1,5 +1,6 @@
 #include "Base/Config/ConfigValue.h"
 #include "Base/Runtime/TimeFormat.h"
+#include "Base/Security/PasswordHash.h"
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Auth/AuthService.h"
@@ -13,6 +14,7 @@
 #include "Core/Http/Authorization.h"
 #include "Core/Http/MiddlewareSetup.h"
 #include "Core/System/LogRepository.h"
+#include "Core/System/TenantRepository.h"
 #include "Core/Telemetry/TelemetryRepository.h"
 #include "Plugins/AlarmPlugin/AlarmController.h"
 #include "Plugins/AuthPlugin/AuthController.h"
@@ -22,6 +24,7 @@
 #include "Plugins/FirmwarePlugin/FirmwareController.h"
 #include "Plugins/TelemetryPlugin/TelemetryController.h"
 #include "TestSupport/AuthTestContext.h"
+#include "TestSupport/EventLoopRunner.h"
 #include "TestSupport/HttpClientHarness.h"
 
 #include <Net/Http/Client/HttpClient.h>
@@ -180,7 +183,8 @@ protected:
                         {
                             co_return std::nullopt;
                         }
-                        co_return EdgePulse::Device::AccessContext{session->userId, session->username, session->departmentId, session->roles, session->permissions};
+                        co_return EdgePulse::Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
+                                                                   session->departmentId, session->roles,    session->permissions};
                     };
                     EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access);
                     EdgePulse::Device::NodeGroupDependencies groups;
@@ -260,6 +264,7 @@ protected:
     }
 
     std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>   m_context;
+    EdgePulse::TestSupport::EventLoopRunner                    m_runner;
     std::shared_ptr<EdgePulse::Device::NodeRepository>         m_nodes;
     std::shared_ptr<EdgePulse::Device::NodeService>            m_nodeService;
     std::shared_ptr<EdgePulse::Device::NodeGroupRepository>    m_groups;
@@ -412,4 +417,50 @@ TEST_F(FleetEndpointsTest, NodeGroupCrud)
     ASSERT_EQ(200, tree.status);
     EXPECT_GE((*tree.json())["data"].size(), 2U);
     EXPECT_EQ(200, m_server->send("DELETE", "/api/node-groups/" + std::to_string(groupId), "", "", bearer(token)).status);
+}
+
+// 钉住：Agent 侧没有会话，命令与固件任务必须按节点/固件自身的租户查找，不能落在默认租户
+TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
+{
+    EdgePulse::System::TenantProvisionRequest request;
+    request.code              = "fleet_tenant";
+    request.name              = "设备租户";
+    request.adminUsername     = "fleet-admin";
+    request.adminPasswordHash = EdgePulse::Common::hashPassword("fleet-pass-1");
+    const auto provisioned    = m_runner.run(m_context->tenants->provision(m_runner.loop(), std::move(request), 1));
+    ASSERT_TRUE(provisioned.has_value()) << provisioned.error();
+    const std::int64_t tenantId = provisioned->tenantId;
+
+    const auto tenantNodes    = m_nodes->scoped({tenantId, false});
+    const auto node           = m_runner.run(tenantNodes->create(m_runner.loop(), "tenant-b-node", "{}"));
+    const auto tenantCommands = m_commands->scoped({tenantId, false});
+    const auto command        = m_runner.run(tenantCommands->create(m_runner.loop(), node.id, "reboot", "{}", 1, 60));
+    ASSERT_TRUE(command.has_value());
+
+    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(node.id));
+    ASSERT_EQ(200, next.status) << next.body;
+    ASSERT_TRUE((*next.json())["data"].is_object()) << next.body;
+    EXPECT_EQ(command->id, (*next.json())["data"]["id"].get<std::int64_t>());
+
+    const auto result = m_server->post("/api/agent/commands/" + std::to_string(command->id) + "/result",
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "succeeded"}, {"result", "{}"}}).dump());
+    ASSERT_EQ(200, result.status) << result.body;
+    EXPECT_EQ("succeeded", (*result.json())["data"]["status"].get<std::string>());
+
+    EdgePulse::Firmware::FirmwareRecord firmware;
+    firmware.name                     = "Tenant OS";
+    firmware.version                  = "2.0.0";
+    firmware.fileName                 = "tenant-os.bin";
+    firmware.contentType              = "application/octet-stream";
+    firmware.sha256                   = std::string(64, 'b');
+    firmware.storagePath              = (m_storage / "tenant-os.bin").string();
+    const auto         tenantFirmware = m_firmware->scoped({tenantId, false});
+    const std::int64_t firmwareId     = m_runner.run(tenantFirmware->create(m_runner.loop(), firmware));
+    ASSERT_GT(firmwareId, 0);
+    const std::int64_t taskId = m_runner.run(tenantFirmware->createTask(m_runner.loop(), firmwareId, node.id));
+    ASSERT_GT(taskId, 0);
+    const auto status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "installed"}, {"progress", 100}}).dump());
+    ASSERT_EQ(200, status.status) << status.body;
+    EXPECT_EQ(taskId, (*status.json())["data"]["id"].get<std::int64_t>());
 }

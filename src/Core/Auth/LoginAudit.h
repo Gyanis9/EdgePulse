@@ -32,6 +32,7 @@ namespace EdgePulse::Auth
         std::string  traceId;         ///< 请求标识
         std::int64_t userId{0};       ///< 账号标识；账号不存在时为 0
         std::int64_t departmentId{0}; ///< 归属部门；未知时为 0
+        std::int64_t tenantId{0};     ///< 归属租户；未知时为 0
     };
 
     /**

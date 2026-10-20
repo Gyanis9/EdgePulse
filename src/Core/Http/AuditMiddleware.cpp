@@ -213,6 +213,7 @@ namespace EdgePulse::Web
                     record.deptName = session->departmentName;
                     record.operId   = session->userId;
                     record.deptId   = session->departmentId;
+                    record.tenantId = session->tenantId;
                     record.params   = sanitizedParams(request);
                     record.result   = (failed || response.status() >= 400) ? 0 : 1;
                     record.errorMsg = failed ? errorMessage : (response.status() >= 400 ? "请求失败，HTTP " + std::to_string(response.status()) : "");

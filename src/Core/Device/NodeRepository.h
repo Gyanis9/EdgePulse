@@ -11,6 +11,7 @@
 
 #include "Base/Database/Database.h"
 #include "Base/Api/Pagination.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 #include <Core/EventLoop/EventLoop.h>
@@ -30,6 +31,7 @@ namespace EdgePulse::Device
     struct NodeRecord
     {
         std::int64_t id{0};           ///< 主键
+        std::int64_t tenantId{1};     ///< 归属租户
         std::string  name;            ///< 节点名
         std::string  status;          ///< online / offline
         std::string  agentVersion;    ///< Agent 版本
@@ -66,10 +68,11 @@ namespace EdgePulse::Device
      */
     struct AgentUpsert
     {
-        std::string name;            ///< 节点名
-        std::string agentVersion;    ///< Agent 版本
-        std::string certFingerprint; ///< 自报证书指纹
-        std::string labelsJson;      ///< 标签 JSON 文本，可空
+        std::string  name;            ///< 节点名
+        std::string  agentVersion;    ///< Agent 版本
+        std::string  certFingerprint; ///< 自报证书指纹
+        std::string  labelsJson;      ///< 标签 JSON 文本，可空
+        std::int64_t tenantId{1};     ///< 归属租户
     };
 
     /**
@@ -93,7 +96,10 @@ namespace EdgePulse::Device
          * @brief 用数据库封装构造
          * @param database 进程级数据库
          */
-        explicit NodeRepository(std::shared_ptr<Common::Database> database);
+        explicit NodeRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant = {});
+
+        /// 按租户边界派生仓储视图
+        [[nodiscard]] std::shared_ptr<NodeRepository> scoped(System::TenantScope tenant) const;
 
         /**
          * @brief 分页查询节点
@@ -158,5 +164,6 @@ namespace EdgePulse::Device
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
+        System::TenantScope               m_tenant;   ///< 租户边界
     };
 } // namespace EdgePulse::Device

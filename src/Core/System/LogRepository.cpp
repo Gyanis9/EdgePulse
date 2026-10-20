@@ -30,9 +30,11 @@ namespace EdgePulse::System
         using AsynGyanis::Database::DatabaseResult;
         using AsynGyanis::Database::DatabaseValue;
 
-        constexpr std::string_view kSelectOper = "SELECT id, title, module, action, method, url, ip, oper_name, dept_name, oper_id, dept_id, params, result, error_msg, cost_ms, "
-                                                 "trace_id, oper_time FROM sys_oper_log ";
-        constexpr std::string_view kSelectLogin = "SELECT id, username, ip, status, message, trace_id, login_time, location, browser, os, user_id, dept_id FROM sys_login_log ";
+        constexpr std::string_view kSelectOper =
+                "SELECT id, title, module, action, method, url, ip, oper_name, dept_name, oper_id, dept_id, tenant_id, params, result, error_msg, cost_ms, "
+                "trace_id, oper_time FROM sys_oper_log ";
+        constexpr std::string_view kSelectLogin =
+                "SELECT id, username, ip, status, message, trace_id, login_time, location, browser, os, user_id, dept_id, tenant_id FROM sys_login_log ";
 
         [[nodiscard]] std::int64_t nowEpoch()
         {
@@ -87,7 +89,11 @@ namespace EdgePulse::System
         [[nodiscard]] std::int64_t parseEpoch(const std::string_view text)
         {
             int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+#ifdef _MSC_VER
+            if (sscanf_s(std::string{text}.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6)
+#else
             if (std::sscanf(std::string{text}.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6)
+#endif
             {
                 return 0;
             }
@@ -124,6 +130,7 @@ namespace EdgePulse::System
             record.deptName = Sql::text(result, "dept_name");
             record.operId   = Sql::integer(result, "oper_id");
             record.deptId   = Sql::integer(result, "dept_id");
+            record.tenantId = Sql::integer(result, "tenant_id");
             record.params   = Sql::text(result, "params");
             record.result   = static_cast<int>(Sql::integer(result, "result"));
             record.errorMsg = Sql::text(result, "error_msg");
@@ -148,6 +155,7 @@ namespace EdgePulse::System
             record.os        = Sql::text(result, "os");
             record.userId    = Sql::integer(result, "user_id");
             record.deptId    = Sql::integer(result, "dept_id");
+            record.tenantId  = Sql::integer(result, "tenant_id");
             return record;
         }
 
@@ -201,20 +209,26 @@ namespace EdgePulse::System
 
         [[nodiscard]] std::string operScopeFilter(const LogScope &scope, std::vector<DatabaseValue> &parameters)
         {
+            std::string clause;
+            if (!scope.allTenants)
+            {
+                clause = " AND tenant_id = ?";
+                parameters.emplace_back(scope.tenantId);
+            }
             if (scope.all)
             {
-                return {};
+                return clause;
             }
             if (scope.selfOnly)
             {
                 parameters.emplace_back(scope.userId);
-                return " AND oper_id = ?";
+                return clause + " AND oper_id = ?";
             }
             if (scope.deptIds.empty())
             {
-                return " AND 1 = 0";
+                return clause + " AND 1 = 0";
             }
-            std::string clause = " AND dept_id IN (";
+            clause += " AND dept_id IN (";
             for (std::size_t index = 0; index < scope.deptIds.size(); ++index)
             {
                 clause += index == 0 ? "?" : ", ?";
@@ -226,20 +240,26 @@ namespace EdgePulse::System
 
         [[nodiscard]] std::string loginScopeFilter(const LogScope &scope, std::vector<DatabaseValue> &parameters)
         {
+            std::string clause;
+            if (!scope.allTenants)
+            {
+                clause = " AND tenant_id = ?";
+                parameters.emplace_back(scope.tenantId);
+            }
             if (scope.all)
             {
-                return {};
+                return clause;
             }
             if (scope.selfOnly)
             {
                 parameters.emplace_back(scope.userId);
-                return " AND user_id = ?";
+                return clause + " AND user_id = ?";
             }
             if (scope.deptIds.empty())
             {
-                return " AND 1 = 0";
+                return clause + " AND 1 = 0";
             }
-            std::string clause = " AND dept_id IN (";
+            clause += " AND dept_id IN (";
             for (std::size_t index = 0; index < scope.deptIds.size(); ++index)
             {
                 clause += index == 0 ? "?" : ", ?";
@@ -306,27 +326,15 @@ namespace EdgePulse::System
                     {
                         record.operTime = Common::nowDateTimeUtc();
                     }
-                    const std::array<DatabaseValue, 17> parameters{record.id,
-                                                                   record.title,
-                                                                   record.module,
-                                                                   record.action,
-                                                                   record.method,
-                                                                   record.url,
-                                                                   record.ip,
-                                                                   record.operName,
-                                                                   record.deptName,
-                                                                   record.operId,
-                                                                   record.deptId,
-                                                                   record.params,
-                                                                   static_cast<std::int64_t>(record.result),
-                                                                   record.errorMsg,
-                                                                   record.costMs,
-                                                                   record.traceId,
-                                                                   record.operTime};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_oper_log (id, title, module, action, method, url, ip, oper_name, dept_name, oper_id, dept_id, params, result, "
-                                            "error_msg, cost_ms, trace_id, oper_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    const std::array<DatabaseValue, 18> parameters{
+                            record.id,       record.title,    record.module,  record.action,  record.method,   record.url,    record.ip,
+                            record.operName, record.deptName, record.operId,  record.deptId,  record.tenantId, record.params, static_cast<std::int64_t>(record.result),
+                            record.errorMsg, record.costMs,   record.traceId, record.operTime};
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO sys_oper_log (id, title, module, action, method, url, ip, oper_name, dept_name, oper_id, dept_id, tenant_id, params, result, "
+                            "error_msg, cost_ms, trace_id, oper_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     return true;
                 });
     }
@@ -383,23 +391,26 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<bool> LogRepository::removeOperLog(AsynGyanis::Core::EventLoop &loop, const std::int64_t id)
+    AsynGyanis::Core::Task<bool> LogRepository::removeOperLog(AsynGyanis::Core::EventLoop &loop, const std::int64_t id, const LogScope &scope)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [id](DatabaseConnection &connection) -> bool
+                                                            [id, scope](DatabaseConnection &connection) -> bool
                                                             {
-                                                                const std::array<DatabaseValue, 1> parameters{id};
-                                                                const auto rows = Sql::executeOrThrow(connection, "DELETE FROM sys_oper_log WHERE id = ?", parameters);
+                                                                std::vector<DatabaseValue> parameters{id};
+                                                                const std::string          filter = operScopeFilter(scope, parameters);
+                                                                const auto rows = Sql::executeOrThrow(connection, "DELETE FROM sys_oper_log WHERE id = ?" + filter, parameters);
                                                                 return rows->affectedRowCount() > 0;
                                                             });
     }
 
-    AsynGyanis::Core::Task<bool> LogRepository::clearOperLogs(AsynGyanis::Core::EventLoop &loop)
+    AsynGyanis::Core::Task<bool> LogRepository::clearOperLogs(AsynGyanis::Core::EventLoop &loop, const LogScope &scope)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [](DatabaseConnection &connection) -> bool
+                                                            [scope](DatabaseConnection &connection) -> bool
                                                             {
-                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_oper_log");
+                                                                std::vector<DatabaseValue> parameters;
+                                                                const std::string          filter = operScopeFilter(scope, parameters);
+                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_oper_log WHERE 1 = 1" + filter, parameters);
                                                                 return true;
                                                             });
     }
@@ -456,23 +467,26 @@ namespace EdgePulse::System
                 });
     }
 
-    AsynGyanis::Core::Task<bool> LogRepository::removeLoginLog(AsynGyanis::Core::EventLoop &loop, const std::int64_t id)
+    AsynGyanis::Core::Task<bool> LogRepository::removeLoginLog(AsynGyanis::Core::EventLoop &loop, const std::int64_t id, const LogScope &scope)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [id](DatabaseConnection &connection) -> bool
+                                                            [id, scope](DatabaseConnection &connection) -> bool
                                                             {
-                                                                const std::array<DatabaseValue, 1> parameters{id};
-                                                                const auto rows = Sql::executeOrThrow(connection, "DELETE FROM sys_login_log WHERE id = ?", parameters);
+                                                                std::vector<DatabaseValue> parameters{id};
+                                                                const std::string          filter = loginScopeFilter(scope, parameters);
+                                                                const auto rows = Sql::executeOrThrow(connection, "DELETE FROM sys_login_log WHERE id = ?" + filter, parameters);
                                                                 return rows->affectedRowCount() > 0;
                                                             });
     }
 
-    AsynGyanis::Core::Task<bool> LogRepository::clearLoginLogs(AsynGyanis::Core::EventLoop &loop)
+    AsynGyanis::Core::Task<bool> LogRepository::clearLoginLogs(AsynGyanis::Core::EventLoop &loop, const LogScope &scope)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [](DatabaseConnection &connection) -> bool
+                                                            [scope](DatabaseConnection &connection) -> bool
                                                             {
-                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_login_log");
+                                                                std::vector<DatabaseValue> parameters;
+                                                                const std::string          filter = loginScopeFilter(scope, parameters);
+                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_login_log WHERE 1 = 1" + filter, parameters);
                                                                 return true;
                                                             });
     }

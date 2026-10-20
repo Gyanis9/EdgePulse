@@ -12,6 +12,7 @@
 #include "Base/Api/Pagination.h"
 #include "Base/Database/Database.h"
 #include "Core/System/SystemModels.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 #include <Core/EventLoop/EventLoop.h>
@@ -29,21 +30,25 @@ namespace EdgePulse::System
      */
     struct UserRecord
     {
-        std::int64_t              id{0};           ///< 主键
-        std::string               username;        ///< 登录名
-        std::string               passwordHash;    ///< PBKDF2 字符串
-        std::string               nickname;        ///< 显示名
-        std::string               phone;           ///< 手机号
-        std::string               email;           ///< 邮箱
-        std::int64_t              departmentId{0}; ///< 部门标识
-        std::string               departmentName;  ///< 部门名
-        int                       status{0};       ///< 1 启用、0 停用
-        std::string               lastLoginTime;   ///< 最近登录时间
-        std::string               createTime;      ///< 创建时间
-        std::string               roleNames;       ///< 角色名，逗号分隔
-        std::string               postNames;       ///< 岗位名，逗号分隔
-        std::vector<std::int64_t> roleIds;         ///< 角色标识
-        std::vector<std::int64_t> postIds;         ///< 岗位标识
+        std::int64_t              id{0};                ///< 主键
+        std::int64_t              tenantId{1};          ///< 归属租户
+        std::string               tenantCode;           ///< 租户编码
+        std::string               tenantName;           ///< 租户名称
+        bool                      platformAdmin{false}; ///< 是否平台管理员
+        std::string               username;             ///< 登录名
+        std::string               passwordHash;         ///< PBKDF2 字符串
+        std::string               nickname;             ///< 显示名
+        std::string               phone;                ///< 手机号
+        std::string               email;                ///< 邮箱
+        std::int64_t              departmentId{0};      ///< 部门标识
+        std::string               departmentName;       ///< 部门名
+        int                       status{0};            ///< 1 启用、0 停用
+        std::string               lastLoginTime;        ///< 最近登录时间
+        std::string               createTime;           ///< 创建时间
+        std::string               roleNames;            ///< 角色名，逗号分隔
+        std::string               postNames;            ///< 岗位名，逗号分隔
+        std::vector<std::int64_t> roleIds;              ///< 角色标识
+        std::vector<std::int64_t> postIds;              ///< 岗位标识
     };
 
     /**
@@ -56,7 +61,15 @@ namespace EdgePulse::System
          * @brief 用数据库封装构造
          * @param database 进程级数据库
          */
-        explicit UserRepository(std::shared_ptr<Common::Database> database);
+        explicit UserRepository(std::shared_ptr<Common::Database> database, TenantScope tenant = {});
+
+        /**
+         * @brief 按租户范围派生一份仓储视图
+         * @param tenant 租户范围
+         * @return std::shared_ptr<UserRepository> 共享同一数据库的视图
+         * @note 视图只影响查询过滤与插入归属，不复制连接
+         */
+        [[nodiscard]] std::shared_ptr<UserRepository> scoped(TenantScope tenant) const;
 
         /**
          * @brief 按登录名查未删除用户
@@ -216,5 +229,6 @@ namespace EdgePulse::System
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
+        TenantScope                       m_tenant;   ///< 租户范围
     };
 } // namespace EdgePulse::System

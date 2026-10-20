@@ -44,10 +44,11 @@ namespace EdgePulse::Device
      */
     struct AgentRegistration
     {
-        std::string name;            ///< 节点名
-        std::string agentVersion;    ///< Agent 版本
-        std::string certFingerprint; ///< 自报证书 SHA-256
-        std::string labelsJson;      ///< 标签 JSON，可空
+        std::string  name;            ///< 节点名
+        std::string  agentVersion;    ///< Agent 版本
+        std::string  certFingerprint; ///< 自报证书 SHA-256
+        std::string  labelsJson;      ///< 标签 JSON，可空
+        std::int64_t tenantId{1};     ///< 节点归属租户，由注册请求的租户编码解析
     };
 
     /// 节点状态变化后的发布回调；在服务器循环线程上 co_await

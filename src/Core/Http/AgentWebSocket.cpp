@@ -54,11 +54,14 @@ namespace EdgePulse::Web
         router.get("/api/agent/ws",
                    [&loop, &nodes, &commands, &channels](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
+                       // Agent 请求没有会话：节点与命令都按全租户视图处理，归属由节点自身决定
+                       const auto                              allNodes    = nodes.scoped(System::TenantScope{0, true});
+                       const auto                              allCommands = commands.scoped(System::TenantScope{0, true});
                        AsynGyanis::Net::WebSocketUpgradePolicy policy;
                        // Agent 已在 mTLS 监听器上完成证书校验；此处不再要求浏览器 Origin
                        policy.originMode = AsynGyanis::Net::WebSocketOriginMode::AllowAny;
                        response.upgradeToWebSocket(
-                               [&loop, &nodes, &commands, &channels](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
+                               [&loop, allNodes, allCommands, &channels](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
                                {
                                    std::int64_t nodeId = 0;
                                    // 首条消息必须是 hello；mTLS 已经挡住匿名对端，这里只校验节点确实存在
@@ -74,13 +77,13 @@ namespace EdgePulse::Web
                                            continue;
                                        }
                                        const auto id = integerOf(*hello, "nodeId");
-                                       if (!id.has_value() || !(co_await nodes.findById(loop, *id)).has_value())
+                                       if (!id.has_value() || !(co_await allNodes->findById(loop, *id)).has_value())
                                        {
                                            co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unknown node");
                                            co_return;
                                        }
                                        nodeId = *id;
-                                       static_cast<void>(co_await nodes.heartbeat(loop, nodeId, stringOf(*hello, "agentVersion")));
+                                       static_cast<void>(co_await allNodes->heartbeat(loop, nodeId, stringOf(*hello, "agentVersion")));
                                        channels.registerNode(nodeId, &peer);
                                        static_cast<void>(co_await peer.sendText(R"({"type":"hello","ok":true})"));
                                        break;
@@ -124,7 +127,12 @@ namespace EdgePulse::Web
                                            const auto messageText = stringOf(*value, "message");
                                            if (commandId.has_value())
                                            {
-                                               static_cast<void>(co_await commands.finish(loop, *commandId, status.empty() ? "failed" : status, result, messageText));
+                                               const auto command = co_await allCommands->find(loop, *commandId);
+                                               if (!command.has_value() || command->nodeId != nodeId)
+                                               {
+                                                   continue;
+                                               }
+                                               static_cast<void>(co_await allCommands->finish(loop, *commandId, status.empty() ? "failed" : status, result, messageText));
                                            }
                                            continue;
                                        }

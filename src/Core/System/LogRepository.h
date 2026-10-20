@@ -123,10 +123,12 @@ namespace EdgePulse::System
      */
     struct LogScope
     {
-        bool                      all{true};       ///< 可见全部
-        bool                      selfOnly{false}; ///< 仅本人
-        std::int64_t              userId{0};       ///< 当前账号
-        std::vector<std::int64_t> deptIds;         ///< 可见部门
+        bool                      all{true};        ///< 可见全部
+        bool                      selfOnly{false};  ///< 仅本人
+        std::int64_t              userId{0};        ///< 当前账号
+        std::vector<std::int64_t> deptIds;          ///< 可见部门
+        std::int64_t              tenantId{1};      ///< 归属租户
+        bool                      allTenants{true}; ///< 是否跨租户（仅平台管理员）
     };
 
     /**
@@ -173,16 +175,18 @@ namespace EdgePulse::System
          * @brief 删除一条操作日志
          * @param loop 恢复协程用的事件循环
          * @param id 日志标识
+         * @param scope 租户与数据范围
          * @return bool 是否命中
          */
-        AsynGyanis::Core::Task<bool> removeOperLog(AsynGyanis::Core::EventLoop &loop, std::int64_t id);
+        AsynGyanis::Core::Task<bool> removeOperLog(AsynGyanis::Core::EventLoop &loop, std::int64_t id, const LogScope &scope);
 
         /**
-         * @brief 清空操作日志
+         * @brief 清空可见范围内的操作日志
          * @param loop 恢复协程用的事件循环
+         * @param scope 租户与数据范围
          * @return bool 是否成功
          */
-        AsynGyanis::Core::Task<bool> clearOperLogs(AsynGyanis::Core::EventLoop &loop);
+        AsynGyanis::Core::Task<bool> clearOperLogs(AsynGyanis::Core::EventLoop &loop, const LogScope &scope);
 
         /**
          * @brief 分页查询登录日志
@@ -208,16 +212,18 @@ namespace EdgePulse::System
          * @brief 删除一条登录日志
          * @param loop 恢复协程用的事件循环
          * @param id 日志标识
+         * @param scope 租户与数据范围
          * @return bool 是否命中
          */
-        AsynGyanis::Core::Task<bool> removeLoginLog(AsynGyanis::Core::EventLoop &loop, std::int64_t id);
+        AsynGyanis::Core::Task<bool> removeLoginLog(AsynGyanis::Core::EventLoop &loop, std::int64_t id, const LogScope &scope);
 
         /**
-         * @brief 清空登录日志
+         * @brief 清空可见范围内的登录日志
          * @param loop 恢复协程用的事件循环
+         * @param scope 租户与数据范围
          * @return bool 是否成功
          */
-        AsynGyanis::Core::Task<bool> clearLoginLogs(AsynGyanis::Core::EventLoop &loop);
+        AsynGyanis::Core::Task<bool> clearLoginLogs(AsynGyanis::Core::EventLoop &loop, const LogScope &scope);
 
         /**
          * @brief 登录统计

@@ -36,19 +36,35 @@ namespace EdgePulse::Device
         }
     } // namespace
 
-    NodeGroupRepository::NodeGroupRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    NodeGroupRepository::NodeGroupRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
+    }
+
+    std::shared_ptr<NodeGroupRepository> NodeGroupRepository::scoped(const System::TenantScope tenant) const
+    {
+        return std::make_shared<NodeGroupRepository>(m_database, tenant);
     }
 
     AsynGyanis::Core::Task<std::vector<NodeGroupRecord>> NodeGroupRepository::tree(AsynGyanis::Core::EventLoop &loop)
     {
         co_return co_await m_database->withConnection<std::vector<NodeGroupRecord>>(
                 loop,
-                [](DatabaseConnection &connection) -> std::vector<NodeGroupRecord>
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::vector<NodeGroupRecord>
                 {
-                    const auto rows = Sql::executeOrThrow(connection, "SELECT g.id, g.parent_id, g.name, g.sort, g.remark, g.created_at, "
-                                                                      "COALESCE((SELECT COUNT(*) FROM biz_node n WHERE n.group_id = g.id AND n.deleted = 0), 0) AS node_count "
-                                                                      "FROM biz_node_group g WHERE g.deleted = 0 ORDER BY g.sort, g.id");
+                    std::vector<DatabaseValue> parameters;
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND g.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(
+                            connection,
+                            "SELECT g.id, g.parent_id, g.name, g.sort, g.remark, g.created_at, "
+                            "COALESCE((SELECT COUNT(*) FROM biz_node n WHERE n.group_id = g.id AND n.deleted = 0 AND n.tenant_id = g.tenant_id), 0) AS node_count "
+                            "FROM biz_node_group g WHERE g.deleted = 0" +
+                                    clause + " ORDER BY g.sort, g.id",
+                            parameters);
                     std::unordered_map<std::int64_t, NodeGroupRecord>           groups;
                     std::unordered_map<std::int64_t, std::vector<std::int64_t>> children;
                     while (rows->next())
@@ -84,14 +100,20 @@ namespace EdgePulse::Device
 
     AsynGyanis::Core::Task<bool> NodeGroupRepository::exists(AsynGyanis::Core::EventLoop &loop, const std::int64_t groupId)
     {
-        co_return co_await m_database->withConnection<bool>(loop,
-                                                            [groupId](DatabaseConnection &connection) -> bool
-                                                            {
-                                                                const std::array<DatabaseValue, 1> parameters{groupId};
-                                                                const auto                         rows = Sql::executeOrThrow(
-                                                                        connection, "SELECT COUNT(*) AS total FROM biz_node_group WHERE id = ? AND deleted = 0", parameters);
-                                                                return rows->next() && Sql::integer(*rows, "total") > 0;
-                                                            });
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [groupId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{groupId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_node_group WHERE id = ? AND deleted = 0" + clause, parameters);
+                    return rows->next() && Sql::integer(*rows, "total") > 0;
+                });
     }
 
     AsynGyanis::Core::Task<std::int64_t> NodeGroupRepository::create(AsynGyanis::Core::EventLoop &loop, const std::int64_t parentId, std::string name, const int sort,
@@ -99,14 +121,15 @@ namespace EdgePulse::Device
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [parentId, name = std::move(name), sort, remark = std::move(remark), operatorId](DatabaseConnection &connection) -> std::int64_t
+                [parentId, name = std::move(name), sort, remark = std::move(remark), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 10> parameters{id, parentId, name, static_cast<std::int64_t>(sort), remark, now, now, operatorId, operatorId, std::int64_t{0}};
+                    const std::array<DatabaseValue, 11> parameters{id,  parentId,   tenant.tenantId, name,           static_cast<std::int64_t>(sort), remark, now,
+                                                                   now, operatorId, operatorId,      std::int64_t{0}};
                     Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO biz_node_group (id, parent_id, name, sort, remark, created_at, updated_at, created_by, updated_by, deleted) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            "INSERT INTO biz_node_group (id, parent_id, tenant_id, name, sort, remark, created_at, updated_at, created_by, updated_by, deleted) "
+                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             parameters);
                     return id;
                 });
@@ -118,7 +141,7 @@ namespace EdgePulse::Device
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [groupId, parentId, name = std::move(name), sort, remark = std::move(remark), operatorId](DatabaseConnection &connection) -> bool
+                [groupId, parentId, name = std::move(name), sort, remark = std::move(remark), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
                     std::string                sql = "UPDATE biz_node_group SET updated_at = ?, updated_by = ?";
                     std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
@@ -144,6 +167,11 @@ namespace EdgePulse::Device
                     }
                     sql += " WHERE id = ? AND deleted = 0";
                     parameters.emplace_back(groupId);
+                    if (!tenant.allTenants)
+                    {
+                        sql += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
                     const auto rows = Sql::executeOrThrow(connection, sql, parameters);
                     return rows->affectedRowCount() > 0;
                 });
@@ -153,10 +181,16 @@ namespace EdgePulse::Device
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [groupId](DatabaseConnection &connection) -> bool
+                [groupId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), groupId};
-                    const auto rows = Sql::executeOrThrow(connection, "UPDATE biz_node_group SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), groupId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, "UPDATE biz_node_group SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
                     return rows->affectedRowCount() > 0;
                 });
     }
@@ -164,14 +198,27 @@ namespace EdgePulse::Device
     AsynGyanis::Core::Task<bool> NodeGroupRepository::isInUse(AsynGyanis::Core::EventLoop &loop, const std::int64_t groupId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [groupId](DatabaseConnection &connection) -> bool
+                                                            [groupId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
-                                                                const std::array<DatabaseValue, 1> parameters{groupId};
-                                                                const auto                         rows =
-                                                                        Sql::executeOrThrow(connection,
-                                                                                            "SELECT (SELECT COUNT(*) FROM biz_node_group WHERE parent_id = ? AND deleted = 0) + "
-                                                                                            "(SELECT COUNT(*) FROM biz_node WHERE group_id = ? AND deleted = 0) AS total",
-                                                                                            std::array<DatabaseValue, 2>{groupId, groupId});
+                                                                std::vector<DatabaseValue> parameters{groupId};
+                                                                std::string                childClause;
+                                                                std::string                nodeClause;
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    childClause = " AND tenant_id = ?";
+                                                                    nodeClause  = " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
+                                                                parameters.emplace_back(groupId);
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
+                                                                const auto rows = Sql::executeOrThrow(
+                                                                        connection,
+                                                                        "SELECT (SELECT COUNT(*) FROM biz_node_group WHERE parent_id = ? AND deleted = 0" + childClause +
+                                                                                ") + (SELECT COUNT(*) FROM biz_node WHERE group_id = ? AND deleted = 0" + nodeClause + ") AS total",
+                                                                        parameters);
                                                                 return rows->next() && Sql::integer(*rows, "total") > 0;
                                                             });
     }

@@ -36,7 +36,7 @@ namespace EdgePulse::Web
                        {
                            co_return;
                        }
-                       const std::uint64_t subscription = broadcaster.subscribe();
+                       const std::uint64_t subscription = broadcaster.subscribe(session->tenantId, session->platformAdmin);
                        struct SubscriptionGuard
                        {
                            SseBroadcaster &broadcaster;

@@ -116,23 +116,24 @@ namespace EdgePulse::System
      */
     struct OperLogRecord
     {
-        std::int64_t id{0};     ///< 主键
-        std::string  title;     ///< 标题
-        std::string  module;    ///< 模块
-        std::string  action;    ///< 动作
-        std::string  method;    ///< HTTP 方法
-        std::string  url;       ///< 请求路径
-        std::string  ip;        ///< 来源地址
-        std::string  operName;  ///< 操作人
-        std::string  deptName;  ///< 部门
-        std::int64_t operId{0}; ///< 操作人标识
-        std::int64_t deptId{0}; ///< 部门标识
-        std::string  params;    ///< 请求参数
-        int          result{1}; ///< 1 成功、0 失败
-        std::string  errorMsg;  ///< 失败原因
-        std::int64_t costMs{0}; ///< 耗时毫秒
-        std::string  traceId;   ///< 请求标识
-        std::string  operTime;  ///< 操作时间
+        std::int64_t id{0};       ///< 主键
+        std::string  title;       ///< 标题
+        std::string  module;      ///< 模块
+        std::string  action;      ///< 动作
+        std::string  method;      ///< HTTP 方法
+        std::string  url;         ///< 请求路径
+        std::string  ip;          ///< 来源地址
+        std::string  operName;    ///< 操作人
+        std::string  deptName;    ///< 部门
+        std::int64_t operId{0};   ///< 操作人标识
+        std::int64_t deptId{0};   ///< 部门标识
+        std::int64_t tenantId{1}; ///< 归属租户
+        std::string  params;      ///< 请求参数
+        int          result{1};   ///< 1 成功、0 失败
+        std::string  errorMsg;    ///< 失败原因
+        std::int64_t costMs{0};   ///< 耗时毫秒
+        std::string  traceId;     ///< 请求标识
+        std::string  operTime;    ///< 操作时间
     };
 
     /**
@@ -140,18 +141,19 @@ namespace EdgePulse::System
      */
     struct LoginLogRecord
     {
-        std::int64_t id{0};     ///< 主键
-        std::string  username;  ///< 登录名
-        std::string  ip;        ///< 来源地址
-        int          status{0}; ///< 1 成功、0 失败
-        std::string  message;   ///< 说明
-        std::string  traceId;   ///< 请求标识
-        std::string  loginTime; ///< 登录时间
-        std::string  location;  ///< 归属地
-        std::string  browser;   ///< 浏览器
-        std::string  os;        ///< 操作系统
-        std::int64_t userId{0}; ///< 账号标识
-        std::int64_t deptId{0}; ///< 部门标识
+        std::int64_t id{0};       ///< 主键
+        std::string  username;    ///< 登录名
+        std::string  ip;          ///< 来源地址
+        int          status{0};   ///< 1 成功、0 失败
+        std::string  message;     ///< 说明
+        std::string  traceId;     ///< 请求标识
+        std::string  loginTime;   ///< 登录时间
+        std::string  location;    ///< 归属地
+        std::string  browser;     ///< 浏览器
+        std::string  os;          ///< 操作系统
+        std::int64_t userId{0};   ///< 账号标识
+        std::int64_t deptId{0};   ///< 部门标识
+        std::int64_t tenantId{1}; ///< 归属租户
     };
 
     /**

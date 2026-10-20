@@ -81,7 +81,7 @@ protected:
         // 测试专用：只给列表权限，用来验证写接口的 403 闸门
         if (const auto testHeader = request.getHeader("x-test-permissions"); testHeader == "list-only")
         {
-            co_return EdgePulse::Device::AccessContext{0, "tester", 0, {}, {"device:node:list"}};
+            co_return EdgePulse::Device::AccessContext{0, 1, false, "tester", 0, {}, {"device:node:list"}};
         }
         const std::optional<std::string> token = bearerToken(request);
         if (!token.has_value())
@@ -93,7 +93,8 @@ protected:
         {
             co_return std::nullopt;
         }
-        co_return EdgePulse::Device::AccessContext{session->userId, session->username, session->departmentId, session->roles, session->permissions};
+        co_return EdgePulse::Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
+                                                   session->departmentId, session->roles,    session->permissions};
     }
 
     std::string login()

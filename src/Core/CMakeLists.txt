@@ -34,6 +34,7 @@ add_library(edgepulse-core STATIC
         System/MigrationRunner.cpp
         System/OrgRepository.cpp
         System/RoleRepository.cpp
+        System/TenantRepository.cpp
         System/UserRepository.cpp
         Telemetry/TelemetryIngest.cpp
         Telemetry/TelemetryRepository.cpp

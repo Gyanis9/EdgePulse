@@ -157,6 +157,7 @@ namespace EdgePulse::App
         configuration.oidcAutoProvision        = configurationManager.getBool("edgepulse.oidc.auto_provision", configuration.oidcAutoProvision);
         configuration.oidcDefaultRoleId        = configurationManager.getInt("edgepulse.oidc.default_role_id", configuration.oidcDefaultRoleId);
         configuration.oidcDefaultDepartmentId  = configurationManager.getInt("edgepulse.oidc.default_dept_id", configuration.oidcDefaultDepartmentId);
+        configuration.oidcTenantCode           = configurationManager.getString("edgepulse.oidc.tenant_code", configuration.oidcTenantCode);
         configuration.captchaTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.captcha.ttl_seconds", configuration.captchaTtlSeconds));
         configuration.captchaRequestsPerMinute = static_cast<int>(configurationManager.getInt("edgepulse.captcha.requests_per_minute", configuration.captchaRequestsPerMinute));
         configuration.sessionTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.session.ttl_seconds", configuration.sessionTtlSeconds));

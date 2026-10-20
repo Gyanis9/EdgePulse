@@ -166,11 +166,12 @@ namespace EdgePulse::Device
                        }
                        const Auth::DataScope                              scope = co_await resolveScope(dataScopes, loop, *access);
                        const NodeListScope                                nodeScope{scope.all, scope.deptIds, scope.selfOnly, scope.userId};
+                       const auto                                         service   = nodeService.scoped({access->tenantId, access->platformAdmin});
                        const std::unordered_map<std::string, std::string> query   = request.queryParams();
                        const std::string                                  keyword = query.contains("keyword") ? query.at("keyword") : std::string{};
                        const std::string                                  status  = query.contains("status") ? query.at("status") : std::string{};
                        const std::int64_t                                 groupId = Common::queryInteger(query, "groupId").value_or(0);
-                       const NodePage                page = co_await nodeService.list(loop, Common::parsePageParameters(query), keyword, status, groupId, nodeScope);
+                       const NodePage                page = co_await service->list(loop, Common::parsePageParameters(query), keyword, status, groupId, nodeScope);
                        AsynGyanis::Base::ConfigValue rows = AsynGyanis::Base::ConfigValue::array();
                        for (const NodeRecord &node: page.rows)
                        {
@@ -190,6 +191,7 @@ namespace EdgePulse::Device
                         {
                             co_return;
                         }
+                        const auto service = nodeService.scoped({access->tenantId, access->platformAdmin});
                         const std::optional<AsynGyanis::Base::ConfigValue> body = request.jsonBody();
                         if (!body.has_value())
                         {
@@ -204,7 +206,7 @@ namespace EdgePulse::Device
                             co_return;
                         }
                         const std::int64_t groupId = body->contains("groupId") ? body->value("groupId", std::int64_t{200}) : 200;
-                        const auto         result  = co_await nodeService.create(loop, *name, *labels, groupId, access->departmentId, access->userId);
+                        const auto         result  = co_await service->create(loop, *name, *labels, groupId, access->departmentId, access->userId);
                         if (!result.has_value())
                         {
                             writeNodeError(response, result.error(), traceId);
@@ -223,6 +225,7 @@ namespace EdgePulse::Device
                        {
                            co_return;
                        }
+                       const auto service = nodeService.scoped({access->tenantId, access->platformAdmin});
                        const std::optional<std::int64_t> nodeId = parseIdentifier(request.param("id"));
                        if (!nodeId.has_value())
                        {
@@ -230,7 +233,7 @@ namespace EdgePulse::Device
                            co_return;
                        }
                        const Auth::DataScope scope    = co_await resolveScope(dataScopes, loop, *access);
-                       const auto            existing = co_await nodeService.find(loop, *nodeId);
+                       const auto            existing = co_await service->find(loop, *nodeId);
                        if (!existing.has_value() || !nodeInScope(*existing, scope))
                        {
                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
@@ -271,7 +274,7 @@ namespace EdgePulse::Device
                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "name、labels 与 groupId 至少给一个", traceId);
                            co_return;
                        }
-                       const auto result = co_await nodeService.update(loop, *nodeId, std::move(name), labels, groupId, version);
+                       const auto result = co_await service->update(loop, *nodeId, std::move(name), labels, groupId, version);
                        if (!result.has_value())
                        {
                            writeNodeError(response, result.error(), traceId);
@@ -290,6 +293,7 @@ namespace EdgePulse::Device
                        {
                            co_return;
                        }
+                       const auto service = nodeService.scoped({access->tenantId, access->platformAdmin});
                        const std::optional<std::int64_t> nodeId = parseIdentifier(request.param("id"));
                        if (!nodeId.has_value())
                        {
@@ -297,13 +301,13 @@ namespace EdgePulse::Device
                            co_return;
                        }
                        const Auth::DataScope scope    = co_await resolveScope(dataScopes, loop, *access);
-                       const auto            existing = co_await nodeService.find(loop, *nodeId);
+                       const auto            existing = co_await service->find(loop, *nodeId);
                        if (!existing.has_value() || !nodeInScope(*existing, scope))
                        {
                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                            co_return;
                        }
-                       if (!co_await nodeService.remove(loop, *nodeId))
+                       if (!co_await service->remove(loop, *nodeId))
                        {
                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                            co_return;

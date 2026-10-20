@@ -10,6 +10,7 @@
 #pragma once
 
 #include "Core/Alarm/AlarmRepository.h"
+#include "Core/System/TenantScope.h"
 #include "Core/Telemetry/TelemetryModels.h"
 
 #include <Core/Coroutine/Task.h>
@@ -44,6 +45,9 @@ namespace EdgePulse::Alarm
          * @param notifier 变更通知；可为空
          */
         AlarmService(std::shared_ptr<AlarmRepository> repository, AlarmNotifier notifier = {});
+
+        /// 按租户边界派生服务视图
+        [[nodiscard]] std::shared_ptr<AlarmService> scoped(System::TenantScope tenant) const;
 
         /**
          * @brief 按一批遥测评估规则

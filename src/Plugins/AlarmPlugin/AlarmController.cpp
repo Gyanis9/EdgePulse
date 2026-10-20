@@ -90,9 +90,10 @@ namespace EdgePulse::Alarm
                        {
                            co_return;
                        }
+                       const auto alarms = deps->alarms->scoped(session->tenantScope());
                        const Common::QueryMap       query = request.queryParams();
                        const Common::PageParameters page  = Common::parsePageParameters(query);
-                       const auto  result = co_await deps->alarms->repository().listAlarms(loop, Common::queryText(query, "status"), Common::queryText(query, "level"),
+                       const auto  result = co_await alarms->repository().listAlarms(loop, Common::queryText(query, "status"), Common::queryText(query, "level"),
                                                                                            Common::queryInteger(query, "nodeId").value_or(0), page);
                        ConfigValue rows   = ConfigValue::array();
                        for (const AlarmRecord &alarm: result.rows)
@@ -100,7 +101,7 @@ namespace EdgePulse::Alarm
                            rows.push_back(alarmJson(alarm));
                        }
                        ConfigValue data  = Common::makePageResult(page, result.total, std::move(rows));
-                       data["openCount"] = co_await deps->alarms->repository().openCount(loop);
+                       data["openCount"] = co_await alarms->repository().openCount(loop);
                        Common::writeSuccess(response, std::move(data), traceId);
                        co_return;
                    });
@@ -114,13 +115,14 @@ namespace EdgePulse::Alarm
                        {
                            co_return;
                        }
+                       const auto alarms = deps->alarms->scoped(session->tenantScope());
                        const auto id = Common::parsePositiveIdentifier(request.param("id"));
                        if (!id.has_value())
                        {
                            fail(response, Common::kCodeBadRequest, "告警标识不合法", traceId);
                            co_return;
                        }
-                       const auto alarm = co_await deps->alarms->repository().findAlarm(loop, *id);
+                       const auto alarm = co_await alarms->repository().findAlarm(loop, *id);
                        if (!alarm.has_value())
                        {
                            fail(response, Common::kCodeNotFound, "告警不存在", traceId);
@@ -139,19 +141,20 @@ namespace EdgePulse::Alarm
                        {
                            co_return;
                        }
+                       const auto alarms = deps->alarms->scoped(session->tenantScope());
                        const auto id = Common::parsePositiveIdentifier(request.param("id"));
                        if (!id.has_value())
                        {
                            fail(response, Common::kCodeBadRequest, "告警标识不合法", traceId);
                            co_return;
                        }
-                       const auto alarm = co_await deps->alarms->repository().acknowledge(loop, *id, session->userId);
+                       const auto alarm = co_await alarms->repository().acknowledge(loop, *id, session->userId);
                        if (!alarm.has_value())
                        {
                            fail(response, Common::kCodeConflict, "告警不存在或已确认/恢复", traceId);
                            co_return;
                        }
-                       co_await deps->alarms->notify(*alarm);
+                       co_await alarms->notify(*alarm);
                        Common::writeSuccess(response, alarmJson(*alarm), traceId);
                        co_return;
                    });
@@ -165,19 +168,20 @@ namespace EdgePulse::Alarm
                        {
                            co_return;
                        }
+                       const auto alarms = deps->alarms->scoped(session->tenantScope());
                        const auto id = Common::parsePositiveIdentifier(request.param("id"));
                        if (!id.has_value())
                        {
                            fail(response, Common::kCodeBadRequest, "告警标识不合法", traceId);
                            co_return;
                        }
-                       const auto alarm = co_await deps->alarms->repository().resolve(loop, *id, session->userId);
+                       const auto alarm = co_await alarms->repository().resolve(loop, *id, session->userId);
                        if (!alarm.has_value())
                        {
                            fail(response, Common::kCodeConflict, "告警不存在或已恢复", traceId);
                            co_return;
                        }
-                       co_await deps->alarms->notify(*alarm);
+                       co_await alarms->notify(*alarm);
                        Common::writeSuccess(response, alarmJson(*alarm), traceId);
                        co_return;
                    });
@@ -191,9 +195,10 @@ namespace EdgePulse::Alarm
                        {
                            co_return;
                        }
+                       const auto alarms = deps->alarms->scoped(session->tenantScope());
                        const Common::QueryMap       query  = request.queryParams();
                        const Common::PageParameters page   = Common::parsePageParameters(query);
-                       const auto                   result = co_await deps->alarms->repository().listRules(loop, Common::queryText(query, "keyword"), page);
+                       const auto                   result = co_await alarms->repository().listRules(loop, Common::queryText(query, "keyword"), page);
                        ConfigValue                  rows   = ConfigValue::array();
                        for (const AlarmRuleRecord &rule: result.rows)
                        {
@@ -212,6 +217,7 @@ namespace EdgePulse::Alarm
                         {
                             co_return;
                         }
+                        const auto alarms = deps->alarms->scoped(session->tenantScope());
                         const auto body = request.jsonBody();
                         if (!body.has_value() || !body->is_object())
                         {
@@ -239,7 +245,7 @@ namespace EdgePulse::Alarm
                             fail(response, Common::kCodeBadRequest, "阈值必须是有限数值", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->alarms->repository().createRule(loop, rule, session->userId);
+                        const std::int64_t id = co_await alarms->repository().createRule(loop, rule, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -253,13 +259,14 @@ namespace EdgePulse::Alarm
                        {
                            co_return;
                        }
+                       const auto alarms = deps->alarms->scoped(session->tenantScope());
                        const auto id = Common::parsePositiveIdentifier(request.param("id"));
                        if (!id.has_value())
                        {
                            fail(response, Common::kCodeBadRequest, "规则标识不合法", traceId);
                            co_return;
                        }
-                       const auto existing = co_await deps->alarms->repository().findRule(loop, *id);
+                       const auto existing = co_await alarms->repository().findRule(loop, *id);
                        if (!existing.has_value())
                        {
                            fail(response, Common::kCodeNotFound, "规则不存在", traceId);
@@ -288,7 +295,7 @@ namespace EdgePulse::Alarm
                            fail(response, Common::kCodeBadRequest, "规则字段不合法", traceId);
                            co_return;
                        }
-                       if (!co_await deps->alarms->repository().updateRule(loop, *id, rule, session->userId))
+                       if (!co_await alarms->repository().updateRule(loop, *id, rule, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "规则不存在", traceId);
                            co_return;
@@ -306,13 +313,14 @@ namespace EdgePulse::Alarm
                        {
                            co_return;
                        }
+                       const auto alarms = deps->alarms->scoped(session->tenantScope());
                        const auto id = Common::parsePositiveIdentifier(request.param("id"));
                        if (!id.has_value())
                        {
                            fail(response, Common::kCodeBadRequest, "规则标识不合法", traceId);
                            co_return;
                        }
-                       if (!co_await deps->alarms->repository().removeRule(loop, *id))
+                       if (!co_await alarms->repository().removeRule(loop, *id))
                        {
                            fail(response, Common::kCodeNotFound, "规则不存在", traceId);
                            co_return;

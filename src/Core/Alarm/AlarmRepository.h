@@ -12,6 +12,7 @@
 #include "Base/Api/Pagination.h"
 #include "Base/Database/Database.h"
 #include "Core/Telemetry/TelemetryModels.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 
@@ -38,7 +39,10 @@ namespace EdgePulse::Alarm
          * @brief 构造
          * @param database 数据库封装
          */
-        explicit AlarmRepository(std::shared_ptr<Common::Database> database);
+        explicit AlarmRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant = {});
+
+        /// 按租户边界派生仓储视图
+        [[nodiscard]] std::shared_ptr<AlarmRepository> scoped(System::TenantScope tenant) const;
 
         /**
          * @brief 分页查询规则
@@ -169,5 +173,6 @@ namespace EdgePulse::Alarm
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
+        System::TenantScope               m_tenant;   ///< 租户边界
     };
 } // namespace EdgePulse::Alarm

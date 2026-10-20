@@ -11,6 +11,7 @@
 
 #include "Base/Api/Pagination.h"
 #include "Base/Database/Database.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 
@@ -33,6 +34,7 @@ namespace EdgePulse::Command
     struct CommandRecord
     {
         std::int64_t id{0};              ///< 主键
+        std::int64_t tenantId{1};        ///< 归属租户
         std::int64_t nodeId{0};          ///< 目标节点
         std::string  nodeName;           ///< 节点名
         std::string  type;               ///< 命令类型
@@ -57,7 +59,10 @@ namespace EdgePulse::Command
          * @brief 构造
          * @param database 数据库封装
          */
-        explicit CommandRepository(std::shared_ptr<Common::Database> database);
+        explicit CommandRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant = {});
+
+        /// 按租户边界派生仓储视图
+        [[nodiscard]] std::shared_ptr<CommandRepository> scoped(System::TenantScope tenant) const;
 
         /**
          * @brief 创建命令
@@ -129,5 +134,6 @@ namespace EdgePulse::Command
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
+        System::TenantScope               m_tenant;   ///< 租户边界
     };
 } // namespace EdgePulse::Command

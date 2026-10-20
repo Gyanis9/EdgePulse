@@ -72,6 +72,7 @@ namespace EdgePulse::Device
 namespace EdgePulse::System
 {
     class DictionaryRepository;
+    class TenantRepository;
     class LogRepository;
     class MenuRepository;
     class OrgRepository;
@@ -181,6 +182,7 @@ namespace EdgePulse::App
         std::shared_ptr<System::MenuRepository>                   m_menuRepository;       ///< 菜单仓储
         std::shared_ptr<System::OrgRepository>                    m_orgRepository;        ///< 部门与岗位
         std::shared_ptr<System::DictionaryRepository>             m_dictionaryRepository; ///< 字典与参数
+        std::shared_ptr<System::TenantRepository>                 m_tenantRepository;     ///< 租户
         std::shared_ptr<System::LogRepository>                    m_logRepository;        ///< 日志与统计
         std::shared_ptr<Auth::DataScopeService>                   m_dataScopeService;     ///< 数据范围
         std::shared_ptr<Device::NodeGroupRepository>              m_nodeGroupRepository;  ///< 节点分组

@@ -57,6 +57,11 @@ namespace EdgePulse::Device
     {
     }
 
+    std::shared_ptr<NodeService> NodeService::scoped(const System::TenantScope tenant) const
+    {
+        return std::make_shared<NodeService>(m_repository->scoped(tenant));
+    }
+
     AsynGyanis::Core::Task<NodePage> NodeService::list(AsynGyanis::Core::EventLoop &loop, Common::PageParameters parameters, std::string keyword, std::string status,
                                                        const std::int64_t groupId, NodeListScope scope)
     {

@@ -23,7 +23,7 @@ namespace EdgePulse::Alarm
 
         constexpr std::string_view kSelectRule = "SELECT id, name, node_id, metric, comparison, threshold, level, enabled, cooldown_seconds, created_at FROM biz_alarm_rule ";
         constexpr std::string_view kSelectAlarm =
-                "SELECT a.id, a.rule_id, a.node_id, a.level, a.metric, a.value, a.threshold, a.status, a.message, a.triggered_at, a.acknowledged_at, a.resolved_at, "
+                "SELECT a.id, a.tenant_id, a.rule_id, a.node_id, a.level, a.metric, a.value, a.threshold, a.status, a.message, a.triggered_at, a.acknowledged_at, a.resolved_at, "
                 "COALESCE(n.name, '') AS node_name FROM biz_alarm a LEFT JOIN biz_node n ON n.id = a.node_id ";
 
         [[nodiscard]] AlarmRuleRecord readRule(const DatabaseResult &result)
@@ -53,6 +53,7 @@ namespace EdgePulse::Alarm
         {
             AlarmRecord alarm;
             alarm.id                  = Sql::integer(result, "id");
+            alarm.tenantId            = Sql::integer(result, "tenant_id");
             alarm.ruleId              = Sql::integer(result, "rule_id");
             alarm.nodeId              = Sql::integer(result, "node_id");
             alarm.nodeName            = Sql::text(result, "node_name");
@@ -77,18 +78,28 @@ namespace EdgePulse::Alarm
         }
     } // namespace
 
-    AlarmRepository::AlarmRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    AlarmRepository::AlarmRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
+    }
+
+    std::shared_ptr<AlarmRepository> AlarmRepository::scoped(const System::TenantScope tenant) const
+    {
+        return std::make_shared<AlarmRepository>(m_database, tenant);
     }
 
     AsynGyanis::Core::Task<Common::PageRows<AlarmRuleRecord>> AlarmRepository::listRules(AsynGyanis::Core::EventLoop &loop, std::string keyword, const Common::PageParameters &page)
     {
         co_return co_await m_database->withConnection<Common::PageRows<AlarmRuleRecord>>(
                 loop,
-                [keyword = std::move(keyword), page](DatabaseConnection &connection) -> Common::PageRows<AlarmRuleRecord>
+                [keyword = std::move(keyword), page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<AlarmRuleRecord>
                 {
                     std::string                filter = "WHERE deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -121,9 +132,18 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<std::vector<AlarmRuleRecord>>(
                 loop,
-                [](DatabaseConnection &connection) -> std::vector<AlarmRuleRecord>
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::vector<AlarmRuleRecord>
                 {
-                    const auto                   rows = Sql::executeOrThrow(connection, std::string{kSelectRule} + "WHERE deleted = 0 AND enabled = 1 ORDER BY id");
+                    std::vector<DatabaseValue> parameters;
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = parameters.empty() ? Sql::executeOrThrow(connection, std::string{kSelectRule} + "WHERE deleted = 0 AND enabled = 1 ORDER BY id")
+                                                         : Sql::executeOrThrow(connection, std::string{kSelectRule} + "WHERE deleted = 0 AND enabled = 1" + clause + " ORDER BY id",
+                                                                               parameters);
                     std::vector<AlarmRuleRecord> rules;
                     while (rows->next())
                     {
@@ -137,11 +157,12 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [rule = std::move(rule), operatorId](DatabaseConnection &connection) -> std::int64_t
+                [rule = std::move(rule), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 13> parameters{id,
+                    const std::array<DatabaseValue, 14> parameters{id,
+                                                                   tenant.tenantId,
                                                                    rule.name,
                                                                    rule.nodeId,
                                                                    rule.metric,
@@ -154,10 +175,11 @@ namespace EdgePulse::Alarm
                                                                    now,
                                                                    operatorId,
                                                                    std::int64_t{0}};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO biz_alarm_rule (id, name, node_id, metric, comparison, threshold, level, enabled, cooldown_seconds, created_at, "
-                                            "updated_at, created_by, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO biz_alarm_rule (id, tenant_id, name, node_id, metric, comparison, threshold, level, enabled, cooldown_seconds, created_at, "
+                            "updated_at, created_by, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     return id;
                 });
     }
@@ -166,22 +188,29 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [ruleId, rule = std::move(rule), operatorId](DatabaseConnection &connection) -> bool
+                [ruleId, rule = std::move(rule), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 11> parameters{rule.name,
-                                                                   rule.nodeId,
-                                                                   rule.metric,
-                                                                   rule.comparison,
-                                                                   rule.threshold,
-                                                                   rule.level,
-                                                                   static_cast<std::int64_t>(rule.enabled ? 1 : 0),
-                                                                   static_cast<std::int64_t>(rule.cooldownSeconds),
-                                                                   Common::nowDateTimeUtc(),
-                                                                   operatorId,
-                                                                   ruleId};
+                    std::vector<DatabaseValue> parameters{rule.name,
+                                                          rule.nodeId,
+                                                          rule.metric,
+                                                          rule.comparison,
+                                                          rule.threshold,
+                                                          rule.level,
+                                                          static_cast<std::int64_t>(rule.enabled ? 1 : 0),
+                                                          static_cast<std::int64_t>(rule.cooldownSeconds),
+                                                          Common::nowDateTimeUtc(),
+                                                          operatorId,
+                                                          ruleId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
                     const auto rows = Sql::executeOrThrow(connection,
                                                           "UPDATE biz_alarm_rule SET name = ?, node_id = ?, metric = ?, comparison = ?, threshold = ?, level = ?, enabled = ?, "
-                                                          "cooldown_seconds = ?, updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0",
+                                                          "cooldown_seconds = ?, updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0" +
+                                                                  clause,
                                                           parameters);
                     return rows->affectedRowCount() > 0;
                 });
@@ -191,10 +220,16 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [ruleId](DatabaseConnection &connection) -> bool
+                [ruleId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), ruleId};
-                    const auto rows = Sql::executeOrThrow(connection, "UPDATE biz_alarm_rule SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), ruleId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, "UPDATE biz_alarm_rule SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
                     return rows->affectedRowCount() > 0;
                 });
     }
@@ -203,10 +238,16 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<std::optional<AlarmRuleRecord>>(
                 loop,
-                [ruleId](DatabaseConnection &connection) -> std::optional<AlarmRuleRecord>
+                [ruleId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<AlarmRuleRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{ruleId};
-                    const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectRule} + "WHERE id = ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{ruleId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectRule} + "WHERE id = ? AND deleted = 0" + clause, parameters);
                     if (!rows->next())
                     {
                         return std::nullopt;
@@ -237,16 +278,17 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<std::optional<AlarmRecord>>(
                 loop,
-                [rule = std::move(rule), nodeId, value, message = std::move(message)](DatabaseConnection &connection) -> std::optional<AlarmRecord>
+                [rule = std::move(rule), nodeId, value, message = std::move(message), tenant = m_tenant](DatabaseConnection &connection) -> std::optional<AlarmRecord>
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 12> parameters{
-                            id, rule.id, nodeId, rule.level, rule.metric, value, rule.threshold, std::string{"open"}, message, now, std::string{"open"}, now};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO biz_alarm (id, rule_id, node_id, level, metric, value, threshold, status, message, triggered_at, dedup_key, created_at) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    const std::array<DatabaseValue, 13> parameters{
+                            id, tenant.tenantId, rule.id, nodeId, rule.level, rule.metric, value, rule.threshold, std::string{"open"}, message, now, std::string{"open"}, now};
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO biz_alarm (id, tenant_id, rule_id, node_id, level, metric, value, threshold, status, message, triggered_at, dedup_key, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     const std::array<DatabaseValue, 1> idParameter{id};
                     const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectAlarm} + "WHERE a.id = ?", idParameter);
                     if (!rows->next())
@@ -262,16 +304,23 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [ruleId, nodeId, cooldownSeconds](DatabaseConnection &connection) -> bool
+                [ruleId, nodeId, cooldownSeconds, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
                     if (cooldownSeconds <= 0)
                     {
                         return false;
                     }
-                    const std::string                  cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{cooldownSeconds});
-                    const std::array<DatabaseValue, 3> parameters{ruleId, nodeId, cutoff};
-                    const auto                         rows = Sql::executeOrThrow(
-                            connection, "SELECT COUNT(*) AS total FROM biz_alarm WHERE rule_id = ? AND node_id = ? AND status = 'resolved' AND resolved_at >= ?", parameters);
+                    const std::string          cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{cooldownSeconds});
+                    std::vector<DatabaseValue> parameters{ruleId, nodeId, cutoff};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(
+                            connection, "SELECT COUNT(*) AS total FROM biz_alarm WHERE rule_id = ? AND node_id = ? AND status = 'resolved' AND resolved_at >= ?" + clause,
+                            parameters);
                     return rows->next() && Sql::integer(*rows, "total") > 0;
                 });
     }
@@ -281,10 +330,15 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<Common::PageRows<AlarmRecord>>(
                 loop,
-                [status = std::move(status), level = std::move(level), nodeId, page](DatabaseConnection &connection) -> Common::PageRows<AlarmRecord>
+                [status = std::move(status), level = std::move(level), nodeId, page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<AlarmRecord>
                 {
                     std::string                filter = "WHERE 1 = 1";
                     std::vector<DatabaseValue> parameters;
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND a.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
                     if (!status.empty())
                     {
                         filter += " AND a.status = ?";
@@ -324,11 +378,17 @@ namespace EdgePulse::Alarm
     AsynGyanis::Core::Task<std::optional<AlarmRecord>> AlarmRepository::findAlarm(AsynGyanis::Core::EventLoop &loop, const std::int64_t alarmId)
     {
         co_return co_await m_database->withConnection<std::optional<AlarmRecord>>(loop,
-                                                                                  [alarmId](DatabaseConnection &connection) -> std::optional<AlarmRecord>
+                                                                                  [alarmId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<AlarmRecord>
                                                                                   {
-                                                                                      const std::array<DatabaseValue, 1> parameters{alarmId};
-                                                                                      const auto                         rows = Sql::executeOrThrow(
-                                                                                              connection, std::string{kSelectAlarm} + "WHERE a.id = ?", parameters);
+                                                                                      std::vector<DatabaseValue> parameters{alarmId};
+                                                                                      std::string                clause;
+                                                                                      if (!tenant.allTenants)
+                                                                                      {
+                                                                                          clause = " AND a.tenant_id = ?";
+                                                                                          parameters.emplace_back(tenant.tenantId);
+                                                                                      }
+                                                                                      const auto rows = Sql::executeOrThrow(
+                                                                                              connection, std::string{kSelectAlarm} + "WHERE a.id = ?" + clause, parameters);
                                                                                       if (!rows->next())
                                                                                       {
                                                                                           return std::nullopt;
@@ -341,19 +401,32 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<std::optional<AlarmRecord>>(
                 loop,
-                [alarmId, operatorId](DatabaseConnection &connection) -> std::optional<AlarmRecord>
+                [alarmId, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<AlarmRecord>
                 {
-                    const std::array<DatabaseValue, 3> parameters{Common::nowDateTimeUtc(), operatorId, alarmId};
-                    const auto                         update = Sql::executeOrThrow(connection,
-                                                                                    "UPDATE biz_alarm SET status = 'acknowledged', acknowledged_at = ?, acknowledged_by = ? "
-                                                                                    "WHERE id = ? AND status = 'open'",
-                                                                                    parameters);
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId, alarmId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto update = Sql::executeOrThrow(connection,
+                                                            "UPDATE biz_alarm SET status = 'acknowledged', acknowledged_at = ?, acknowledged_by = ? "
+                                                            "WHERE id = ? AND status = 'open'" +
+                                                                    clause,
+                                                            parameters);
                     if (update->affectedRowCount() == 0)
                     {
                         return std::nullopt;
                     }
-                    const std::array<DatabaseValue, 1> idParameter{alarmId};
-                    const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectAlarm} + "WHERE a.id = ?", idParameter);
+                    std::vector<DatabaseValue> idParameter{alarmId};
+                    std::string                selectClause;
+                    if (!tenant.allTenants)
+                    {
+                        selectClause = " AND a.tenant_id = ?";
+                        idParameter.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectAlarm} + "WHERE a.id = ?" + selectClause, idParameter);
                     if (!rows->next())
                     {
                         return std::nullopt;
@@ -366,19 +439,32 @@ namespace EdgePulse::Alarm
     {
         co_return co_await m_database->withConnection<std::optional<AlarmRecord>>(
                 loop,
-                [alarmId, operatorId](DatabaseConnection &connection) -> std::optional<AlarmRecord>
+                [alarmId, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<AlarmRecord>
                 {
-                    const std::array<DatabaseValue, 3> parameters{Common::nowDateTimeUtc(), operatorId, alarmId};
-                    const auto                         update = Sql::executeOrThrow(connection,
-                                                                                    "UPDATE biz_alarm SET status = 'resolved', resolved_at = ?, resolved_by = ? "
-                                                                                    "WHERE id = ? AND status <> 'resolved'",
-                                                                                    parameters);
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId, alarmId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto update = Sql::executeOrThrow(connection,
+                                                            "UPDATE biz_alarm SET status = 'resolved', resolved_at = ?, resolved_by = ? "
+                                                            "WHERE id = ? AND status <> 'resolved'" +
+                                                                    clause,
+                                                            parameters);
                     if (update->affectedRowCount() == 0)
                     {
                         return std::nullopt;
                     }
-                    const std::array<DatabaseValue, 1> idParameter{alarmId};
-                    const auto                         rows = Sql::executeOrThrow(connection, std::string{kSelectAlarm} + "WHERE a.id = ?", idParameter);
+                    std::vector<DatabaseValue> idParameter{alarmId};
+                    std::string                selectClause;
+                    if (!tenant.allTenants)
+                    {
+                        selectClause = " AND a.tenant_id = ?";
+                        idParameter.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectAlarm} + "WHERE a.id = ?" + selectClause, idParameter);
                     if (!rows->next())
                     {
                         return std::nullopt;
@@ -389,12 +475,19 @@ namespace EdgePulse::Alarm
 
     AsynGyanis::Core::Task<std::int64_t> AlarmRepository::openCount(AsynGyanis::Core::EventLoop &loop)
     {
-        co_return co_await m_database->withConnection<std::int64_t>(loop,
-                                                                    [](DatabaseConnection &connection) -> std::int64_t
-                                                                    {
-                                                                        const auto rows = Sql::executeOrThrow(connection,
-                                                                                                              "SELECT COUNT(*) AS total FROM biz_alarm WHERE status <> 'resolved'");
-                                                                        return rows->next() ? Sql::integer(*rows, "total") : 0;
-                                                                    });
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                {
+                    std::vector<DatabaseValue> parameters;
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_alarm WHERE status <> 'resolved'" + clause, parameters);
+                    return rows->next() ? Sql::integer(*rows, "total") : 0;
+                });
     }
 } // namespace EdgePulse::Alarm

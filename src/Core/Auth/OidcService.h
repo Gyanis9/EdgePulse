@@ -29,7 +29,8 @@ namespace EdgePulse::Cache
 namespace EdgePulse::System
 {
     class UserRepository;
-}
+    class TenantRepository;
+} // namespace EdgePulse::System
 
 namespace EdgePulse::Auth
 {
@@ -51,6 +52,7 @@ namespace EdgePulse::Auth
         std::int64_t defaultRoleId{0};               ///< 自动建号时分配的角色
         std::int64_t defaultDepartmentId{101};       ///< 自动建号时的部门
         std::string  allowedEmailDomains;            ///< 允许的邮箱域，逗号分隔；空表示不限制
+        std::string  tenantCode{"default"};          ///< 登录与自动建号归属的租户编码
     };
 
     /**
@@ -96,10 +98,11 @@ namespace EdgePulse::Auth
          * @brief 构造
          * @param configuration 配置
          * @param users 用户仓储
+         * @param tenants 租户仓储，用于把外部身份绑定到配置的租户
          * @param cache 状态与一次性 code 的存储
          * @param auth 认证服务，用于签发会话
          */
-        OidcService(OidcConfiguration configuration, System::UserRepository &users, Cache::KeyValueStore &cache, AuthService &auth);
+        OidcService(OidcConfiguration configuration, System::UserRepository &users, System::TenantRepository &tenants, Cache::KeyValueStore &cache, AuthService &auth);
 
         /**
          * @brief 生成 state、nonce 与 PKCE，返回 IdP 授权地址
@@ -166,10 +169,11 @@ namespace EdgePulse::Auth
 
         [[nodiscard]] bool emailDomainAllowed(std::string_view email) const;
 
-        OidcConfiguration        m_configuration;
-        System::UserRepository  &m_users;
-        Cache::KeyValueStore    &m_cache;
-        AuthService             &m_auth;
-        std::optional<Discovery> m_discovery;
+        OidcConfiguration         m_configuration;
+        System::UserRepository   &m_users;
+        System::TenantRepository &m_tenants;
+        Cache::KeyValueStore     &m_cache;
+        AuthService              &m_auth;
+        std::optional<Discovery>  m_discovery;
     };
 } // namespace EdgePulse::Auth

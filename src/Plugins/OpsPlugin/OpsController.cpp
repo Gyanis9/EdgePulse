@@ -30,7 +30,7 @@ namespace EdgePulse::Ops
                        {
                            co_return;
                        }
-                       const OpsSummary                    summary  = co_await deps->repository->summary(loop);
+                       const OpsSummary                    summary  = co_await deps->repository->scoped(session->tenantScope())->summary(loop);
                        const AsynGyanis::Base::ConfigValue nodes    = AsynGyanis::Base::ConfigValue::object({{"total", summary.nodeTotal}, {"online", summary.nodeOnline}});
                        const AsynGyanis::Base::ConfigValue alarms   = AsynGyanis::Base::ConfigValue::object({{"open", summary.alarmOpen}});
                        const AsynGyanis::Base::ConfigValue commands = AsynGyanis::Base::ConfigValue::object({{"total", summary.commandTotal}, {"pending", summary.commandPending}});
