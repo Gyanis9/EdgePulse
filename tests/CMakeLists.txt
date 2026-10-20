@@ -17,6 +17,7 @@ edgepulse_enable_warnings(edgepulse-test-support)
 add_executable(edgepulse-unit-tests
         Unit/TestCaptchaService.cpp
         Unit/TestCsvWriter.cpp
+        Unit/TestIdGenerator.cpp
         Unit/TestMemoryKeyValueStore.cpp
         Unit/TestMigrationSqlSplitter.cpp
         Unit/TestPagination.cpp
