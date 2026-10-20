@@ -1,239 +1,166 @@
-# EdgePulse API（P0）
+# EdgePulse API
 
-- 版本：P0（2026-10-20）
-- 基址：开发档 `http://127.0.0.1:8080/api`；控制台 HTTPS `https://<host>:8443/api`
-- Agent 接口只在 `9443` mTLS 监听器上提供，不出现在 8080/8443
+- 基础路径：`/api`
+- 认证：除匿名端点外，`Authorization: Bearer <token>`
+- 响应包络：`{ "code": 200, "message": "ok", "data": ..., "traceId": "..." }`
+- 分页：`{ "pageNum": 1, "pageSize": 10, "total": 0, "rows": [] }`；`pageSize` 上限 100
+- 失败时 HTTP 状态为 4xx/5xx，`code` 为同一业务码，`data` 为 `null`
+- 请求标识：响应头回写 `x-request-id`
+- 时间：请求与响应里的 DATETIME 使用 `YYYY-MM-DD HH:MM:SS`（UTC）
 
-## 1. 统一约定
+## 1. 健康与认证
 
-成功：
-
-```json
-{ "code": 200, "message": "ok", "data": {}, "traceId": "0001-0000000000000001" }
-```
-
-失败：
-
-```json
-{ "code": 401, "message": "用户名或密码错误", "data": null, "traceId": "0001-0000000000000002" }
-```
-
-- HTTP 状态码与 `code` 同值；`data` 失败时为 `null`。
-- 响应回写 `x-request-id`；`traceId` 取自该请求的标识。
-- 分页：`{ "pageNum": 1, "pageSize": 10, "total": 0, "rows": [] }`；`pageSize` 上限 100。
-- 认证：`Authorization: Bearer <token>`。
-- 中文错误文案不包含驱动内部原文、口令、token 或文件路径。
-
-## 2. 认证
-
-### GET /auth/captcha
-
-匿名。开发档：
-
-```json
-{ "uuid": "…", "imageSvg": "<svg …>", "code": "A7K2" }
-```
-
-生产档不返回 `code`。`uuid` 一次性，2 分钟有效；按 IP 每分钟最多 30 次，超限 429。
-
-### POST /auth/login
-
-```json
-{ "username": "admin", "password": "admin123", "captcha": "A7K2", "captchaUuid": "…" }
-```
-
-成功：
-
-```json
-{ "token": "<64 位十六进制>", "expiresIn": 7200 }
-```
-
-失败：验证码错误 400；用户名/口令错误 401；限流 429。
-
-### POST /auth/logout
-
-需要 Bearer。成功 `data: null`；删除会话。
-
-### GET /auth/me
-
-需要 Bearer。返回：
-
-```json
-{
-  "id": 1,
-  "userId": 1,
-  "username": "admin",
-  "nickname": "超级管理员",
-  "deptId": 0,
-  "deptName": "",
-  "roles": ["super_admin"],
-  "permissions": ["device:node:list", "device:node:write"]
-}
-```
-
-### GET /auth/routes
-
-需要 Bearer。返回当前用户可见菜单树：
-
-```json
-{
-  "routes": [
-    {
-      "id": 1000,
-      "parentId": 0,
-      "name": "边缘运维",
-      "type": "dir",
-      "path": "/device",
-      "component": "",
-      "icon": "layers",
-      "permission": "",
-      "children": [
-        {
-          "id": 1001,
-          "parentId": 1000,
-          "name": "节点",
-          "type": "menu",
-          "path": "/device/nodes",
-          "component": "device/Nodes",
-          "icon": "server",
-          "permission": "device:node:list",
-          "children": []
-        }
-      ]
-    }
-  ]
-}
-```
-
-### PUT /auth/password
-
-需要 Bearer：
-
-```json
-{ "oldPassword": "admin123", "newPassword": "new-pass-123" }
-```
-
-新口令长度 6..64；原口令错误 400；成功 `data: null`。
-
-## 3. 节点
-
-权限：列表 `device:node:list`；创建/更新/删除 `device:node:write`。匿名 401，无权限 403。
-
-### GET /nodes
-
-查询：`pageNum`、`pageSize`、`keyword`、`status`（`online` / `offline`）。返回分页；行形状：
-
-```json
-{
-  "id": 1879577769666412544,
-  "name": "edgepulse-agent",
-  "status": "online",
-  "agentVersion": "0.1.0",
-  "certFingerprint": "<64 位小写十六进制>",
-  "labels": { "probe": "true" },
-  "lastSeen": "2026-10-20T14:02:11Z",
-  "version": 3
-}
-```
-
-### POST /nodes
-
-```json
-{ "name": "edge-sh-01", "labels": { "site": "shanghai" } }
-```
-
-`name` 1..128 字符且唯一；`labels` 可省略或为 JSON 对象。成功返回节点；重名 409。
-
-### PUT /nodes/{id}
-
-```json
-{ "name": "edge-sh-01b", "version": 1 }
-```
-
-`version` 必填；`name` 与 `labels` 至少给一个。版本不匹配 409；节点不存在 404。
-
-### DELETE /nodes/{id}
-
-软删除；不存在或已删除 404。
-
-## 4. Agent（仅 9443 mTLS）
-
-TLS 要求客户端证书由开发/生产 CA 签发；无证书或陌生 CA 在握手期被拒。注册时 `certFingerprint` 还必须命中服务端白名单（白名单为空时只做 CA 链校验）。
-
-### POST /agent/register
-
-```json
-{ "name": "edgepulse-agent", "agentVersion": "0.1.0", "certFingerprint": "<sha256>", "labels": { "zone": "edge" } }
-```
-
-按名称更新或新建节点，状态置 `online`，返回节点 JSON。指纹不在白名单 403；字段不合法 400。
-
-### POST /agent/heartbeat
-
-```json
-{ "nodeId": 1879577769666412544, "agentVersion": "0.1.0" }
-```
-
-更新 `last_seen`、`status=online`、`version+1`；节点不存在 404。注册与心跳都会发布 `node.status` 到 WebSocket 的 `nodes` 主题。
-
-## 5. 浏览器 WebSocket
-
-`GET /api/ws`（Upgrade）。Origin 必须在配置白名单内（空列表只允许同源）；非浏览器客户端可不带 Origin。
-
-首条消息必须是一次性认证：
-
-```json
-{ "type": "auth", "token": "<会话 token>" }
-```
-
-服务端 5 秒内未收到有效认证会以 1008 关闭；成功后：
-
-```json
-{ "type": "auth", "ok": true }
-```
-
-随后服务端推送：
-
-```json
-{ "type": "node.status", "data": { "id": 1, "name": "edgepulse-agent", "status": "online", "version": 4, "...": "..." } }
-```
-
-客户端每 25 秒发 `{ "type": "ping" }` 保活；服务端读取但不回业务数据。
-
-## 6. 运维
-
-运维口 `9100` 只监听 `127.0.0.1`：
-
-| 方法 | 路径 | 认证 | 说明 |
+| 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/metrics` | Bearer | Prometheus 文本（引擎进程指标 + HTTP 统计） |
-| GET | `/healthz` | 匿名 | 进程存活 |
-| GET | `/readyz` | 匿名 | 就绪；依赖不可用时 503 |
-| GET | `/debug/loops`、`/debug/connections`、`/debug/log-level` | Bearer | 引擎调试端点 |
+| GET | `/api/health` | 匿名 | `{status:"UP",time}` |
+| GET | `/api/auth/captcha` | 匿名 | `{uuid,imageSvg,code?}`；开发档带 code |
+| POST | `/api/auth/login` | 匿名 | `{username,password,captcha,captchaUuid}` → `{token,expiresIn}` |
+| POST | `/api/auth/logout` | 登录 | 删除当前会话 |
+| GET | `/api/auth/me` | 登录 | `{id,userId,username,nickname,deptId,deptName,roles,permissions}` |
+| GET | `/api/auth/routes` | 登录 | 动态菜单树；节点形状 `{id,parentId,name,type,path,component,icon,permission,children}` |
+| PUT | `/api/auth/password` | 登录 | `{oldPassword,newPassword}` |
 
-Bearer 令牌来自 `EDGEPULSE_OPS_BEARER_TOKEN` 或未跟踪的 `var/ops-token`；缺失时服务拒绝启动。
+登录失败按 IP 计数，超过 10 次/分钟返回 429；验证码一次性、2 分钟过期。
 
-## 7. 健康
+## 2. 系统管理
 
-`GET /api/health` 匿名：
+所有写接口要求对应权限码；列表支持 `keyword`、`pageNum`、`pageSize`，导出返回 UTF-8 BOM 的 CSV。
 
-```json
-{ "status": "UP", "time": "2026-10-20T14:02:11Z" }
-```
+| 方法 | 路径 | 权限 |
+|---|---|---|
+| GET/POST | `/api/system/users` | `system:user:list` / `system:user:add` |
+| PUT/DELETE | `/api/system/users/{id}` | `system:user:edit` / `system:user:remove` |
+| GET | `/api/system/users/options` | `system:user:list` |
+| GET | `/api/system/users/export` | `system:user:export` |
+| PUT | `/api/system/users/{id}/status` | `system:user:edit` |
+| PUT | `/api/system/users/{id}/password` | `system:user:reset` |
+| GET/POST | `/api/system/roles` | `system:role:list` / `system:role:add` |
+| PUT/DELETE | `/api/system/roles/{id}` | `system:role:edit` / `system:role:remove` |
+| GET | `/api/system/roles/{id}/menus` | `system:role:list` |
+| GET | `/api/system/roles/export` | `system:role:export` |
+| GET | `/api/system/permissions/graph` | `system:role:list` |
+| GET/POST | `/api/system/menus/tree`、`/api/system/menus` | `system:menu:list` / `system:menu:add` |
+| PUT/DELETE | `/api/system/menus/{id}` | `system:menu:edit` / `system:menu:remove` |
+| GET | `/api/system/menus/export` | `system:menu:export` |
+| GET/POST | `/api/system/depts/tree`、`/api/system/depts` | `system:dept:list` / `system:dept:add` |
+| PUT/DELETE | `/api/system/depts/{id}` | `system:dept:edit` / `system:dept:remove` |
+| GET | `/api/system/depts/export` | `system:dept:export` |
+| GET/POST | `/api/system/posts` | `system:post:list` / `system:post:add` |
+| PUT/DELETE | `/api/system/posts/{id}` | `system:post:edit` / `system:post:remove` |
+| GET | `/api/system/posts/export` | `system:post:export` |
+| GET/POST | `/api/system/dict/types` | `system:dict:list` / `system:dict:add` |
+| PUT/DELETE | `/api/system/dict/types/{id}` | `system:dict:edit` / `system:dict:remove` |
+| GET | `/api/system/dict/types/export` | `system:dict:export` |
+| GET | `/api/system/dict/data/{dictType}` | `system:dict:list` |
+| GET | `/api/system/dict/options/{dictType}` | 登录 |
+| POST/PUT/DELETE | `/api/system/dict/data[/{id}]` | `system:dict:add/edit/remove` |
+| GET/POST | `/api/system/configs` | `system:config:list` / `system:config:add` |
+| PUT/DELETE | `/api/system/configs/{id}` | `system:config:edit` / `system:config:remove` |
+| GET | `/api/system/configs/export` | `system:config:export` |
+
+用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`。
+
+## 3. 监控与工作台
+
+| 方法 | 路径 | 权限/说明 |
+|---|---|---|
+| GET | `/api/monitor/oper-logs` | `monitor:operlog:list`；`keyword,result` |
+| GET | `/api/monitor/oper-logs/stats` | `monitor:operlog:list`；`range=24h/7d/30d` |
+| GET | `/api/monitor/oper-logs/timeline` | `monitor:operlog:list`；`date=YYYY-MM-DD` |
+| GET | `/api/monitor/oper-logs/export` | `monitor:operlog:export` |
+| DELETE | `/api/monitor/oper-logs/{id}`、`/api/monitor/oper-logs` | `monitor:operlog:remove` |
+| GET | `/api/monitor/login-logs` | `monitor:loginlog:list`；`keyword,status` |
+| GET | `/api/monitor/login-logs/stats` | `monitor:loginlog:list` |
+| GET | `/api/monitor/login-logs/heatmap` | `monitor:loginlog:list`；`days=7/30` |
+| GET | `/api/monitor/login-logs/export` | `monitor:loginlog:export` |
+| DELETE | `/api/monitor/login-logs/{id}`、`/api/monitor/login-logs` | `monitor:loginlog:remove` |
+| GET | `/api/dashboard/summary` | 登录；`range=24h/7d/30d` |
+
+操作统计返回 `total,failed,successRate,avgCost,p95Cost,activeUsers,series`；登录统计返回 `total,failed,successRate,users,ips,series`；登录热力返回 `cells`（星期×小时）与 `anomalies`（失败聚合）。
+
+## 4. 节点与分组
+
+| 方法 | 路径 | 权限/说明 |
+|---|---|---|
+| GET/POST | `/api/nodes` | `device:node:list` / `device:node:write` |
+| PUT/DELETE | `/api/nodes/{id}` | `device:node:write`；更新需 `version`，冲突 409 |
+| GET/POST | `/api/node-groups` | `device:node:list` / `device:node:write` |
+| PUT/DELETE | `/api/node-groups/{id}` | `device:node:write`；仍有子分组或节点时 409 |
+| GET | `/api/ws` | WebSocket；升级后首条消息认证 |
+
+节点字段：`id,name,status,agentVersion,certFingerprint,labels,lastSeen,groupId,groupName,version`。
+
+## 5. 遥测、告警、固件、命令
+
+| 方法 | 路径 | 权限/说明 |
+|---|---|---|
+| GET | `/api/telemetry/latest?nodeId=` | `device:telemetry:view` |
+| GET | `/api/telemetry/series?nodeId=&metric=&from=&to=` | `device:telemetry:view`；最多 2000 点 |
+| GET | `/api/alarms` | `device:alarm:list`；`status,level,nodeId`；返回 `openCount` |
+| GET | `/api/alarms/{id}` | `device:alarm:list` |
+| PUT | `/api/alarms/{id}/ack` | `device:alarm:handle` |
+| PUT | `/api/alarms/{id}/resolve` | `device:alarm:handle` |
+| GET/POST | `/api/alarm-rules` | `device:alarm:list` / `device:alarm:add` |
+| PUT/DELETE | `/api/alarm-rules/{id}` | `device:alarm:edit` / `device:alarm:remove` |
+| GET | `/api/events/alarms` | 登录；SSE，事件名 `alarm` 与 `ready` |
+| GET | `/api/firmware` | `device:firmware:list` |
+| POST | `/api/firmware?name=&version=&fileName=` | `device:firmware:upload`；流式二进制正文 |
+| GET | `/api/firmware/{id}/tasks` | `device:firmware:list` |
+| POST | `/api/firmware/{id}/deploy` | `device:firmware:upload`；`{nodeIds:[...]}` |
+| DELETE | `/api/firmware/{id}` | `device:firmware:remove` |
+| GET | `/api/commands` | `device:command:list`；`status,nodeId` |
+| POST | `/api/commands` | `device:command:send`；`{nodeId,type,payload,timeoutSeconds}` |
+| PUT | `/api/commands/{id}/cancel` | `device:command:send` |
+| GET | `/api/ops/summary` | `monitor:operlog:list`；节点/告警/遥测/命令读数 |
+| GET | `/api/ops/protocols` | `monitor:operlog:list`；监听与协议开关 |
+
+告警规则字段：`name,nodeId(0=全部),metric,comparison,threshold,level,enabled,cooldownSeconds`。
+
+## 6. Agent 通道（只挂 9443 mTLS）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?}` |
+| POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}` |
+| POST | `/api/agent/telemetry` | `{nodeId,samples:[{metric,value,unit?,collectedAt?,labels?}]}`，1–500 条 |
+| GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
+| POST | `/api/agent/commands/{id}/result` | `{nodeId,status,result,message}` |
+| GET | `/api/agent/firmware/{id}/download` | 支持 `ETag`/`If-None-Match` 与单段 `Range` |
+| POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message}` |
+| GET | `/api/agent/ws` | WebSocket；首条 `{"type":"hello","nodeId":...}`；接收 `command.result` |
+
+## 7. WebSocket、SSE 与运维端点
+
+浏览器 `/api/ws`：
+
+- 首条消息 `{"type":"auth","token":"..."}`；5 秒内未认证关闭 1008。
+- 成功回 `{"type":"auth","ok":true}`，并订阅 `nodes`、`alarms`、`commands`。
+- 推送：`{"type":"node.status","data":...}`、`{"type":"alarm","data":...}`、`{"type":"command.status","data":...}`。
+- 客户端每 25 秒发 `{"type":"ping"}`；服务端不要求 pong。
+
+SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `event: alarm` 发送，每 15 秒注释保活。浏览器用 fetch 流式读取并在请求头带 Bearer。
+
+运维口（9100）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/metrics` | Prometheus 文本；需 Bearer |
+| GET | `/healthz` | 进程存活；匿名 |
+| GET | `/readyz` | 就绪；停机排空期间 503 |
+| GET | `/debug/loops`、`/debug/connections` | 循环与连接诊断；需 Bearer |
+| POST | `/debug/log-level` | 改日志等级；需 Bearer |
 
 ## 8. 错误码
 
-| HTTP / code | 含义 |
+| HTTP | 场景 |
 |---|---|
-| 400 | 请求字段缺失或格式不合法 |
-| 401 | 未登录、会话过期、用户名或口令错误 |
-| 403 | 已登录但缺少权限，或 Agent 指纹被拒、Origin 被拒 |
-| 404 | 资源不存在或已删除 |
-| 409 | 节点名重复或乐观锁版本冲突 |
-| 429 | 验证码签发或登录限流 |
-| 500 | 内部错误（详情只进日志） |
-| 503 | 就绪探针依赖不可用 |
-
-## 9. 未实现（P1+）
-
-`/api/system/*`、`/api/monitor/*`、`/api/dashboard/summary`、`/api/devices*`、`/api/telemetry/*`、`/api/alarms*`、`/api/firmware*`、`/api/commands*`、`/api/ops/summary`、`/api/ops/protocols`、`/api/events/logs`（SSE）、Agent WebSocket 与 Agent 遥测/固件接口。
+| 400 | 参数缺失、JSON 不合法、Range 不可满足以外的请求错误 |
+| 401 | 未登录、会话过期、Redis/数据库不可用导致的认证失败 |
+| 403 | 已登录但缺权限；Agent 命令不属于该节点 |
+| 404 | 资源不存在；`/api/*` 未命中 |
+| 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；乐观锁冲突；仍被占用的删除 |
+| 413 | 固件超过上传上限 |
+| 416 | Range 越界 |
+| 429 | 验证码签发过频、登录失败过频 |
+| 500 | 数据库/文件/未知内部故障 |
+| 503 | 服务未就绪或停机排空 |
