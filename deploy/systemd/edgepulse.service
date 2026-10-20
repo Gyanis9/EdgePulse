@@ -1,0 +1,27 @@
+[Unit]
+Description=EdgePulse 边缘节点与设备运维平台
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edgepulse
+Group=edgepulse
+WorkingDirectory=/opt/edgepulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+ExecStart=/opt/edgepulse/edgepulse-server --config /etc/edgepulse/config.yaml
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# 秘密来自 EnvironmentFile（权限 0600，不进版本库）；运行目录只放开固件与数据库
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/edgepulse
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

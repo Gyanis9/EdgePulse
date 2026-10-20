@@ -1,0 +1,66 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: edgepulse
+      MYSQL_USER: edgepulse
+      MYSQL_PASSWORD: ${EDGEPULSE_DB_PASSWORD:?请在 .env 中设置 EDGEPULSE_DB_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${EDGEPULSE_REDIS_PASSWORD:?请在 .env 中设置 EDGEPULSE_REDIS_PASSWORD}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${EDGEPULSE_REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  edgepulse:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      EDGEPULSE_DB_PASSWORD: ${EDGEPULSE_DB_PASSWORD}
+      EDGEPULSE_REDIS_PASSWORD: ${EDGEPULSE_REDIS_PASSWORD}
+      EDGEPULSE_OPS_BEARER_TOKEN: ${EDGEPULSE_OPS_BEARER_TOKEN:?请在 .env 中设置 EDGEPULSE_OPS_BEARER_TOKEN}
+      EDGEPULSE_AGENT_FINGERPRINT: ${EDGEPULSE_AGENT_FINGERPRINT:-}
+      EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
+    volumes:
+      - ../../config:/app/config
+      - ../../var/certs:/etc/edgepulse/tls:ro
+      - firmware-data:/var/lib/edgepulse/firmware
+    ports:
+      - "8080:8080"
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
+      - "9443:9443"
+      - "9100:9100"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    depends_on:
+      - edgepulse
+    volumes:
+      - ../prometheus:/etc/prometheus:ro
+    ports:
+      - "9090:9090"
+
+volumes:
+  mysql-data:
+  redis-data:
+  firmware-data:
