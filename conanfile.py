@@ -7,7 +7,7 @@ class EdgePulseRecipe(ConanFile):
 
     settings = "os", "compiler", "build_type", "arch"
     requires = (
-        "asyngyanis/4.0.0",
+        "asyngyanis/1.0.0",
         "openssl/3.6.5",
         "gtest/1.17.0",
     )
