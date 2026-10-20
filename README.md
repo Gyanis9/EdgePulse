@@ -94,13 +94,13 @@ npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ## 验收
 
 ```bash
-# 后端：74 条用例（真机存储 2 条按环境变量门控）
+# 后端：82 条用例（真机存储 2 条按环境变量门控）
 ctest --preset debug --output-on-failure
 
-# 前端：23 条单测 + 类型检查/构建 + 5 条 Playwright
+# 前端：23 条单测 + 类型检查/构建 + 6 条 Playwright
 cd frontend && npm run test:unit && npm run build && npm run test:e2e
 
-# 全量协议与安全验收：认证、系统管理、节点、遥测告警、SSE、命令、100 MiB 固件、h3、mTLS、metrics、readyz
+# 全量协议与安全验收：认证、租户隔离、系统管理、节点、遥测告警、SSE、命令、100 MiB 固件、h3、mTLS、metrics、readyz
 python scripts/check-acceptance.py
 
 # Docker 全栈：镜像 + MySQL/Redis + Prometheus + 真实 OTel collector + 优雅停机
