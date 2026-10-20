@@ -7,7 +7,7 @@ EdgePulse 是面向边缘节点与设备的运维平台：控制面是 Vue 3 管
 - 认证与权限：验证码、PBKDF2 登录、不透明会话、动态菜单、权限码、数据范围、操作审计。
 - 系统管理：用户、角色、菜单、部门、岗位、字典、参数、操作日志、登录日志、CSV 导出。
 - 设备域：节点、节点分组、Agent mTLS 注册/心跳、遥测、告警规则与告警生命周期、固件上传/下载/下发、命令下发。
-- 实时：浏览器 WebSocket（节点、告警、命令主题）、告警 SSE、Agent 命令长连接与轮询兜底。
+- 实时：浏览器 WebSocket（节点、告警、命令主题）、告警 SSE、Agent 命令长连接与轮询兜底、HMAC 签名的 UDP 遥测入口。
 - 运行时：SQLite 本地档、MySQL 生产档、Redis 可选会话/验证码后端、配置热重载、数据库健康探针。
 - 可观测：Prometheus 指标、`/readyz`、业务运维总览、OTLP 指标出口开关。
 - 交付：生产静态站点回退、Docker Compose、systemd、Prometheus 抓取配置。
@@ -112,7 +112,7 @@ python scripts/check-docker-stack.py --build
 - `config/dev.yaml` 只放非敏感项；生产从 `config/prod.yaml.example` 复制一份未跟踪的配置。
 - 数据库/Redis 口令、运维令牌、Agent 指纹、初始口令提示只从环境变量读取：
   `EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、
-  `EDGEPULSE_AGENT_FINGERPRINT`、`EDGEPULSE_INITIAL_PASSWORD`。
+  `EDGEPULSE_AGENT_FINGERPRINT`、`EDGEPULSE_INITIAL_PASSWORD`、`EDGEPULSE_UDP_TELEMETRY_SECRET`。
 - 开发脚本把运维令牌写进 `var/ops-token`，证书写进 `var/certs`，两者都在 `.gitignore` 中。
 - 仓库零明文凭据；日志不回显 Authorization、Cookie、口令与 token。
 
@@ -124,6 +124,7 @@ python scripts/check-docker-stack.py --build
 - 前端：API 契约单测；Playwright 用系统 Edge（`channel: 'msedge'`），不下载浏览器。
 - `ExternalStores.*` 需要真实 MySQL/Redis：设置 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 后运行；缺变量时用例 SKIP，不伪造通过。本机已用临时容器跑绿。
 - Docker：`scripts/check-docker-stack.py` 起 MySQL 8.4、Redis 7、Prometheus 与真实 OTel collector，验证登录、自定义角色、节点、审计落库、会话跨重启、指标抓取与 SIGTERM 优雅停机。
+- UDP 遥测：`scripts/check-udp-telemetry.py` 用真实数据报验证 HMAC 签名、重放拒绝、落库与回读。
 
 ## 已知边界
 

@@ -124,6 +124,20 @@
 | POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?}` |
 | POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}` |
 | POST | `/api/agent/telemetry` | `{nodeId,samples:[{metric,value,unit?,collectedAt?,labels?}]}`，1–500 条 |
+
+### UDP 遥测数据报
+
+默认关闭；启用后向 `edgepulse.udp_telemetry.port` 发送一条 JSON 数据报：
+
+```json
+{"nodeId":123,"timestamp":1760000000,"nonce":"8-64 字符","body":{"samples":[{"metric":"cpu.usage","value":42.5,"unit":"%"}]},"signature":"64 位十六进制"}
+```
+
+签名覆盖 `v1
+<nodeId>
+<timestamp>
+<nonce>
+<body.dump()>`，密钥为环境变量 `EDGEPULSE_UDP_TELEMETRY_SECRET`，算法 HMAC-SHA256。时间戳与服务器相差超过 120 秒、同一节点同一随机串重复、或样本不合法（1–500 条）都会被拒。应答是 `{"accepted":N,"alarms":M}` 或 `{"error":"..."}`。
 | GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
 | POST | `/api/agent/commands/{id}/result` | `{nodeId,status,result,message}` |
 | GET | `/api/agent/firmware/{id}/download` | 支持 `ETag`/`If-None-Match` 与单段 `Range` |
