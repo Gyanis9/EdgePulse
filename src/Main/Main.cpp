@@ -35,6 +35,10 @@ int main(const int argc, char **argv)
 
     try
     {
+        // 必须早于日志器与应用线程：日志器的异步写线程同样会继承信号屏蔽字，
+        // 晚一步设置就会让 SIGTERM 落到未屏蔽线程上按默认动作直接结束进程
+        static_cast<void>(AsynGyanis::Core::GracefulShutdown::blockStopSignals());
+
         const std::expected<EdgePulse::App::ApplicationConfiguration, EdgePulse::App::ConfigurationError> configuration =
                 EdgePulse::App::ApplicationConfiguration::load(configurationPath);
         if (!configuration.has_value())
@@ -54,7 +58,6 @@ int main(const int argc, char **argv)
         }
         LOG_INFO_FMT("EdgePulse 已启动，HTTP 端口 {}", configuration->httpPort);
 
-        static_cast<void>(AsynGyanis::Core::GracefulShutdown::blockStopSignals());
         AsynGyanis::Core::GracefulShutdown shutdown;
         shutdown.onShutdown([&application] { application.requestStop(); });
         return application.run();
