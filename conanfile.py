@@ -14,7 +14,11 @@ class EdgePulseRecipe(ConanFile):
     default_options = {"gtest/*:shared": False, "asyngyanis/*:with_mysql": True}
 
     def layout(self):
-        cmake_layout(self)
+        # Conan 2.25 的单配置布局会把生成器放进 build/<build_type>/generators，
+        # 而仓库预设固定引用 build/generators；这里统一成不随平台与构建类型变化的路径
+        cmake_layout(self, generator="Ninja")
+        self.folders.build = "build"
+        self.folders.generators = "build/generators"
 
     def generate(self):
         CMakeDeps(self).generate()
