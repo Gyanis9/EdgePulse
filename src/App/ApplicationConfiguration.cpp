@@ -114,18 +114,20 @@ namespace EdgePulse::App
         }
 
         ApplicationConfiguration configuration;
-        configuration.configurationFile    = configurationPath;
-        configuration.listenAddress        = configurationManager.getString("edgepulse.listen_address", configuration.listenAddress);
-        configuration.opsAddress           = configurationManager.getString("edgepulse.ops_address", configuration.opsAddress);
-        configuration.databaseDriver       = configurationManager.getString("edgepulse.database.driver", configuration.databaseDriver);
-        configuration.databasePath         = configurationManager.getString("edgepulse.database.path", configuration.databasePath);
-        configuration.webRoot              = configurationManager.getString("edgepulse.web_root", configuration.webRoot);
-        configuration.certificateDirectory = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
-        configuration.agentFingerprint     = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
-        configuration.captchaTtlSeconds    = static_cast<int>(configurationManager.getInt("edgepulse.captcha.ttl_seconds", configuration.captchaTtlSeconds));
-        configuration.sessionTtlSeconds    = static_cast<int>(configurationManager.getInt("edgepulse.session.ttl_seconds", configuration.sessionTtlSeconds));
-        configuration.exposeCaptchaCode    = configurationManager.getBool("edgepulse.captcha.expose_code", configuration.exposeCaptchaCode);
-        configuration.allowedOrigins       = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
+        configuration.configurationFile        = configurationPath;
+        configuration.listenAddress            = configurationManager.getString("edgepulse.listen_address", configuration.listenAddress);
+        configuration.opsAddress               = configurationManager.getString("edgepulse.ops_address", configuration.opsAddress);
+        configuration.databaseDriver           = configurationManager.getString("edgepulse.database.driver", configuration.databaseDriver);
+        configuration.databasePath             = configurationManager.getString("edgepulse.database.path", configuration.databasePath);
+        configuration.migrationsDirectory      = configurationManager.getString("edgepulse.migrations_dir", configuration.migrationsDirectory);
+        configuration.webRoot                  = configurationManager.getString("edgepulse.web_root", configuration.webRoot);
+        configuration.certificateDirectory     = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
+        configuration.agentFingerprint         = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
+        configuration.captchaTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.captcha.ttl_seconds", configuration.captchaTtlSeconds));
+        configuration.captchaRequestsPerMinute = static_cast<int>(configurationManager.getInt("edgepulse.captcha.requests_per_minute", configuration.captchaRequestsPerMinute));
+        configuration.sessionTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.session.ttl_seconds", configuration.sessionTtlSeconds));
+        configuration.exposeCaptchaCode        = configurationManager.getBool("edgepulse.captcha.expose_code", configuration.exposeCaptchaCode);
+        configuration.allowedOrigins           = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
 
         // P0 只实现 SQLite 快速档；配成 mysql 时明确拒绝，避免带着未接通的驱动上线
         if (configuration.databaseDriver != "sqlite")

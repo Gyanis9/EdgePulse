@@ -1,11 +1,21 @@
 #include "App/Application.h"
 
 #include "App/ListenerAssembly.h"
+#include "Auth/AuthController.h"
+#include "Auth/AuthService.h"
+#include "Auth/CaptchaService.h"
+#include "Auth/LoginAudit.h"
+#include "Auth/SessionStore.h"
+#include "Common/Database.h"
+#include "System/MigrationRunner.h"
 #include "Web/MiddlewareSetup.h"
 
 #include "Core/EventLoop/IoContext.h"
 #include "Core/Socket/InetAddress.h"
 #include "Net/Http/HttpServer.h"
+
+#include <exception>
+#include <string>
 
 namespace EdgePulse::App
 {
@@ -21,6 +31,25 @@ namespace EdgePulse::App
         m_ioContext                       = std::make_unique<AsynGyanis::Core::IoContext>(1);
         AsynGyanis::Core::EventLoop &loop = m_ioContext->threadPool().eventLoop(0);
 
+        try
+        {
+            // 启动期在独立连接上应用迁移；失败原因带文件名与语句序号，直接拒绝启动
+            {
+                const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirectSqlite(m_configuration.databasePath);
+                System::MigrationRunner::apply(*connection, m_configuration.migrationsDirectory);
+            }
+            m_database       = Common::Database::openSqlite(m_configuration.databasePath);
+            m_sessionStore   = std::make_shared<Auth::SessionStore>(m_configuration.sessionTtlSeconds);
+            m_captchaService = std::make_shared<Auth::CaptchaService>(Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
+            m_loginAudit     = std::make_shared<Auth::LoginAudit>(m_database);
+            m_authService    = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit);
+        } catch (const std::exception &failure)
+        {
+            // 数据库或迁移不可用时没有可服务的业务，直接把原因交给进程入口
+            error = std::string{"数据库初始化失败："} + failure.what();
+            return false;
+        }
+
         const std::optional<AsynGyanis::Core::InetAddress> address = AsynGyanis::Core::InetAddress::resolve(m_configuration.listenAddress, m_configuration.httpPort);
         // 地址解析失败属于启动期配置错误：写清主机与端口后直接失败，不带着空监听继续
         if (!address.has_value())
@@ -34,6 +63,7 @@ namespace EdgePulse::App
         // 中间件必须先于业务路由注册，异常兜底才能包住所有处理器
         Web::applySecurityHeaders(router);
         registerHealthRoutes(router);
+        Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
         registerFallbackRoute(router);
 
         m_acceptTask.emplace(m_httpServer->start());

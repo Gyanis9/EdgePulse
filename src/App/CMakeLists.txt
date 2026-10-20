@@ -8,6 +8,8 @@ target_include_directories(edgepulse-app PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(edgepulse-app
         PUBLIC EdgePulse::Common
                EdgePulse::Web
+               EdgePulse::System
+               EdgePulse::Auth
                AsynGyanis::Net
                AsynGyanis::Base
                AsynGyanis::Core)

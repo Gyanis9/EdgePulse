@@ -1,7 +1,11 @@
 add_library(edgepulse-common STATIC
         ApiResponse.cpp
         Database.cpp
+        IdGenerator.cpp
         Pagination.cpp
+        PasswordHash.cpp
+        RandomBytes.cpp
+        RandomToken.cpp
         TimeFormat.cpp)
 add_library(EdgePulse::Common ALIAS edgepulse-common)
 

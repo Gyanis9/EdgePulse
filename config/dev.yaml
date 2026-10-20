@@ -10,9 +10,11 @@ edgepulse:
   database:
     driver: sqlite
     path: var/edgepulse.db
+  migrations_dir: migrations
   captcha:
     ttl_seconds: 120
     expose_code: true
+    requests_per_minute: 30
   session:
     ttl_seconds: 7200
   security:

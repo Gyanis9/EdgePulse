@@ -89,7 +89,7 @@ namespace EdgePulse::TestSupport
         return AsynGyanis::Base::parseConfigValue(body);
     }
 
-    ServerHarness::ServerHarness(const std::function<void(AsynGyanis::Net::Router &)> &configure)
+    ServerHarness::ServerHarness(const std::function<void(AsynGyanis::Net::Router &, AsynGyanis::Core::EventLoop &)> &configure)
     {
         // 端口 0 让内核分配，多个用例并行时不会撞固定端口
         const std::optional<AsynGyanis::Core::InetAddress> address = AsynGyanis::Core::InetAddress::resolve("127.0.0.1", 0);
@@ -98,7 +98,7 @@ namespace EdgePulse::TestSupport
             throw std::runtime_error("回环地址解析失败");
         }
         m_server = std::make_unique<AsynGyanis::Net::HttpServer>(m_loop, *address);
-        configure(m_server->router());
+        configure(m_server->router(), m_loop);
         m_acceptTask.emplace(m_server->start());
         // 循环尚未开始运行，本线程可安全入本地队列
         m_loop.scheduler().schedule(m_acceptTask->handle());
@@ -133,6 +133,11 @@ namespace EdgePulse::TestSupport
     std::uint16_t ServerHarness::port() const noexcept
     {
         return m_port;
+    }
+
+    AsynGyanis::Core::EventLoop &ServerHarness::loop() noexcept
+    {
+        return m_loop;
     }
 
     HttpResult ServerHarness::send(std::string method, std::string path, std::string body, std::string contentType, std::vector<std::pair<std::string, std::string>> headers)

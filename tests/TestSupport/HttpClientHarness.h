@@ -67,7 +67,7 @@ namespace EdgePulse::TestSupport
          * @param configure 路由注册回调，在 start() 之前执行
          * @throws std::runtime_error 端口未能在时限内就绪
          */
-        explicit ServerHarness(const std::function<void(AsynGyanis::Net::Router &)> &configure);
+        explicit ServerHarness(const std::function<void(AsynGyanis::Net::Router &, AsynGyanis::Core::EventLoop &)> &configure);
 
         ~ServerHarness();
 
@@ -76,6 +76,9 @@ namespace EdgePulse::TestSupport
 
         /// 内核分配的监听端口
         [[nodiscard]] std::uint16_t port() const noexcept;
+
+        /// 服务端所属事件循环
+        [[nodiscard]] AsynGyanis::Core::EventLoop &loop() noexcept;
 
         /**
          * @brief 发一次请求

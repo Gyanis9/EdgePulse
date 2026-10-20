@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <Core/Coroutine/Task.h>
@@ -26,6 +27,19 @@ namespace AsynGyanis::Core
 namespace AsynGyanis::Net
 {
     class HttpServer;
+}
+
+namespace EdgePulse::Auth
+{
+    class AuthService;
+    class CaptchaService;
+    class LoginAudit;
+    class SessionStore;
+} // namespace EdgePulse::Auth
+
+namespace EdgePulse::Common
+{
+    class Database;
 }
 
 namespace EdgePulse::App
@@ -75,6 +89,11 @@ namespace EdgePulse::App
     private:
         ApplicationConfiguration                     m_configuration;
         std::unique_ptr<AsynGyanis::Core::IoContext> m_ioContext;
+        std::shared_ptr<Common::Database>            m_database;       ///< 进程级数据库
+        std::shared_ptr<Auth::SessionStore>          m_sessionStore;   ///< 会话表
+        std::shared_ptr<Auth::CaptchaService>        m_captchaService; ///< 验证码
+        std::shared_ptr<Auth::LoginAudit>            m_loginAudit;     ///< 登录审计
+        std::shared_ptr<Auth::AuthService>           m_authService;    ///< 认证服务
         std::unique_ptr<AsynGyanis::Net::HttpServer> m_httpServer;
         std::optional<AsynGyanis::Core::Task<>>      m_acceptTask;
         std::atomic<bool>                            m_stopRequested{false};

@@ -13,7 +13,7 @@
 TEST(ApiResponse, SuccessAndFailureShareEnvelopeShape)
 {
     EdgePulse::TestSupport::ServerHarness server(
-            [](AsynGyanis::Net::Router &router)
+            [](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
             {
                 EdgePulse::Web::applySecurityHeaders(router);
                 router.get("/api/success",

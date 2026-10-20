@@ -39,9 +39,11 @@ namespace EdgePulse::App
         std::string              opsAddress{"127.0.0.1"};           ///< 运维口监听地址
         std::string              databaseDriver{"sqlite"};          ///< P0 只接受 sqlite
         std::string              databasePath{"var/edgepulse.db"};  ///< SQLite 文件路径
+        std::string              migrationsDirectory{"migrations"}; ///< SQL 迁移目录
         std::string              webRoot{"web"};                    ///< 静态站点根目录
         std::string              certificateDirectory{"var/certs"}; ///< 开发证书目录
         int                      captchaTtlSeconds{120};            ///< 验证码有效期，单位秒
+        int                      captchaRequestsPerMinute{30};      ///< 单 IP 每分钟签发上限
         int                      sessionTtlSeconds{7200};           ///< 会话有效期，单位秒
         bool                     exposeCaptchaCode{false};          ///< 开发档在响应里带验证码答案
         std::vector<std::string> allowedOrigins;                    ///< 浏览器 WebSocket 的 Origin 白名单
