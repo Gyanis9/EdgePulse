@@ -119,7 +119,7 @@ python scripts/check-acceptance.py
 - 后端集成：迁移 V1–V6、认证、用户/角色/菜单/组织/字典/参数、数据范围、遥测、告警、命令、固件、节点分组。
 - 协议：401/403 矩阵、管理端 CRUD、遥测告警、命令往返、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
 - 前端：API 契约单测；Playwright 用系统 Edge（`channel: 'msedge'`），不下载浏览器。
-- MySQL/Redis 真机用例按 `EDGEPULSE_TEST_MYSQL_*` / `EDGEPULSE_TEST_REDIS_*` 门控，缺依赖即 SKIP，不伪造。
+- 本机没有常驻 MySQL/Redis 服务，未运行真机集成；切换生产后端前必须在部署环境重新验证，不伪造通过结果。
 
 ## 已知边界
 

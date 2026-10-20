@@ -232,7 +232,7 @@ src/
 - 协议：401/403 矩阵、系统接口、WS 认证与广播、SSE、mTLS 拒绝/通过、h3 真实连接、Range 206、ETag 304。
 - 前端：新增 API 模块单测、SSE 解析、Playwright 登录/节点/系统用户/告警。
 - 验收脚本：登录、系统页、节点、遥测、告警 2 秒内到达、100 MiB 固件哈希一致、Range/ETag、WS 1008、mTLS、h3、metrics、readyz。
-- MySQL/Redis 用例一律环境变量门控，缺依赖即 `GTEST_SKIP`，不伪造。
+- MySQL/Redis 真机验证取决于部署环境；本机没有常驻服务时只验证 SQLite + 内存档，不伪造。
 
 ## 11. 实施顺序与提交
 
