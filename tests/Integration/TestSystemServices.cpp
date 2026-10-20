@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -75,7 +76,7 @@ TEST(SystemServices, UserCrudKeepsRelations)
     EXPECT_FALSE(runner.run(users.findById(runner.loop(), userId)).has_value());
 }
 
-// 钉住：DEPT 角色只可见本部门；SELF 角色只看本人；管理员 ALL 不受限
+// 钉住：DEPT 角色只可见本部门；SELF 角色只看本人；CUSTOM 按配置部门；管理员 ALL 不受限
 TEST(SystemServices, DataScopeFollowsRoleConfiguration)
 {
     EdgePulse::TestSupport::AuthTestContext context;
@@ -118,6 +119,23 @@ TEST(SystemServices, DataScopeFollowsRoleConfiguration)
     const std::int64_t selfId    = runner.run(users.create(runner.loop(), selfUser, EdgePulse::Common::hashPassword("carol123"), 1));
     const auto         selfScope = runner.run(scopes.resolve(runner.loop(), selfId));
     EXPECT_TRUE(selfScope.selfOnly);
+
+    // CUSTOM 角色按 sys_role_dept 展开；读错角色列会让它静默退化成仅本人
+    EdgePulse::System::RoleWrite customWrite;
+    customWrite.name                = "自定义范围";
+    customWrite.code                = "custom_scope";
+    customWrite.dataScope           = "CUSTOM";
+    customWrite.deptIds             = std::vector<std::int64_t>{103};
+    const std::int64_t customRole   = runner.run(roles.create(runner.loop(), customWrite, 1));
+    UserWrite          customUser   = newUser("dave", "戴夫", 101);
+    customUser.roleIds              = std::vector<std::int64_t>{customRole};
+    const std::int64_t customUserId = runner.run(users.create(runner.loop(), customUser, EdgePulse::Common::hashPassword("dave12345"), 1));
+    const auto         customScope  = runner.run(scopes.resolve(runner.loop(), customUserId));
+    EXPECT_FALSE(customScope.all);
+    EXPECT_FALSE(customScope.selfOnly);
+    EXPECT_NE(customScope.deptIds.end(), std::find(customScope.deptIds.begin(), customScope.deptIds.end(), 103));
+    EXPECT_EQ(customScope.deptIds.end(), std::find(customScope.deptIds.begin(), customScope.deptIds.end(), 101));
+    EXPECT_EQ(std::vector<std::int64_t>{103}, runner.run(roles.deptIdsFor(runner.loop(), customRole)));
 
     const auto adminScope = runner.run(scopes.resolve(runner.loop(), 1));
     EXPECT_TRUE(adminScope.all);

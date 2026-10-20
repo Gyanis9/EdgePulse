@@ -51,6 +51,17 @@ namespace EdgePulse::System
                 Sql::executeOrThrowVoid(connection, "INSERT INTO sys_role_menu (role_id, menu_id) VALUES (?, ?)", parameters);
             }
         }
+
+        void replaceDepts(DatabaseConnection &connection, const std::int64_t roleId, const std::vector<std::int64_t> &deptIds)
+        {
+            const std::array<DatabaseValue, 1> roleParameter{roleId};
+            Sql::executeOrThrowVoid(connection, "DELETE FROM sys_role_dept WHERE role_id = ?", roleParameter);
+            for (const std::int64_t deptId: deptIds)
+            {
+                const std::array<DatabaseValue, 2> parameters{roleId, deptId};
+                Sql::executeOrThrowVoid(connection, "INSERT INTO sys_role_dept (role_id, dept_id) VALUES (?, ?)", parameters);
+            }
+        }
     } // namespace
 
     RoleRepository::RoleRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
@@ -182,6 +193,7 @@ namespace EdgePulse::System
                                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             parameters);
                     replaceMenus(connection, id, write.menuIds.value_or(std::vector<std::int64_t>{}));
+                    replaceDepts(connection, id, write.deptIds.value_or(std::vector<std::int64_t>{}));
                     return id;
                 });
     }
@@ -234,6 +246,10 @@ namespace EdgePulse::System
                                                                 {
                                                                     replaceMenus(connection, roleId, *write.menuIds);
                                                                 }
+                                                                if (write.deptIds.has_value())
+                                                                {
+                                                                    replaceDepts(connection, roleId, *write.deptIds);
+                                                                }
                                                                 return true;
                                                             });
     }
@@ -270,6 +286,23 @@ namespace EdgePulse::System
                     while (rows->next())
                     {
                         ids.push_back(Sql::integer(*rows, "menu_id"));
+                    }
+                    return ids;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::vector<std::int64_t>> RoleRepository::deptIdsFor(AsynGyanis::Core::EventLoop &loop, const std::int64_t roleId)
+    {
+        co_return co_await m_database->withConnection<std::vector<std::int64_t>>(
+                loop,
+                [roleId](DatabaseConnection &connection) -> std::vector<std::int64_t>
+                {
+                    const std::array<DatabaseValue, 1> parameters{roleId};
+                    const auto                         rows = Sql::executeOrThrow(connection, "SELECT dept_id FROM sys_role_dept WHERE role_id = ? ORDER BY dept_id", parameters);
+                    std::vector<std::int64_t>          ids;
+                    while (rows->next())
+                    {
+                        ids.push_back(Sql::integer(*rows, "dept_id"));
                     }
                     return ids;
                 });

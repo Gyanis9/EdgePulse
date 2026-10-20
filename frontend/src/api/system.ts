@@ -52,6 +52,7 @@ export interface RoleWriteRequest {
   status?: number
   remark?: string
   menuIds?: number[]
+  deptIds?: number[]
 }
 
 export interface MenuWriteRequest {
@@ -192,6 +193,7 @@ export function createSystemApi(client: HttpClient) {
     roles: {
       ...crudPage<Record<string, unknown>, RoleWriteRequest>(client, '/system/roles'),
       menus: (id: number) => client.get<{ menuIds: number[] }>(`/system/roles/${id}/menus`),
+      depts: (id: number) => client.get<{ deptIds: number[] }>(`/system/roles/${id}/depts`),
       export: (query?: QueryParams) => client.download('/system/roles/export', query),
     },
     permissions: {

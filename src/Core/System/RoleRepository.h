@@ -107,6 +107,14 @@ namespace EdgePulse::System
         AsynGyanis::Core::Task<std::vector<std::int64_t>> menuIdsFor(AsynGyanis::Core::EventLoop &loop, std::int64_t roleId);
 
         /**
+         * @brief 取角色自定义数据范围的部门
+         * @param loop 恢复协程用的事件循环
+         * @param roleId 角色标识
+         * @return std::vector<std::int64_t> 部门标识
+         */
+        AsynGyanis::Core::Task<std::vector<std::int64_t>> deptIdsFor(AsynGyanis::Core::EventLoop &loop, std::int64_t roleId);
+
+        /**
          * @brief 替换角色菜单授权
          * @param loop 恢复协程用的事件循环
          * @param roleId 角色标识

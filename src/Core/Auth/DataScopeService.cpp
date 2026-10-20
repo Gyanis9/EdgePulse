@@ -42,7 +42,7 @@ namespace EdgePulse::Auth
                     }
 
                     const auto                roleRows = Sql::executeOrThrow(connection,
-                                                                             "SELECT r.id, r.data_scope FROM sys_role r JOIN sys_user_role ur ON ur.role_id = r.id "
+                                                                             "SELECT r.id AS role_id, r.data_scope FROM sys_role r JOIN sys_user_role ur ON ur.role_id = r.id "
                                                                              "WHERE ur.user_id = ? AND r.status = 1 AND r.deleted = 0",
                                                                              userParameter);
                     std::vector<std::int64_t> customRoleIds;

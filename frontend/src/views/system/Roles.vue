@@ -3,7 +3,7 @@ import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import { Button, Drawer, Field, Segmented, Select, StatusTag, Switch, Tag, TextInput, type Column } from '@/components/ui'
-import { DictSelect, FormDialog, ListPage, PermissionButton, PermissionTree } from '@/components/business'
+import { DictSelect, DeptMultiSelect, FormDialog, ListPage, PermissionButton, PermissionTree } from '@/components/business'
 import PermissionMatrix, { type MatrixRole } from '@/components/business/PermissionMatrix.vue'
 import PermissionTrace from '@/components/business/PermissionTrace.vue'
 import { invalidatePermissionGraph } from '@/composables/permissionGraph'
@@ -125,8 +125,8 @@ watch(view, async (next, prev) => {
 }, { immediate: true })
 
 /* ── 新增 / 编辑 ── */
-interface RoleForm { id?: number; name: string; code: string; dataScope: string; sort: number | null; status: number; remark: string }
-const emptyForm = (): RoleForm => ({ name: '', code: '', dataScope: 'SELF', sort: 10, status: 1, remark: '' })
+interface RoleForm { id?: number; name: string; code: string; dataScope: string; deptIds: number[]; sort: number | null; status: number; remark: string }
+const emptyForm = (): RoleForm => ({ name: '', code: '', dataScope: 'SELF', deptIds: [], sort: 10, status: 1, remark: '' })
 const dialog = ref(false)
 const saving = ref(false)
 const form = reactive<RoleForm>(emptyForm())
@@ -139,9 +139,26 @@ function openCreate() {
   dialog.value = true
 }
 
-function openEdit(row: RoleRow) {
-  Object.assign(form, { id: row.id, name: row.name, code: row.code, dataScope: scopeCodeOf(row.dataScope), sort: row.sort, status: row.status, remark: row.remark ?? '' })
+async function openEdit(row: RoleRow) {
+  Object.assign(form, {
+    id: row.id,
+    name: row.name,
+    code: row.code,
+    dataScope: scopeCodeOf(row.dataScope),
+    deptIds: [],
+    sort: row.sort,
+    status: row.status,
+    remark: row.remark ?? '',
+  })
   errors.value = {}
+  if (form.dataScope === 'CUSTOM') {
+    try {
+      const assigned = await systemApi.roles.depts(row.id)
+      form.deptIds = (assigned.deptIds ?? []).map(Number)
+    } catch (error) {
+      toastError(error, '自定义部门加载失败')
+    }
+  }
   dialog.value = true
 }
 
@@ -150,9 +167,20 @@ async function submit() {
     name: [required('请输入角色名称')],
     code: [required('请输入角色编码'), pattern(/^[a-z][a-z0-9_]*$/, '小写字母开头，仅含小写字母、数字、下划线')],
   })
+  if (form.dataScope === 'CUSTOM' && form.deptIds.length === 0) {
+    errors.value.deptIds = '自定义数据范围至少要选择一个部门'
+  }
   if (Object.keys(errors.value).length) return
   saving.value = true
-  const payload = { name: form.name.trim(), code: form.code.trim(), dataScope: form.dataScope, sort: form.sort ?? 0, status: form.status, remark: form.remark }
+  const payload = {
+    name: form.name.trim(),
+    code: form.code.trim(),
+    dataScope: form.dataScope,
+    deptIds: form.dataScope === 'CUSTOM' ? form.deptIds : [],
+    sort: form.sort ?? 0,
+    status: form.status,
+    remark: form.remark,
+  }
   try {
     if (form.id) {
       await systemApi.roles.update(form.id, payload)
@@ -313,6 +341,9 @@ async function savePermission() {
       </Field>
       <Field label="数据权限">
         <Select v-model="form.dataScope" :options="scopeOptions" />
+      </Field>
+      <Field v-if="form.dataScope === 'CUSTOM'" label="自定义部门" required :error="errors.deptIds" span>
+        <DeptMultiSelect v-model="form.deptIds" :invalid="!!errors.deptIds" />
       </Field>
       <Field label="显示排序">
         <TextInput v-model="form.sort" type="number" />

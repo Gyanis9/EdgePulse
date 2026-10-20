@@ -217,6 +217,37 @@ TEST_F(SystemEndpointsTest, ScopesLogsToSessionScope)
     EXPECT_EQ(200, m_server->get("/api/dashboard/summary?range=24h", bearer(lowToken)).status);
 }
 
+// 钉住：CUSTOM 数据范围的部门可写可读，空部门集合被拒绝
+TEST_F(SystemEndpointsTest, RoleCustomScopePersistsDepartments)
+{
+    const std::string token      = login("admin", "admin123");
+    const std::string createBody = AsynGyanis::Base::ConfigValue::object({{"name", "自定义部门"},
+                                                                          {"code", "custom_depts"},
+                                                                          {"dataScope", "CUSTOM"},
+                                                                          {"deptIds", std::vector<std::int64_t>{101, 102}},
+                                                                          {"menuIds", std::vector<std::int64_t>{1300}}})
+                                           .dump();
+    const auto        created    = m_server->post("/api/system/roles", createBody, "application/json", bearer(token));
+    ASSERT_EQ(200, created.status) << created.body;
+    const std::int64_t roleId = (*created.json())["data"]["id"].get<std::int64_t>();
+
+    const std::string path   = "/api/system/roles/" + std::to_string(roleId) + "/depts";
+    const auto        before = m_server->get(path, bearer(token));
+    ASSERT_EQ(200, before.status) << before.body;
+    ASSERT_EQ(2, (*before.json())["data"]["deptIds"].size());
+
+    const std::string updateBody = AsynGyanis::Base::ConfigValue::object({{"dataScope", "CUSTOM"}, {"deptIds", std::vector<std::int64_t>{103}}}).dump();
+    ASSERT_EQ(200, m_server->send("PUT", "/api/system/roles/" + std::to_string(roleId), updateBody, "application/json", bearer(token)).status);
+    const auto after = m_server->get(path, bearer(token));
+    ASSERT_EQ(200, after.status) << after.body;
+    ASSERT_EQ(1, (*after.json())["data"]["deptIds"].size());
+    EXPECT_EQ(103, (*after.json())["data"]["deptIds"][0].get<std::int64_t>());
+
+    const std::string emptyBody =
+            AsynGyanis::Base::ConfigValue::object({{"name", "空范围"}, {"code", "empty_custom"}, {"dataScope", "CUSTOM"}, {"deptIds", std::vector<std::int64_t>{}}}).dump();
+    EXPECT_EQ(400, m_server->post("/api/system/roles", emptyBody, "application/json", bearer(token)).status);
+}
+
 // 钉住：导出接口是 CSV 而不是 JSON，且带 BOM
 TEST_F(SystemEndpointsTest, ExportsCsvWithBom)
 {

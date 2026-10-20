@@ -191,6 +191,7 @@ namespace EdgePulse::System
         std::optional<int>                       status;    ///< 1 启用
         std::optional<std::string>               remark;    ///< 备注
         std::optional<std::vector<std::int64_t>> menuIds;   ///< 菜单授权
+        std::optional<std::vector<std::int64_t>> deptIds;   ///< 自定义数据范围的部门
     };
 
     /**

@@ -280,6 +280,10 @@ namespace EdgePulse::System
             {
                 write.menuIds = integerArrayField(body, "menuIds");
             }
+            if (body.contains("deptIds"))
+            {
+                write.deptIds = integerArrayField(body, "deptIds");
+            }
             return write;
         }
 
@@ -436,6 +440,11 @@ namespace EdgePulse::System
             if (write.dataScope.has_value() && !isValidScope(*write.dataScope))
             {
                 message = "数据范围只能是 ALL、DEPT_AND_CHILD、DEPT、SELF 或 CUSTOM";
+                return false;
+            }
+            if (write.dataScope.value_or("") == "CUSTOM" && (!write.deptIds.has_value() || write.deptIds->empty()))
+            {
+                message = "自定义数据范围至少要选择一个部门";
                 return false;
             }
             return true;
@@ -874,6 +883,26 @@ namespace EdgePulse::System
                        }
                        const auto menuIds = co_await deps->roles->menuIdsFor(loop, *roleId);
                        Common::writeSuccess(response, ConfigValue::object({{"menuIds", Json::integerArray(menuIds)}}), traceId);
+                       co_return;
+                   });
+
+        router.get("/api/system/roles/:id/depts",
+                   [&loop, deps, authOf](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string traceId = Web::resolveRequestId(request);
+                       const auto        session = co_await Web::requireSession(authOf(), loop, request, response, "system:role:list", traceId);
+                       if (!session.has_value())
+                       {
+                           co_return;
+                       }
+                       const auto roleId = Common::parsePositiveIdentifier(request.param("id"));
+                       if (!roleId.has_value())
+                       {
+                           fail(response, Common::kCodeBadRequest, "角色标识不合法", traceId);
+                           co_return;
+                       }
+                       const auto deptIds = co_await deps->roles->deptIdsFor(loop, *roleId);
+                       Common::writeSuccess(response, ConfigValue::object({{"deptIds", Json::integerArray(deptIds)}}), traceId);
                        co_return;
                    });
 
