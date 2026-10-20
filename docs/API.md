@@ -61,6 +61,15 @@
 
 用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds,deptIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`；取 `CUSTOM` 时必须给出非空 `deptIds`。
 
+## 2.1 边缘反向代理
+
+配置 `edgepulse.reverse_proxy.enabled=true` 后，`prefix`（默认 `/edge`）与 `prefix/*` 转发到 `upstream`。默认剥离前缀，例如 `GET /edge/api/status?a=1` 转发为 `GET <upstream>/api/status?a=1`。
+
+- 默认要求 EdgePulse 会话；`require_session: false` 可公开，`permission` 可再加权限码。
+- 只转发白名单请求头，不透传 Authorization/Cookie；响应状态、白名单响应头与正文原样返回。
+- `maximum_request_bytes` / `maximum_response_bytes` / `timeout_ms` 限制单次转发；超过请求上限返回 413，上游失败返回 502。
+- 不代理 WebSocket 升级与流式大响应。
+
 ## 3. 监控与工作台
 
 | 方法 | 路径 | 权限/说明 |

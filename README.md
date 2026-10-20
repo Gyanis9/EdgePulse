@@ -8,6 +8,7 @@ EdgePulse 是面向边缘节点与设备的运维平台：控制面是 Vue 3 管
 - 系统管理：用户、角色、菜单、部门、岗位、字典、参数、操作日志、登录日志、CSV 导出。
 - 设备域：节点、节点分组、Agent mTLS 注册/心跳、遥测、告警规则与告警生命周期、固件上传/下载/下发、命令下发。
 - 实时：浏览器 WebSocket（节点、告警、命令主题）、告警 SSE、Agent 命令长连接与轮询兜底、HMAC 签名的 UDP 遥测入口。
+- 边缘入口：可选的 HTTP 反向代理前缀，把受控请求转发到上游服务。
 - 运行时：SQLite 本地档、MySQL 生产档、Redis 可选会话/验证码后端、配置热重载、数据库健康探针。
 - 可观测：Prometheus 指标、`/readyz`、业务运维总览、OTLP 指标出口开关。
 - 交付：生产静态站点回退、Docker Compose、systemd、Prometheus 抓取配置。
@@ -128,7 +129,7 @@ python scripts/check-docker-stack.py --build
 
 ## 已知边界
 
-- P4（边缘反向代理、UDP 遥测、OIDC、多租户）按原设计另行设计，本次不实现空壳。
+- P4 中的 OIDC 与多租户仍按原设计另行设计；UDP 遥测与边缘反向代理已落地，反代当前只做 HTTP 转发（不代理 WebSocket 升级与流式大响应）。
 - 监听器目前统一绑定事件循环 0；`edgepulse.threads` 只创建额外循环，不会分担监听。多 worker 监听分发与多进程编排未作为本次交付形态。
 - mTLS 指纹白名单在 Agent 注册时按自报值校验；逐请求身份绑定需要引擎开放对端证书接口或每节点独立 CA。
 - WebSocket 首条认证的 5 秒兜底仍用计时线程（实现标注了 `shortcut`），等引擎提供带超时接收后替换。
