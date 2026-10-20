@@ -9,12 +9,15 @@ export interface NodeRow {
   certFingerprint: string
   labels: Record<string, string> | null
   lastSeen: string
+  groupId: number
+  groupName: string
   version: number
 }
 
 export interface NodeWriteRequest {
   name?: string
   labels?: Record<string, string> | null
+  groupId?: number
   version?: number
 }
 

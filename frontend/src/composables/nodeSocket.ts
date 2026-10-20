@@ -15,7 +15,12 @@ const HEARTBEAT_MILLISECONDS = 25000
 /**
  * 浏览器节点状态推送：首条消息认证、指数退避重连、页面隐藏时暂停心跳、卸载时关闭。
  */
-export function useNodeSocket(onStatus: (node: NodeRow) => void) {
+export interface NodeSocketHandlers {
+  onAlarm?: (data: Record<string, unknown>) => void
+  onCommand?: (data: Record<string, unknown>) => void
+}
+
+export function useNodeSocket(onStatus: (node: NodeRow) => void, handlers: NodeSocketHandlers = {}) {
   const state = ref<NodeSocketState>('disconnected')
   let socket: WebSocket | null = null
   let reconnectTimer = 0
@@ -80,6 +85,14 @@ export function useNodeSocket(onStatus: (node: NodeRow) => void) {
       }
       if (message.type === 'node.status' && message.data && typeof message.data === 'object') {
         onStatus(message.data as NodeRow)
+        return
+      }
+      if (message.type === 'alarm' && message.data && typeof message.data === 'object') {
+        handlers.onAlarm?.(message.data as Record<string, unknown>)
+        return
+      }
+      if (message.type === 'command.status' && message.data && typeof message.data === 'object') {
+        handlers.onCommand?.(message.data as Record<string, unknown>)
       }
     }
     socket.onerror = () => {

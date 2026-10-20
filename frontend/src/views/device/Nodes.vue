@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { ListPage, FormDialog, PermissionButton } from '@/components/business'
-import { Field, StatusTag, TextInput, type Column } from '@/components/ui'
-import { deviceApi, type NodeRow } from '@/api'
+import { Field, Select, StatusTag, TextInput, type Column } from '@/components/ui'
+import { deviceApi, fleetApi, type NodeGroupRow, type NodeRow } from '@/api'
 import { useListPage } from '@/composables/list'
 import { useNodeSocket } from '@/composables/nodeSocket'
 import { confirm } from '@/composables/confirm'
@@ -10,6 +10,7 @@ import { pushToast, toastError } from '@/composables/toast'
 
 const columns: Column[] = [
   { key: 'name', title: '节点名', minWidth: 180 },
+  { key: 'groupName', title: '分组', width: 140 },
   { key: 'status', title: '状态', width: 100 },
   { key: 'agentVersion', title: 'Agent 版本', width: 130 },
   { key: 'lastSeen', title: '最后心跳', minWidth: 190 },
@@ -17,9 +18,27 @@ const columns: Column[] = [
   { key: 'actions', title: '操作', width: 100, className: 'col-actions' },
 ]
 
-const list = useListPage<NodeRow, { keyword: string }>({
-  query: { keyword: '' },
+const list = useListPage<NodeRow, { keyword: string; groupId: number | null }>({
+  query: { keyword: '', groupId: null },
   fetch: params => deviceApi.nodes.list(params),
+})
+
+const groupRows = ref<NodeGroupRow[]>([])
+const groupOptions = ref<Array<{ label: string; value: number; depth?: number }>>([])
+function flattenGroups(nodes: NodeGroupRow[], depth = 0, output: Array<{ label: string; value: number; depth: number }> = []) {
+  nodes.forEach(node => {
+    output.push({ label: node.name, value: node.id, depth })
+    flattenGroups(node.children ?? [], depth + 1, output)
+  })
+  return output
+}
+onMounted(async () => {
+  try {
+    groupRows.value = await fleetApi.nodeGroups.tree()
+    groupOptions.value = [{ label: '全部分组', value: 0 }, ...flattenGroups(groupRows.value)]
+  } catch (error) {
+    toastError(error, '分组加载失败')
+  }
 })
 
 const socket = useNodeSocket(node => {
@@ -37,12 +56,13 @@ function labelText(node: NodeRow) {
 
 const dialog = ref(false)
 const saving = ref(false)
-const form = reactive({ name: '', labels: '' })
+const form = reactive({ name: '', labels: '', groupId: 200 })
 const errors = ref<Partial<Record<'name' | 'labels', string>>>({})
 
 function openCreate() {
   form.name = ''
   form.labels = ''
+  form.groupId = groupOptions.value.find(option => option.value !== 0)?.value ?? 200
   errors.value = {}
   dialog.value = true
 }
@@ -63,7 +83,7 @@ async function submit() {
   if (Object.keys(errors.value).length) return
   saving.value = true
   try {
-    await deviceApi.nodes.create({ name: form.name.trim(), labels })
+    await deviceApi.nodes.create({ name: form.name.trim(), labels, groupId: form.groupId })
     pushToast('节点已创建')
     dialog.value = false
     await list.load()
@@ -97,12 +117,16 @@ async function remove(node: NodeRow) {
     <ListPage title="节点" desc="边缘节点的注册、心跳与在线状态；写操作需要节点写权限。" table-title="节点列表" :list="list" :columns="columns" :min-width="980">
       <template #search>
         <TextInput v-model="list.query.keyword" icon="search" placeholder="搜索节点名" clearable />
+        <Select v-model="list.query.groupId" :options="groupOptions" placeholder="全部分组" />
       </template>
       <template #tools>
         <PermissionButton perm="device:node:write" icon="plus" label="新增节点" @click="openCreate" />
       </template>
       <template #cell-status="{ row }">
         <StatusTag :status="row.status === 'online'" on="在线" off="离线" />
+      </template>
+      <template #cell-groupName="{ row }">
+        <span class="faint">{{ row.groupName || '—' }}</span>
       </template>
       <template #cell-lastSeen="{ row }">
         <span class="mono faint">{{ row.lastSeen || '—' }}</span>
@@ -118,6 +142,9 @@ async function remove(node: NodeRow) {
     <FormDialog :open="dialog" title="新增节点" sub="名称唯一；标签是可选的 JSON 对象。" :saving="saving" @close="dialog = false" @submit="submit">
       <Field label="节点名" :error="errors.name" required>
         <TextInput v-model="form.name" placeholder="例如 edge-sh-01" :invalid="!!errors.name" />
+      </Field>
+      <Field label="所属分组" required>
+        <Select v-model="form.groupId" :options="groupOptions.filter(option => option.value !== 0)" placeholder="选择分组" />
       </Field>
       <Field label="标签（JSON 对象）" :error="errors.labels" hint="留空表示无标签">
         <TextInput v-model="form.labels" placeholder='{"site":"shanghai"}' :invalid="!!errors.labels" />

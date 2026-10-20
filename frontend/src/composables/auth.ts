@@ -47,6 +47,10 @@ const COMPONENT_MAP: Record<string, () => Promise<{ default: Component }>> = {
   'monitor/operlog/index': () => import('@/views/monitor/OperLog.vue'),
   'monitor/loginlog/index': () => import('@/views/monitor/LoginLog.vue'),
   'device/Nodes': () => import('@/views/device/Nodes.vue'),
+  'device/Alarms': () => import('@/views/device/Alarms.vue'),
+  'device/Telemetry': () => import('@/views/device/Telemetry.vue'),
+  'device/Firmware': () => import('@/views/device/Firmware.vue'),
+  'device/Commands': () => import('@/views/device/Commands.vue'),
 }
 
 /** 路由名由路径推导：/system/user → system-user */

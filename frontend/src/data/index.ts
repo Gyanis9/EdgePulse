@@ -5,7 +5,7 @@ export const APP = Object.freeze({
   name: 'EdgePulse',
   shortName: 'EdgePulse',
   subtitle: '边缘运维平台',
-  version: 'v0.1.0',
+  version: 'v1.0.0',
   copyright: `© ${new Date().getFullYear()} EdgePulse`,
 })
 

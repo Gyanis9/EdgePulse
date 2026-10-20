@@ -1,0 +1,138 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { EmptyState, Metric, SectionLabel, Select, Tag } from '@/components/ui'
+import TrendChart from '@/components/charts/TrendChart.vue'
+import { deviceApi, fleetApi, type NodeRow, type TelemetryPoint } from '@/api'
+import { toastError } from '@/composables/toast'
+
+const nodes = ref<NodeRow[]>([])
+const nodeId = ref<number | null>(null)
+const nodeOptions = computed(() => nodes.value.map(node => ({ label: `${node.name} · ${node.status === 'online' ? '在线' : '离线'}`, value: node.id })))
+const latest = ref<TelemetryPoint[]>([])
+const metric = ref('')
+const metricOptions = computed(() => latest.value.map(point => ({ label: `${point.metric}${point.unit ? ` (${point.unit})` : ''}`, value: point.metric })))
+const range = ref('24h')
+const ranges = [
+  { label: '近 1 小时', value: '1h' },
+  { label: '近 6 小时', value: '6h' },
+  { label: '近 24 小时', value: '24h' },
+  { label: '近 7 天', value: '7d' },
+]
+const points = ref<TelemetryPoint[]>([])
+const loading = ref(false)
+const latestLoading = ref(false)
+const selected = computed(() => latest.value.find(point => point.metric === metric.value) ?? null)
+const values = computed(() => points.value.map(point => point.value))
+const labels = computed(() => points.value.map(point => point.collectedAt.slice(11, 16)))
+
+function fromTime(): string {
+  const now = new Date()
+  const hours = range.value === '1h' ? 1 : range.value === '6h' ? 6 : range.value === '24h' ? 24 : 24 * 7
+  const start = new Date(now.getTime() - hours * 3600 * 1000)
+  return start.toISOString().slice(0, 19).replace('T', ' ')
+}
+function toTime(): string {
+  return new Date().toISOString().slice(0, 19).replace('T', ' ')
+}
+
+async function loadNodes() {
+  try {
+    const page = await deviceApi.nodes.list({ pageNum: 1, pageSize: 100 })
+    nodes.value = page.rows
+    if (!nodeId.value && page.rows.length) nodeId.value = page.rows[0].id
+  } catch (error) {
+    toastError(error, '节点加载失败')
+  }
+}
+
+async function loadLatest() {
+  if (!nodeId.value) return
+  latestLoading.value = true
+  try {
+    latest.value = await fleetApi.telemetry.latest(nodeId.value)
+    if (!metric.value || !latest.value.some(point => point.metric === metric.value)) {
+      metric.value = latest.value[0]?.metric ?? ''
+    }
+  } catch (error) {
+    toastError(error, '最新遥测加载失败')
+  } finally {
+    latestLoading.value = false
+  }
+}
+
+async function loadSeries() {
+  if (!nodeId.value || !metric.value) {
+    points.value = []
+    return
+  }
+  loading.value = true
+  try {
+    points.value = await fleetApi.telemetry.series(nodeId.value, metric.value, fromTime(), toTime())
+  } catch (error) {
+    toastError(error, '遥测曲线加载失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+watch(nodeId, async () => {
+  metric.value = ''
+  await loadLatest()
+  await loadSeries()
+})
+watch(metric, loadSeries)
+watch(range, loadSeries)
+
+let timer = 0
+onMounted(async () => {
+  await loadNodes()
+  await loadLatest()
+  await loadSeries()
+  timer = window.setInterval(() => { loadLatest(); loadSeries() }, 10000)
+})
+onBeforeUnmount(() => window.clearInterval(timer))
+</script>
+
+<template>
+  <div class="page">
+    <section class="band reveal">
+      <div class="band-head">
+        <SectionLabel title="遥测数据" />
+        <div class="band-tools">
+          <Select v-model="nodeId" :options="nodeOptions" placeholder="选择节点" filterable />
+          <Select v-model="range" :options="ranges" />
+        </div>
+      </div>
+      <div class="readout-strip">
+        <Metric label="节点" :value="nodes.length" unit="个" />
+        <Metric label="指标" :value="latest.length" unit="项" />
+        <Metric label="采样点" :value="points.length" unit="个" />
+      </div>
+      <div class="metric-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-top:16px">
+        <button
+          v-for="point in latest"
+          :key="point.metric"
+          type="button"
+          class="lift"
+          :class="{ 'is-active': point.metric === metric }"
+          style="text-align:left;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--surface)"
+          @click="metric = point.metric"
+        >
+          <div class="soft" style="font-size:12px">{{ point.metric }}</div>
+          <div class="tnum" style="font-size:24px;font-weight:650">{{ point.value }}<span class="soft" style="font-size:12px"> {{ point.unit }}</span></div>
+          <div class="mono faint" style="font-size:11px">{{ point.collectedAt }}</div>
+        </button>
+        <EmptyState v-if="!latestLoading && !latest.length" title="暂无遥测" desc="Agent 上报后会显示指标。" icon="line-chart" />
+      </div>
+    </section>
+
+    <section class="band reveal" style="margin-top:18px">
+      <div class="band-head">
+        <SectionLabel :title="selected ? `${selected.metric} 趋势` : '趋势'" />
+        <Tag v-if="selected" tone="info">{{ selected.unit || '数值' }}</Tag>
+      </div>
+      <TrendChart v-if="values.length" :values="values" :labels="labels" :unit="selected?.unit || ''" :height="300" />
+      <EmptyState v-else :title="loading ? '加载中' : '还没有曲线'" desc="选择节点与指标后显示时间序列。" icon="chart" />
+    </section>
+  </div>
+</template>
