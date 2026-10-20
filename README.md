@@ -23,7 +23,7 @@ src/
 └─ Main/       进程入口
 frontend/      Vue 3 + Vite 管理后台
 third_party/AsynGyanis/  引擎 git submodule，只读
-migrations/    SQL 迁移 V1–V6
+migrations/    SQL 迁移 V1–V7
 config/        非敏感配置样例
 deploy/        Docker、systemd、Prometheus
 scripts/       证书、开发运行、验收
@@ -92,7 +92,7 @@ npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ## 验收
 
 ```bash
-# 后端：55 条用例
+# 后端：61 条用例（真机存储 2 条按环境变量门控）
 ctest --preset debug --output-on-failure
 
 # 前端：23 条单测 + 类型检查/构建 + 3 条 Playwright
@@ -116,10 +116,10 @@ python scripts/check-acceptance.py
 ## 测试
 
 - 后端单元：密码、验证码、会话、CSV、KV、分页、时间。
-- 后端集成：迁移 V1–V6、认证、用户/角色/菜单/组织/字典/参数、数据范围、遥测、告警、命令、固件、节点分组。
-- 协议：401/403 矩阵、管理端 CRUD、遥测告警、命令往返、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
+- 后端集成：迁移 V1–V7、认证、用户/角色/菜单/组织/字典/参数、日志与节点的数据范围、遥测、告警、命令、固件、节点分组、真机 MySQL/Redis（环境变量门控）。
+- 协议：401/403 矩阵、管理端 CRUD、数据范围、遥测告警、命令往返与 Agent WebSocket 推送、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
 - 前端：API 契约单测；Playwright 用系统 Edge（`channel: 'msedge'`），不下载浏览器。
-- 本机没有常驻 MySQL/Redis 服务，未运行真机集成；切换生产后端前必须在部署环境重新验证，不伪造通过结果。
+- `ExternalStores.*` 需要真实 MySQL/Redis：设置 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 后运行；缺变量时用例 SKIP，不伪造通过。本机已用临时容器跑绿。
 
 ## 已知边界
 
@@ -127,8 +127,8 @@ python scripts/check-acceptance.py
 - 监听器目前统一绑定事件循环 0；`edgepulse.threads` 只创建额外循环，不会分担监听。多 worker 监听分发与多进程编排未作为本次交付形态。
 - mTLS 指纹白名单在 Agent 注册时按自报值校验；逐请求身份绑定需要引擎开放对端证书接口或每节点独立 CA。
 - WebSocket 首条认证的 5 秒兜底仍用计时线程（实现标注了 `shortcut`），等引擎提供带超时接收后替换。
-- OTLP 出口开关已接通，但本机没有采集端；未对接真实 collector 验证。
-- Docker/systemd 产物已提供；本机未运行 Docker 真机验证安装包依赖。
+- OTLP 出口已用 `scripts/check-otlp.py` 的 mock collector 验证真实 POST；未对接外部生产采集端。
+- Docker Compose 与 systemd 产物已提供；本机用 Docker 起过临时 MySQL/Redis 跑集成与验收，未构建应用镜像，也未启动 systemd 服务。
 
 ## 编码与提交
 
