@@ -309,7 +309,7 @@ def main() -> int:
             "(SELECT COUNT(*) FROM sys_tenant));\"",
         )
         stored = mysql_check.stdout.strip().split("|")
-        report("MySQL 迁移、种子、角色部门、节点与租户落库", stored == ["8", "1", "2", "1", "1"], mysql_check.stdout.strip() or mysql_check.stderr.strip())
+        report("MySQL 迁移、种子、角色部门、节点与租户落库", stored == ["12", "1", "2", "1", "1"], mysql_check.stdout.strip() or mysql_check.stderr.strip())
 
         redis_check = compose("exec", "-T", "redis", "redis-cli", "--no-auth-warning", "-a", values["EDGEPULSE_REDIS_PASSWORD"], "KEYS", "edgepulse:session:*")
         session_keys = [line for line in redis_check.stdout.splitlines() if line.strip()]

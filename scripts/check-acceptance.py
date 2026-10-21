@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import http.client
 import json
 import os
 import queue
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -14,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -29,6 +33,76 @@ AGENT_BASE = "https://127.0.0.1:9443"
 OPS_BASE = "http://127.0.0.1:9100"
 RUN_ID = str(time.time_ns())[-8:]
 failures: list[str] = []
+webhook_events: queue.Queue = queue.Queue()
+mail_events: queue.Queue = queue.Queue()
+
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(length)
+        webhook_events.put((body, self.headers.get("x-edgepulse-signature", "")))
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class SmtpHandler(socketserver.StreamRequestHandler):
+    def handle(self) -> None:
+        self.wfile.write(b"220 fake-smtp ready\r\n")
+        in_data = False
+        message = bytearray()
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                break
+            if in_data:
+                if line in (b".\r\n", b".\n"):
+                    in_data = False
+                    mail_events.put(bytes(message))
+                    self.wfile.write(b"250 queued\r\n")
+                else:
+                    message.extend(line)
+                continue
+            upper = line.upper()
+            if upper.startswith(b"EHLO") or upper.startswith(b"HELO"):
+                self.wfile.write(b"250-fake-smtp\r\n250 AUTH PLAIN\r\n")
+            elif upper.startswith(b"AUTH"):
+                self.wfile.write(b"235 authenticated\r\n")
+            elif upper.startswith(b"DATA"):
+                self.wfile.write(b"354 send data\r\n")
+                in_data = True
+            elif upper.startswith(b"QUIT"):
+                self.wfile.write(b"221 bye\r\n")
+                break
+            elif upper.startswith((b"MAIL", b"RCPT")):
+                self.wfile.write(b"250 ok\r\n")
+            else:
+                self.wfile.write(b"250 ok\r\n")
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class SmtpServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
+def start_smtp_receiver() -> tuple[SmtpServer, threading.Thread]:
+    server = SmtpServer(("127.0.0.1", 0), SmtpHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def start_webhook_receiver() -> tuple[ThreadingHTTPServer, threading.Thread]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), WebhookHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
 
 
 def report(name: str, ok: bool, detail: str = "") -> None:
@@ -207,6 +281,8 @@ def check_tenancy(token: str) -> None:
     status, _, _ = request_json("PUT", HTTP_BASE + f"/api/system/tenants/{tenant_id}", {"status": 0}, token=token)
     report("租户停用", status == 200, f"HTTP {status}")
     report("停用租户拒绝新登录", login_user(admin_name, "tenant123", tenant_code) is None)
+    old_session = request_json("GET", HTTP_BASE + "/api/auth/me", token=tenant_token)[0]
+    report("停用租户旧会话失效", old_session == 401, f"HTTP {old_session}")
 
 
 def create_node(token: str, name: str) -> int | None:
@@ -224,6 +300,53 @@ def check_nodes(token: str) -> None:
     status, groups, _ = request_json("GET", HTTP_BASE + "/api/node-groups", token=token)
     report("节点分组可读", status == 200 and isinstance(groups.get("data"), list), f"HTTP {status}")
     return node_id
+
+
+def check_notifications(token: str) -> tuple[ThreadingHTTPServer, threading.Thread, int, str, SmtpServer, threading.Thread, int]:
+    server, thread = start_webhook_receiver()
+    smtp, smtp_thread = start_smtp_receiver()
+    secret = "accept-webhook-secret"
+    status, payload, _ = request_json("POST", HTTP_BASE + "/api/system/notifications",
+                                      {"name": "验收 Webhook", "type": "webhook",
+                                       "endpoint": f"http://127.0.0.1:{server.server_port}/hook",
+                                       "secret": secret, "minLevel": "warning", "enabled": True}, token=token)
+    channel_id = int(payload.get("data", {}).get("id") or 0)
+    report("通知渠道创建", status == 200 and bool(channel_id), f"HTTP {status}")
+    status, mail, _ = request_json("POST", HTTP_BASE + "/api/system/notifications",
+                                   {"name": "验收邮件", "type": "email",
+                                    "endpoint": f"smtp://127.0.0.1:{smtp.server_address[1]}",
+                                    "recipients": "ops@example.com", "sender": "edgepulse@example.com",
+                                    "username": "mailer", "secret": "mail-pass", "minLevel": "warning", "enabled": True}, token=token)
+    mail_id = int(mail.get("data", {}).get("id") or 0)
+    report("邮件通知渠道创建", status == 200 and bool(mail_id), f"HTTP {status}")
+    status, listing, _ = request_json("GET", HTTP_BASE + "/api/system/notifications?pageNum=1&pageSize=10", token=token)
+    rows = listing.get("data", {}).get("rows", [])
+    report("通知渠道密钥不回显", status == 200 and rows and all(row.get("secretConfigured") is True and "secret" not in row for row in rows), f"HTTP {status}")
+    return server, thread, channel_id, secret, smtp, smtp_thread, mail_id
+
+
+def verify_notification(token: str, state: tuple[ThreadingHTTPServer, threading.Thread, int, str, SmtpServer, threading.Thread, int]) -> None:
+    server, thread, channel_id, secret, smtp, smtp_thread, mail_id = state
+    try:
+        body, signature = webhook_events.get(timeout=5)
+        expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        report("告警 Webhook 收到事件", b'"type":"alarm"' in body, body[:120].decode("utf-8", "replace"))
+        report("告警 Webhook 签名正确", hmac.compare_digest(expected, signature), signature)
+    except queue.Empty:
+        report("告警 Webhook 收到事件", False, "5 秒内没有收到")
+    try:
+        message = mail_events.get(timeout=5)
+        report("告警邮件收到事件", b"Subject:" in message and b"ops@example.com" in message, message[:120].decode("utf-8", "replace"))
+    except queue.Empty:
+        report("告警邮件收到事件", False, "5 秒内没有收到")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        smtp.shutdown()
+        smtp_thread.join(timeout=2)
+        for identifier in (channel_id, mail_id):
+            if identifier:
+                request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{identifier}", token=token)
 
 
 def check_telemetry_alarm(token: str, node_id: int) -> None:
@@ -539,7 +662,9 @@ def main() -> int:
             node_id = check_nodes(token)
             check_websocket(token)
             if node_id:
+                notification_state = check_notifications(token)
                 check_telemetry_alarm(token, node_id)
+                verify_notification(token, notification_state)
                 check_sse_alarm(token, node_id)
                 check_commands(token, node_id)
                 check_agent_websocket(token)
