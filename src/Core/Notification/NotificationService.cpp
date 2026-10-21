@@ -224,6 +224,15 @@ namespace EdgePulse::Notification
             {
                 host.resize(slash);
             }
+            // 目标只保留主机，避免把 URL 中的凭据写进投递记录
+            if (const std::size_t at = host.rfind('@'); at != std::string::npos)
+            {
+                host.erase(0, at + 1);
+            }
+            if (host.size() > 140)
+            {
+                host.resize(140);
+            }
             record.target = "webhook://" + host;
         }
         try
