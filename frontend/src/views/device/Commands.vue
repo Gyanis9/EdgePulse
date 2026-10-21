@@ -6,6 +6,7 @@ import { deviceApi, fleetApi, type CommandRow, type NodeRow } from '@/api'
 import { useListPage } from '@/composables/list'
 import { useNodeSocket } from '@/composables/nodeSocket'
 import { pushToast, toastError } from '@/composables/toast'
+import { confirm } from '@/composables/confirm'
 
 const STATUSES = [
   { label: '全部状态', value: '' },
@@ -30,6 +31,7 @@ const columns: Column[] = [
   { key: 'nodeName', title: '节点', minWidth: 150 },
   { key: 'status', title: '状态', width: 100 },
   { key: 'message', title: '说明', minWidth: 160 },
+  { key: 'batchId', title: '批次', width: 150 },
   { key: 'createdAt', title: '创建时间', width: 170 },
   { key: 'finishedAt', title: '结束时间', width: 170 },
   { key: 'actions', title: '操作', width: 130, className: 'col-actions' },
@@ -105,6 +107,18 @@ async function submit() {
   }
 }
 
+async function cancelBatch(row: CommandRow) {
+  const ok = await confirm({ title: '取消批次', message: `确认取消批次 #${row.batchId} 内所有待执行命令吗？`, confirmText: '取消批次', danger: true })
+  if (!ok) return
+  try {
+    const canceled = await fleetApi.commands.cancelBatch(row.batchId)
+    pushToast(`已取消 ${canceled.length} 条命令`)
+    await list.load()
+  } catch (failure) {
+    toastError(failure, '批量取消失败')
+  }
+}
+
 async function cancel(row: CommandRow) {
   try {
     await fleetApi.commands.cancel(row.id)
@@ -137,11 +151,13 @@ onMounted(() => {
       <template #cell-type="{ row }"><span class="mono">{{ row.type }}</span></template>
       <template #cell-status="{ row }"><Tag :tone="STATUS_TONE[row.status] || 'neutral'" dot>{{ STATUS_LABEL[row.status] || row.status }}</Tag></template>
       <template #cell-message="{ row }"><span class="faint">{{ row.message || '—' }}</span></template>
+    <template #cell-batchId="{ row }"><span class="mono faint">{{ row.batchId ? `#${row.batchId}` : '—' }}</span></template>
       <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
       <template #cell-finishedAt="{ row }"><span class="mono soft">{{ row.finishedAt || '—' }}</span></template>
       <template #cell-actions="{ row }">
         <PermissionButton perm="device:command:list" variant="text" size="sm" icon="search" label="详情" @click="detail = row" />
         <PermissionButton v-if="row.status === 'pending' || row.status === 'running'" perm="device:command:send" variant="text" size="sm" danger icon="x" label="取消" @click="cancel(row)" />
+        <PermissionButton v-if="row.batchId && (row.status === 'pending' || row.status === 'running')" perm="device:command:send" variant="text" size="sm" danger icon="ban" label="取消批次" @click="cancelBatch(row)" />
       </template>
     </ListPage>
 

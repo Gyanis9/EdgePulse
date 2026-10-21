@@ -39,6 +39,7 @@ namespace EdgePulse::Notification
                                         {"recipients", channel.recipients},
                                         {"username", channel.username},
                                         {"sender", channel.sender},
+                                        {"caFile", channel.caFile},
                                         {"minLevel", channel.minLevel},
                                         {"enabled", channel.enabled},
                                         {"secretConfigured", !channel.secret.empty()},
@@ -64,6 +65,7 @@ namespace EdgePulse::Notification
             record.username   = Json::stringField(body, "username");
             record.secret     = Json::stringField(body, "secret");
             record.sender     = Json::stringField(body, "sender");
+            record.caFile     = Json::stringField(body, "caFile");
             record.minLevel   = Json::stringField(body, "minLevel", "info");
             record.enabled    = Json::boolField(body, "enabled", true);
             if (record.name.empty() || record.name.size() > 64)
@@ -101,9 +103,9 @@ namespace EdgePulse::Notification
                     error = "收件人、发件人与用户名不能包含换行";
                     return std::nullopt;
                 }
-                if (!record.endpoint.starts_with("smtp://") && !record.endpoint.starts_with("smtps://"))
+                if (!record.endpoint.starts_with("smtp://") && !record.endpoint.starts_with("smtps://") && !record.endpoint.starts_with("starttls://"))
                 {
-                    error = "SMTP 地址必须以 smtp:// 或 smtps:// 开头";
+                    error = "SMTP 地址必须以 smtp://、smtps:// 或 starttls:// 开头";
                     return std::nullopt;
                 }
                 if (record.recipients.empty() || record.recipients.size() > 512)

@@ -21,7 +21,7 @@ namespace EdgePulse::Notification
         using AsynGyanis::Database::DatabaseResult;
         using AsynGyanis::Database::DatabaseValue;
 
-        constexpr std::string_view kSelectChannel = "SELECT id, tenant_id, name, type, endpoint, recipients, username, secret, sender, min_level, enabled, created_by, "
+        constexpr std::string_view kSelectChannel = "SELECT id, tenant_id, name, type, endpoint, recipients, username, secret, sender, ca_file, min_level, enabled, created_by, "
                                                     "created_at FROM biz_notification_channel ";
 
         [[nodiscard]] ChannelRecord readChannel(const DatabaseResult &result)
@@ -36,6 +36,7 @@ namespace EdgePulse::Notification
             record.username   = Sql::text(result, "username");
             record.secret     = Sql::text(result, "secret");
             record.sender     = Sql::text(result, "sender");
+            record.caFile     = Sql::text(result, "ca_file");
             record.minLevel   = Sql::text(result, "min_level");
             record.enabled    = Sql::boolean(result, "enabled");
             record.createdBy  = Sql::integer(result, "created_by");

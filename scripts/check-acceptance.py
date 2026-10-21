@@ -71,6 +71,14 @@ class SmtpHandler(socketserver.StreamRequestHandler):
                 self.wfile.write(b"250-fake-smtp\r\n250 AUTH PLAIN\r\n")
             elif upper.startswith(b"AUTH"):
                 self.wfile.write(b"235 authenticated\r\n")
+            elif upper.startswith(b"STARTTLS"):
+                self.wfile.write(b"220 ready for tls\r\n")
+                self.wfile.flush()
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(str(CERTS / "server.pem"), str(CERTS / "server-key.pem"))
+                self.connection = context.wrap_socket(self.connection, server_side=True)
+                self.rfile = self.connection.makefile("rb", self.rbufsize)
+                self.wfile = self.connection.makefile("wb", self.wbufsize)
             elif upper.startswith(b"DATA"):
                 self.wfile.write(b"354 send data\r\n")
                 in_data = True
@@ -314,8 +322,9 @@ def check_notifications(token: str) -> tuple[ThreadingHTTPServer, threading.Thre
     report("通知渠道创建", status == 200 and bool(channel_id), f"HTTP {status}")
     status, mail, _ = request_json("POST", HTTP_BASE + "/api/system/notifications",
                                    {"name": "验收邮件", "type": "email",
-                                    "endpoint": f"smtp://127.0.0.1:{smtp.server_address[1]}",
+                                    "endpoint": f"starttls://127.0.0.1:{smtp.server_address[1]}",
                                     "recipients": "ops@example.com", "sender": "edgepulse@example.com",
+                                    "caFile": str(CERTS / "ca.pem"),
                                     "username": "mailer", "secret": "mail-pass", "minLevel": "warning", "enabled": True}, token=token)
     mail_id = int(mail.get("data", {}).get("id") or 0)
     report("邮件通知渠道创建", status == 200 and bool(mail_id), f"HTTP {status}")

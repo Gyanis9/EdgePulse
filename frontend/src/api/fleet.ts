@@ -153,6 +153,7 @@ export function createFleetApi(client: HttpClient) {
       batch: (body: { nodeIds: number[]; type: string; payload: string; timeoutSeconds: number; scheduledAt?: string }) =>
         client.post<{ batchId: number; commands: CommandRow[] }>('/commands/batch', body),
       cancel: (id: number) => client.put<CommandRow>(`/commands/${id}/cancel`, {}),
+      cancelBatch: (batchId: number) => client.put<CommandRow[]>(`/commands/batch/${batchId}/cancel`, {}),
     },
     firmware: {
       list: (query?: QueryParams) => client.get<PageResult<FirmwareRow>>('/firmware', query),

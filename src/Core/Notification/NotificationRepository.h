@@ -42,6 +42,7 @@ namespace EdgePulse::Notification
         std::string  username;         ///< SMTP 用户名
         std::string  secret;           ///< Webhook 签名密钥或 SMTP 口令
         std::string  sender;           ///< 邮件发件人
+        std::string  caFile;           ///< 邮件 TLS 的私有 CA 文件，空表示系统信任库
         std::string  minLevel{"info"}; ///< 最低告警级别
         bool         enabled{true};    ///< 是否启用
         std::int64_t createdBy{0};     ///< 创建人

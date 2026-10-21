@@ -31,6 +31,7 @@ namespace EdgePulse::Notification
         std::string              username;   ///< 认证用户名，可空
         std::string              password;   ///< 认证口令，可空
         std::string              sender;     ///< 发件人地址；空时用 username
+        std::string              caFile;     ///< 邮件 TLS 的私有 CA 文件，空表示系统信任库
         std::vector<std::string> recipients; ///< 收件人
     };
 

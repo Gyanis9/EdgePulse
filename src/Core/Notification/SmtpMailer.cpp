@@ -60,6 +60,11 @@ namespace EdgePulse::Notification
                 m_stream->close();
             }
 
+            [[nodiscard]] std::unique_ptr<AsynGyanis::Net::TcpStream> takeStream()
+            {
+                return std::move(m_stream);
+            }
+
         private:
             std::unique_ptr<AsynGyanis::Net::TcpStream> m_stream;
         };
@@ -125,9 +130,10 @@ namespace EdgePulse::Notification
 
         struct Endpoint
         {
-            bool          tls{false}; ///< smtps://
-            std::string   host;       ///< 主机名
-            std::uint16_t port{25};   ///< 端口
+            bool          tls{false};      ///< smtps://
+            bool          startTls{false}; ///< starttls://
+            std::string   host;            ///< 主机名
+            std::uint16_t port{25};        ///< 端口
         };
 
         [[nodiscard]] bool parseEndpoint(const std::string &url, Endpoint &endpoint)
@@ -142,6 +148,11 @@ namespace EdgePulse::Notification
             {
                 endpoint.port = 25;
                 rest          = std::string_view{url}.substr(7);
+            } else if (url.starts_with("starttls://"))
+            {
+                endpoint.startTls = true;
+                endpoint.port     = 587;
+                rest              = std::string_view{url}.substr(11);
             } else
             {
                 return false;
@@ -252,6 +263,29 @@ namespace EdgePulse::Notification
             co_return true;
         }
 
+        [[nodiscard]] AsynGyanis::Core::Task<std::unique_ptr<SmtpTransport>> upgradeToTls(AsynGyanis::Core::EventLoop &loop, std::unique_ptr<AsynGyanis::Net::TcpStream> stream,
+                                                                                          const std::string &host, const std::string &caFile, std::string &error)
+        {
+            AsynGyanis::Core::TlsPolicy policy;
+            policy.certificateAuthorityFile = caFile;
+            AsynGyanis::Core::TlsContext context(policy, AsynGyanis::Core::TlsContext::Role::Client);
+            SSL *const                   ssl = SSL_new(context.nativeHandle());
+            if (ssl == nullptr || SSL_set_fd(ssl, stream->socket().fileDescriptor()) == 0)
+            {
+                if (ssl != nullptr)
+                {
+                    SSL_free(ssl);
+                }
+                error = "SMTP TLS 会话创建失败";
+                co_return nullptr;
+            }
+            static_cast<void>(SSL_set_tlsext_host_name(ssl, host.c_str()));
+            static_cast<void>(SSL_set1_host(ssl, host.c_str()));
+            AsynGyanis::Core::TlsSocket tls(ssl, loop, std::move(stream->socket()), AsynGyanis::Core::TlsSocket::Role::Client);
+            co_await tls.handshake();
+            co_return std::make_unique<TlsTransport>(std::move(tls));
+        }
+
         [[nodiscard]] std::string base64Lines(const std::string &text)
         {
             const std::string encoded = AsynGyanis::Base::base64Encode(text);
@@ -270,7 +304,7 @@ namespace EdgePulse::Notification
         Endpoint endpoint;
         if (!parseEndpoint(settings.endpoint, endpoint))
         {
-            error = "SMTP 地址必须是 smtp://host:port 或 smtps://host:port";
+            error = "SMTP 地址必须是 smtp://、smtps:// 或 starttls://host:port";
             co_return false;
         }
         if (settings.recipients.empty())
@@ -296,22 +330,11 @@ namespace EdgePulse::Notification
             }
             if (endpoint.tls)
             {
-                AsynGyanis::Core::TlsContext context(AsynGyanis::Core::TlsPolicy{}, AsynGyanis::Core::TlsContext::Role::Client);
-                SSL *const                   ssl = SSL_new(context.nativeHandle());
-                if (ssl == nullptr || SSL_set_fd(ssl, stream->socket().fileDescriptor()) == 0)
+                transport = co_await upgradeToTls(loop, std::move(stream), endpoint.host, settings.caFile, error);
+                if (!transport)
                 {
-                    if (ssl != nullptr)
-                    {
-                        SSL_free(ssl);
-                    }
-                    error = "SMTP TLS 会话创建失败";
                     co_return false;
                 }
-                static_cast<void>(SSL_set_tlsext_host_name(ssl, endpoint.host.c_str()));
-                static_cast<void>(SSL_set1_host(ssl, endpoint.host.c_str()));
-                AsynGyanis::Core::TlsSocket tls(ssl, loop, std::move(stream->socket()), AsynGyanis::Core::TlsSocket::Role::Client);
-                co_await tls.handshake();
-                transport = std::make_unique<TlsTransport>(std::move(tls));
             } else
             {
                 transport = std::make_unique<PlainTransport>(std::move(stream));
@@ -332,6 +355,30 @@ namespace EdgePulse::Notification
             if (!co_await command(*transport, "EHLO edgepulse.local", 250, error))
             {
                 co_return false;
+            }
+            if (endpoint.startTls)
+            {
+                if (!co_await command(*transport, "STARTTLS", 220, error))
+                {
+                    co_return false;
+                }
+                auto *plain = dynamic_cast<PlainTransport *>(transport.get());
+                if (plain == nullptr)
+                {
+                    error = "SMTP STARTTLS 状态异常";
+                    co_return false;
+                }
+                auto upgraded = co_await upgradeToTls(loop, plain->takeStream(), endpoint.host, settings.caFile, error);
+                if (!upgraded)
+                {
+                    co_return false;
+                }
+                transport = std::move(upgraded);
+                // RFC 3207：升级后必须重新 EHLO，能力列表才是 TLS 通道上的
+                if (!co_await command(*transport, "EHLO edgepulse.local", 250, error))
+                {
+                    co_return false;
+                }
             }
             if (!settings.username.empty())
             {

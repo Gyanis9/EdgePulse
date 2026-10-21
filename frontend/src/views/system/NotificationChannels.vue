@@ -46,13 +46,14 @@ interface ChannelForm {
   recipients: string
   username: string
   sender: string
+  caFile: string
   minLevel: string
   enabled: boolean
   secret: string
 }
 const emptyForm = (): ChannelForm => ({
   tenantId: currentUser.value?.tenantId ?? null,
-  name: '', type: 'webhook', endpoint: '', recipients: '', username: '', sender: '', minLevel: 'warning', enabled: true, secret: '',
+  name: '', type: 'webhook', endpoint: '', recipients: '', username: '', sender: '', caFile: '', minLevel: 'warning', enabled: true, secret: '',
 })
 const dialog = ref(false)
 const saving = ref(false)
@@ -79,7 +80,7 @@ function openCreate() {
 function openEdit(row: NotificationChannelRow) {
   Object.assign(form, {
     id: row.id, tenantId: row.tenantId, name: row.name, type: row.type, endpoint: row.endpoint, recipients: row.recipients,
-    username: row.username, sender: row.sender, minLevel: row.minLevel, enabled: row.enabled, secret: '',
+    username: row.username, sender: row.sender, caFile: row.caFile, minLevel: row.minLevel, enabled: row.enabled, secret: '',
   })
   errors.value = {}
   dialog.value = true
@@ -100,6 +101,7 @@ async function submit() {
     recipients: form.recipients,
     username: form.username,
     sender: form.sender,
+    caFile: form.caFile,
     minLevel: form.minLevel,
     enabled: form.enabled,
     secret: form.secret || undefined,
@@ -175,7 +177,7 @@ async function remove(row: NotificationChannelRow) {
         <Select v-model="form.minLevel" :options="LEVELS" />
       </Field>
       <Field :label="form.type === 'webhook' ? 'Webhook 地址' : 'SMTP 地址'" required :error="errors.endpoint"
-             :hint="form.type === 'webhook' ? '接收 JSON POST 的 http(s) 地址' : 'smtp://host:25 或 smtps://host:465'" span>
+             :hint="form.type === 'webhook' ? '接收 JSON POST 的 http(s) 地址' : 'smtp://host:25、smtps://host:465 或 starttls://host:587'" span>
         <TextInput v-model="form.endpoint" :placeholder="form.type === 'webhook' ? 'https://example.com/hook' : 'smtps://smtp.example.com:465'" :invalid="!!errors.endpoint" />
       </Field>
       <template v-if="form.type === 'email'">
@@ -187,6 +189,9 @@ async function remove(row: NotificationChannelRow) {
         </Field>
         <Field label="发件人">
           <TextInput v-model="form.sender" placeholder="edgepulse@example.com" />
+        </Field>
+        <Field label="CA 文件" hint="私有 SMTP CA 的 PEM 路径；留空使用系统信任库" span>
+          <TextInput v-model="form.caFile" placeholder="/etc/ssl/certs/internal-ca.pem" />
         </Field>
       </template>
       <Field :label="form.type === 'webhook' ? '签名密钥' : 'SMTP 口令'" :hint="isEdit ? '留空保持不变' : 'Webhook 用 HMAC-SHA256 签名；邮件为认证口令'" span>

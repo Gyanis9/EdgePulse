@@ -508,6 +508,13 @@ TEST_F(FleetEndpointsTest, BatchAndScheduledCommands)
     const auto early = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA));
     ASSERT_EQ(200, early.status) << early.body;
     EXPECT_TRUE((*early.json())["data"].is_null());
+    const auto canceled = m_server->send("PUT", "/api/commands/batch/" + std::to_string(batchId) + "/cancel", "{}", "application/json", bearer(token));
+    ASSERT_EQ(200, canceled.status) << canceled.body;
+    ASSERT_EQ(2, (*canceled.json())["data"].size());
+    EXPECT_EQ("canceled", (*canceled.json())["data"][0]["status"].get<std::string>());
+    const auto afterCancel = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA));
+    ASSERT_EQ(200, afterCancel.status) << afterCancel.body;
+    EXPECT_TRUE((*afterCancel.json())["data"].is_null());
 
     const auto due = m_server->post(
             "/api/commands/batch",

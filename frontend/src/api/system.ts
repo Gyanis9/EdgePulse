@@ -83,6 +83,7 @@ export interface NotificationChannelRow {
   recipients: string
   username: string
   sender: string
+  caFile: string
   minLevel: 'info' | 'warning' | 'critical'
   enabled: boolean
   secretConfigured: boolean
@@ -96,6 +97,7 @@ export interface NotificationChannelWriteRequest {
   recipients?: string
   username?: string
   sender?: string
+  caFile?: string
   minLevel?: string
   enabled?: boolean
   secret?: string

@@ -145,6 +145,14 @@ namespace EdgePulse::Command
          */
         AsynGyanis::Core::Task<std::optional<CommandRecord>> cancel(AsynGyanis::Core::EventLoop &loop, std::int64_t commandId);
 
+        /**
+         * @brief 取消一个批次内尚未结束的命令
+         * @param loop 恢复协程用的事件循环
+         * @param batchId 批次标识
+         * @return std::vector<CommandRecord> 被取消的命令
+         */
+        AsynGyanis::Core::Task<std::vector<CommandRecord>> cancelBatch(AsynGyanis::Core::EventLoop &loop, std::int64_t batchId);
+
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
         System::TenantScope               m_tenant;   ///< 租户边界

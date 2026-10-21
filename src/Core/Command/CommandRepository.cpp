@@ -306,6 +306,54 @@ namespace EdgePulse::Command
                 });
     }
 
+    AsynGyanis::Core::Task<std::vector<CommandRecord>> CommandRepository::cancelBatch(AsynGyanis::Core::EventLoop &loop, const std::int64_t batchId)
+    {
+        co_return co_await m_database->withConnection<std::vector<CommandRecord>>(
+                loop,
+                [batchId, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<CommandRecord>
+                {
+                    std::vector<DatabaseValue> parameters{batchId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND c.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(
+                            connection, "SELECT c.id FROM biz_command c WHERE c.batch_id = ? AND c.status IN ('pending', 'running')" + clause + " ORDER BY c.id", parameters);
+                    std::vector<std::int64_t> ids;
+                    while (rows->next())
+                    {
+                        ids.push_back(Sql::integer(*rows, "id"));
+                    }
+                    if (ids.empty())
+                    {
+                        return {};
+                    }
+                    std::vector<DatabaseValue> updateParameters{Common::nowDateTimeUtc(), batchId};
+                    std::string                updateClause;
+                    if (!tenant.allTenants)
+                    {
+                        updateClause = " AND tenant_id = ?";
+                        updateParameters.emplace_back(tenant.tenantId);
+                    }
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "UPDATE biz_command SET status = 'canceled', message = '已批量取消', finished_at = ? WHERE batch_id = ? AND status IN ('pending', 'running')" +
+                                    updateClause,
+                            updateParameters);
+                    std::vector<CommandRecord> commands;
+                    for (const std::int64_t commandId: ids)
+                    {
+                        if (auto command = findOnConnection(connection, commandId, tenant); command.has_value())
+                        {
+                            commands.push_back(std::move(*command));
+                        }
+                    }
+                    return commands;
+                });
+    }
+
     AsynGyanis::Core::Task<std::optional<CommandRecord>> CommandRepository::cancel(AsynGyanis::Core::EventLoop &loop, const std::int64_t commandId)
     {
         co_return co_await m_database->withConnection<std::optional<CommandRecord>>(

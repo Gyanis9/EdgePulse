@@ -239,6 +239,43 @@ namespace EdgePulse::Command
                         co_return;
                     });
 
+        router.put("/api/commands/batch/:batchId/cancel",
+                   [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string traceId = Web::resolveRequestId(request);
+                       const auto        session = co_await Web::requireSession(*deps->auth, loop, request, response, "device:command:send", traceId);
+                       if (!session.has_value())
+                       {
+                           co_return;
+                       }
+                       const auto batchId = Common::parsePositiveIdentifier(request.param("batchId"));
+                       if (!batchId.has_value())
+                       {
+                           fail(response, Common::kCodeBadRequest, "批次标识不合法", traceId);
+                           co_return;
+                       }
+                       const auto commands = co_await deps->commands->scoped(session->tenantScope())->cancelBatch(loop, *batchId);
+                       if (commands.empty())
+                       {
+                           fail(response, Common::kCodeConflict, "批次内没有待取消的命令", traceId);
+                           co_return;
+                       }
+                       if (deps->notifier)
+                       {
+                           for (const CommandRecord &command: commands)
+                           {
+                               static_cast<void>(co_await deps->notifier(command));
+                           }
+                       }
+                       ConfigValue rows = ConfigValue::array();
+                       for (const CommandRecord &command: commands)
+                       {
+                           rows.push_back(commandJson(command));
+                       }
+                       Common::writeSuccess(response, std::move(rows), traceId);
+                       co_return;
+                   });
+
         router.put("/api/commands/:id/cancel",
                    [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {

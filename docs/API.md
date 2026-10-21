@@ -71,7 +71,9 @@
 
 租户隔离范围：用户、节点、节点分组、遥测、告警、固件与任务、命令、操作/登录日志、运维总览、角色、部门、岗位、字典。菜单与参数配置为平台级共享。平台管理员跨租户读写；租户管理员只能访问本租户数据，创建角色时只能授予自己已有的权限，不能管理租户或平台级配置。
 
-通知渠道：`GET/POST /api/system/notifications`、`PUT/DELETE /api/system/notifications/{id}`，权限码 `system:notification:list/add/edit/remove`。写入 `{name,type('webhook'|'email'),endpoint,recipients?,username?,sender?,secret?,minLevel,enabled}`；Webhook 地址为 http(s)，邮件为 `smtp://` 或 `smtps://`。`secret` 只写不回显，响应仅给 `secretConfigured`。
+通知渠道：`GET/POST /api/system/notifications`、`PUT/DELETE /api/system/notifications/{id}`，权限码 `system:notification:list/add/edit/remove`。写入 `{name,type('webhook'|'email'),endpoint,recipients?,username?,sender?,secret?,minLevel,enabled}`；Webhook 地址为 http(s)，邮件为 `smtp://`、`smtps://` 或 `starttls://`；私有 CA 用 `caFile` 指定 PEM。`secret` 只写不回显，响应仅给 `secretConfigured`。
+
+命令批次取消：`PUT /api/commands/batch/{batchId}/cancel`，取消批次内 pending/running 命令并返回被取消列表。
 
 命令批量与计划：`POST /api/commands/batch`，正文 `{nodeIds[1-100],type,payload,timeoutSeconds,scheduledAt?}`，返回 `{batchId,commands}`；`scheduledAt` 为 `YYYY-MM-DD HH:MM:SS`（UTC），到点前 Agent 轮询取不到。
 
