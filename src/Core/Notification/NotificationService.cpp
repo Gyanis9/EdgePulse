@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -148,15 +149,24 @@ namespace EdgePulse::Notification
             {
                 request.headers.emplace_back("X-EdgePulse-Signature", "sha256=" + Common::hmacSha256Hex(channel.secret, payload));
             }
-            const auto response = co_await AsynGyanis::Net::HttpClient::send(loop, channel.endpoint, request, kWebhookTimeout);
-            if (response && response->statusCode >= 200 && response->statusCode < 300)
+            try
             {
-                outcome.ok = true;
+                const auto response = co_await AsynGyanis::Net::HttpClient::send(loop, channel.endpoint, request, kWebhookTimeout);
+                if (response && response->statusCode >= 200 && response->statusCode < 300)
+                {
+                    outcome.ok = true;
+                    co_return outcome;
+                }
+                outcome.error = response ? "HTTP " + std::to_string(response->statusCode) : "网络不可用";
+                LOG_WARN_FMT("告警 Webhook 投递失败：channel={} tenant={} node={} attempt={} status={}", channel.name, alarm.tenantId, alarm.nodeId, attempt + 1,
+                             response ? response->statusCode : 0);
+            } catch (const std::exception &failure)
+            {
+                // 地址本身被拒（如带 userinfo）重试也不会成功，直接记一条失败
+                outcome.error = failure.what();
+                LOG_WARN_FMT("告警 Webhook 地址被拒：channel={} tenant={} node={} error={}", channel.name, alarm.tenantId, alarm.nodeId, failure.what());
                 co_return outcome;
             }
-            outcome.error = response ? "HTTP " + std::to_string(response->statusCode) : "网络不可用";
-            LOG_WARN_FMT("告警 Webhook 投递失败：channel={} tenant={} node={} attempt={} status={}", channel.name, alarm.tenantId, alarm.nodeId, attempt + 1,
-                         response ? response->statusCode : 0);
         }
         co_return outcome;
     }

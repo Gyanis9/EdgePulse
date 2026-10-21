@@ -95,6 +95,30 @@ TEST(NotificationChannels, WebhookReceivesSignedAlarm)
     EXPECT_EQ(1, probe->count.load());
 }
 
+// 钉住：Webhook 地址里的凭据不写进投递记录；地址本身被拒时也只记失败，不向告警链路抛出
+TEST(NotificationChannels, DeliveryRecordKeepsOnlyWebhookHost)
+{
+    EdgePulse::TestSupport::AuthTestContext         context;
+    EdgePulse::TestSupport::EventLoopRunner         runner;
+    EdgePulse::Notification::NotificationRepository repository(context.database);
+    EdgePulse::Notification::ChannelRecord          channel;
+    const std::string                               host = "127.0.0.1:19999";
+    channel.name                                         = "带凭据的 Webhook";
+    channel.type                                         = "webhook";
+    channel.endpoint                                     = "http://ops:topsecret@" + host + "/hook";
+    channel.enabled                                      = true;
+    const std::int64_t channelId                         = runner.run(repository.create(runner.loop(), channel));
+    ASSERT_GT(channelId, 0);
+
+    EdgePulse::Notification::NotificationService service(std::make_shared<EdgePulse::Notification::NotificationRepository>(context.database));
+    runner.run(service.dispatch(runner.loop(), sampleAlarm(1)));
+
+    const auto deliveries = runner.run(repository.scoped({1, false})->listDeliveries(runner.loop(), "", channelId, {1, 10}));
+    ASSERT_EQ(1, deliveries.total);
+    EXPECT_EQ("webhook://" + host, deliveries.rows.front().target);
+    EXPECT_EQ("failed", deliveries.rows.front().status);
+}
+
 // 钉住：黑名单之外的邮箱口令不出现在查询结果里，仓库只在给出新口令时覆盖
 TEST(NotificationChannels, RepositoryKeepsSecretAndScopesTenant)
 {
