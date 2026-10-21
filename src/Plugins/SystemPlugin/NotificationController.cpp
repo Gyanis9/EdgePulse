@@ -95,6 +95,12 @@ namespace EdgePulse::Notification
                 }
             } else
             {
+                const auto hasNewline = [](const std::string &text) { return text.find('\r') != std::string::npos || text.find('\n') != std::string::npos; };
+                if (hasNewline(record.recipients) || hasNewline(record.sender) || hasNewline(record.username))
+                {
+                    error = "收件人、发件人与用户名不能包含换行";
+                    return std::nullopt;
+                }
                 if (!record.endpoint.starts_with("smtp://") && !record.endpoint.starts_with("smtps://"))
                 {
                     error = "SMTP 地址必须以 smtp:// 或 smtps:// 开头";

@@ -404,6 +404,12 @@ TEST_F(SystemEndpointsTest, NotificationChannelCrudMasksSecret)
     EXPECT_TRUE(row["secretConfigured"].get<bool>());
     EXPECT_EQ("warning", row["minLevel"].get<std::string>());
 
+    const auto injected = m_server->post("/api/system/notifications",
+                                         R"({"name":"换行注入","type":"email","endpoint":"smtp://127.0.0.1:25","recipients":"ops@example.com
+Bcc:evil@example.com","sender":"edgepulse@example.com","minLevel":"info","enabled":true})",
+                                         "application/json", bearer(token));
+    EXPECT_EQ(400, injected.status) << injected.body;
+
     const std::string updateBody = R"({"name":"值班群-改","type":"webhook","endpoint":"https://example.com/hook","minLevel":"critical","enabled":true})";
     EXPECT_EQ(200, m_server->send("PUT", "/api/system/notifications/" + std::to_string(id), updateBody, "application/json", bearer(token)).status);
     const auto after = m_server->get("/api/system/notifications?pageNum=1&pageSize=10&keyword=值班群-改", bearer(token));
