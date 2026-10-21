@@ -20,6 +20,8 @@ edgepulse:
   firmware_dir: /var/lib/edgepulse/firmware
   maximum_firmware_bytes: 268435456
   telemetry_retention_days: 30
+  log_retention_days: 90
+  delivery_retention_days: 30
   database:
     driver: mysql
     host: mysql

@@ -226,6 +226,14 @@ namespace EdgePulse::System
         AsynGyanis::Core::Task<bool> clearLoginLogs(AsynGyanis::Core::EventLoop &loop, const LogScope &scope);
 
         /**
+         * @brief 按保留天数清理操作日志与登录日志
+         * @param loop 恢复协程用的事件循环
+         * @param retentionDays 保留天数，非正数不清理
+         * @return bool 是否执行了清理
+         */
+        AsynGyanis::Core::Task<bool> prune(AsynGyanis::Core::EventLoop &loop, int retentionDays);
+
+        /**
          * @brief 登录统计
          * @param loop 恢复协程用的事件循环
          * @param range 24h、7d、30d

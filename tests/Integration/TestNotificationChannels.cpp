@@ -1,3 +1,4 @@
+#include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/Hmac.h"
 #include "Core/Notification/NotificationRepository.h"
 #include "Core/Notification/NotificationService.h"
@@ -117,6 +118,43 @@ TEST(NotificationChannels, DeliveryRecordKeepsOnlyWebhookHost)
     ASSERT_EQ(1, deliveries.total);
     EXPECT_EQ("webhook://" + host, deliveries.rows.front().target);
     EXPECT_EQ("failed", deliveries.rows.front().status);
+}
+
+// 钉住：投递记录保留期只删窗口外的行，非正数天数不删任何数据
+TEST(NotificationChannels, DeliveryPruneRespectsRetentionWindow)
+{
+    EdgePulse::TestSupport::AuthTestContext         context;
+    EdgePulse::TestSupport::EventLoopRunner         runner;
+    EdgePulse::Notification::NotificationRepository repository(context.database);
+
+    EdgePulse::Notification::ChannelRecord channel;
+    channel.name                 = "清理渠道";
+    channel.type                 = "webhook";
+    channel.endpoint             = "http://127.0.0.1:19999/hook";
+    channel.enabled              = true;
+    const std::int64_t channelId = runner.run(repository.create(runner.loop(), channel));
+    ASSERT_GT(channelId, 0);
+
+    auto stale        = EdgePulse::Notification::DeliveryRecord{};
+    stale.tenantId    = 1;
+    stale.channelId   = channelId;
+    stale.channelName = channel.name;
+    stale.channelType = channel.type;
+    stale.target      = "webhook://127.0.0.1:19999";
+    stale.status      = "succeeded";
+    stale.createdAt   = "2020-01-01 00:00:00";
+    auto fresh        = stale;
+    fresh.createdAt   = EdgePulse::Common::nowDateTimeUtc();
+    ASSERT_GT(runner.run(repository.recordDelivery(runner.loop(), stale)), 0);
+    ASSERT_GT(runner.run(repository.recordDelivery(runner.loop(), fresh)), 0);
+
+    EXPECT_FALSE(runner.run(repository.prune(runner.loop(), 0)));
+    EXPECT_EQ(2, runner.run(repository.listDeliveries(runner.loop(), "", channelId, {1, 10})).total);
+
+    ASSERT_TRUE(runner.run(repository.prune(runner.loop(), 30)));
+    const auto remaining = runner.run(repository.listDeliveries(runner.loop(), "", channelId, {1, 10}));
+    ASSERT_EQ(1, remaining.total);
+    EXPECT_EQ(fresh.createdAt, remaining.rows.front().createdAt);
 }
 
 // 钉住：黑名单之外的邮箱口令不出现在查询结果里，仓库只在给出新口令时覆盖

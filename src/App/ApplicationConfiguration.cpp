@@ -133,6 +133,8 @@ namespace EdgePulse::App
         configuration.firmwareDirectory               = configurationManager.getString("edgepulse.firmware_dir", configuration.firmwareDirectory);
         configuration.maximumFirmwareBytes            = configurationManager.getInt("edgepulse.maximum_firmware_bytes", configuration.maximumFirmwareBytes);
         configuration.telemetryRetentionDays          = static_cast<int>(configurationManager.getInt("edgepulse.telemetry_retention_days", configuration.telemetryRetentionDays));
+        configuration.logRetentionDays                = static_cast<int>(configurationManager.getInt("edgepulse.log_retention_days", configuration.logRetentionDays));
+        configuration.deliveryRetentionDays           = static_cast<int>(configurationManager.getInt("edgepulse.delivery_retention_days", configuration.deliveryRetentionDays));
         configuration.certificateDirectory            = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
         configuration.agentFingerprint                = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
         configuration.udpTelemetryEnabled             = configurationManager.getBool("edgepulse.udp_telemetry.enabled", configuration.udpTelemetryEnabled);

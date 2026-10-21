@@ -6,6 +6,7 @@
 #include "Base/Runtime/TimeFormat.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -311,5 +312,28 @@ namespace EdgePulse::Notification
                     }
                     return pageRows;
                 });
+    }
+
+    AsynGyanis::Core::Task<bool> NotificationRepository::prune(AsynGyanis::Core::EventLoop &loop, const int retentionDays)
+    {
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [retentionDays, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                if (retentionDays <= 0)
+                                                                {
+                                                                    return false;
+                                                                }
+                                                                const auto                 cutoff = std::chrono::system_clock::now() - std::chrono::hours{24 * retentionDays};
+                                                                std::vector<DatabaseValue> parameters{Common::formatDateTimeUtc(cutoff)};
+                                                                std::string                clause;
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    clause = " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
+                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM biz_notification_delivery WHERE created_at < ?" + clause,
+                                                                                        parameters);
+                                                                return true;
+                                                            });
     }
 } // namespace EdgePulse::Notification

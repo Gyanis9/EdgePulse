@@ -152,6 +152,14 @@ namespace EdgePulse::Notification
         AsynGyanis::Core::Task<Common::PageRows<DeliveryRecord>> listDeliveries(AsynGyanis::Core::EventLoop &loop, std::string status, std::int64_t channelId,
                                                                                 const Common::PageParameters &page);
 
+        /**
+         * @brief 按保留天数清理投递记录
+         * @param loop 恢复协程用的事件循环
+         * @param retentionDays 保留天数，非正数不清理
+         * @return bool 是否执行了清理
+         */
+        AsynGyanis::Core::Task<bool> prune(AsynGyanis::Core::EventLoop &loop, int retentionDays);
+
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
         System::TenantScope               m_tenant;   ///< 租户边界

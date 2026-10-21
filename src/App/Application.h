@@ -178,11 +178,11 @@ namespace EdgePulse::App
         AsynGyanis::Core::Task<> runCommandScheduler(AsynGyanis::Core::EventLoop &loop);
 
         /**
-         * @brief 周期按保留天数清理过期遥测
+         * @brief 周期按保留天数清理遥测、日志与投递记录
          * @param loop 服务器所属事件循环
          * @return AsynGyanis::Core::Task<> 周期协程，活到应用析构
          */
-        AsynGyanis::Core::Task<> runTelemetryRetention(AsynGyanis::Core::EventLoop &loop);
+        AsynGyanis::Core::Task<> runDataRetention(AsynGyanis::Core::EventLoop &loop);
 
     private:
         ApplicationConfiguration                                  m_configuration;
@@ -219,7 +219,7 @@ namespace EdgePulse::App
         std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;     ///< 固件
         std::shared_ptr<Command::CommandRepository>               m_commandRepository;      ///< 命令
         std::optional<AsynGyanis::Core::Task<>>                   m_commandScheduler;       ///< 计划命令推进协程
-        std::optional<AsynGyanis::Core::Task<>>                   m_telemetryRetention;     ///< 遥测保留期清理协程
+        std::optional<AsynGyanis::Core::Task<>>                   m_dataRetention;          ///< 数据保留期清理协程
         std::shared_ptr<Command::AgentChannelRegistry>            m_agentChannels;          ///< Agent 长连接
         std::shared_ptr<Ops::OpsRepository>                       m_opsRepository;          ///< 运维总览
         std::shared_ptr<Web::SseBroadcaster>                      m_sseBroadcaster;         ///< 告警 SSE

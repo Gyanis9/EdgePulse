@@ -1,3 +1,4 @@
+#include "Base/Database/Database.h"
 #include "Base/Security/PasswordHash.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/DataScopeService.h"
@@ -122,22 +123,22 @@ TEST(SystemServices, DataScopeFollowsRoleConfiguration)
 
     // CUSTOM 角色按 sys_role_dept 展开；读错角色列会让它静默退化成仅本人
     EdgePulse::System::RoleWrite customWrite;
-    customWrite.name                = "自定义范围";
-    customWrite.code                = "custom_scope";
-    customWrite.dataScope           = "CUSTOM";
-    customWrite.deptIds             = std::vector<std::int64_t>{102};
-    const std::int64_t customRole   = runner.run(roles.create(runner.loop(), customWrite, 1));
+    customWrite.name              = "自定义范围";
+    customWrite.code              = "custom_scope";
+    customWrite.dataScope         = "CUSTOM";
+    customWrite.deptIds           = std::vector<std::int64_t>{102};
+    const std::int64_t customRole = runner.run(roles.create(runner.loop(), customWrite, 1));
     ASSERT_GT(customRole, 0);
     const auto customStored = runner.run(roles.findById(runner.loop(), customRole));
     ASSERT_TRUE(customStored.has_value());
     EXPECT_EQ("CUSTOM", customStored->dataScope);
     EXPECT_EQ(1, customStored->status);
-    UserWrite          customUser   = newUser("dave", "戴夫", 101);
+    UserWrite customUser            = newUser("dave", "戴夫", 101);
     customUser.roleIds              = std::vector<std::int64_t>{customRole};
     const std::int64_t customUserId = runner.run(users.create(runner.loop(), customUser, EdgePulse::Common::hashPassword("dave12345"), 1));
     ASSERT_GT(customUserId, 0);
     EXPECT_EQ(std::vector<std::int64_t>{customRole}, runner.run(users.roleIdsFor(runner.loop(), customUserId)));
-    const auto         customScope  = runner.run(scopes.resolve(runner.loop(), customUserId));
+    const auto customScope = runner.run(scopes.resolve(runner.loop(), customUserId));
     EXPECT_FALSE(customScope.all);
     EXPECT_FALSE(customScope.selfOnly);
     EXPECT_NE(customScope.deptIds.end(), std::find(customScope.deptIds.begin(), customScope.deptIds.end(), 102));
@@ -249,4 +250,38 @@ TEST(SystemServices, LogScopeFiltersOperAndLoginLogs)
     EXPECT_EQ("bob", selfOper.rows[0].operName);
     const auto allLogin = runner.run(logs.listLoginLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}));
     EXPECT_EQ(2, allLogin.total);
+}
+
+// 钉住：日志保留期只删窗口外的操作与登录日志，非正数天数不删任何数据
+TEST(SystemServices, LogPruneRespectsRetentionWindow)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::System::LogRepository        logs(context.database);
+
+    EdgePulse::System::OperLogRecord staleOper;
+    staleOper.module   = "验收";
+    staleOper.operTime = "2020-01-01 00:00:00";
+    ASSERT_TRUE(runner.run(logs.insertOperLog(runner.loop(), staleOper)));
+    EdgePulse::System::OperLogRecord freshOper;
+    freshOper.module   = "验收";
+    freshOper.operTime = EdgePulse::Common::nowDateTimeUtc();
+    ASSERT_TRUE(runner.run(logs.insertOperLog(runner.loop(), freshOper)));
+
+    const auto connection = EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+    ASSERT_NE(nullptr, connection->execute("INSERT INTO sys_login_log (id, username, status, login_time) VALUES (9100000000000001, 'stale', 1, '2020-01-01 00:00:00')"));
+    ASSERT_NE(nullptr, connection->execute("INSERT INTO sys_login_log (id, username, status, login_time) VALUES (9100000000000002, 'fresh', 1, '" +
+                                           EdgePulse::Common::nowDateTimeUtc() + "')"));
+
+    EXPECT_FALSE(runner.run(logs.prune(runner.loop(), 0)));
+    EXPECT_EQ(2, runner.run(logs.listOperLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10})).total);
+    EXPECT_EQ(2, runner.run(logs.listLoginLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10})).total);
+
+    ASSERT_TRUE(runner.run(logs.prune(runner.loop(), 30)));
+    const auto opers = runner.run(logs.listOperLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}));
+    ASSERT_EQ(1, opers.total);
+    EXPECT_EQ(freshOper.operTime, opers.rows.front().operTime);
+    const auto logins = runner.run(logs.listLoginLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}));
+    ASSERT_EQ(1, logins.total);
+    EXPECT_EQ("fresh", logins.rows.front().username);
 }

@@ -491,6 +491,23 @@ namespace EdgePulse::System
                                                             });
     }
 
+    AsynGyanis::Core::Task<bool> LogRepository::prune(AsynGyanis::Core::EventLoop &loop, const int retentionDays)
+    {
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [retentionDays](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                if (retentionDays <= 0)
+                                                                {
+                                                                    return false;
+                                                                }
+                                                                const auto                 cutoff = std::chrono::system_clock::now() - std::chrono::hours{24 * retentionDays};
+                                                                std::vector<DatabaseValue> parameters{Common::formatDateTimeUtc(cutoff)};
+                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_oper_log WHERE oper_time < ?", parameters);
+                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_login_log WHERE login_time < ?", parameters);
+                                                                return true;
+                                                            });
+    }
+
     AsynGyanis::Core::Task<LoginStats> LogRepository::loginStats(AsynGyanis::Core::EventLoop &loop, std::string range, const LogScope scope)
     {
         co_return co_await m_database->withConnection<LoginStats>(

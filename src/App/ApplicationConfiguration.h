@@ -55,6 +55,8 @@ namespace EdgePulse::App
         std::string              firmwareDirectory{"var/firmware"};                   ///< 固件落盘目录
         std::int64_t             maximumFirmwareBytes{256LL * 1024 * 1024};           ///< 单份固件上限
         int                      telemetryRetentionDays{30};                          ///< 遥测保留天数
+        int                      logRetentionDays{90};                                ///< 操作与登录日志保留天数
+        int                      deliveryRetentionDays{30};                           ///< 通知投递记录保留天数
         std::string              certificateDirectory{"var/certs"};                   ///< 开发证书目录
         std::string              opsTokenFile{"var/ops-token"};                       ///< 运维口令牌文件
         int                      captchaTtlSeconds{120};                              ///< 验证码有效期，单位秒

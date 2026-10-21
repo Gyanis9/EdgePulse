@@ -507,13 +507,13 @@ namespace EdgePulse::App
         }
         m_commandScheduler = runCommandScheduler(loop);
         loop.scheduler().schedule(m_commandScheduler->handle());
-        if (m_configuration.telemetryRetentionDays > 0)
+        if (m_configuration.telemetryRetentionDays > 0 || m_configuration.logRetentionDays > 0 || m_configuration.deliveryRetentionDays > 0)
         {
-            m_telemetryRetention = runTelemetryRetention(loop);
-            loop.scheduler().schedule(m_telemetryRetention->handle());
+            m_dataRetention = runDataRetention(loop);
+            loop.scheduler().schedule(m_dataRetention->handle());
         } else
         {
-            LOG_WARN_FMT("遥测保留天数不是正数（{}），不启用过期清理", m_configuration.telemetryRetentionDays);
+            LOG_WARN("遥测、日志与投递记录的保留天数都不是正数，不启用过期清理");
         }
         m_ready.store(true, std::memory_order_release);
         return true;
@@ -575,28 +575,41 @@ namespace EdgePulse::App
         }
     }
 
-    AsynGyanis::Core::Task<> Application::runTelemetryRetention(AsynGyanis::Core::EventLoop &loop)
+    AsynGyanis::Core::Task<> Application::runDataRetention(AsynGyanis::Core::EventLoop &loop)
     {
-        AsynGyanis::Core::Timer                               ticker(loop);
-        const std::shared_ptr<Telemetry::TelemetryRepository> allTelemetry = m_telemetryRepository->scoped({0, true});
-        bool                                                  firstRun     = true;
+        AsynGyanis::Core::Timer                                     ticker(loop);
+        const std::shared_ptr<Telemetry::TelemetryRepository>       allTelemetry  = m_telemetryRepository->scoped({0, true});
+        const std::shared_ptr<Notification::NotificationRepository> allDeliveries = m_notificationRepository->scoped({0, true});
+        bool                                                        firstRun      = true;
         while (true)
         {
             // 重启后先尽快清一次，避免积压等到首个六小时周期
             co_await ticker.waitFor(firstRun ? std::chrono::minutes{1} : std::chrono::hours{6});
             firstRun = false;
+            // 三张表各自兜底，一张失败不拖住其余清理
             try
             {
-                if (!co_await allTelemetry->prune(loop, m_configuration.telemetryRetentionDays))
-                {
-                    LOG_WARN("遥测清理被跳过：保留天数不是正数");
-                    continue;
-                }
-                LOG_INFO_FMT("遥测清理完成：保留 {} 天", m_configuration.telemetryRetentionDays);
+                static_cast<void>(co_await allTelemetry->prune(loop, m_configuration.telemetryRetentionDays));
             } catch (const std::exception &failure)
             {
                 LOG_WARN_FMT("遥测清理失败：{}", failure.what());
             }
+            try
+            {
+                static_cast<void>(co_await m_logRepository->prune(loop, m_configuration.logRetentionDays));
+            } catch (const std::exception &failure)
+            {
+                LOG_WARN_FMT("日志清理失败：{}", failure.what());
+            }
+            try
+            {
+                static_cast<void>(co_await allDeliveries->prune(loop, m_configuration.deliveryRetentionDays));
+            } catch (const std::exception &failure)
+            {
+                LOG_WARN_FMT("投递记录清理失败：{}", failure.what());
+            }
+            LOG_INFO_FMT("数据清理完成（保留天数，0 表示关闭）：遥测 {}、日志 {}、投递记录 {}", m_configuration.telemetryRetentionDays, m_configuration.logRetentionDays,
+                         m_configuration.deliveryRetentionDays);
         }
     }
 
