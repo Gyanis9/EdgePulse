@@ -17,6 +17,7 @@ namespace EdgePulse::Device
             }
         }
         return AsynGyanis::Base::ConfigValue::object({{"id", node.id},
+                                                      {"tenantId", node.tenantId},
                                                       {"name", node.name},
                                                       {"status", node.status},
                                                       {"agentVersion", node.agentVersion},

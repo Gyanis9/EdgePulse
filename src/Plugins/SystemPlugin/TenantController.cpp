@@ -171,6 +171,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeNotFound, "租户不存在", traceId);
                            co_return;
                        }
+                       co_await dependencies->auth->invalidateTenant(loop, *id);
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;
                    });

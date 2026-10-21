@@ -123,6 +123,13 @@ namespace EdgePulse::Auth
         AsynGyanis::Core::Task<bool> logout(AsynGyanis::Core::EventLoop &loop, std::string_view token);
 
         /**
+         * @brief 清掉租户状态缓存，使停用在下一次鉴权时生效
+         * @param loop 恢复协程用的事件循环
+         * @param tenantId 租户标识
+         */
+        AsynGyanis::Core::Task<void> invalidateTenant(AsynGyanis::Core::EventLoop &loop, std::int64_t tenantId);
+
+        /**
          * @brief 取用户可见的菜单树
          * @param loop 恢复协程用的事件循环
          * @param session 已认证身份

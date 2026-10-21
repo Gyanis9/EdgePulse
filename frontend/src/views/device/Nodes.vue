@@ -2,7 +2,8 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ListPage, FormDialog, PermissionButton } from '@/components/business'
 import { Field, Select, StatusTag, TextInput, type Column } from '@/components/ui'
-import { deviceApi, fleetApi, type NodeGroupRow, type NodeRow } from '@/api'
+import { deviceApi, fleetApi, systemApi, type NodeGroupRow, type NodeRow } from '@/api'
+import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { useNodeSocket } from '@/composables/nodeSocket'
 import { confirm } from '@/composables/confirm'
@@ -23,6 +24,9 @@ const list = useListPage<NodeRow, { keyword: string; groupId: number | null }>({
   fetch: params => deviceApi.nodes.list(params),
 })
 
+const platformAdmin = Boolean(currentUser.value?.platformAdmin)
+const tenants = ref<Array<{ id: number; name: string; code: string }>>([])
+const tenantOptions = ref<Array<{ label: string; value: number }>>([])
 const groupRows = ref<NodeGroupRow[]>([])
 const groupOptions = ref<Array<{ label: string; value: number; depth?: number }>>([])
 function flattenGroups(nodes: NodeGroupRow[], depth = 0, output: Array<{ label: string; value: number; depth: number }> = []) {
@@ -38,6 +42,15 @@ onMounted(async () => {
     groupOptions.value = [{ label: '全部分组', value: 0 }, ...flattenGroups(groupRows.value)]
   } catch (error) {
     toastError(error, '分组加载失败')
+  }
+  if (platformAdmin) {
+    try {
+      const page = await systemApi.tenants.list({ pageNum: 1, pageSize: 100, status: '1' })
+      tenants.value = page.rows.map(row => ({ id: row.id, name: row.name, code: row.code }))
+      tenantOptions.value = tenants.value.map(t => ({ label: `${t.name}（${t.code}）`, value: t.id }))
+    } catch {
+      tenantOptions.value = []
+    }
   }
 })
 
@@ -56,13 +69,14 @@ function labelText(node: NodeRow) {
 
 const dialog = ref(false)
 const saving = ref(false)
-const form = reactive({ name: '', labels: '', groupId: 200 })
+const form = reactive({ name: '', labels: '', groupId: 200, tenantId: currentUser.value?.tenantId ?? null as number | null })
 const errors = ref<Partial<Record<'name' | 'labels', string>>>({})
 
 function openCreate() {
   form.name = ''
   form.labels = ''
   form.groupId = groupOptions.value.find(option => option.value !== 0)?.value ?? 200
+  form.tenantId = currentUser.value?.tenantId ?? null
   errors.value = {}
   dialog.value = true
 }
@@ -83,7 +97,7 @@ async function submit() {
   if (Object.keys(errors.value).length) return
   saving.value = true
   try {
-    await deviceApi.nodes.create({ name: form.name.trim(), labels, groupId: form.groupId })
+    await deviceApi.nodes.create({ name: form.name.trim(), labels, groupId: form.groupId, tenantId: platformAdmin ? form.tenantId ?? undefined : undefined })
     pushToast('节点已创建')
     dialog.value = false
     await list.load()
@@ -140,6 +154,9 @@ async function remove(node: NodeRow) {
     </ListPage>
 
     <FormDialog :open="dialog" title="新增节点" sub="名称唯一；标签是可选的 JSON 对象。" :saving="saving" @close="dialog = false" @submit="submit">
+      <Field v-if="platformAdmin" label="所属租户" hint="默认落在当前租户">
+        <Select v-model="form.tenantId" :options="tenantOptions" placeholder="选择租户" />
+      </Field>
       <Field label="节点名" :error="errors.name" required>
         <TextInput v-model="form.name" placeholder="例如 edge-sh-01" :invalid="!!errors.name" />
       </Field>

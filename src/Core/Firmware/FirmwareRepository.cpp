@@ -22,15 +22,16 @@ namespace EdgePulse::Firmware
         using AsynGyanis::Database::DatabaseValue;
 
         constexpr std::string_view kSelectFirmware =
-                "SELECT id, name, version, file_name, content_type, size_bytes, sha256, storage_path, created_by, created_at FROM biz_firmware ";
+                "SELECT id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, storage_path, created_by, created_at FROM biz_firmware ";
         constexpr std::string_view kSelectTask =
-                "SELECT t.id, t.firmware_id, t.node_id, t.status, t.progress, t.message, t.created_at, t.updated_at, COALESCE(n.name, '') AS node_name "
+                "SELECT t.id, t.firmware_id, t.node_id, t.status, t.progress, t.message, t.created_at, t.updated_at, t.previous_firmware_id, COALESCE(n.name, '') AS node_name "
                 "FROM biz_firmware_task t LEFT JOIN biz_node n ON n.id = t.node_id ";
 
         [[nodiscard]] FirmwareRecord readFirmware(const DatabaseResult &result)
         {
             FirmwareRecord record;
             record.id          = Sql::integer(result, "id");
+            record.tenantId    = Sql::integer(result, "tenant_id");
             record.name        = Sql::text(result, "name");
             record.version     = Sql::text(result, "version");
             record.fileName    = Sql::text(result, "file_name");
@@ -46,15 +47,16 @@ namespace EdgePulse::Firmware
         [[nodiscard]] FirmwareTaskRecord readTask(const DatabaseResult &result)
         {
             FirmwareTaskRecord record;
-            record.id         = Sql::integer(result, "id");
-            record.firmwareId = Sql::integer(result, "firmware_id");
-            record.nodeId     = Sql::integer(result, "node_id");
-            record.nodeName   = Sql::text(result, "node_name");
-            record.status     = Sql::text(result, "status");
-            record.progress   = static_cast<int>(Sql::integer(result, "progress"));
-            record.message    = Sql::text(result, "message");
-            record.createdAt  = Sql::dateTimeText(result, "created_at");
-            record.updatedAt  = Sql::dateTimeText(result, "updated_at");
+            record.id                 = Sql::integer(result, "id");
+            record.firmwareId         = Sql::integer(result, "firmware_id");
+            record.nodeId             = Sql::integer(result, "node_id");
+            record.nodeName           = Sql::text(result, "node_name");
+            record.status             = Sql::text(result, "status");
+            record.progress           = static_cast<int>(Sql::integer(result, "progress"));
+            record.message            = Sql::text(result, "message");
+            record.createdAt          = Sql::dateTimeText(result, "created_at");
+            record.updatedAt          = Sql::dateTimeText(result, "updated_at");
+            record.previousFirmwareId = Sql::integer(result, "previous_firmware_id");
             return record;
         }
     } // namespace
@@ -187,11 +189,12 @@ namespace EdgePulse::Firmware
                 });
     }
 
-    AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::createTask(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId, const std::int64_t nodeId)
+    AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::createTask(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId, const std::int64_t nodeId,
+                                                                        const std::int64_t previousFirmwareId)
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [firmwareId, nodeId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                [firmwareId, nodeId, previousFirmwareId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     // 任务与固件同租户：平台管理员跨租户下发时不能落到自身默认租户
                     std::vector<DatabaseValue> firmwareParameters{firmwareId};
@@ -216,14 +219,57 @@ namespace EdgePulse::Firmware
                     {
                         return 0;
                     }
-                    const std::int64_t                 id  = Common::nextIdentifier();
-                    const std::string                  now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 9> insertParameters{id, ownerTenantId, firmwareId, nodeId, std::string{"pending"}, std::int64_t{0}, std::string{}, now, now};
+                    const std::int64_t                  id  = Common::nextIdentifier();
+                    const std::string                   now = Common::nowDateTimeUtc();
+                    const std::array<DatabaseValue, 10> insertParameters{id,  ownerTenantId, firmwareId,        nodeId, std::string{"pending"}, std::int64_t{0}, std::string{},
+                                                                         now, now,           previousFirmwareId};
                     Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, "
+                                            "previous_firmware_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             insertParameters);
                     return id;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::latestOtherFirmware(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, const std::int64_t excludeFirmwareId)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [nodeId, excludeFirmwareId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                {
+                    std::vector<DatabaseValue> parameters{nodeId, excludeFirmwareId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection,
+                                                          "SELECT firmware_id FROM biz_firmware_task WHERE node_id = ? AND firmware_id <> ?" + clause +
+                                                                  " ORDER BY CASE WHEN status = 'installed' THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT 1",
+                                                          parameters);
+                    return rows->next() ? Sql::integer(*rows, "firmware_id") : 0;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::rollbackSource(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId, const std::int64_t nodeId)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [firmwareId, nodeId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                {
+                    std::vector<DatabaseValue> parameters{firmwareId, nodeId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection,
+                                                          "SELECT previous_firmware_id FROM biz_firmware_task WHERE firmware_id = ? AND node_id = ? AND previous_firmware_id > 0" +
+                                                                  clause + " ORDER BY id DESC LIMIT 1",
+                                                          parameters);
+                    return rows->next() ? Sql::integer(*rows, "previous_firmware_id") : 0;
                 });
     }
 

@@ -32,6 +32,8 @@ test('system user page loads from the management API', async ({ page }) => {
   await page.goto('/system/user')
   await expect(page.getByRole('heading', { name: '用户管理', exact: true })).toBeVisible()
   await expect(page.getByText('用户列表')).toBeVisible()
+  await page.goto('/system/notification')
+  await expect(page.getByRole('heading', { name: '通知渠道', exact: true })).toBeVisible()
 })
 
 test('device domain pages render with live data endpoints', async ({ page }) => {

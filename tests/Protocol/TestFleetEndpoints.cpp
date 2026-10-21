@@ -186,7 +186,7 @@ protected:
                         co_return EdgePulse::Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                                                    session->departmentId, session->roles,    session->permissions};
                     };
-                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access);
+                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get());
                     EdgePulse::Device::NodeGroupDependencies groups;
                     groups.auth   = m_context->auth.get();
                     groups.groups = m_groups.get();
@@ -219,6 +219,7 @@ protected:
                     firmware.nodes              = m_nodes.get();
                     firmware.commands           = m_commands.get();
                     firmware.channels           = m_channels.get();
+                    firmware.tenants            = m_context->tenants.get();
                     firmware.storageDirectory   = m_storage.string();
                     firmware.maximumUploadBytes = 8U * 1024U * 1024U;
                     EdgePulse::Firmware::registerFirmwareRoutes(router, loop, firmware);
@@ -240,6 +241,22 @@ protected:
         m_context.reset();
         std::error_code error;
         std::filesystem::remove_all(m_storage, error);
+    }
+
+    std::string loginInTenant(const std::string &username, const std::string &password, const std::string &tenantCode)
+    {
+        const auto captcha = m_server->get("/api/auth/captcha");
+        EXPECT_EQ(200, captcha.status);
+        const auto json = captcha.json();
+        EXPECT_TRUE(json.has_value());
+        const auto response = m_server->post("/api/auth/login", AsynGyanis::Base::ConfigValue::object({{"username", username},
+                                                                                                       {"password", password},
+                                                                                                       {"captcha", (*json)["data"]["code"]},
+                                                                                                       {"captchaUuid", (*json)["data"]["uuid"]},
+                                                                                                       {"tenantCode", tenantCode}})
+                                                                        .dump());
+        EXPECT_EQ(200, response.status) << response.body;
+        return (*response.json())["data"]["token"].get<std::string>();
     }
 
     std::string login()
@@ -463,4 +480,132 @@ TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
                                        AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "installed"}, {"progress", 100}}).dump());
     ASSERT_EQ(200, status.status) << status.body;
     EXPECT_EQ(taskId, (*status.json())["data"]["id"].get<std::int64_t>());
+}
+
+// 钉住：批量命令共享批次号；计划时间未到时 Agent 取不到，到点后可取
+TEST_F(FleetEndpointsTest, BatchAndScheduledCommands)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeA  = createNode(token, "batch-node-a");
+    const std::int64_t nodeB  = createNode(token, "batch-node-b");
+    const auto         now    = std::chrono::system_clock::now();
+    const std::string  future = EdgePulse::Common::formatDateTimeUtc(now + std::chrono::hours{1});
+    const std::string  past   = EdgePulse::Common::formatDateTimeUtc(now - std::chrono::minutes{1});
+
+    const auto scheduled =
+            m_server->post("/api/commands/batch",
+                           AsynGyanis::Base::ConfigValue::object(
+                                   {{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeA, nodeB})}, {"type", "diagnostics.collect"}, {"payload", "{}"}, {"scheduledAt", future}})
+                                   .dump(),
+                           "application/json", bearer(token));
+    ASSERT_EQ(200, scheduled.status) << scheduled.body;
+    const auto scheduledJson = scheduled.json();
+    ASSERT_TRUE(scheduledJson.has_value());
+    ASSERT_EQ(2, (*scheduledJson)["data"]["commands"].size());
+    const std::int64_t batchId = (*scheduledJson)["data"]["batchId"].get<std::int64_t>();
+    EXPECT_EQ(batchId, (*scheduledJson)["data"]["commands"][0]["batchId"].get<std::int64_t>());
+    EXPECT_EQ(future, (*scheduledJson)["data"]["commands"][0]["scheduledAt"].get<std::string>());
+    const auto early = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA));
+    ASSERT_EQ(200, early.status) << early.body;
+    EXPECT_TRUE((*early.json())["data"].is_null());
+
+    const auto due = m_server->post(
+            "/api/commands/batch",
+            AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeA})}, {"type", "reboot"}, {"payload", "{}"}, {"scheduledAt", past}})
+                    .dump(),
+            "application/json", bearer(token));
+    ASSERT_EQ(200, due.status) << due.body;
+    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA));
+    ASSERT_EQ(200, next.status) << next.body;
+    ASSERT_TRUE((*next.json())["data"].is_object()) << next.body;
+    EXPECT_EQ("reboot", (*next.json())["data"]["type"].get<std::string>());
+}
+
+// 钉住：灰度下发按批次返回剩余节点，回滚把节点切回上一版本
+TEST_F(FleetEndpointsTest, FirmwareCanaryAndRollback)
+{
+    const std::string  token = login();
+    const std::int64_t nodeA = createNode(token, "canary-node-a");
+    const std::int64_t nodeB = createNode(token, "canary-node-b");
+    const std::string  bytes(1024, 'F');
+
+    const auto uploadFirst = m_server->send("POST", "/api/firmware?name=Canary+OS&version=1.0.0&fileName=a.bin", bytes, "application/octet-stream", bearer(token));
+    ASSERT_EQ(200, uploadFirst.status) << uploadFirst.body;
+    const std::int64_t firstId = (*uploadFirst.json())["data"]["id"].get<std::int64_t>();
+    const auto         deployFirst =
+            m_server->post("/api/firmware/" + std::to_string(firstId) + "/deploy",
+                           AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeA, nodeB})}}).dump(), "application/json", bearer(token));
+    ASSERT_EQ(200, deployFirst.status) << deployFirst.body;
+    for (const std::int64_t nodeId: {nodeA, nodeB})
+    {
+        ASSERT_EQ(200, m_server->post("/api/agent/firmware/" + std::to_string(firstId) + "/status",
+                                      AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}}).dump())
+                               .status);
+    }
+
+    const auto uploadSecond = m_server->send("POST", "/api/firmware?name=Canary+OS&version=2.0.0&fileName=b.bin", bytes, "application/octet-stream", bearer(token));
+    ASSERT_EQ(200, uploadSecond.status) << uploadSecond.body;
+    const std::int64_t secondId = (*uploadSecond.json())["data"]["id"].get<std::int64_t>();
+    const auto         canary = m_server->post("/api/firmware/" + std::to_string(secondId) + "/deploy",
+                                               AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeA, nodeB})}, {"batchSize", 1}}).dump(),
+                                               "application/json", bearer(token));
+    ASSERT_EQ(200, canary.status) << canary.body;
+    const auto canaryJson = canary.json();
+    ASSERT_TRUE(canaryJson.has_value());
+    ASSERT_EQ(1, (*canaryJson)["data"]["deployed"].size());
+    ASSERT_EQ(1, (*canaryJson)["data"]["deferredNodeIds"].size());
+    EXPECT_EQ(nodeB, (*canaryJson)["data"]["deferredNodeIds"][0].get<std::int64_t>());
+    ASSERT_EQ(200, m_server->post("/api/agent/firmware/" + std::to_string(secondId) + "/status",
+                                  AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeA}, {"status", "installed"}, {"progress", 100}}).dump())
+                           .status);
+
+    const auto rollback =
+            m_server->post("/api/firmware/" + std::to_string(secondId) + "/rollback",
+                           AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeA})}}).dump(), "application/json", bearer(token));
+    ASSERT_EQ(200, rollback.status) << rollback.body;
+    const auto rollbackJson = rollback.json();
+    ASSERT_TRUE(rollbackJson.has_value());
+    ASSERT_EQ(1, (*rollbackJson)["data"].size());
+    EXPECT_EQ(firstId, (*rollbackJson)["data"][0]["toFirmwareId"].get<std::int64_t>());
+}
+
+// 钉住：平台管理员可把节点与固件建到指定租户，租户管理员只看到自己的
+TEST_F(FleetEndpointsTest, PlatformAdminProvisionsTenantNodesAndFirmware)
+{
+    EdgePulse::System::TenantProvisionRequest request;
+    request.code              = "fleet_b";
+    request.name              = "设备租户B";
+    request.adminUsername     = "fleet-b-admin";
+    request.adminPasswordHash = EdgePulse::Common::hashPassword("fleet-b-pass");
+    const auto provisioned    = m_runner.run(m_context->tenants->provision(m_runner.loop(), std::move(request), 1));
+    ASSERT_TRUE(provisioned.has_value()) << provisioned.error();
+    const std::int64_t tenantId = provisioned->tenantId;
+
+    const std::string platformToken = login();
+    const auto createdNode = m_server->post("/api/nodes", AsynGyanis::Base::ConfigValue::object({{"name", "tenant-b-node"}, {"groupId", 200}, {"tenantId", tenantId}}).dump(),
+                                            "application/json", bearer(platformToken));
+    ASSERT_EQ(200, createdNode.status) << createdNode.body;
+    EXPECT_EQ(tenantId, (*createdNode.json())["data"]["tenantId"].get<std::int64_t>());
+    createNode(platformToken, "default-tenant-node");
+
+    const auto badTenant = m_server->post("/api/nodes", AsynGyanis::Base::ConfigValue::object({{"name", "bad-tenant-node"}, {"tenantId", 99999999}}).dump(), "application/json",
+                                          bearer(platformToken));
+    EXPECT_EQ(400, badTenant.status);
+
+    const std::string tenantToken = loginInTenant("fleet-b-admin", "fleet-b-pass", "fleet_b");
+    const auto        tenantNodes = m_server->get("/api/nodes?pageNum=1&pageSize=10&keyword=tenant-b-node", bearer(tenantToken));
+    ASSERT_EQ(200, tenantNodes.status) << tenantNodes.body;
+    EXPECT_EQ(1, (*tenantNodes.json())["data"]["total"].get<std::int64_t>());
+    const auto hidden = m_server->get("/api/nodes?pageNum=1&pageSize=10&keyword=default-tenant-node", bearer(tenantToken));
+    ASSERT_EQ(200, hidden.status) << hidden.body;
+    EXPECT_EQ(0, (*hidden.json())["data"]["total"].get<std::int64_t>());
+
+    const std::string bytes(512, 'T');
+    const auto upload = m_server->send("POST", "/api/firmware?name=Tenant+OS&version=3.0.0&fileName=t.bin&tenantId=" + std::to_string(tenantId), bytes, "application/octet-stream",
+                                       bearer(platformToken));
+    ASSERT_EQ(200, upload.status) << upload.body;
+    EXPECT_EQ(tenantId, (*upload.json())["data"]["tenantId"].get<std::int64_t>());
+    const auto tenantFirmware = m_server->get("/api/firmware?pageNum=1&pageSize=10&keyword=Tenant", bearer(tenantToken));
+    ASSERT_EQ(200, tenantFirmware.status) << tenantFirmware.body;
+    EXPECT_EQ(1, (*tenantFirmware.json())["data"]["total"].get<std::int64_t>());
 }

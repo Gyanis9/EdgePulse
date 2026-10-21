@@ -7,6 +7,7 @@
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Auth/DataScopeService.h"
+#include "Core/System/TenantRepository.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpResponse.h"
 #include "Net/Http/Router.h"
@@ -153,7 +154,7 @@ namespace EdgePulse::Device
     } // namespace
 
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes)
+                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants)
     {
         router.get("/api/nodes",
                    [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -166,7 +167,7 @@ namespace EdgePulse::Device
                        }
                        const Auth::DataScope                              scope = co_await resolveScope(dataScopes, loop, *access);
                        const NodeListScope                                nodeScope{scope.all, scope.deptIds, scope.selfOnly, scope.userId};
-                       const auto                                         service   = nodeService.scoped({access->tenantId, access->platformAdmin});
+                       const auto                                         service = nodeService.scoped({access->tenantId, access->platformAdmin});
                        const std::unordered_map<std::string, std::string> query   = request.queryParams();
                        const std::string                                  keyword = query.contains("keyword") ? query.at("keyword") : std::string{};
                        const std::string                                  status  = query.contains("status") ? query.at("status") : std::string{};
@@ -183,7 +184,7 @@ namespace EdgePulse::Device
                    });
 
         router.post("/api/nodes",
-                    [&loop, &nodeService, accessResolver](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, &nodeService, accessResolver, tenants](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string traceId = Web::resolveRequestId(request);
                         const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
@@ -191,7 +192,6 @@ namespace EdgePulse::Device
                         {
                             co_return;
                         }
-                        const auto service = nodeService.scoped({access->tenantId, access->platformAdmin});
                         const std::optional<AsynGyanis::Base::ConfigValue> body = request.jsonBody();
                         if (!body.has_value())
                         {
@@ -205,6 +205,24 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少 name，或 labels 既不是对象也不是字符串", traceId);
                             co_return;
                         }
+                        System::TenantScope tenantScope{access->tenantId, access->platformAdmin};
+                        if (access->platformAdmin && body->contains("tenantId"))
+                        {
+                            const auto tenantId = body->find("tenantId");
+                            if (tenantId == body->end() || !tenantId->is_number_integer() || tenantId->get<std::int64_t>() <= 0)
+                            {
+                                Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "tenantId 不合法", traceId);
+                                co_return;
+                            }
+                            const auto tenant = tenants != nullptr ? co_await tenants->findById(loop, tenantId->get<std::int64_t>()) : std::nullopt;
+                            if (!tenant.has_value() || tenant->status != 1)
+                            {
+                                Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "目标租户不存在或已停用", traceId);
+                                co_return;
+                            }
+                            tenantScope = System::TenantScope{tenant->id, false};
+                        }
+                        const auto         service = nodeService.scoped(tenantScope);
                         const std::int64_t groupId = body->contains("groupId") ? body->value("groupId", std::int64_t{200}) : 200;
                         const auto         result  = co_await service->create(loop, *name, *labels, groupId, access->departmentId, access->userId);
                         if (!result.has_value())
@@ -225,8 +243,8 @@ namespace EdgePulse::Device
                        {
                            co_return;
                        }
-                       const auto service = nodeService.scoped({access->tenantId, access->platformAdmin});
-                       const std::optional<std::int64_t> nodeId = parseIdentifier(request.param("id"));
+                       const auto                        service = nodeService.scoped({access->tenantId, access->platformAdmin});
+                       const std::optional<std::int64_t> nodeId  = parseIdentifier(request.param("id"));
                        if (!nodeId.has_value())
                        {
                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "节点标识不合法", traceId);
@@ -293,8 +311,8 @@ namespace EdgePulse::Device
                        {
                            co_return;
                        }
-                       const auto service = nodeService.scoped({access->tenantId, access->platformAdmin});
-                       const std::optional<std::int64_t> nodeId = parseIdentifier(request.param("id"));
+                       const auto                        service = nodeService.scoped({access->tenantId, access->platformAdmin});
+                       const std::optional<std::int64_t> nodeId  = parseIdentifier(request.param("id"));
                        if (!nodeId.has_value())
                        {
                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "节点标识不合法", traceId);

@@ -13,7 +13,8 @@ add_library(edgepulse-plugins STATIC
         OpsPlugin/OpsController.cpp
         TelemetryPlugin/TelemetryController.cpp
         SystemPlugin/SystemController.cpp
-        SystemPlugin/TenantController.cpp)
+        SystemPlugin/TenantController.cpp
+        SystemPlugin/NotificationController.cpp)
 add_library(EdgePulse::Plugins ALIAS edgepulse-plugins)
 
 target_include_directories(edgepulse-plugins PUBLIC ${PROJECT_SOURCE_DIR}/src)

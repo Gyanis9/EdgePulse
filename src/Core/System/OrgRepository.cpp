@@ -12,6 +12,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -113,17 +114,37 @@ namespace EdgePulse::System
         }
     } // namespace
 
-    OrgRepository::OrgRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    OrgRepository::OrgRepository(std::shared_ptr<Common::Database> database, TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
     }
+
+    std::shared_ptr<OrgRepository> OrgRepository::scoped(const TenantScope tenant) const
+    {
+        return std::make_shared<OrgRepository>(m_database, tenant);
+    }
+
+    namespace
+    {
+        [[nodiscard]] std::string tenantClause(const TenantScope &tenant, std::vector<DatabaseValue> &parameters, const std::string_view column)
+        {
+            if (tenant.allTenants)
+            {
+                return {};
+            }
+            parameters.emplace_back(tenant.tenantId);
+            return " AND " + std::string{column} + " = ?";
+        }
+    } // namespace
 
     AsynGyanis::Core::Task<std::vector<DeptRecord>> OrgRepository::deptTree(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status)
     {
         co_return co_await m_database->withConnection<std::vector<DeptRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status)](DatabaseConnection &connection) -> std::vector<DeptRecord>
+                [keyword = std::move(keyword), status = std::move(status), tenant = m_tenant](DatabaseConnection &connection) -> std::vector<DeptRecord>
                 {
-                    const auto              rows = Sql::executeOrThrow(connection, std::string{kSelectDept} + "WHERE d.deleted = 0 ORDER BY d.sort, d.id");
+                    std::vector<DatabaseValue> parameters;
+                    const std::string          clause = tenantClause(tenant, parameters, "d.tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectDept} + "WHERE d.deleted = 0" + clause + " ORDER BY d.sort, d.id", parameters);
                     std::vector<DeptRecord> nodes;
                     while (rows->next())
                     {
@@ -137,45 +158,49 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<std::vector<DeptRecord>> OrgRepository::allDepts(AsynGyanis::Core::EventLoop &loop)
     {
-        co_return co_await m_database->withConnection<std::vector<DeptRecord>>(loop,
-                                                                               [](DatabaseConnection &connection) -> std::vector<DeptRecord>
-                                                                               {
-                                                                                   const auto rows = Sql::executeOrThrow(
-                                                                                           connection, std::string{kSelectDept} + "WHERE d.deleted = 0 ORDER BY d.sort, d.id");
-                                                                                   std::vector<DeptRecord> depts;
-                                                                                   while (rows->next())
-                                                                                   {
-                                                                                       depts.push_back(readDept(*rows));
-                                                                                   }
-                                                                                   return depts;
-                                                                               });
+        co_return co_await m_database->withConnection<std::vector<DeptRecord>>(
+                loop,
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::vector<DeptRecord>
+                {
+                    std::vector<DatabaseValue> parameters;
+                    const std::string          clause = tenantClause(tenant, parameters, "d.tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectDept} + "WHERE d.deleted = 0" + clause + " ORDER BY d.sort, d.id", parameters);
+                    std::vector<DeptRecord> depts;
+                    while (rows->next())
+                    {
+                        depts.push_back(readDept(*rows));
+                    }
+                    return depts;
+                });
     }
 
     AsynGyanis::Core::Task<std::optional<DeptRecord>> OrgRepository::findDept(AsynGyanis::Core::EventLoop &loop, const std::int64_t deptId)
     {
-        co_return co_await m_database->withConnection<std::optional<DeptRecord>>(loop,
-                                                                                 [deptId](DatabaseConnection &connection) -> std::optional<DeptRecord>
-                                                                                 {
-                                                                                     const std::array<DatabaseValue, 1> parameters{deptId};
-                                                                                     const auto                         rows = Sql::executeOrThrow(
-                                                                                             connection, std::string{kSelectDept} + "WHERE d.id = ? AND d.deleted = 0", parameters);
-                                                                                     if (!rows->next())
-                                                                                     {
-                                                                                         return std::nullopt;
-                                                                                     }
-                                                                                     return readDept(*rows);
-                                                                                 });
+        co_return co_await m_database->withConnection<std::optional<DeptRecord>>(
+                loop,
+                [deptId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<DeptRecord>
+                {
+                    std::vector<DatabaseValue> parameters{deptId};
+                    const std::string          clause = tenantClause(tenant, parameters, "d.tenant_id");
+                    const auto                 rows   = Sql::executeOrThrow(connection, std::string{kSelectDept} + "WHERE d.id = ? AND d.deleted = 0" + clause, parameters);
+                    if (!rows->next())
+                    {
+                        return std::nullopt;
+                    }
+                    return readDept(*rows);
+                });
     }
 
     AsynGyanis::Core::Task<bool> OrgRepository::deptNameExists(AsynGyanis::Core::EventLoop &loop, const std::int64_t parentId, std::string name, const std::int64_t excludeId)
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [parentId, name = std::move(name), excludeId](DatabaseConnection &connection) -> bool
+                [parentId, name = std::move(name), excludeId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 3> parameters{parentId, name, excludeId};
-                    const auto                         rows =
-                            Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_dept WHERE parent_id = ? AND name = ? AND id <> ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{parentId, name, excludeId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto                 rows   = Sql::executeOrThrow(
+                            connection, "SELECT COUNT(*) AS total FROM sys_dept WHERE parent_id = ? AND name = ? AND id <> ? AND deleted = 0" + clause, parameters);
                     return rows->next() && Sql::integer(*rows, "total") > 0;
                 });
     }
@@ -184,11 +209,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [write, operatorId](DatabaseConnection &connection) -> std::int64_t
+                [write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 12> parameters{id,
+                    const std::array<DatabaseValue, 13> parameters{id,
+                                                                   tenant.tenantId,
                                                                    write.parentId.value_or(0),
                                                                    write.name.value_or(std::string{}),
                                                                    write.leader.value_or(std::string{}),
@@ -200,10 +226,11 @@ namespace EdgePulse::System
                                                                    now,
                                                                    operatorId,
                                                                    operatorId};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_dept (id, parent_id, name, leader, phone, email, sort, status, created_at, updated_at, created_by, updated_by) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO sys_dept (id, tenant_id, parent_id, name, leader, phone, email, sort, status, created_at, updated_at, created_by, updated_by) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     return id;
                 });
     }
@@ -211,7 +238,7 @@ namespace EdgePulse::System
     AsynGyanis::Core::Task<bool> OrgRepository::updateDept(AsynGyanis::Core::EventLoop &loop, const std::int64_t deptId, const DeptWrite &write, const std::int64_t operatorId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [deptId, write, operatorId](DatabaseConnection &connection) -> bool
+                                                            [deptId, write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
                                                                 std::string                sql = "UPDATE sys_dept SET updated_at = ?, updated_by = ?";
                                                                 std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
@@ -252,6 +279,7 @@ namespace EdgePulse::System
                                                                 }
                                                                 sql += " WHERE id = ? AND deleted = 0";
                                                                 parameters.emplace_back(deptId);
+                                                                sql += tenantClause(tenant, parameters, "tenant_id");
                                                                 const auto rows = Sql::executeOrThrow(connection, sql, parameters);
                                                                 return rows->affectedRowCount() > 0;
                                                             });
@@ -259,38 +287,41 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<bool> OrgRepository::removeDept(AsynGyanis::Core::EventLoop &loop, const std::int64_t deptId)
     {
-        co_return co_await m_database->withConnection<bool>(loop,
-                                                            [deptId](DatabaseConnection &connection) -> bool
-                                                            {
-                                                                const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), deptId};
-                                                                const auto                         rows = Sql::executeOrThrow(
-                                                                        connection, "UPDATE sys_dept SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
-                                                                return rows->affectedRowCount() > 0;
-                                                            });
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [deptId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), deptId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, "UPDATE sys_dept SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
+                    return rows->affectedRowCount() > 0;
+                });
     }
 
     AsynGyanis::Core::Task<bool> OrgRepository::deptHasChildren(AsynGyanis::Core::EventLoop &loop, const std::int64_t deptId)
     {
-        co_return co_await m_database->withConnection<bool>(loop,
-                                                            [deptId](DatabaseConnection &connection) -> bool
-                                                            {
-                                                                const std::array<DatabaseValue, 1> parameters{deptId};
-                                                                const auto                         rows = Sql::executeOrThrow(
-                                                                        connection, "SELECT COUNT(*) AS total FROM sys_dept WHERE parent_id = ? AND deleted = 0", parameters);
-                                                                return rows->next() && Sql::integer(*rows, "total") > 0;
-                                                            });
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [deptId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{deptId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_dept WHERE parent_id = ? AND deleted = 0" + clause, parameters);
+                    return rows->next() && Sql::integer(*rows, "total") > 0;
+                });
     }
 
     AsynGyanis::Core::Task<bool> OrgRepository::deptHasUsers(AsynGyanis::Core::EventLoop &loop, const std::int64_t deptId)
     {
-        co_return co_await m_database->withConnection<bool>(loop,
-                                                            [deptId](DatabaseConnection &connection) -> bool
-                                                            {
-                                                                const std::array<DatabaseValue, 1> parameters{deptId};
-                                                                const auto                         rows = Sql::executeOrThrow(
-                                                                        connection, "SELECT COUNT(*) AS total FROM sys_user WHERE dept_id = ? AND deleted = 0", parameters);
-                                                                return rows->next() && Sql::integer(*rows, "total") > 0;
-                                                            });
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [deptId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{deptId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_user WHERE dept_id = ? AND deleted = 0" + clause, parameters);
+                    return rows->next() && Sql::integer(*rows, "total") > 0;
+                });
     }
 
     AsynGyanis::Core::Task<Common::PageRows<PostRecord>> OrgRepository::listPosts(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status,
@@ -298,10 +329,11 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<Common::PageRows<PostRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status), page](DatabaseConnection &connection) -> Common::PageRows<PostRecord>
+                [keyword = std::move(keyword), status = std::move(status), page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<PostRecord>
                 {
                     std::string                filter = "WHERE p.deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    filter += tenantClause(tenant, parameters, "p.tenant_id");
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -339,10 +371,11 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<PostRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status)](DatabaseConnection &connection) -> std::vector<PostRecord>
+                [keyword = std::move(keyword), status = std::move(status), tenant = m_tenant](DatabaseConnection &connection) -> std::vector<PostRecord>
                 {
                     std::string                filter = "WHERE p.deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    filter += tenantClause(tenant, parameters, "p.tenant_id");
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -369,9 +402,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<PostRecord>>(
                 loop,
-                [](DatabaseConnection &connection) -> std::vector<PostRecord>
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::vector<PostRecord>
                 {
-                    const auto              rows = Sql::executeOrThrow(connection, std::string{kSelectPost} + "WHERE p.deleted = 0 AND p.status = 1 ORDER BY p.sort, p.id");
+                    std::vector<DatabaseValue> parameters;
+                    const std::string          clause = tenantClause(tenant, parameters, "p.tenant_id");
+                    const auto                 rows =
+                            Sql::executeOrThrow(connection, std::string{kSelectPost} + "WHERE p.deleted = 0 AND p.status = 1" + clause + " ORDER BY p.sort, p.id", parameters);
                     std::vector<PostRecord> result;
                     while (rows->next())
                     {
@@ -385,10 +421,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [code = std::move(code), excludeId](DatabaseConnection &connection) -> bool
+                [code = std::move(code), excludeId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 2> parameters{code, excludeId};
-                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_post WHERE post_code = ? AND id <> ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{code, excludeId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto                 rows =
+                            Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_post WHERE post_code = ? AND id <> ? AND deleted = 0" + clause, parameters);
                     return rows->next() && Sql::integer(*rows, "total") > 0;
                 });
     }
@@ -397,11 +435,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [write, operatorId](DatabaseConnection &connection) -> std::int64_t
+                [write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 11> parameters{id,
+                    const std::array<DatabaseValue, 12> parameters{id,
+                                                                   tenant.tenantId,
                                                                    write.code.value_or(std::string{}),
                                                                    write.name.value_or(std::string{}),
                                                                    static_cast<std::int64_t>(write.sort.value_or(0)),
@@ -412,10 +451,11 @@ namespace EdgePulse::System
                                                                    operatorId,
                                                                    operatorId,
                                                                    std::int64_t{0}};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_post (id, post_code, post_name, sort, status, remark, created_at, updated_at, created_by, updated_by, deleted) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO sys_post (id, tenant_id, post_code, post_name, sort, status, remark, created_at, updated_at, created_by, updated_by, deleted) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     return id;
                 });
     }
@@ -423,7 +463,7 @@ namespace EdgePulse::System
     AsynGyanis::Core::Task<bool> OrgRepository::updatePost(AsynGyanis::Core::EventLoop &loop, const std::int64_t postId, const PostWrite &write, const std::int64_t operatorId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [postId, write, operatorId](DatabaseConnection &connection) -> bool
+                                                            [postId, write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
                                                                 std::string                sql = "UPDATE sys_post SET updated_at = ?, updated_by = ?";
                                                                 std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
@@ -454,6 +494,7 @@ namespace EdgePulse::System
                                                                 }
                                                                 sql += " WHERE id = ? AND deleted = 0";
                                                                 parameters.emplace_back(postId);
+                                                                sql += tenantClause(tenant, parameters, "tenant_id");
                                                                 const auto rows = Sql::executeOrThrow(connection, sql, parameters);
                                                                 return rows->affectedRowCount() > 0;
                                                             });
@@ -461,14 +502,15 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<bool> OrgRepository::removePost(AsynGyanis::Core::EventLoop &loop, const std::int64_t postId)
     {
-        co_return co_await m_database->withConnection<bool>(loop,
-                                                            [postId](DatabaseConnection &connection) -> bool
-                                                            {
-                                                                const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), postId};
-                                                                const auto                         rows = Sql::executeOrThrow(
-                                                                        connection, "UPDATE sys_post SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
-                                                                return rows->affectedRowCount() > 0;
-                                                            });
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [postId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), postId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, "UPDATE sys_post SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
+                    return rows->affectedRowCount() > 0;
+                });
     }
 
     AsynGyanis::Core::Task<bool> OrgRepository::postHasUsers(AsynGyanis::Core::EventLoop &loop, const std::int64_t postId)

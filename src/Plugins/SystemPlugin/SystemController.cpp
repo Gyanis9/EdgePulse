@@ -534,9 +534,9 @@ namespace EdgePulse::System
                                tenantOptions.push_back(ConfigValue::object({{"id", tenant.id}, {"name", tenant.name}, {"code", tenant.code}}));
                            }
                        }
-                       const auto  roles       = co_await deps->roles->listOptions(loop);
-                       const auto  posts       = co_await deps->org->postOptions(loop);
-                       const auto  depts       = co_await deps->org->deptTree(loop, "", "");
+                       const auto  roles       = co_await deps->roles->scoped(session->tenantScope())->listOptions(loop);
+                       const auto  posts       = co_await deps->org->scoped(session->tenantScope())->postOptions(loop);
+                       const auto  depts       = co_await deps->org->scoped(session->tenantScope())->deptTree(loop, "", "");
                        ConfigValue roleOptions = ConfigValue::array();
                        for (const RoleRecord &role: roles)
                        {
@@ -553,12 +553,13 @@ namespace EdgePulse::System
                            deptOptions.push_back(deptJson(dept));
                        }
                        const std::string initPassword = Common::environmentValue("EDGEPULSE_INITIAL_PASSWORD").value_or("");
-                       Common::writeSuccess(
-                               response,
-                               ConfigValue::object(
-                                       {{"depts", std::move(deptOptions)}, {"roles", std::move(roleOptions)}, {"posts", std::move(postOptions)}, {"tenants", std::move(tenantOptions)},
-                                        {"initPassword", initPassword}}),
-                               traceId);
+                       Common::writeSuccess(response,
+                                            ConfigValue::object({{"depts", std::move(deptOptions)},
+                                                                 {"roles", std::move(roleOptions)},
+                                                                 {"posts", std::move(postOptions)},
+                                                                 {"tenants", std::move(tenantOptions)},
+                                                                 {"initPassword", initPassword}}),
+                                            traceId);
                        co_return;
                    });
 
@@ -596,70 +597,69 @@ namespace EdgePulse::System
                        co_return;
                    });
 
-        router.post("/api/system/users",
-                    [&loop, deps, authOf](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+        router.post(
+                "/api/system/users",
+                [&loop, deps, authOf](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                {
+                    const std::string traceId = Web::resolveRequestId(request);
+                    const auto        session = co_await Web::requireSession(authOf(), loop, request, response, "system:user:add", traceId);
+                    if (!session.has_value())
                     {
-                        const std::string traceId = Web::resolveRequestId(request);
-                        const auto        session = co_await Web::requireSession(authOf(), loop, request, response, "system:user:add", traceId);
-                        if (!session.has_value())
-                        {
-                            co_return;
-                        }
-                        const auto body = request.jsonBody();
-                        if (!body.has_value() || !body->is_object())
-                        {
-                            fail(response, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
-                            co_return;
-                        }
-                        UserWrite   write = parseUserWrite(*body);
-                        std::string message;
-                        if (!validUserWrite(write, message) || !write.username.has_value() || !write.nickname.has_value())
-                        {
-                            fail(response, Common::kCodeBadRequest, message.empty() ? "登录账号与用户姓名不能为空" : message, traceId);
-                            co_return;
-                        }
-                        const std::string password = stringField(*body, "password");
-                        if (password.size() < 6 || password.size() > 64)
-                        {
-                            fail(response, Common::kCodeBadRequest, "初始密码长度必须是 6 到 64 个字符", traceId);
-                            co_return;
-                        }
-                        if (!session->platformAdmin && write.roleIds.has_value() &&
-                            std::find(write.roleIds->begin(), write.roleIds->end(), std::int64_t{1}) != write.roleIds->end())
-                        {
-                            fail(response, Common::kCodeForbidden, "租户账号不能分配平台超级管理员角色", traceId);
-                            co_return;
-                        }
-                        std::int64_t targetTenantId = session->tenantId;
-                        if (session->platformAdmin && body->contains("tenantId"))
-                        {
-                            const auto tenantId = optionalInteger(*body, "tenantId");
-                            if (!tenantId.has_value() || *tenantId <= 0)
-                            {
-                                fail(response, Common::kCodeBadRequest, "tenantId 不合法", traceId);
-                                co_return;
-                            }
-                            const auto tenant = co_await deps->tenants->findById(loop, *tenantId);
-                            if (!tenant.has_value() || tenant->status != 1)
-                            {
-                                fail(response, Common::kCodeBadRequest, "目标租户不存在或已停用", traceId);
-                                co_return;
-                            }
-                            targetTenantId = *tenantId;
-                        }
-                        const auto globalUsers = deps->users->scoped({1, true});
-                        if (co_await globalUsers->usernameExists(loop, *write.username))
-                        {
-                            fail(response, Common::kCodeConflict, "登录账号已存在", traceId);
-                            co_return;
-                        }
-                        const std::string hash =
-                                co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::string>(loop, [password] { return Common::hashPassword(password); });
-                        const auto         targetUsers = deps->users->scoped({targetTenantId, false});
-                        const std::int64_t id          = co_await targetUsers->create(loop, write, hash, session->userId);
-                        Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
-                    });
+                    }
+                    const auto body = request.jsonBody();
+                    if (!body.has_value() || !body->is_object())
+                    {
+                        fail(response, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
+                        co_return;
+                    }
+                    UserWrite   write = parseUserWrite(*body);
+                    std::string message;
+                    if (!validUserWrite(write, message) || !write.username.has_value() || !write.nickname.has_value())
+                    {
+                        fail(response, Common::kCodeBadRequest, message.empty() ? "登录账号与用户姓名不能为空" : message, traceId);
+                        co_return;
+                    }
+                    const std::string password = stringField(*body, "password");
+                    if (password.size() < 6 || password.size() > 64)
+                    {
+                        fail(response, Common::kCodeBadRequest, "初始密码长度必须是 6 到 64 个字符", traceId);
+                        co_return;
+                    }
+                    if (!session->platformAdmin && write.roleIds.has_value() && std::find(write.roleIds->begin(), write.roleIds->end(), std::int64_t{1}) != write.roleIds->end())
+                    {
+                        fail(response, Common::kCodeForbidden, "租户账号不能分配平台超级管理员角色", traceId);
+                        co_return;
+                    }
+                    std::int64_t targetTenantId = session->tenantId;
+                    if (session->platformAdmin && body->contains("tenantId"))
+                    {
+                        const auto tenantId = optionalInteger(*body, "tenantId");
+                        if (!tenantId.has_value() || *tenantId <= 0)
+                        {
+                            fail(response, Common::kCodeBadRequest, "tenantId 不合法", traceId);
+                            co_return;
+                        }
+                        const auto tenant = co_await deps->tenants->findById(loop, *tenantId);
+                        if (!tenant.has_value() || tenant->status != 1)
+                        {
+                            fail(response, Common::kCodeBadRequest, "目标租户不存在或已停用", traceId);
+                            co_return;
+                        }
+                        targetTenantId = *tenantId;
+                    }
+                    const auto globalUsers = deps->users->scoped({1, true});
+                    if (co_await globalUsers->usernameExists(loop, *write.username))
+                    {
+                        fail(response, Common::kCodeConflict, "登录账号已存在", traceId);
+                        co_return;
+                    }
+                    const std::string  hash = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::string>(loop, [password] { return Common::hashPassword(password); });
+                    const auto         targetUsers = deps->users->scoped({targetTenantId, false});
+                    const std::int64_t id          = co_await targetUsers->create(loop, write, hash, session->userId);
+                    Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
+                    co_return;
+                });
 
         router.put("/api/system/users/:id",
                    [&loop, deps, authOf](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -689,8 +689,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, message, traceId);
                            co_return;
                        }
-                       if (!session->platformAdmin && write.roleIds.has_value() &&
-                           std::find(write.roleIds->begin(), write.roleIds->end(), std::int64_t{1}) != write.roleIds->end())
+                       if (!session->platformAdmin && write.roleIds.has_value() && std::find(write.roleIds->begin(), write.roleIds->end(), std::int64_t{1}) != write.roleIds->end())
                        {
                            fail(response, Common::kCodeForbidden, "租户账号不能分配平台超级管理员角色", traceId);
                            co_return;
@@ -761,7 +760,7 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const std::string hash = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::string>(loop, [password] { return Common::hashPassword(password); });
-                       const auto users = deps->users->scoped(session->tenantScope());
+                       const auto        users = deps->users->scoped(session->tenantScope());
                        if (!co_await users->resetPassword(loop, *userId, hash, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "用户不存在或已删除", traceId);
@@ -811,10 +810,11 @@ namespace EdgePulse::System
                        {
                            co_return;
                        }
-                       const Common::QueryMap       query  = request.queryParams();
-                       const Common::PageParameters page   = Common::parsePageParameters(query);
-                       const auto                   result = co_await deps->roles->list(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page);
-                       ConfigValue                  rows   = ConfigValue::array();
+                       const Common::QueryMap       query = request.queryParams();
+                       const Common::PageParameters page  = Common::parsePageParameters(query);
+                       const auto                   result =
+                               co_await deps->roles->scoped(session->tenantScope())->list(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page);
+                       ConfigValue rows = ConfigValue::array();
                        for (const RoleRecord &role: result.rows)
                        {
                            rows.push_back(roleJson(role, true));
@@ -833,8 +833,9 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             rows  = co_await deps->roles->exportAll(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
-                       Common::CsvWriter      writer;
+                       const auto             rows =
+                               co_await deps->roles->scoped(session->tenantScope())->exportAll(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
+                       Common::CsvWriter writer;
                        writer.addRow({"角色ID", "角色名称", "角色编码", "数据范围", "用户数", "排序", "状态", "备注", "创建时间"});
                        for (const RoleRecord &role: rows)
                        {
@@ -867,12 +868,39 @@ namespace EdgePulse::System
                             fail(response, Common::kCodeBadRequest, message, traceId);
                             co_return;
                         }
-                        if (co_await deps->roles->codeExists(loop, *write.code))
+                        if (!session->platformAdmin)
+                        {
+                            if (write.menuIds.has_value())
+                            {
+                                const auto permissions = co_await deps->menus->permissionsFor(loop, *write.menuIds);
+                                for (const std::string &permission: permissions)
+                                {
+                                    if (!deps->auth->hasPermission(*session, permission))
+                                    {
+                                        fail(response, Common::kCodeForbidden, "不能授予当前账号没有的权限", traceId);
+                                        co_return;
+                                    }
+                                }
+                            }
+                            if (write.deptIds.has_value())
+                            {
+                                const auto org = deps->org->scoped(session->tenantScope());
+                                for (const std::int64_t deptId: *write.deptIds)
+                                {
+                                    if (!(co_await org->findDept(loop, deptId)).has_value())
+                                    {
+                                        fail(response, Common::kCodeBadRequest, "数据范围包含其他租户的部门", traceId);
+                                        co_return;
+                                    }
+                                }
+                            }
+                        }
+                        if (co_await deps->roles->scoped(session->tenantScope())->codeExists(loop, *write.code))
                         {
                             fail(response, Common::kCodeConflict, "角色编码已存在", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->roles->create(loop, write, session->userId);
+                        const std::int64_t id = co_await deps->roles->scoped(session->tenantScope())->create(loop, write, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -905,12 +933,39 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, message, traceId);
                            co_return;
                        }
-                       if (write.code.has_value() && co_await deps->roles->codeExists(loop, *write.code, *roleId))
+                       if (!session->platformAdmin)
+                       {
+                           if (write.menuIds.has_value())
+                           {
+                               const auto permissions = co_await deps->menus->permissionsFor(loop, *write.menuIds);
+                               for (const std::string &permission: permissions)
+                               {
+                                   if (!deps->auth->hasPermission(*session, permission))
+                                   {
+                                       fail(response, Common::kCodeForbidden, "不能授予当前账号没有的权限", traceId);
+                                       co_return;
+                                   }
+                               }
+                           }
+                           if (write.deptIds.has_value())
+                           {
+                               const auto org = deps->org->scoped(session->tenantScope());
+                               for (const std::int64_t deptId: *write.deptIds)
+                               {
+                                   if (!(co_await org->findDept(loop, deptId)).has_value())
+                                   {
+                                       fail(response, Common::kCodeBadRequest, "数据范围包含其他租户的部门", traceId);
+                                       co_return;
+                                   }
+                               }
+                           }
+                       }
+                       if (write.code.has_value() && co_await deps->roles->scoped(session->tenantScope())->codeExists(loop, *write.code, *roleId))
                        {
                            fail(response, Common::kCodeConflict, "角色编码已存在", traceId);
                            co_return;
                        }
-                       if (!co_await deps->roles->update(loop, *roleId, write, session->userId))
+                       if (!co_await deps->roles->scoped(session->tenantScope())->update(loop, *roleId, write, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "角色不存在或已删除", traceId);
                            co_return;
@@ -934,7 +989,13 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "角色标识不合法", traceId);
                            co_return;
                        }
-                       const auto menuIds = co_await deps->roles->menuIdsFor(loop, *roleId);
+                       const auto roles = deps->roles->scoped(session->tenantScope());
+                       if (!(co_await roles->findById(loop, *roleId)).has_value())
+                       {
+                           fail(response, Common::kCodeNotFound, "角色不存在或已删除", traceId);
+                           co_return;
+                       }
+                       const auto menuIds = co_await roles->menuIdsFor(loop, *roleId);
                        Common::writeSuccess(response, ConfigValue::object({{"menuIds", Json::integerArray(menuIds)}}), traceId);
                        co_return;
                    });
@@ -954,7 +1015,13 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "角色标识不合法", traceId);
                            co_return;
                        }
-                       const auto deptIds = co_await deps->roles->deptIdsFor(loop, *roleId);
+                       const auto roles = deps->roles->scoped(session->tenantScope());
+                       if (!(co_await roles->findById(loop, *roleId)).has_value())
+                       {
+                           fail(response, Common::kCodeNotFound, "角色不存在或已删除", traceId);
+                           co_return;
+                       }
+                       const auto deptIds = co_await roles->deptIdsFor(loop, *roleId);
                        Common::writeSuccess(response, ConfigValue::object({{"deptIds", Json::integerArray(deptIds)}}), traceId);
                        co_return;
                    });
@@ -974,7 +1041,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "角色标识不合法", traceId);
                            co_return;
                        }
-                       const auto role = co_await deps->roles->findById(loop, *roleId);
+                       const auto role = co_await deps->roles->scoped(session->tenantScope())->findById(loop, *roleId);
                        if (!role.has_value())
                        {
                            fail(response, Common::kCodeNotFound, "角色不存在或已删除", traceId);
@@ -985,7 +1052,16 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeConflict, "内置角色不能删除", traceId);
                            co_return;
                        }
-                       if (!co_await deps->roles->remove(loop, *roleId))
+                       if (!session->platformAdmin)
+                       {
+                           const auto ownRoles = co_await deps->users->roleIdsFor(loop, session->userId);
+                           if (std::find(ownRoles.begin(), ownRoles.end(), *roleId) != ownRoles.end())
+                           {
+                               fail(response, Common::kCodeConflict, "不能删除自己正在使用的角色", traceId);
+                               co_return;
+                           }
+                       }
+                       if (!co_await deps->roles->scoped(session->tenantScope())->remove(loop, *roleId))
                        {
                            fail(response, Common::kCodeNotFound, "角色不存在或已删除", traceId);
                            co_return;
@@ -1005,7 +1081,7 @@ namespace EdgePulse::System
                        }
                        const Common::PageParameters page{1, 100};
                        const auto                   usersPage = co_await deps->users->list(loop, UserQuery{}, page);
-                       const auto                   rolesPage = co_await deps->roles->list(loop, "", "", page);
+                       const auto                   rolesPage = co_await deps->roles->scoped(session->tenantScope())->list(loop, "", "", page);
                        const auto                   menuTree  = co_await deps->menus->tree(loop, "", "");
                        ConfigValue                  users     = ConfigValue::array();
                        for (const UserRecord &user: usersPage.rows)
@@ -1016,7 +1092,7 @@ namespace EdgePulse::System
                        ConfigValue roles = ConfigValue::array();
                        for (const RoleRecord &role: rolesPage.rows)
                        {
-                           const auto menuIds = co_await deps->roles->menuIdsFor(loop, role.id);
+                           const auto menuIds = co_await deps->roles->scoped(session->tenantScope())->menuIdsFor(loop, role.id);
                            roles.push_back(ConfigValue::object({{"id", role.id},
                                                                 {"name", role.name},
                                                                 {"code", role.code},
@@ -1224,8 +1300,9 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             tree  = co_await deps->org->deptTree(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
-                       ConfigValue            rows  = ConfigValue::array();
+                       const auto             tree =
+                               co_await deps->org->scoped(session->tenantScope())->deptTree(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
+                       ConfigValue rows = ConfigValue::array();
                        for (const DeptRecord &dept: tree)
                        {
                            rows.push_back(deptJson(dept));
@@ -1244,8 +1321,9 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             tree  = co_await deps->org->deptTree(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
-                       Common::CsvWriter      writer;
+                       const auto             tree =
+                               co_await deps->org->scoped(session->tenantScope())->deptTree(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
+                       Common::CsvWriter writer;
                        writer.addRow({"部门ID", "上级部门", "部门名称", "负责人", "联系电话", "邮箱", "排序", "状态", "人数"});
                        const auto flatten = [&writer](const auto &self, const DeptRecord &dept) -> void
                        {
@@ -1285,12 +1363,17 @@ namespace EdgePulse::System
                             fail(response, Common::kCodeBadRequest, "部门名称不能为空", traceId);
                             co_return;
                         }
-                        if (co_await deps->org->deptNameExists(loop, write.parentId.value_or(0), *write.name))
+                        if (co_await deps->org->scoped(session->tenantScope())->deptNameExists(loop, write.parentId.value_or(0), *write.name))
                         {
                             fail(response, Common::kCodeConflict, "同级部门名称已存在", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->org->createDept(loop, write, session->userId);
+                        if (write.parentId.value_or(0) != 0 && !(co_await deps->org->scoped(session->tenantScope())->findDept(loop, *write.parentId)).has_value())
+                        {
+                            fail(response, Common::kCodeBadRequest, "上级部门不存在", traceId);
+                            co_return;
+                        }
+                        const std::int64_t id = co_await deps->org->scoped(session->tenantScope())->createDept(loop, write, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -1322,12 +1405,17 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "上级部门不能是自身", traceId);
                            co_return;
                        }
-                       if (write.name.has_value() && co_await deps->org->deptNameExists(loop, write.parentId.value_or(0), *write.name, *deptId))
+                       if (write.parentId.has_value() && *write.parentId != 0 && !(co_await deps->org->scoped(session->tenantScope())->findDept(loop, *write.parentId)).has_value())
+                       {
+                           fail(response, Common::kCodeBadRequest, "上级部门不存在", traceId);
+                           co_return;
+                       }
+                       if (write.name.has_value() && co_await deps->org->scoped(session->tenantScope())->deptNameExists(loop, write.parentId.value_or(0), *write.name, *deptId))
                        {
                            fail(response, Common::kCodeConflict, "同级部门名称已存在", traceId);
                            co_return;
                        }
-                       if (!co_await deps->org->updateDept(loop, *deptId, write, session->userId))
+                       if (!co_await deps->org->scoped(session->tenantScope())->updateDept(loop, *deptId, write, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "部门不存在或已删除", traceId);
                            co_return;
@@ -1351,17 +1439,17 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "部门标识不合法", traceId);
                            co_return;
                        }
-                       if (co_await deps->org->deptHasChildren(loop, *deptId))
+                       if (co_await deps->org->scoped(session->tenantScope())->deptHasChildren(loop, *deptId))
                        {
                            fail(response, Common::kCodeConflict, "请先删除子部门", traceId);
                            co_return;
                        }
-                       if (co_await deps->org->deptHasUsers(loop, *deptId))
+                       if (co_await deps->org->scoped(session->tenantScope())->deptHasUsers(loop, *deptId))
                        {
                            fail(response, Common::kCodeConflict, "部门下仍有用户，不能删除", traceId);
                            co_return;
                        }
-                       if (!co_await deps->org->removeDept(loop, *deptId))
+                       if (!co_await deps->org->scoped(session->tenantScope())->removeDept(loop, *deptId))
                        {
                            fail(response, Common::kCodeNotFound, "部门不存在或已删除", traceId);
                            co_return;
@@ -1380,10 +1468,11 @@ namespace EdgePulse::System
                        {
                            co_return;
                        }
-                       const Common::QueryMap       query  = request.queryParams();
-                       const Common::PageParameters page   = Common::parsePageParameters(query);
-                       const auto                   result = co_await deps->org->listPosts(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page);
-                       ConfigValue                  rows   = ConfigValue::array();
+                       const Common::QueryMap       query = request.queryParams();
+                       const Common::PageParameters page  = Common::parsePageParameters(query);
+                       const auto                   result =
+                               co_await deps->org->scoped(session->tenantScope())->listPosts(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page);
+                       ConfigValue rows = ConfigValue::array();
                        for (const PostRecord &post: result.rows)
                        {
                            rows.push_back(postJson(post));
@@ -1402,8 +1491,9 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             rows  = co_await deps->org->exportPosts(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
-                       Common::CsvWriter      writer;
+                       const auto             rows =
+                               co_await deps->org->scoped(session->tenantScope())->exportPosts(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
+                       Common::CsvWriter writer;
                        writer.addRow({"岗位ID", "岗位编码", "岗位名称", "在岗人数", "排序", "状态", "备注", "创建时间"});
                        for (const PostRecord &post: rows)
                        {
@@ -1435,12 +1525,12 @@ namespace EdgePulse::System
                             fail(response, Common::kCodeBadRequest, "岗位名称不能为空，编码必须以字母开头且只含字母、数字、下划线或短横线", traceId);
                             co_return;
                         }
-                        if (co_await deps->org->postCodeExists(loop, *write.code))
+                        if (co_await deps->org->scoped(session->tenantScope())->postCodeExists(loop, *write.code))
                         {
                             fail(response, Common::kCodeConflict, "岗位编码已存在", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->org->createPost(loop, write, session->userId);
+                        const std::int64_t id = co_await deps->org->scoped(session->tenantScope())->createPost(loop, write, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -1472,12 +1562,12 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "岗位编码格式不合法", traceId);
                            co_return;
                        }
-                       if (write.code.has_value() && co_await deps->org->postCodeExists(loop, *write.code, *postId))
+                       if (write.code.has_value() && co_await deps->org->scoped(session->tenantScope())->postCodeExists(loop, *write.code, *postId))
                        {
                            fail(response, Common::kCodeConflict, "岗位编码已存在", traceId);
                            co_return;
                        }
-                       if (!co_await deps->org->updatePost(loop, *postId, write, session->userId))
+                       if (!co_await deps->org->scoped(session->tenantScope())->updatePost(loop, *postId, write, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "岗位不存在或已删除", traceId);
                            co_return;
@@ -1501,12 +1591,12 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "岗位标识不合法", traceId);
                            co_return;
                        }
-                       if (co_await deps->org->postHasUsers(loop, *postId))
+                       if (co_await deps->org->scoped(session->tenantScope())->postHasUsers(loop, *postId))
                        {
                            fail(response, Common::kCodeConflict, "岗位下仍有用户，不能删除", traceId);
                            co_return;
                        }
-                       if (!co_await deps->org->removePost(loop, *postId))
+                       if (!co_await deps->org->scoped(session->tenantScope())->removePost(loop, *postId))
                        {
                            fail(response, Common::kCodeNotFound, "岗位不存在或已删除", traceId);
                            co_return;
@@ -1525,10 +1615,11 @@ namespace EdgePulse::System
                        {
                            co_return;
                        }
-                       const Common::QueryMap       query = request.queryParams();
-                       const Common::PageParameters page  = Common::parsePageParameters(query);
-                       const auto  result = co_await deps->dictionaries->listDictTypes(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page);
-                       ConfigValue rows   = ConfigValue::array();
+                       const Common::QueryMap       query  = request.queryParams();
+                       const Common::PageParameters page   = Common::parsePageParameters(query);
+                       const auto                   result = co_await deps->dictionaries->scoped(session->tenantScope())
+                                                                     ->listDictTypes(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"), page);
+                       ConfigValue                  rows   = ConfigValue::array();
                        for (const DictTypeRecord &record: result.rows)
                        {
                            rows.push_back(dictTypeJson(record));
@@ -1547,7 +1638,8 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             rows  = co_await deps->dictionaries->exportDictTypes(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
+                       const auto             rows  = co_await deps->dictionaries->scoped(session->tenantScope())
+                                                              ->exportDictTypes(loop, Common::queryText(query, "keyword"), Common::queryText(query, "status"));
                        Common::CsvWriter      writer;
                        writer.addRow({"字典ID", "字典名称", "字典类型", "状态", "备注", "创建时间"});
                        for (const DictTypeRecord &record: rows)
@@ -1579,12 +1671,12 @@ namespace EdgePulse::System
                             fail(response, Common::kCodeBadRequest, "字典名称不能为空，类型必须小写字母开头且只含小写字母、数字与下划线", traceId);
                             co_return;
                         }
-                        if (co_await deps->dictionaries->dictTypeExists(loop, *write.type))
+                        if (co_await deps->dictionaries->scoped(session->tenantScope())->dictTypeExists(loop, *write.type))
                         {
                             fail(response, Common::kCodeConflict, "字典类型已存在", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->dictionaries->createDictType(loop, write, session->userId);
+                        const std::int64_t id = co_await deps->dictionaries->scoped(session->tenantScope())->createDictType(loop, write, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -1616,12 +1708,12 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "字典类型格式不合法", traceId);
                            co_return;
                        }
-                       if (write.type.has_value() && co_await deps->dictionaries->dictTypeExists(loop, *write.type, *typeId))
+                       if (write.type.has_value() && co_await deps->dictionaries->scoped(session->tenantScope())->dictTypeExists(loop, *write.type, *typeId))
                        {
                            fail(response, Common::kCodeConflict, "字典类型已存在", traceId);
                            co_return;
                        }
-                       if (!co_await deps->dictionaries->updateDictType(loop, *typeId, write, session->userId))
+                       if (!co_await deps->dictionaries->scoped(session->tenantScope())->updateDictType(loop, *typeId, write, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "字典类型不存在", traceId);
                            co_return;
@@ -1645,7 +1737,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "字典类型标识不合法", traceId);
                            co_return;
                        }
-                       if (!co_await deps->dictionaries->removeDictType(loop, *typeId))
+                       if (!co_await deps->dictionaries->scoped(session->tenantScope())->removeDictType(loop, *typeId))
                        {
                            fail(response, Common::kCodeNotFound, "字典类型不存在", traceId);
                            co_return;
@@ -1669,7 +1761,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "字典类型不能为空", traceId);
                            co_return;
                        }
-                       const auto  rows   = co_await deps->dictionaries->dictData(loop, *dictType);
+                       const auto  rows   = co_await deps->dictionaries->scoped(session->tenantScope())->dictData(loop, *dictType);
                        ConfigValue result = ConfigValue::array();
                        for (const DictDataRecord &record: rows)
                        {
@@ -1694,7 +1786,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "字典类型不能为空", traceId);
                            co_return;
                        }
-                       const auto  rows   = co_await deps->dictionaries->dictOptions(loop, *dictType);
+                       const auto  rows   = co_await deps->dictionaries->scoped(session->tenantScope())->dictOptions(loop, *dictType);
                        ConfigValue result = ConfigValue::array();
                        for (const DictDataRecord &record: rows)
                        {
@@ -1725,7 +1817,7 @@ namespace EdgePulse::System
                             fail(response, Common::kCodeBadRequest, "字典类型、标签与键值不能为空", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->dictionaries->createDictData(loop, write, session->userId);
+                        const std::int64_t id = co_await deps->dictionaries->scoped(session->tenantScope())->createDictData(loop, write, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -1752,7 +1844,7 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const DictDataWrite write = parseDictDataWrite(*body);
-                       if (!co_await deps->dictionaries->updateDictData(loop, *dataId, write, session->userId))
+                       if (!co_await deps->dictionaries->scoped(session->tenantScope())->updateDictData(loop, *dataId, write, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "字典数据不存在", traceId);
                            co_return;
@@ -1776,7 +1868,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "字典数据标识不合法", traceId);
                            co_return;
                        }
-                       if (!co_await deps->dictionaries->removeDictData(loop, *dataId))
+                       if (!co_await deps->dictionaries->scoped(session->tenantScope())->removeDictData(loop, *dataId))
                        {
                            fail(response, Common::kCodeNotFound, "字典数据不存在", traceId);
                            co_return;
@@ -1795,10 +1887,10 @@ namespace EdgePulse::System
                        {
                            co_return;
                        }
-                       const Common::QueryMap       query  = request.queryParams();
-                       const Common::PageParameters page   = Common::parsePageParameters(query);
-                       const auto                   result = co_await deps->dictionaries->listConfigs(loop, Common::queryText(query, "keyword"), page);
-                       ConfigValue                  rows   = ConfigValue::array();
+                       const Common::QueryMap       query = request.queryParams();
+                       const Common::PageParameters page  = Common::parsePageParameters(query);
+                       const auto  result = co_await deps->dictionaries->scoped(session->tenantScope())->listConfigs(loop, Common::queryText(query, "keyword"), page);
+                       ConfigValue rows   = ConfigValue::array();
                        for (const ConfigRecord &record: result.rows)
                        {
                            rows.push_back(configJson(record));
@@ -1817,7 +1909,7 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const Common::QueryMap query = request.queryParams();
-                       const auto             rows  = co_await deps->dictionaries->exportConfigs(loop, Common::queryText(query, "keyword"));
+                       const auto             rows  = co_await deps->dictionaries->scoped(session->tenantScope())->exportConfigs(loop, Common::queryText(query, "keyword"));
                        Common::CsvWriter      writer;
                        writer.addRow({"参数ID", "参数名称", "参数键名", "参数值", "类型", "备注", "创建时间"});
                        for (const ConfigRecord &record: rows)
@@ -1849,12 +1941,12 @@ namespace EdgePulse::System
                             fail(response, Common::kCodeBadRequest, "参数名称与键名不能为空", traceId);
                             co_return;
                         }
-                        if (co_await deps->dictionaries->configKeyExists(loop, *write.key))
+                        if (co_await deps->dictionaries->scoped(session->tenantScope())->configKeyExists(loop, *write.key))
                         {
                             fail(response, Common::kCodeConflict, "参数键名已存在", traceId);
                             co_return;
                         }
-                        const std::int64_t id = co_await deps->dictionaries->createConfig(loop, write, session->userId);
+                        const std::int64_t id = co_await deps->dictionaries->scoped(session->tenantScope())->createConfig(loop, write, session->userId);
                         Common::writeSuccess(response, ConfigValue::object({{"id", id}}), traceId);
                         co_return;
                     });
@@ -1881,12 +1973,12 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const ConfigWrite write = parseConfigWrite(*body);
-                       if (write.key.has_value() && co_await deps->dictionaries->configKeyExists(loop, *write.key, *configId))
+                       if (write.key.has_value() && co_await deps->dictionaries->scoped(session->tenantScope())->configKeyExists(loop, *write.key, *configId))
                        {
                            fail(response, Common::kCodeConflict, "参数键名已存在", traceId);
                            co_return;
                        }
-                       if (!co_await deps->dictionaries->updateConfig(loop, *configId, write, session->userId))
+                       if (!co_await deps->dictionaries->scoped(session->tenantScope())->updateConfig(loop, *configId, write, session->userId))
                        {
                            fail(response, Common::kCodeNotFound, "参数不存在", traceId);
                            co_return;
@@ -1910,7 +2002,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeBadRequest, "参数标识不合法", traceId);
                            co_return;
                        }
-                       const auto config = co_await deps->dictionaries->findConfig(loop, *configId);
+                       const auto config = co_await deps->dictionaries->scoped(session->tenantScope())->findConfig(loop, *configId);
                        if (!config.has_value())
                        {
                            fail(response, Common::kCodeNotFound, "参数不存在", traceId);
@@ -1921,7 +2013,7 @@ namespace EdgePulse::System
                            fail(response, Common::kCodeConflict, "内置参数不能删除", traceId);
                            co_return;
                        }
-                       if (!co_await deps->dictionaries->removeConfig(loop, *configId))
+                       if (!co_await deps->dictionaries->scoped(session->tenantScope())->removeConfig(loop, *configId))
                        {
                            fail(response, Common::kCodeNotFound, "参数不存在", traceId);
                            co_return;

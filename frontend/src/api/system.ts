@@ -74,6 +74,34 @@ export interface TenantUpdateRequest {
   remark?: string
 }
 
+export interface NotificationChannelRow {
+  id: number
+  tenantId: number
+  name: string
+  type: 'webhook' | 'email'
+  endpoint: string
+  recipients: string
+  username: string
+  sender: string
+  minLevel: 'info' | 'warning' | 'critical'
+  enabled: boolean
+  secretConfigured: boolean
+  createdAt: string
+}
+
+export interface NotificationChannelWriteRequest {
+  name: string
+  type: 'webhook' | 'email'
+  endpoint: string
+  recipients?: string
+  username?: string
+  sender?: string
+  minLevel?: string
+  enabled?: boolean
+  secret?: string
+  tenantId?: number
+}
+
 export interface RoleWriteRequest {
   name?: string
   code?: string
@@ -223,6 +251,9 @@ export function createSystemApi(client: HttpClient) {
     tenants: {
       ...crudPage<TenantRow, TenantUpdateRequest>(client, '/system/tenants'),
       create: (body: TenantCreateRequest) => client.post<{ tenantId: number; adminUserId: number }>('/system/tenants', body),
+    },
+    notifications: {
+      ...crudPage<NotificationChannelRow, NotificationChannelWriteRequest>(client, '/system/notifications'),
     },
     roles: {
       ...crudPage<Record<string, unknown>, RoleWriteRequest>(client, '/system/roles'),

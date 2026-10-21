@@ -12,6 +12,7 @@
 #include "Base/Api/Pagination.h"
 #include "Base/Database/Database.h"
 #include "Core/System/SystemModels.h"
+#include "Core/System/TenantScope.h"
 
 #include <Core/Coroutine/Task.h>
 
@@ -32,8 +33,12 @@ namespace EdgePulse::System
         /**
          * @brief 构造
          * @param database 数据库封装
+         * @param tenant 租户边界
          */
-        explicit OrgRepository(std::shared_ptr<Common::Database> database);
+        explicit OrgRepository(std::shared_ptr<Common::Database> database, TenantScope tenant = {});
+
+        /// 按租户边界派生仓储视图
+        [[nodiscard]] std::shared_ptr<OrgRepository> scoped(TenantScope tenant) const;
 
         /**
          * @brief 部门树
@@ -185,5 +190,6 @@ namespace EdgePulse::System
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
+        TenantScope                       m_tenant;   ///< 租户边界
     };
 } // namespace EdgePulse::System

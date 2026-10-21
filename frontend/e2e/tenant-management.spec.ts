@@ -62,6 +62,11 @@ test('platform admin provisions a tenant and its admin logs in scoped', async ({
   await page.goto('/system/user')
   await expect(page.getByRole('heading', { name: '用户管理', exact: true })).toBeVisible()
   await expect(page.getByRole('row', { name: new RegExp(adminUser) })).toBeVisible()
+  // 租户管理员模板已包含角色与部门自助管理
+  await page.goto('/system/role')
+  await expect(page.getByRole('heading', { name: '角色管理', exact: true })).toBeVisible()
+  await page.goto('/system/dept')
+  await expect(page.getByRole('heading', { name: '部门管理', exact: true })).toBeVisible()
   // 默认租户的 admin 不在租户管理员的数据面里
   await expect(page.getByRole('row', { name: /@admin\b/ })).toHaveCount(0)
 })

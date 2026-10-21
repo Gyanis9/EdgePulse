@@ -140,3 +140,72 @@ TEST(FleetServices, FirmwareTasksAndNodeGroups)
     const auto tree = runner.run(groups.tree(runner.loop()));
     EXPECT_GE(tree.size(), 2U);
 }
+
+// 钉住：计划命令到点前不参与轮询，到点后才进入待执行队列
+TEST(FleetServices, ScheduledCommandsWaitForDueTime)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Command::CommandRepository   repository(context.database);
+    EdgePulse::Device::NodeRepository       nodes(context.database);
+    const auto                              node   = runner.run(nodes.create(runner.loop(), "scheduled-node", "{}"));
+    const std::int64_t                      nodeId = node.id;
+    const auto                              now    = std::chrono::system_clock::now();
+    const std::string                       future = EdgePulse::Common::formatDateTimeUtc(now + std::chrono::hours{1});
+    const std::string                       past   = EdgePulse::Common::formatDateTimeUtc(now - std::chrono::minutes{1});
+
+    const auto waiting = runner.run(repository.create(runner.loop(), nodeId, "reboot", "{}", 1, 60, future));
+    ASSERT_TRUE(waiting.has_value());
+    EXPECT_FALSE(runner.run(repository.takeNext(runner.loop(), nodeId)).has_value());
+    EXPECT_TRUE(runner.run(repository.listDue(runner.loop())).empty());
+
+    const auto due = runner.run(repository.create(runner.loop(), nodeId, "diagnostics.collect", "{}", 1, 60, past));
+    ASSERT_TRUE(due.has_value());
+    const auto dueList = runner.run(repository.listDue(runner.loop()));
+    ASSERT_EQ(1U, dueList.size());
+    EXPECT_EQ(due->id, dueList[0].id);
+    const auto next = runner.run(repository.takeNext(runner.loop(), nodeId));
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(due->id, next->id);
+}
+
+// 钉住：任务记录下发前版本，回滚目标与节点上一版本都能取回
+TEST(FleetServices, FirmwareRollbackTracksPreviousVersion)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Firmware::FirmwareRepository firmware(context.database);
+    EdgePulse::Device::NodeRepository       nodes(context.database);
+    const auto                              node = runner.run(nodes.create(runner.loop(), "rollback-node", "{}"));
+
+    EdgePulse::Firmware::FirmwareRecord first;
+    first.name                 = "Firmware A";
+    first.version              = "1.0.0";
+    first.fileName             = "a.bin";
+    first.contentType          = "application/octet-stream";
+    first.sha256               = std::string(64, 'a');
+    first.storagePath          = "unused-a";
+    const std::int64_t firstId = runner.run(firmware.create(runner.loop(), first));
+
+    EdgePulse::Firmware::FirmwareRecord second = first;
+    second.name                                = "Firmware B";
+    second.version                             = "2.0.0";
+    second.sha256                              = std::string(64, 'b');
+    second.storagePath                         = "unused-b";
+    const std::int64_t secondId                = runner.run(firmware.create(runner.loop(), second));
+
+    const std::int64_t firstTask = runner.run(firmware.createTask(runner.loop(), firstId, node.id));
+    ASSERT_GT(firstTask, 0);
+    ASSERT_TRUE(runner.run(firmware.updateTask(runner.loop(), firstId, node.id, "installed", 100, "ok")).has_value());
+
+    const std::int64_t taskId = runner.run(firmware.createTask(runner.loop(), secondId, node.id, firstId));
+    ASSERT_GT(taskId, 0);
+    ASSERT_TRUE(runner.run(firmware.updateTask(runner.loop(), secondId, node.id, "installed", 100, "ok")).has_value());
+    EXPECT_EQ(firstId, runner.run(firmware.latestOtherFirmware(runner.loop(), node.id, secondId)));
+    EXPECT_EQ(firstId, runner.run(firmware.rollbackSource(runner.loop(), secondId, node.id)));
+
+    // 回滚任务把当前版本记为“上一版”，之后还能再切回来
+    const std::int64_t rollbackTask = runner.run(firmware.createTask(runner.loop(), firstId, node.id, secondId));
+    ASSERT_GT(rollbackTask, 0);
+    EXPECT_EQ(secondId, runner.run(firmware.rollbackSource(runner.loop(), firstId, node.id)));
+}

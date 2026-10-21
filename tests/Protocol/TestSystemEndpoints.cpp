@@ -15,6 +15,8 @@
 #include "Plugins/MonitorPlugin/MonitorController.h"
 #include "Plugins/SystemPlugin/SystemController.h"
 #include "Plugins/SystemPlugin/TenantController.h"
+#include "Plugins/SystemPlugin/NotificationController.h"
+#include "Core/Notification/NotificationRepository.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
 
@@ -38,16 +40,17 @@ class SystemEndpointsTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        m_context    = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
-        m_users      = std::make_shared<EdgePulse::System::UserRepository>(m_context->database);
-        m_roles      = std::make_shared<EdgePulse::System::RoleRepository>(m_context->database);
-        m_menus      = std::make_shared<EdgePulse::System::MenuRepository>(m_context->database);
-        m_org        = std::make_shared<EdgePulse::System::OrgRepository>(m_context->database);
-        m_dictionary = std::make_shared<EdgePulse::System::DictionaryRepository>(m_context->database);
-        m_logs       = std::make_shared<EdgePulse::System::LogRepository>(m_context->database);
-        m_dataScopes = std::make_shared<EdgePulse::Auth::DataScopeService>(m_context->database);
-        m_tenants    = std::make_shared<EdgePulse::System::TenantRepository>(m_context->database);
-        m_server     = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
+        m_context       = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
+        m_users         = std::make_shared<EdgePulse::System::UserRepository>(m_context->database);
+        m_roles         = std::make_shared<EdgePulse::System::RoleRepository>(m_context->database);
+        m_menus         = std::make_shared<EdgePulse::System::MenuRepository>(m_context->database);
+        m_org           = std::make_shared<EdgePulse::System::OrgRepository>(m_context->database);
+        m_dictionary    = std::make_shared<EdgePulse::System::DictionaryRepository>(m_context->database);
+        m_logs          = std::make_shared<EdgePulse::System::LogRepository>(m_context->database);
+        m_dataScopes    = std::make_shared<EdgePulse::Auth::DataScopeService>(m_context->database);
+        m_tenants       = std::make_shared<EdgePulse::System::TenantRepository>(m_context->database);
+        m_notifications = std::make_shared<EdgePulse::Notification::NotificationRepository>(m_context->database);
+        m_server        = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
                     EdgePulse::Web::applySecurityHeaders(router);
@@ -67,6 +70,11 @@ protected:
                     tenantDependencies.auth    = m_context->auth.get();
                     tenantDependencies.tenants = m_tenants.get();
                     EdgePulse::System::registerTenantRoutes(router, loop, tenantDependencies);
+                    EdgePulse::Notification::NotificationDependencies notificationDependencies;
+                    notificationDependencies.auth     = m_context->auth.get();
+                    notificationDependencies.channels = m_notifications.get();
+                    notificationDependencies.tenants  = m_tenants.get();
+                    EdgePulse::Notification::registerNotificationRoutes(router, loop, notificationDependencies);
                     EdgePulse::Monitor::MonitorDependencies monitorDependencies;
                     monitorDependencies.auth       = m_context->auth.get();
                     monitorDependencies.dataScopes = m_dataScopes.get();
@@ -142,16 +150,17 @@ protected:
         return (*response.json())["data"]["id"].get<std::int64_t>();
     }
 
-    std::unique_ptr<EdgePulse::TestSupport::AuthTestContext> m_context;
-    std::shared_ptr<EdgePulse::System::UserRepository>       m_users;
-    std::shared_ptr<EdgePulse::System::RoleRepository>       m_roles;
-    std::shared_ptr<EdgePulse::System::MenuRepository>       m_menus;
-    std::shared_ptr<EdgePulse::System::OrgRepository>        m_org;
-    std::shared_ptr<EdgePulse::System::DictionaryRepository> m_dictionary;
-    std::shared_ptr<EdgePulse::System::LogRepository>        m_logs;
-    std::shared_ptr<EdgePulse::Auth::DataScopeService>       m_dataScopes;
-    std::shared_ptr<EdgePulse::System::TenantRepository>     m_tenants;
-    std::unique_ptr<EdgePulse::TestSupport::ServerHarness>   m_server;
+    std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>         m_context;
+    std::shared_ptr<EdgePulse::System::UserRepository>               m_users;
+    std::shared_ptr<EdgePulse::System::RoleRepository>               m_roles;
+    std::shared_ptr<EdgePulse::System::MenuRepository>               m_menus;
+    std::shared_ptr<EdgePulse::System::OrgRepository>                m_org;
+    std::shared_ptr<EdgePulse::System::DictionaryRepository>         m_dictionary;
+    std::shared_ptr<EdgePulse::System::LogRepository>                m_logs;
+    std::shared_ptr<EdgePulse::Auth::DataScopeService>               m_dataScopes;
+    std::shared_ptr<EdgePulse::System::TenantRepository>             m_tenants;
+    std::shared_ptr<EdgePulse::Notification::NotificationRepository> m_notifications;
+    std::unique_ptr<EdgePulse::TestSupport::ServerHarness>           m_server;
 };
 
 // 钉住：管理端各列表、角色/用户写入、审计落库与导出都走真实 HTTP 与数据库
@@ -250,12 +259,12 @@ TEST_F(SystemEndpointsTest, RoleCustomScopePersistsDepartments)
     ASSERT_EQ(200, before.status) << before.body;
     ASSERT_EQ(2, (*before.json())["data"]["deptIds"].size());
 
-    const std::string updateBody = AsynGyanis::Base::ConfigValue::object({{"dataScope", "CUSTOM"}, {"deptIds", std::vector<std::int64_t>{103}}}).dump();
+    const std::string updateBody = AsynGyanis::Base::ConfigValue::object({{"dataScope", "CUSTOM"}, {"deptIds", std::vector<std::int64_t>{102}}}).dump();
     ASSERT_EQ(200, m_server->send("PUT", "/api/system/roles/" + std::to_string(roleId), updateBody, "application/json", bearer(token)).status);
     const auto after = m_server->get(path, bearer(token));
     ASSERT_EQ(200, after.status) << after.body;
     ASSERT_EQ(1, (*after.json())["data"]["deptIds"].size());
-    EXPECT_EQ(103, (*after.json())["data"]["deptIds"][0].get<std::int64_t>());
+    EXPECT_EQ(102, (*after.json())["data"]["deptIds"][0].get<std::int64_t>());
 
     const std::string emptyBody =
             AsynGyanis::Base::ConfigValue::object({{"name", "空范围"}, {"code", "empty_custom"}, {"dataScope", "CUSTOM"}, {"deptIds", std::vector<std::int64_t>{}}}).dump();
@@ -323,7 +332,28 @@ TEST_F(SystemEndpointsTest, TenantAdminIsIsolatedAndTenantLifecycle)
     EXPECT_EQ(403, m_server->post("/api/system/tenants", createTenantBody, "application/json", bearer(tenantToken)).status);
 
     // 租户管理员建的用户落在本租户；平台管理员按关键字能看到，默认租户管理员看不到
-    const std::int64_t tenantUserId = createUser(tenantToken, "acme-ops", "租户运维", 3);
+    const auto tenantRoles = m_server->get("/api/system/roles?pageNum=1&pageSize=10", bearer(tenantToken));
+    ASSERT_EQ(200, tenantRoles.status) << tenantRoles.body;
+    const auto tenantRoleRows = (*tenantRoles.json())["data"]["rows"];
+    ASSERT_FALSE(tenantRoleRows.empty());
+    const std::int64_t tenantRoleId = tenantRoleRows[0]["id"].get<std::int64_t>();
+    const auto         tenantDepts  = m_server->get("/api/system/depts/tree", bearer(tenantToken));
+    ASSERT_EQ(200, tenantDepts.status) << tenantDepts.body;
+    const auto tenantDeptRows = (*tenantDepts.json())["data"];
+    ASSERT_FALSE(tenantDeptRows.empty());
+    const std::int64_t tenantDeptId = tenantDeptRows[0]["id"].get<std::int64_t>();
+    const auto         tenantUser   = m_server->post("/api/system/users",
+                                                     AsynGyanis::Base::ConfigValue::object({{"username", "acme-ops"},
+                                                                                            {"password", "userpass1"},
+                                                                                            {"nickname", "租户运维"},
+                                                                                            {"deptId", tenantDeptId},
+                                                                                            {"status", 1},
+                                                                                            {"roleIds", std::vector<std::int64_t>{tenantRoleId}},
+                                                                                            {"postIds", std::vector<std::int64_t>{}}})
+                                                             .dump(),
+                                                     "application/json", bearer(tenantToken));
+    ASSERT_EQ(200, tenantUser.status) << tenantUser.body;
+    const std::int64_t tenantUserId = (*tenantUser.json())["data"]["id"].get<std::int64_t>();
     EXPECT_GT(tenantUserId, 0);
     const std::int64_t defaultAdminRole = 3;
     static_cast<void>(createUser(platformToken, "default-ops", "默认运维", defaultAdminRole));
@@ -349,4 +379,100 @@ TEST_F(SystemEndpointsTest, TenantAdminIsIsolatedAndTenantLifecycle)
                                                                                  {"tenantCode", "acme"}})
                                                   .dump();
     EXPECT_EQ(401, m_server->post("/api/auth/login", disabledLoginBody).status);
+}
+
+// 钉住：通知渠道可增删改查，密钥只回报是否已配置，编辑不传密钥时保留原值
+TEST_F(SystemEndpointsTest, NotificationChannelCrudMasksSecret)
+{
+    const std::string token = login("admin", "admin123");
+    const std::string createBody =
+            AsynGyanis::Base::ConfigValue::object(
+                    {{"name", "值班群"}, {"type", "webhook"}, {"endpoint", "https://example.com/hook"}, {"secret", "hook-secret"}, {"minLevel", "warning"}, {"enabled", true}})
+                    .dump();
+    const auto created = m_server->post("/api/system/notifications", createBody, "application/json", bearer(token));
+    ASSERT_EQ(200, created.status) << created.body;
+    const std::int64_t id = (*created.json())["data"]["id"].get<std::int64_t>();
+    EXPECT_GT(id, 0);
+
+    const auto list = m_server->get("/api/system/notifications?pageNum=1&pageSize=10&keyword=值班群", bearer(token));
+    ASSERT_EQ(200, list.status) << list.body;
+    const auto listJson = list.json();
+    ASSERT_TRUE(listJson.has_value());
+    ASSERT_EQ(1, (*listJson)["data"]["total"].get<std::int64_t>());
+    const auto &row = (*listJson)["data"]["rows"][0];
+    EXPECT_FALSE(row.contains("secret"));
+    EXPECT_TRUE(row["secretConfigured"].get<bool>());
+    EXPECT_EQ("warning", row["minLevel"].get<std::string>());
+
+    const std::string updateBody = R"({"name":"值班群-改","type":"webhook","endpoint":"https://example.com/hook","minLevel":"critical","enabled":true})";
+    EXPECT_EQ(200, m_server->send("PUT", "/api/system/notifications/" + std::to_string(id), updateBody, "application/json", bearer(token)).status);
+    const auto after = m_server->get("/api/system/notifications?pageNum=1&pageSize=10&keyword=值班群-改", bearer(token));
+    ASSERT_EQ(200, after.status) << after.body;
+    EXPECT_TRUE((*after.json())["data"]["rows"][0]["secretConfigured"].get<bool>());
+
+    EXPECT_EQ(200, m_server->send("DELETE", "/api/system/notifications/" + std::to_string(id), "", "", bearer(token)).status);
+    const auto empty = m_server->get("/api/system/notifications?pageNum=1&pageSize=10", bearer(token));
+    ASSERT_EQ(200, empty.status);
+    EXPECT_EQ(0, (*empty.json())["data"]["total"].get<std::int64_t>());
+}
+
+// 钉住：租户可自建角色、部门、岗位与字典；跨租户不可见，且不能授予自己没有的菜单权限
+TEST_F(SystemEndpointsTest, TenantScopedRbacAndOrganization)
+{
+    const std::string platformToken = login("admin", "admin123");
+    const auto        createdTenant = m_server->post(
+            "/api/system/tenants",
+            AsynGyanis::Base::ConfigValue::object({{"code", "rbac_b"}, {"name", "权限租户"}, {"adminUsername", "rbac-admin"}, {"adminPassword", "rbac-pass-1"}}).dump(),
+            "application/json", bearer(platformToken));
+    ASSERT_EQ(200, createdTenant.status) << createdTenant.body;
+    const std::string tenantToken = loginInTenant("rbac-admin", "rbac-pass-1", "rbac_b");
+
+    const auto rolesBefore = m_server->get("/api/system/roles?pageNum=1&pageSize=10", bearer(tenantToken));
+    ASSERT_EQ(200, rolesBefore.status) << rolesBefore.body;
+    ASSERT_EQ(1, (*rolesBefore.json())["data"]["total"].get<std::int64_t>());
+    const std::int64_t ownRoleId = (*rolesBefore.json())["data"]["rows"][0]["id"].get<std::int64_t>();
+    EXPECT_EQ(200, m_server->get("/api/system/roles/" + std::to_string(ownRoleId) + "/menus", bearer(tenantToken)).status);
+    EXPECT_EQ(404, m_server->get("/api/system/roles/2/menus", bearer(tenantToken)).status);
+
+    const auto role = m_server->post(
+            "/api/system/roles",
+            AsynGyanis::Base::ConfigValue::object(
+                    {{"name", "租户只读"}, {"code", "rbac_readonly"}, {"dataScope", "SELF"}, {"sort", 10}, {"status", 1}, {"menuIds", std::vector<std::int64_t>{1300}}})
+                    .dump(),
+            "application/json", bearer(tenantToken));
+    ASSERT_EQ(200, role.status) << role.body;
+    const auto escalated = m_server->post(
+            "/api/system/roles",
+            AsynGyanis::Base::ConfigValue::object({{"name", "越权"}, {"code", "rbac_escalate"}, {"dataScope", "SELF"}, {"status", 1}, {"menuIds", std::vector<std::int64_t>{1103}}})
+                    .dump(),
+            "application/json", bearer(tenantToken));
+    EXPECT_EQ(403, escalated.status) << escalated.body;
+
+    // 平台默认租户的部门、岗位与字典不出现在租户视图里
+    const auto tenantDepts = m_server->get("/api/system/depts/tree?keyword=研发中心", bearer(tenantToken));
+    ASSERT_EQ(200, tenantDepts.status) << tenantDepts.body;
+    EXPECT_EQ(0U, (*tenantDepts.json())["data"].size());
+    const auto dept = m_server->post("/api/system/depts", R"({"parentId":0,"name":"租户研发","sort":1,"status":1})", "application/json", bearer(tenantToken));
+    ASSERT_EQ(200, dept.status) << dept.body;
+
+    const auto platformPost =
+            m_server->post("/api/system/posts", R"({"postCode":"platform_post","postName":"平台岗位","sort":10,"status":1})", "application/json", bearer(platformToken));
+    ASSERT_EQ(200, platformPost.status) << platformPost.body;
+    const auto hiddenPost = m_server->get("/api/system/posts?pageNum=1&pageSize=10&keyword=platform_post", bearer(tenantToken));
+    ASSERT_EQ(200, hiddenPost.status) << hiddenPost.body;
+    EXPECT_EQ(0, (*hiddenPost.json())["data"]["total"].get<std::int64_t>());
+    const auto post = m_server->post("/api/system/posts", R"({"postCode":"tenant_ops","postName":"租户运维","sort":10,"status":1})", "application/json", bearer(tenantToken));
+    ASSERT_EQ(200, post.status) << post.body;
+
+    const auto platformDict =
+            m_server->post("/api/system/dict/types", R"({"dictName":"平台字典","dictType":"platform_custom","status":1})", "application/json", bearer(platformToken));
+    ASSERT_EQ(200, platformDict.status) << platformDict.body;
+    const auto hiddenDict = m_server->get("/api/system/dict/types?pageNum=1&pageSize=10&keyword=platform_custom", bearer(tenantToken));
+    ASSERT_EQ(200, hiddenDict.status) << hiddenDict.body;
+    EXPECT_EQ(0, (*hiddenDict.json())["data"]["total"].get<std::int64_t>());
+    const auto dictType = m_server->post("/api/system/dict/types", R"({"dictName":"租户字典","dictType":"tenant_custom","status":1})", "application/json", bearer(tenantToken));
+    ASSERT_EQ(200, dictType.status) << dictType.body;
+    const auto tenantDict = m_server->get("/api/system/dict/types?pageNum=1&pageSize=10&keyword=tenant_custom", bearer(tenantToken));
+    ASSERT_EQ(200, tenantDict.status) << tenantDict.body;
+    EXPECT_EQ(1, (*tenantDict.json())["data"]["total"].get<std::int64_t>());
 }

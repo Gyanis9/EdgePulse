@@ -34,17 +34,20 @@ namespace EdgePulse::Auth
                     scope.userId = userId;
 
                     const std::array<DatabaseValue, 1> userParameter{userId};
-                    const auto                         userRows     = Sql::executeOrThrow(connection, "SELECT dept_id FROM sys_user WHERE id = ? AND deleted = 0", userParameter);
-                    std::int64_t                       departmentId = 0;
+                    const auto   userRows     = Sql::executeOrThrow(connection, "SELECT dept_id, tenant_id FROM sys_user WHERE id = ? AND deleted = 0", userParameter);
+                    std::int64_t departmentId = 0;
+                    std::int64_t tenantId     = 1;
                     if (userRows->next())
                     {
                         departmentId = Sql::integer(*userRows, "dept_id");
+                        tenantId     = Sql::integer(*userRows, "tenant_id");
                     }
 
+                    const std::array<DatabaseValue, 2> roleParameter{userId, tenantId};
                     const auto                roleRows = Sql::executeOrThrow(connection,
                                                                              "SELECT r.id AS role_id, r.data_scope FROM sys_role r JOIN sys_user_role ur ON ur.role_id = r.id "
-                                                                             "WHERE ur.user_id = ? AND r.status = 1 AND r.deleted = 0",
-                                                                             userParameter);
+                                                                             "WHERE ur.user_id = ? AND r.status = 1 AND r.deleted = 0 AND r.tenant_id = ?",
+                                                                             roleParameter);
                     std::vector<std::int64_t> customRoleIds;
                     bool                      hasDepartment = false;
                     bool                      hasSelf       = false;
@@ -77,7 +80,8 @@ namespace EdgePulse::Auth
 
                     // 部门树在内存里展开，避免依赖两家数据库各不相同的递归语法
                     std::unordered_map<std::int64_t, std::vector<std::int64_t>> children;
-                    const auto                                                  deptRows = Sql::executeOrThrow(connection, "SELECT id, parent_id FROM sys_dept WHERE deleted = 0");
+                    const auto                                                  deptRows =
+                            Sql::executeOrThrow(connection, "SELECT id, parent_id FROM sys_dept WHERE deleted = 0 AND tenant_id = ?", std::array<DatabaseValue, 1>{tenantId});
                     while (deptRows->next())
                     {
                         children[Sql::integer(*deptRows, "parent_id")].push_back(Sql::integer(*deptRows, "id"));
@@ -89,8 +93,10 @@ namespace EdgePulse::Auth
                     }
                     for (const std::int64_t roleId: customRoleIds)
                     {
-                        const std::array<DatabaseValue, 1> roleParameter{roleId};
-                        const auto                         customRows = Sql::executeOrThrow(connection, "SELECT dept_id FROM sys_role_dept WHERE role_id = ?", roleParameter);
+                        const auto customRows = Sql::executeOrThrow(
+                                connection,
+                                "SELECT rd.dept_id FROM sys_role_dept rd JOIN sys_dept d ON d.id = rd.dept_id AND d.deleted = 0 AND d.tenant_id = ? WHERE rd.role_id = ?",
+                                std::array<DatabaseValue, 2>{tenantId, roleId});
                         while (customRows->next())
                         {
                             roots.push_back(Sql::integer(*customRows, "dept_id"));

@@ -19,6 +19,7 @@ export interface NodeWriteRequest {
   labels?: Record<string, string> | null
   groupId?: number
   version?: number
+  tenantId?: number
 }
 
 export function createDeviceApi(client: HttpClient) {

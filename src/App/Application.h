@@ -80,6 +80,13 @@ namespace EdgePulse::System
     class UserRepository;
 } // namespace EdgePulse::System
 
+namespace EdgePulse::Notification
+{
+    class NotificationDispatcher;
+    class NotificationRepository;
+    class NotificationService;
+} // namespace EdgePulse::Notification
+
 namespace EdgePulse::Telemetry
 {
     class TelemetryRepository;
@@ -107,6 +114,7 @@ namespace EdgePulse::Ops
 namespace EdgePulse::Web
 {
     class BrowserWebSocket;
+    class RealtimeBus;
     class SseBroadcaster;
 } // namespace EdgePulse::Web
 
@@ -162,58 +170,70 @@ namespace EdgePulse::App
          */
         void registerPublicRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop);
 
+        /**
+         * @brief 周期推进到期的计划命令
+         * @param loop 服务器所属事件循环
+         * @return AsynGyanis::Core::Task<> 周期协程，活到应用析构
+         */
+        AsynGyanis::Core::Task<> runCommandScheduler(AsynGyanis::Core::EventLoop &loop);
+
     private:
         ApplicationConfiguration                                  m_configuration;
         std::filesystem::path                                     m_webRoot; ///< 前端构建产物目录
         std::unique_ptr<AsynGyanis::Core::IoContext>              m_ioContext;
-        std::shared_ptr<Common::Database>                         m_database;             ///< 进程级数据库
-        std::shared_ptr<Cache::KeyValueStore>                     m_cache;                ///< 会话与验证码存储
-        std::shared_ptr<Auth::SessionStore>                       m_sessionStore;         ///< 会话表
-        std::shared_ptr<Auth::CaptchaService>                     m_captchaService;       ///< 验证码
-        std::shared_ptr<Auth::LoginAudit>                         m_loginAudit;           ///< 登录审计
-        std::shared_ptr<Auth::AuthService>                        m_authService;          ///< 认证服务
-        std::unique_ptr<Auth::OidcService>                        m_oidcService;          ///< OIDC 登录
-        std::shared_ptr<Web::BrowserWebSocket>                    m_browserWebSocket;     ///< 浏览器 WebSocket 与节点扇出
-        std::shared_ptr<Device::NodeRepository>                   m_nodeRepository;       ///< 节点仓储
-        std::shared_ptr<Device::NodeService>                      m_nodeService;          ///< 节点服务
-        std::shared_ptr<Device::AgentRegistry>                    m_agentRegistry;        ///< Agent 注册表
-        std::shared_ptr<System::UserRepository>                   m_userRepository;       ///< 用户仓储
-        std::shared_ptr<System::RoleRepository>                   m_roleRepository;       ///< 角色仓储
-        std::shared_ptr<System::MenuRepository>                   m_menuRepository;       ///< 菜单仓储
-        std::shared_ptr<System::OrgRepository>                    m_orgRepository;        ///< 部门与岗位
-        std::shared_ptr<System::DictionaryRepository>             m_dictionaryRepository; ///< 字典与参数
-        std::shared_ptr<System::TenantRepository>                 m_tenantRepository;     ///< 租户
-        std::shared_ptr<System::LogRepository>                    m_logRepository;        ///< 日志与统计
-        std::shared_ptr<Auth::DataScopeService>                   m_dataScopeService;     ///< 数据范围
-        std::shared_ptr<Device::NodeGroupRepository>              m_nodeGroupRepository;  ///< 节点分组
-        std::shared_ptr<Telemetry::TelemetryRepository>           m_telemetryRepository;  ///< 遥测
-        std::unique_ptr<Telemetry::UdpTelemetryEndpoint>          m_udpTelemetry;         ///< UDP 遥测监听
-        std::optional<AsynGyanis::Core::Task<>>                   m_udpListen;            ///< UDP 收包协程
-        std::shared_ptr<Alarm::AlarmRepository>                   m_alarmRepository;      ///< 告警
-        std::shared_ptr<Alarm::AlarmService>                      m_alarmService;         ///< 告警评估
-        std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;   ///< 固件
-        std::shared_ptr<Command::CommandRepository>               m_commandRepository;    ///< 命令
-        std::shared_ptr<Command::AgentChannelRegistry>            m_agentChannels;        ///< Agent 长连接
-        std::shared_ptr<Ops::OpsRepository>                       m_opsRepository;        ///< 运维总览
-        std::shared_ptr<Web::SseBroadcaster>                      m_sseBroadcaster;       ///< 告警 SSE
-        std::unique_ptr<AsynGyanis::Net::Router>                  m_h3Router;             ///< h3 专属路由器
-        std::unique_ptr<AsynGyanis::Net::HttpServer>              m_httpServer;           ///< 8080 开发口
-        std::optional<AsynGyanis::Core::Task<>>                   m_acceptTask;           ///< 8080 接受协程
-        std::unique_ptr<AsynGyanis::Net::HttpsServer>             m_httpsServer;          ///< 8443 控制台
-        std::optional<AsynGyanis::Core::Task<>>                   m_httpsAccept;          ///< 8443 接受协程
-        std::unique_ptr<AsynGyanis::Net::QuicServer>              m_quicServer;           ///< 8443/UDP h3
-        std::optional<AsynGyanis::Core::Task<>>                   m_quicListen;           ///< h3 监听协程
-        std::unique_ptr<AsynGyanis::Net::HttpsServer>             m_agentServer;          ///< 9443 mTLS
-        std::optional<AsynGyanis::Core::Task<>>                   m_agentAccept;          ///< 9443 接受协程
-        std::unique_ptr<AsynGyanis::Net::HttpServer>              m_opsServer;            ///< 9100 运维口
-        std::optional<AsynGyanis::Core::Task<>>                   m_opsAccept;            ///< 9100 接受协程
-        std::optional<AsynGyanis::Core::Task<>>                   m_shutdownTask;         ///< 排空协程，活到应用析构
-        std::optional<std::jthread>                               m_stopThread;           ///< 从池外叫停 IoContext 的线程
-        std::jthread                                              m_healthProbe;          ///< 数据库健康探针
-        std::unique_ptr<AsynGyanis::Net::OtlpHttpMetricsExporter> m_metricsExporter;      ///< OTLP 读数出口
-        std::optional<AsynGyanis::Core::ProcessMetricHandle>      m_buildInfoMetric;      ///< 构建信息读数
-        std::atomic<bool>                                         m_ready{false};         ///< 就绪探针的对外状态
-        std::atomic<bool>                                         m_databaseReady{true};  ///< 最近一轮数据库探针
+        std::shared_ptr<Common::Database>                         m_database;               ///< 进程级数据库
+        std::shared_ptr<Cache::KeyValueStore>                     m_cache;                  ///< 会话与验证码存储
+        std::shared_ptr<Auth::SessionStore>                       m_sessionStore;           ///< 会话表
+        std::shared_ptr<Auth::CaptchaService>                     m_captchaService;         ///< 验证码
+        std::shared_ptr<Auth::LoginAudit>                         m_loginAudit;             ///< 登录审计
+        std::shared_ptr<Auth::AuthService>                        m_authService;            ///< 认证服务
+        std::unique_ptr<Auth::OidcService>                        m_oidcService;            ///< OIDC 登录
+        std::shared_ptr<Web::BrowserWebSocket>                    m_browserWebSocket;       ///< 浏览器 WebSocket 与节点扇出
+        std::shared_ptr<Device::NodeRepository>                   m_nodeRepository;         ///< 节点仓储
+        std::shared_ptr<Device::NodeService>                      m_nodeService;            ///< 节点服务
+        std::shared_ptr<Device::AgentRegistry>                    m_agentRegistry;          ///< Agent 注册表
+        std::shared_ptr<System::UserRepository>                   m_userRepository;         ///< 用户仓储
+        std::shared_ptr<System::RoleRepository>                   m_roleRepository;         ///< 角色仓储
+        std::shared_ptr<System::MenuRepository>                   m_menuRepository;         ///< 菜单仓储
+        std::shared_ptr<System::OrgRepository>                    m_orgRepository;          ///< 部门与岗位
+        std::shared_ptr<System::DictionaryRepository>             m_dictionaryRepository;   ///< 字典与参数
+        std::shared_ptr<System::TenantRepository>                 m_tenantRepository;       ///< 租户
+        std::shared_ptr<System::LogRepository>                    m_logRepository;          ///< 日志与统计
+        std::shared_ptr<Auth::DataScopeService>                   m_dataScopeService;       ///< 数据范围
+        std::shared_ptr<Device::NodeGroupRepository>              m_nodeGroupRepository;    ///< 节点分组
+        std::shared_ptr<Telemetry::TelemetryRepository>           m_telemetryRepository;    ///< 遥测
+        std::unique_ptr<Telemetry::UdpTelemetryEndpoint>          m_udpTelemetry;           ///< UDP 遥测监听
+        std::optional<AsynGyanis::Core::Task<>>                   m_udpListen;              ///< UDP 收包协程
+        std::shared_ptr<Alarm::AlarmRepository>                   m_alarmRepository;        ///< 告警
+        std::shared_ptr<Alarm::AlarmService>                      m_alarmService;           ///< 告警评估
+        std::shared_ptr<Notification::NotificationRepository>     m_notificationRepository; ///< 通知渠道
+        std::shared_ptr<Notification::NotificationService>        m_notificationService;    ///< 通知投递
+        std::shared_ptr<Notification::NotificationDispatcher>     m_notificationDispatcher; ///< 通知队列
+        std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;     ///< 固件
+        std::shared_ptr<Command::CommandRepository>               m_commandRepository;      ///< 命令
+        std::optional<AsynGyanis::Core::Task<>>                   m_commandScheduler;       ///< 计划命令推进协程
+        std::shared_ptr<Command::AgentChannelRegistry>            m_agentChannels;          ///< Agent 长连接
+        std::shared_ptr<Ops::OpsRepository>                       m_opsRepository;          ///< 运维总览
+        std::shared_ptr<Web::SseBroadcaster>                      m_sseBroadcaster;         ///< 告警 SSE
+        std::unique_ptr<Web::RealtimeBus>                         m_realtimeBus;            ///< 实时事件跨实例总线
+        std::unique_ptr<AsynGyanis::Net::Router>                  m_h3Router;               ///< h3 专属路由器
+        std::unique_ptr<AsynGyanis::Net::HttpServer>              m_httpServer;             ///< 8080 开发口
+        std::optional<AsynGyanis::Core::Task<>>                   m_acceptTask;             ///< 8080 接受协程
+        std::unique_ptr<AsynGyanis::Net::HttpsServer>             m_httpsServer;            ///< 8443 控制台
+        std::optional<AsynGyanis::Core::Task<>>                   m_httpsAccept;            ///< 8443 接受协程
+        std::unique_ptr<AsynGyanis::Net::QuicServer>              m_quicServer;             ///< 8443/UDP h3
+        std::optional<AsynGyanis::Core::Task<>>                   m_quicListen;             ///< h3 监听协程
+        std::unique_ptr<AsynGyanis::Net::HttpsServer>             m_agentServer;            ///< 9443 mTLS
+        std::optional<AsynGyanis::Core::Task<>>                   m_agentAccept;            ///< 9443 接受协程
+        std::unique_ptr<AsynGyanis::Net::HttpServer>              m_opsServer;              ///< 9100 运维口
+        std::optional<AsynGyanis::Core::Task<>>                   m_opsAccept;              ///< 9100 接受协程
+        std::optional<AsynGyanis::Core::Task<>>                   m_shutdownTask;           ///< 排空协程，活到应用析构
+        std::optional<std::jthread>                               m_stopThread;             ///< 从池外叫停 IoContext 的线程
+        std::jthread                                              m_healthProbe;            ///< 数据库健康探针
+        std::unique_ptr<AsynGyanis::Net::OtlpHttpMetricsExporter> m_metricsExporter;        ///< OTLP 读数出口
+        std::optional<AsynGyanis::Core::ProcessMetricHandle>      m_buildInfoMetric;        ///< 构建信息读数
+        std::atomic<bool>                                         m_ready{false};           ///< 就绪探针的对外状态
+        std::atomic<bool>                                         m_databaseReady{true};    ///< 最近一轮数据库探针
         std::atomic<bool>                                         m_stopRequested{false};
     };
 } // namespace EdgePulse::App

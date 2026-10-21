@@ -114,6 +114,14 @@ namespace EdgePulse::System
          */
         AsynGyanis::Core::Task<bool> hasChildren(AsynGyanis::Core::EventLoop &loop, std::int64_t menuId);
 
+        /**
+         * @brief 一组菜单携带的权限码
+         * @param loop 恢复协程用的事件循环
+         * @param menuIds 菜单标识
+         * @return std::vector<std::string> 非空权限码
+         */
+        AsynGyanis::Core::Task<std::vector<std::string>> permissionsFor(AsynGyanis::Core::EventLoop &loop, std::vector<std::int64_t> menuIds);
+
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
     };

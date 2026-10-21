@@ -16,6 +16,7 @@
 #include "Core/Firmware/FirmwareRepository.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
+#include "Core/System/TenantRepository.h"
 #include "Net/Http/HttpRequest.h"
 #include "Net/Http/HttpRequestBody.h"
 #include "Net/Http/HttpResponse.h"
@@ -48,6 +49,7 @@ namespace EdgePulse::Firmware
         [[nodiscard]] ConfigValue firmwareJson(const FirmwareRecord &record)
         {
             return ConfigValue::object({{"id", record.id},
+                                        {"tenantId", record.tenantId},
                                         {"name", record.name},
                                         {"version", record.version},
                                         {"fileName", record.fileName},
@@ -244,6 +246,15 @@ namespace EdgePulse::Firmware
                                      const auto requestedTenant = Common::queryInteger(query, "tenantId");
                                      if (requestedTenant.has_value() && *requestedTenant > 0)
                                      {
+                                         if (deps->tenants != nullptr)
+                                         {
+                                             const auto tenant = co_await deps->tenants->findById(loop, *requestedTenant);
+                                             if (!tenant.has_value() || tenant->status != 1)
+                                             {
+                                                 fail(response, Common::kCodeBadRequest, "目标租户不存在或已停用", traceId);
+                                                 co_return;
+                                             }
+                                         }
                                          targetTenantId = *requestedTenant;
                                      }
                                  }
@@ -309,6 +320,7 @@ namespace EdgePulse::Firmware
                                  record.storagePath = finalPath;
                                  record.createdBy   = session->userId;
                                  record.createdAt   = Common::nowDateTimeUtc();
+                                 record.tenantId    = targetTenantId;
                                  try
                                  {
                                      static_cast<void>(co_await firmware->create(loop, record));
@@ -351,12 +363,27 @@ namespace EdgePulse::Firmware
                             fail(response, Common::kCodeBadRequest, "nodeIds 不能为空", traceId);
                             co_return;
                         }
-                        const auto  firmwareRepo = deps->firmware->scoped(session->tenantScope());
-                        const auto  commandRepo  = deps->commands->scoped(session->tenantScope());
-                        ConfigValue results      = ConfigValue::array();
-                        for (const std::int64_t nodeId: nodeIds)
+                        const auto batchSize = Json::optionalInteger(*body, "batchSize");
+                        if (batchSize.has_value() && (*batchSize < 1 || *batchSize > 100))
                         {
-                            const std::int64_t taskId = co_await firmwareRepo->createTask(loop, *id, nodeId);
+                            fail(response, Common::kCodeBadRequest, "batchSize 必须在 1 到 100 之间", traceId);
+                            co_return;
+                        }
+                        const std::size_t batchCount   = batchSize.has_value() ? std::min<std::size_t>(static_cast<std::size_t>(*batchSize), nodeIds.size()) : nodeIds.size();
+                        const auto        firmwareRepo = deps->firmware->scoped(session->tenantScope());
+                        const auto        commandRepo  = deps->commands->scoped(session->tenantScope());
+                        ConfigValue       results      = ConfigValue::array();
+                        ConfigValue       deferred     = ConfigValue::array();
+                        for (std::size_t index = 0; index < nodeIds.size(); ++index)
+                        {
+                            const std::int64_t nodeId = nodeIds[index];
+                            if (index >= batchCount)
+                            {
+                                deferred.push_back(nodeId);
+                                continue;
+                            }
+                            const std::int64_t previousFirmwareId = co_await firmwareRepo->latestOtherFirmware(loop, nodeId, *id);
+                            const std::int64_t taskId             = co_await firmwareRepo->createTask(loop, *id, nodeId, previousFirmwareId);
                             if (taskId == 0)
                             {
                                 continue;
@@ -384,6 +411,87 @@ namespace EdgePulse::Firmware
                                 static_cast<void>(co_await deps->notifier(*command));
                             }
                             results.push_back(ConfigValue::object({{"nodeId", nodeId}, {"taskId", taskId}, {"commandId", command->id}}));
+                        }
+                        if (batchSize.has_value())
+                        {
+                            Common::writeSuccess(response, ConfigValue::object({{"deployed", std::move(results)}, {"deferredNodeIds", std::move(deferred)}}), traceId);
+                            co_return;
+                        }
+                        Common::writeSuccess(response, std::move(results), traceId);
+                        co_return;
+                    });
+
+        router.post("/api/firmware/:id/rollback",
+                    [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string traceId = Web::resolveRequestId(request);
+                        const auto        session = co_await Web::requireSession(*deps->auth, loop, request, response, "device:firmware:upload", traceId);
+                        if (!session.has_value())
+                        {
+                            co_return;
+                        }
+                        const auto id   = Common::parsePositiveIdentifier(request.param("id"));
+                        const auto body = request.jsonBody();
+                        if (!id.has_value() || !body.has_value() || !body->is_object())
+                        {
+                            fail(response, Common::kCodeBadRequest, "固件标识或请求正文不合法", traceId);
+                            co_return;
+                        }
+                        const auto nodeIds = Json::integerArrayField(*body, "nodeIds");
+                        if (nodeIds.empty() || nodeIds.size() > 100)
+                        {
+                            fail(response, Common::kCodeBadRequest, "nodeIds 必须是 1 到 100 个节点", traceId);
+                            co_return;
+                        }
+                        const auto  firmwareRepo = deps->firmware->scoped(session->tenantScope());
+                        const auto  commandRepo  = deps->commands->scoped(session->tenantScope());
+                        ConfigValue results      = ConfigValue::array();
+                        for (const std::int64_t nodeId: nodeIds)
+                        {
+                            const std::int64_t targetId = co_await firmwareRepo->rollbackSource(loop, *id, nodeId);
+                            if (targetId == 0)
+                            {
+                                continue;
+                            }
+                            const auto target = co_await firmwareRepo->find(loop, targetId);
+                            if (!target.has_value())
+                            {
+                                continue;
+                            }
+                            const std::int64_t taskId = co_await firmwareRepo->createTask(loop, targetId, nodeId, *id);
+                            if (taskId == 0)
+                            {
+                                continue;
+                            }
+                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(*target), session->userId, 600);
+                            if (!command.has_value())
+                            {
+                                continue;
+                            }
+                            if (deps->channels != nullptr && deps->channels->isConnected(nodeId))
+                            {
+                                const ConfigValue commandValue = ConfigValue::object({{"id", command->id},
+                                                                                      {"nodeId", command->nodeId},
+                                                                                      {"type", command->type},
+                                                                                      {"payload", command->payload},
+                                                                                      {"timeoutSeconds", command->timeoutSeconds}});
+                                const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
+                                if (co_await deps->channels->send(nodeId, message))
+                                {
+                                    static_cast<void>(co_await commandRepo->markDispatched(loop, command->id));
+                                }
+                            }
+                            if (deps->notifier)
+                            {
+                                static_cast<void>(co_await deps->notifier(*command));
+                            }
+                            results.push_back(
+                                    ConfigValue::object({{"nodeId", nodeId}, {"fromFirmwareId", *id}, {"toFirmwareId", targetId}, {"taskId", taskId}, {"commandId", command->id}}));
+                        }
+                        if (results.empty())
+                        {
+                            fail(response, Common::kCodeNotFound, "没有可回滚的历史版本", traceId);
+                            co_return;
                         }
                         Common::writeSuccess(response, std::move(results), traceId);
                         co_return;

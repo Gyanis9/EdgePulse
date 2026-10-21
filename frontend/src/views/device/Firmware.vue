@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { DataTable, Drawer, Field, Select, Tag, TextInput, type Column } from '@/components/ui'
+import { Checkbox, DataTable, Drawer, Field, Select, Tag, TextInput, type Column } from '@/components/ui'
 import { FormDialog, ListPage, PermissionButton } from '@/components/business'
-import { deviceApi, fleetApi, type FirmwareRow, type FirmwareTaskRow, type NodeRow } from '@/api'
+import { deviceApi, fleetApi, systemApi, type FirmwareRow, type FirmwareTaskRow, type NodeRow } from '@/api'
+import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
@@ -32,7 +33,10 @@ const uploadOpen = ref(false)
 const uploadSaving = ref(false)
 const uploadFile = ref<File | null>(null)
 const uploadProgress = ref(0)
-const uploadForm = reactive({ name: '', version: '' })
+const platformAdmin = Boolean(currentUser.value?.platformAdmin)
+const tenants = ref<Array<{ id: number; name: string; code: string }>>([])
+const tenantOptions = ref<Array<{ label: string; value: number }>>([])
+const uploadForm = reactive({ name: '', version: '', tenantId: currentUser.value?.tenantId ?? null as number | null })
 const uploadError = ref('')
 
 function openUpload() {
@@ -56,7 +60,7 @@ async function submitUpload() {
   uploadSaving.value = true
   uploadError.value = ''
   try {
-    await fleetApi.firmware.upload(uploadFile.value, uploadForm.name.trim(), uploadForm.version.trim(), percent => { uploadProgress.value = percent })
+    await fleetApi.firmware.upload(uploadFile.value, uploadForm.name.trim(), uploadForm.version.trim(), percent => { uploadProgress.value = percent }, platformAdmin ? uploadForm.tenantId ?? undefined : undefined)
     pushToast('固件已上传')
     uploadOpen.value = false
     await list.load()
@@ -70,13 +74,18 @@ async function submitUpload() {
 /* ── 下发 ── */
 const deployOpen = ref(false)
 const deployTarget = ref<FirmwareRow | null>(null)
-const deployNodeId = ref<number | null>(null)
+const deployNodeIds = ref<number[]>([])
+const deployBatchSize = ref(1)
+const rollbackOpen = ref(false)
+const rollbackTarget = ref<FirmwareRow | null>(null)
+const rollbackNodeIds = ref<number[]>([])
 const deploySaving = ref(false)
 const nodes = ref<NodeRow[]>([])
 const nodeOptions = computed(() => nodes.value.map(node => ({ label: `${node.name} · ${node.status === 'online' ? '在线' : '离线'}`, value: node.id })))
 async function openDeploy(row: FirmwareRow) {
   deployTarget.value = row
-  deployNodeId.value = null
+  deployNodeIds.value = []
+  deployBatchSize.value = 1
   deployOpen.value = true
   try {
     nodes.value = (await deviceApi.nodes.list({ pageNum: 1, pageSize: 100 })).rows
@@ -84,15 +93,54 @@ async function openDeploy(row: FirmwareRow) {
     toastError(error, '节点加载失败')
   }
 }
+function toggleDeployNode(id: number, checked: boolean) {
+  deployNodeIds.value = checked ? [...deployNodeIds.value, id] : deployNodeIds.value.filter(nodeId => nodeId !== id)
+}
+
 async function submitDeploy() {
-  if (!deployTarget.value || !deployNodeId.value) return
+  if (!deployTarget.value || !deployNodeIds.value.length) return
   deploySaving.value = true
   try {
-    await fleetApi.firmware.deploy(deployTarget.value.id, [deployNodeId.value])
-    pushToast('固件下发任务已创建，Agent 会下载并回报状态')
-    deployOpen.value = false
+    const result = await fleetApi.firmware.deploy(deployTarget.value.id, deployNodeIds.value, deployBatchSize.value)
+    if (Array.isArray(result)) {
+      pushToast('固件下发任务已创建，Agent 会下载并回报状态')
+      deployOpen.value = false
+      return
+    }
+    if (result.deferredNodeIds.length) {
+      // 保持对话框打开并选中剩余节点，便于按批继续灰度
+      deployNodeIds.value = result.deferredNodeIds
+      pushToast(`本批已下发 ${result.deployed.length} 个节点，剩余 ${result.deferredNodeIds.length} 个可继续下发`)
+    } else {
+      pushToast(`本批已下发 ${result.deployed.length} 个节点，灰度完成`)
+      deployOpen.value = false
+    }
   } catch (error) {
     toastError(error, '固件下发失败')
+  } finally {
+    deploySaving.value = false
+  }
+}
+
+function openRollback(row: FirmwareRow) {
+  rollbackTarget.value = row
+  rollbackNodeIds.value = []
+  rollbackOpen.value = true
+  if (!nodes.value.length) {
+    deviceApi.nodes.list({ pageNum: 1, pageSize: 100 }).then(page => { nodes.value = page.rows }).catch(() => undefined)
+  }
+}
+
+async function submitRollback() {
+  if (!rollbackTarget.value || !rollbackNodeIds.value.length) return
+  deploySaving.value = true
+  try {
+    const result = await fleetApi.firmware.rollback(rollbackTarget.value.id, rollbackNodeIds.value)
+    pushToast(`已为 ${result.length} 个节点安排回滚`)
+    rollbackOpen.value = false
+    await list.load()
+  } catch (error) {
+    toastError(error, '固件回滚失败')
   } finally {
     deploySaving.value = false
   }
@@ -134,8 +182,16 @@ async function remove(row: FirmwareRow) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   list.load()
+  if (!platformAdmin) return
+  try {
+    const page = await systemApi.tenants.list({ pageNum: 1, pageSize: 100, status: '1' })
+    tenants.value = page.rows.map(row => ({ id: row.id, name: row.name, code: row.code }))
+    tenantOptions.value = tenants.value.map(t => ({ label: `${t.name}（${t.code}）`, value: t.id }))
+  } catch {
+    tenantOptions.value = []
+  }
 })
 </script>
 
@@ -153,12 +209,16 @@ onMounted(() => {
       <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
       <template #cell-actions="{ row }">
         <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="send" label="下发" @click="openDeploy(row)" />
+        <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="refresh" label="回滚" @click="openRollback(row)" />
         <PermissionButton perm="device:firmware:list" variant="text" size="sm" icon="activity" label="任务" @click="openTasks(row)" />
         <PermissionButton perm="device:firmware:remove" variant="text" size="sm" danger icon="trash" label="删除" @click="remove(row)" />
       </template>
     </ListPage>
 
     <FormDialog :open="uploadOpen" title="上传固件" sub="支持大文件流式上传；摘要由服务端边收边算。" :saving="uploadSaving" @close="uploadOpen = false" @submit="submitUpload">
+      <Field v-if="platformAdmin" label="所属租户" hint="默认落在当前租户">
+        <Select v-model="uploadForm.tenantId" :options="tenantOptions" placeholder="选择租户" />
+      </Field>
       <Field label="固件名称" required><TextInput v-model="uploadForm.name" placeholder="例如 EdgePulse OS" /></Field>
       <Field label="版本" required><TextInput v-model="uploadForm.version" placeholder="1.2.3" /></Field>
       <Field label="文件" required>
@@ -169,8 +229,28 @@ onMounted(() => {
       <p v-if="uploadError" class="form-error">{{ uploadError }}</p>
     </FormDialog>
 
-    <FormDialog :open="deployOpen" title="下发固件" :sub="deployTarget ? `${deployTarget.name} ${deployTarget.version}` : ''" :saving="deploySaving" @close="deployOpen = false" @submit="submitDeploy">
-      <Field label="目标节点" required><Select v-model="deployNodeId" :options="nodeOptions" placeholder="选择节点" filterable /></Field>
+    <FormDialog :open="deployOpen" title="灰度下发固件" :sub="deployTarget ? `${deployTarget.name} ${deployTarget.version}` : ''" :saving="deploySaving" @close="deployOpen = false" @submit="submitDeploy">
+      <Field label="目标节点" required hint="按列表顺序取本批节点；剩余节点会保留在对话框中">
+        <div class="node-picker">
+          <label v-for="node in nodes" :key="node.id" class="node-picker-row">
+            <Checkbox :model-value="deployNodeIds.includes(node.id)" @update:model-value="toggleDeployNode(node.id, $event)" />
+            <span>{{ node.name }}</span>
+            <span class="faint">{{ node.status === 'online' ? '在线' : '离线' }}</span>
+          </label>
+        </div>
+      </Field>
+      <Field label="本批数量" hint="1–100；小于所选节点数时剩余节点留在对话框中"><TextInput v-model.number="deployBatchSize" type="number" /></Field>
+    </FormDialog>
+
+    <FormDialog :open="rollbackOpen" title="回滚固件" :sub="rollbackTarget ? `从 ${rollbackTarget.name} ${rollbackTarget.version} 回滚` : ''" :saving="deploySaving" @close="rollbackOpen = false" @submit="submitRollback">
+      <Field label="目标节点" required hint="只对记录过上一版本的节点生效">
+        <div class="node-picker">
+          <label v-for="node in nodes" :key="node.id" class="node-picker-row">
+            <Checkbox :model-value="rollbackNodeIds.includes(node.id)" @update:model-value="checked => rollbackNodeIds = checked ? [...rollbackNodeIds, node.id] : rollbackNodeIds.filter(id => id !== node.id)" />
+            <span>{{ node.name }}</span>
+          </label>
+        </div>
+      </Field>
     </FormDialog>
 
     <Drawer :open="tasksOpen" title="下发任务" :sub="deployTarget ? `${deployTarget.name} ${deployTarget.version}` : ''" :width="820" @close="tasksOpen = false">
@@ -181,3 +261,27 @@ onMounted(() => {
     </Drawer>
   </div>
 </template>
+
+<style scoped>
+.node-picker {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.node-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.node-picker-row .faint {
+  margin-left: auto;
+  font-size: 12px;
+}
+</style>

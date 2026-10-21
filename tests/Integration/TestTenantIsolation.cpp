@@ -83,6 +83,8 @@ TEST(TenantIsolation, LoginBindsTenantAndRejectsDisabledTenant)
     const auto rejected = runner.run(context.auth->login(runner.loop(), disabled));
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(401, rejected.error().httpStatus);
+    // 已签发会话也不能继续用
+    EXPECT_FALSE(runner.run(context.auth->authenticate(runner.loop(), loggedIn->token)).has_value());
 }
 
 // 钉住：用户仓储按租户过滤，平台视图可跨租户

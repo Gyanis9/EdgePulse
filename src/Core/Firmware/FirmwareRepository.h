@@ -34,6 +34,7 @@ namespace EdgePulse::Firmware
     struct FirmwareRecord
     {
         std::int64_t id{0};        ///< 主键
+        std::int64_t tenantId{1};  ///< 归属租户
         std::string  name;         ///< 名称
         std::string  version;      ///< 版本
         std::string  fileName;     ///< 原始文件名
@@ -50,15 +51,16 @@ namespace EdgePulse::Firmware
      */
     struct FirmwareTaskRecord
     {
-        std::int64_t id{0};         ///< 主键
-        std::int64_t firmwareId{0}; ///< 固件
-        std::int64_t nodeId{0};     ///< 节点
-        std::string  nodeName;      ///< 节点名
-        std::string  status;        ///< pending/downloading/installed/failed
-        int          progress{0};   ///< 进度 0..100
-        std::string  message;       ///< 说明
-        std::string  createdAt;     ///< 创建时间
-        std::string  updatedAt;     ///< 更新时间
+        std::int64_t id{0};                 ///< 主键
+        std::int64_t firmwareId{0};         ///< 固件
+        std::int64_t nodeId{0};             ///< 节点
+        std::string  nodeName;              ///< 节点名
+        std::string  status;                ///< pending/downloading/installed/failed
+        int          progress{0};           ///< 进度 0..100
+        std::string  message;               ///< 说明
+        std::string  createdAt;             ///< 创建时间
+        std::string  updatedAt;             ///< 更新时间
+        std::int64_t previousFirmwareId{0}; ///< 下发前版本
     };
 
     /**
@@ -114,9 +116,28 @@ namespace EdgePulse::Firmware
          * @param loop 恢复协程用的事件循环
          * @param firmwareId 固件
          * @param nodeId 节点
+         * @param previousFirmwareId 下发前版本，供回滚
          * @return std::int64_t 任务标识；重复下发返回 0
          */
-        AsynGyanis::Core::Task<std::int64_t> createTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t nodeId);
+        AsynGyanis::Core::Task<std::int64_t> createTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t nodeId, std::int64_t previousFirmwareId = 0);
+
+        /**
+         * @brief 节点最近一次安装过的其他版本
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点
+         * @param excludeFirmwareId 排除的固件
+         * @return std::int64_t 固件标识；没有历史时 0
+         */
+        AsynGyanis::Core::Task<std::int64_t> latestOtherFirmware(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::int64_t excludeFirmwareId);
+
+        /**
+         * @brief 某个固件在节点上的回滚目标版本
+         * @param loop 恢复协程用的事件循环
+         * @param firmwareId 当前固件
+         * @param nodeId 节点
+         * @return std::int64_t 固件标识；没有记录时 0
+         */
+        AsynGyanis::Core::Task<std::int64_t> rollbackSource(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t nodeId);
 
         /**
          * @brief 查询固件的下发任务

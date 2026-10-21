@@ -125,17 +125,24 @@ TEST(SystemServices, DataScopeFollowsRoleConfiguration)
     customWrite.name                = "自定义范围";
     customWrite.code                = "custom_scope";
     customWrite.dataScope           = "CUSTOM";
-    customWrite.deptIds             = std::vector<std::int64_t>{103};
+    customWrite.deptIds             = std::vector<std::int64_t>{102};
     const std::int64_t customRole   = runner.run(roles.create(runner.loop(), customWrite, 1));
+    ASSERT_GT(customRole, 0);
+    const auto customStored = runner.run(roles.findById(runner.loop(), customRole));
+    ASSERT_TRUE(customStored.has_value());
+    EXPECT_EQ("CUSTOM", customStored->dataScope);
+    EXPECT_EQ(1, customStored->status);
     UserWrite          customUser   = newUser("dave", "戴夫", 101);
     customUser.roleIds              = std::vector<std::int64_t>{customRole};
     const std::int64_t customUserId = runner.run(users.create(runner.loop(), customUser, EdgePulse::Common::hashPassword("dave12345"), 1));
+    ASSERT_GT(customUserId, 0);
+    EXPECT_EQ(std::vector<std::int64_t>{customRole}, runner.run(users.roleIdsFor(runner.loop(), customUserId)));
     const auto         customScope  = runner.run(scopes.resolve(runner.loop(), customUserId));
     EXPECT_FALSE(customScope.all);
     EXPECT_FALSE(customScope.selfOnly);
-    EXPECT_NE(customScope.deptIds.end(), std::find(customScope.deptIds.begin(), customScope.deptIds.end(), 103));
+    EXPECT_NE(customScope.deptIds.end(), std::find(customScope.deptIds.begin(), customScope.deptIds.end(), 102));
     EXPECT_EQ(customScope.deptIds.end(), std::find(customScope.deptIds.begin(), customScope.deptIds.end(), 101));
-    EXPECT_EQ(std::vector<std::int64_t>{103}, runner.run(roles.deptIdsFor(runner.loop(), customRole)));
+    EXPECT_EQ(std::vector<std::int64_t>{102}, runner.run(roles.deptIdsFor(runner.loop(), customRole)));
 
     const auto adminScope = runner.run(scopes.resolve(runner.loop(), 1));
     EXPECT_TRUE(adminScope.all);

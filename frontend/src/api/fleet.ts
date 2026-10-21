@@ -84,6 +84,8 @@ export interface CommandRow {
   dispatchedAt: string
   finishedAt: string
   timeoutSeconds: number
+  scheduledAt: string
+  batchId: number
 }
 
 export interface FirmwareRow {
@@ -96,6 +98,12 @@ export interface FirmwareRow {
   sha256: string
   createdAt: string
   createdBy: number
+}
+
+export interface FirmwareDeployItem {
+  nodeId: number
+  taskId: number
+  commandId: number
 }
 
 export interface FirmwareTaskRow {
@@ -142,14 +150,19 @@ export function createFleetApi(client: HttpClient) {
     commands: {
       list: (query?: QueryParams) => client.get<PageResult<CommandRow>>('/commands', query),
       create: (body: { nodeId: number; type: string; payload: string; timeoutSeconds: number }) => client.post<CommandRow>('/commands', body),
+      batch: (body: { nodeIds: number[]; type: string; payload: string; timeoutSeconds: number; scheduledAt?: string }) =>
+        client.post<{ batchId: number; commands: CommandRow[] }>('/commands/batch', body),
       cancel: (id: number) => client.put<CommandRow>(`/commands/${id}/cancel`, {}),
     },
     firmware: {
       list: (query?: QueryParams) => client.get<PageResult<FirmwareRow>>('/firmware', query),
       remove: (id: number) => client.delete<void>(`/firmware/${id}`),
       tasks: (id: number) => client.get<FirmwareTaskRow[]>(`/firmware/${id}/tasks`),
-      deploy: (id: number, nodeIds: number[]) => client.post<Array<{ nodeId: number; taskId: number; commandId: number }>>(`/firmware/${id}/deploy`, { nodeIds }),
-      upload: (file: File, name: string, version: string, onProgress?: (percent: number) => void) => uploadFirmware(file, name, version, onProgress),
+      deploy: (id: number, nodeIds: number[], batchSize?: number) =>
+        client.post<FirmwareDeployItem[] | { deployed: FirmwareDeployItem[]; deferredNodeIds: number[] }>(`/firmware/${id}/deploy`, batchSize ? { nodeIds, batchSize } : { nodeIds }),
+      rollback: (id: number, nodeIds: number[]) =>
+        client.post<Array<{ nodeId: number; fromFirmwareId: number; toFirmwareId: number; taskId: number; commandId: number }>>(`/firmware/${id}/rollback`, { nodeIds }),
+      upload: (file: File, name: string, version: string, onProgress?: (percent: number) => void, tenantId?: number) => uploadFirmware(file, name, version, onProgress, tenantId),
     },
     ops: {
       summary: () => client.get<OpsSummary>('/ops/summary'),
@@ -158,7 +171,7 @@ export function createFleetApi(client: HttpClient) {
   }
 }
 
-function uploadFirmware(file: File, name: string, version: string, onProgress?: (percent: number) => void): Promise<FirmwareRow> {
+function uploadFirmware(file: File, name: string, version: string, onProgress?: (percent: number) => void, tenantId?: number): Promise<FirmwareRow> {
   return new Promise((resolve, reject) => {
     const token = authSession.token()
     if (!token) {
@@ -166,6 +179,7 @@ function uploadFirmware(file: File, name: string, version: string, onProgress?: 
       return
     }
     const query = new URLSearchParams({ name, version, fileName: file.name })
+    if (tenantId) query.set('tenantId', String(tenantId))
     const request = new XMLHttpRequest()
     request.open('POST', `/api/firmware?${query.toString()}`)
     request.setRequestHeader('Authorization', `Bearer ${token}`)

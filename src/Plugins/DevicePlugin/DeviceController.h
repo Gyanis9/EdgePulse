@@ -32,6 +32,11 @@ namespace EdgePulse::Auth
     class DataScopeService;
 }
 
+namespace EdgePulse::System
+{
+    class TenantRepository;
+}
+
 namespace EdgePulse::Device
 {
     class NodeService;
@@ -60,7 +65,8 @@ namespace EdgePulse::Device
      * @param nodeService 节点服务
      * @param accessResolver 身份解析回调，由 App 用认证服务注入
      * @param dataScopes 数据范围解析；空表示不限制
+     * @param tenants 租户仓储，平台管理员按 tenantId 指定节点归属
      */
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes = nullptr);
+                        Auth::DataScopeService *dataScopes = nullptr, System::TenantRepository *tenants = nullptr);
 } // namespace EdgePulse::Device

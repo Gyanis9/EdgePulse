@@ -15,6 +15,7 @@
 
 #include <Core/Coroutine/Task.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -47,6 +48,8 @@ namespace EdgePulse::Command
         std::string  dispatchedAt;       ///< 下发时间
         std::string  finishedAt;         ///< 结束时间
         int          timeoutSeconds{60}; ///< 超时秒数
+        std::string  scheduledAt;        ///< 计划执行时间，空表示立即
+        std::int64_t batchId{0};         ///< 批量标识，0 表示单条
     };
 
     /**
@@ -72,10 +75,12 @@ namespace EdgePulse::Command
          * @param payload JSON 载荷
          * @param createdBy 创建人
          * @param timeoutSeconds 超时秒数
+         * @param scheduledAt 计划执行时间（SQL DATETIME），空表示立即
+         * @param batchId 批量标识，0 表示单条
          * @return std::optional<CommandRecord> 新命令；节点不存在时为空
          */
         AsynGyanis::Core::Task<std::optional<CommandRecord>> create(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string type, std::string payload,
-                                                                    std::int64_t createdBy, int timeoutSeconds);
+                                                                    std::int64_t createdBy, int timeoutSeconds, std::string scheduledAt = {}, std::int64_t batchId = 0);
 
         /**
          * @brief 分页查询命令
@@ -103,6 +108,14 @@ namespace EdgePulse::Command
          * @return std::optional<CommandRecord> 命令；没有待执行时为空
          */
         AsynGyanis::Core::Task<std::optional<CommandRecord>> takeNext(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
+
+        /**
+         * @brief 取已到执行时间的待下发命令
+         * @param loop 恢复协程用的事件循环
+         * @param limit 本次最多取多少条
+         * @return std::vector<CommandRecord> 命令
+         */
+        AsynGyanis::Core::Task<std::vector<CommandRecord>> listDue(AsynGyanis::Core::EventLoop &loop, std::size_t limit = 100);
 
         /**
          * @brief 标记命令已下发

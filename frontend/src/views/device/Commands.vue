@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Drawer, Field, Select, StatusTag, Tag, TextInput, type Column } from '@/components/ui'
+import { Checkbox, Drawer, Field, Select, StatusTag, Tag, TextInput, type Column } from '@/components/ui'
 import { FormDialog, ListPage, PermissionButton } from '@/components/business'
 import { deviceApi, fleetApi, type CommandRow, type NodeRow } from '@/api'
 import { useListPage } from '@/composables/list'
@@ -40,7 +40,7 @@ const nodes = ref<NodeRow[]>([])
 const nodeOptions = computed(() => nodes.value.map(node => ({ label: `${node.name} · ${node.status === 'online' ? '在线' : '离线'}`, value: node.id })))
 const dialog = ref(false)
 const saving = ref(false)
-const form = reactive({ nodeId: null as number | null, type: 'reboot', payload: '{}', timeoutSeconds: 60 })
+const form = reactive({ nodeIds: [] as number[], type: 'reboot', payload: '{}', timeoutSeconds: 60, scheduledAt: '' })
 const error = ref('')
 const TYPES = [
   { label: '重启', value: 'reboot' },
@@ -50,10 +50,11 @@ const TYPES = [
 ]
 
 async function openCreate() {
-  form.nodeId = null
+  form.nodeIds = []
   form.type = 'reboot'
   form.payload = '{}'
   form.timeoutSeconds = 60
+  form.scheduledAt = ''
   error.value = ''
   dialog.value = true
   try {
@@ -63,9 +64,26 @@ async function openCreate() {
   }
 }
 
+function toggleNode(id: number, checked: boolean) {
+  form.nodeIds = checked ? [...form.nodeIds, id] : form.nodeIds.filter(nodeId => nodeId !== id)
+}
+
+function toUtcSql(local: string) {
+  if (!local) return undefined
+  const date = new Date(local)
+  if (Number.isNaN(date.getTime())) return null
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
+}
+
 async function submit() {
-  if (!form.nodeId || !form.type.trim()) {
-    error.value = '请选择节点并填写命令类型'
+  if (!form.nodeIds.length || !form.type.trim()) {
+    error.value = '请选择至少一个节点并填写命令类型'
+    return
+  }
+  const scheduledAt = toUtcSql(form.scheduledAt)
+  if (scheduledAt === null) {
+    error.value = '计划时间格式不合法'
     return
   }
   try {
@@ -76,8 +94,8 @@ async function submit() {
   }
   saving.value = true
   try {
-    await fleetApi.commands.create({ nodeId: form.nodeId, type: form.type.trim(), payload: form.payload || '{}', timeoutSeconds: form.timeoutSeconds ?? 60 })
-    pushToast('命令已创建；Agent 在线会立即收到，否则等待轮询')
+    await fleetApi.commands.batch({ nodeIds: form.nodeIds, type: form.type.trim(), payload: form.payload || '{}', timeoutSeconds: form.timeoutSeconds ?? 60, scheduledAt })
+    pushToast(scheduledAt ? `已安排 ${form.nodeIds.length} 条计划命令` : `已向 ${form.nodeIds.length} 个节点下发命令`)
     dialog.value = false
     await list.load()
   } catch (failure) {
@@ -128,10 +146,20 @@ onMounted(() => {
     </ListPage>
 
     <FormDialog :open="dialog" title="下发命令" sub="命令载荷是 JSON；超时时间单位秒。" :saving="saving" @close="dialog = false" @submit="submit">
-      <Field label="目标节点" required><Select v-model="form.nodeId" :options="nodeOptions" placeholder="选择节点" filterable /></Field>
+      <Field label="目标节点" required hint="可多选；在线节点会立即收到，离线节点等待轮询">
+        <div class="node-picker">
+          <label v-for="node in nodes" :key="node.id" class="node-picker-row">
+            <Checkbox :model-value="form.nodeIds.includes(node.id)" @update:model-value="toggleNode(node.id, $event)" />
+            <span>{{ node.name }}</span>
+            <span class="faint">{{ node.status === 'online' ? '在线' : '离线' }}</span>
+          </label>
+          <span v-if="!nodes.length" class="faint">没有可选节点</span>
+        </div>
+      </Field>
       <Field label="命令类型" required><Select v-model="form.type" :options="TYPES" filterable /></Field>
       <Field label="载荷（JSON）"><TextInput v-model="form.payload" placeholder="{}" /></Field>
       <Field label="超时秒数"><TextInput v-model.number="form.timeoutSeconds" placeholder="60" /></Field>
+      <Field label="计划时间" hint="留空立即执行；格式 YYYY-MM-DDTHH:MM，按本地时间解释"><TextInput v-model="form.scheduledAt" placeholder="2026-10-21T20:00" /></Field>
       <p v-if="error" class="form-error">{{ error }}</p>
     </FormDialog>
 
@@ -139,6 +167,8 @@ onMounted(() => {
       <div v-if="detail" class="detail-stack">
         <div class="kv"><div class="kv-label">状态</div><div class="kv-value"><StatusTag :status="detail.status === 'succeeded'" on="已成功" off="未成功" /> {{ STATUS_LABEL[detail.status] }}</div></div>
         <div class="kv"><div class="kv-label">创建 / 结束</div><div class="kv-value mono">{{ detail.createdAt }} → {{ detail.finishedAt || '—' }}</div></div>
+        <div v-if="detail.scheduledAt" class="kv"><div class="kv-label">计划时间</div><div class="kv-value mono">{{ detail.scheduledAt }}</div></div>
+        <div v-if="detail.batchId" class="kv"><div class="kv-label">批次</div><div class="kv-value mono">#{{ detail.batchId }}</div></div>
         <div class="kv"><div class="kv-label">载荷</div><pre class="code-block">{{ pretty(detail.payload) }}</pre></div>
         <div class="kv"><div class="kv-label">结果</div><pre class="code-block">{{ pretty(detail.result) }}</pre></div>
         <div class="kv"><div class="kv-label">说明</div><div class="kv-value">{{ detail.message || '—' }}</div></div>
@@ -146,3 +176,27 @@ onMounted(() => {
     </Drawer>
   </div>
 </template>
+
+<style scoped>
+.node-picker {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.node-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.node-picker-row .faint {
+  margin-left: auto;
+  font-size: 12px;
+}
+</style>

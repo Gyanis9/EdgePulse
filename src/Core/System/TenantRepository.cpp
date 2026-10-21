@@ -169,6 +169,8 @@ namespace EdgePulse::System
 
                     const std::int64_t tenantId = Common::nextIdentifier();
                     const std::int64_t userId   = Common::nextIdentifier();
+                    const std::int64_t deptId   = Common::nextIdentifier();
+                    const std::int64_t roleId   = Common::nextIdentifier();
                     const std::string  now      = Common::nowDateTimeUtc();
                     if (!connection.execute("BEGIN"))
                     {
@@ -185,8 +187,30 @@ namespace EdgePulse::System
                     {
                         return rollback("写入租户失败：" + connection.lastError());
                     }
-                    const std::array<DatabaseValue, 9> userParameters{
-                            userId, tenantId, request.adminUsername, request.adminPasswordHash, request.adminNickname, std::int64_t{100}, now, now, operatorId};
+                    const std::array<DatabaseValue, 7> deptParameters{deptId, tenantId, std::string{"租户根部门"}, now, now, operatorId, operatorId};
+                    if (!connection.execute("INSERT INTO sys_dept (id, tenant_id, parent_id, name, sort, status, deleted, created_at, updated_at, created_by, updated_by) "
+                                            "VALUES (?, ?, 0, ?, 0, 1, 0, ?, ?, ?, ?)",
+                                            deptParameters))
+                    {
+                        return rollback("写入租户根部门失败：" + connection.lastError());
+                    }
+                    const std::string                   roleCode = "tenant_admin_" + request.code;
+                    const std::array<DatabaseValue, 10> roleParameters{roleId,     tenantId,  std::string{"租户管理员"}, roleCode, std::int64_t{0}, std::int64_t{1}, now, now,
+                                                                       operatorId, operatorId};
+                    if (!connection.execute(
+                                "INSERT INTO sys_role (id, tenant_id, role_name, role_code, data_scope, builtin, status, deleted, created_at, updated_at, created_by, updated_by) "
+                                "VALUES (?, ?, ?, ?, 'ALL', ?, ?, 0, ?, ?, ?, ?)",
+                                roleParameters))
+                    {
+                        return rollback("写入租户管理员角色失败：" + connection.lastError());
+                    }
+                    if (!connection.execute("INSERT INTO sys_role_menu (role_id, menu_id) SELECT ?, menu_id FROM sys_role_menu WHERE role_id = 3",
+                                            std::array<DatabaseValue, 1>{roleId}))
+                    {
+                        return rollback("复制租户管理员菜单失败：" + connection.lastError());
+                    }
+                    const std::array<DatabaseValue, 9> userParameters{userId, tenantId,  request.adminUsername, request.adminPasswordHash, request.adminNickname, deptId, now,
+                                                                      now,    operatorId};
                     if (!connection.execute(
                                 "INSERT INTO sys_user (id, tenant_id, username, password, nickname, dept_id, status, deleted, platform_admin, created_at, updated_at, created_by) "
                                 "VALUES (?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, ?)",
@@ -194,7 +218,7 @@ namespace EdgePulse::System
                     {
                         return rollback("写入租户管理员账号失败：" + connection.lastError());
                     }
-                    const std::array<DatabaseValue, 2> userRoleParameters{userId, std::int64_t{3}};
+                    const std::array<DatabaseValue, 2> userRoleParameters{userId, roleId};
                     if (!connection.execute("INSERT INTO sys_user_role (user_id, role_id) VALUES (?, ?)", userRoleParameters))
                     {
                         return rollback("绑定租户管理员角色失败：" + connection.lastError());

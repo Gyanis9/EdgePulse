@@ -267,4 +267,30 @@ namespace EdgePulse::System
                                                                 return rows->next() && Sql::integer(*rows, "total") > 0;
                                                             });
     }
+    AsynGyanis::Core::Task<std::vector<std::string>> MenuRepository::permissionsFor(AsynGyanis::Core::EventLoop &loop, std::vector<std::int64_t> menuIds)
+    {
+        co_return co_await m_database->withConnection<std::vector<std::string>>(loop,
+                                                                                [menuIds = std::move(menuIds)](DatabaseConnection &connection) -> std::vector<std::string>
+                                                                                {
+                                                                                    if (menuIds.empty())
+                                                                                    {
+                                                                                        return {};
+                                                                                    }
+                                                                                    std::string                sql = "SELECT permission FROM sys_menu WHERE id IN (";
+                                                                                    std::vector<DatabaseValue> parameters;
+                                                                                    for (std::size_t index = 0; index < menuIds.size(); ++index)
+                                                                                    {
+                                                                                        sql += index == 0 ? "?" : ", ?";
+                                                                                        parameters.emplace_back(menuIds[index]);
+                                                                                    }
+                                                                                    sql += ") AND permission <> ''";
+                                                                                    const auto               rows = Sql::executeOrThrow(connection, sql, parameters);
+                                                                                    std::vector<std::string> result;
+                                                                                    while (rows->next())
+                                                                                    {
+                                                                                        result.push_back(Sql::text(*rows, "permission"));
+                                                                                    }
+                                                                                    return result;
+                                                                                });
+    }
 } // namespace EdgePulse::System

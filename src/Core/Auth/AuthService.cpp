@@ -18,11 +18,18 @@ namespace EdgePulse::Auth
 {
     namespace
     {
-        constexpr std::size_t          kMinimumPasswordLength = 6;                    ///< 新口令最短长度
-        constexpr std::size_t          kMaximumPasswordLength = 64;                   ///< 新口令最长长度
-        constexpr int                  kMaximumLoginFailures  = 10;                   ///< 单 IP 每分钟失败上限
-        constexpr std::chrono::seconds kLoginFailureWindow{60};                       ///< 失败计数窗口
-        constexpr std::string_view     kLoginFailurePrefix = "edgepulse:login:fail:"; ///< 失败计数键前缀
+        constexpr std::size_t          kMinimumPasswordLength = 6;                       ///< 新口令最短长度
+        constexpr std::size_t          kMaximumPasswordLength = 64;                      ///< 新口令最长长度
+        constexpr int                  kMaximumLoginFailures  = 10;                      ///< 单 IP 每分钟失败上限
+        constexpr std::chrono::seconds kLoginFailureWindow{60};                          ///< 失败计数窗口
+        constexpr std::string_view     kLoginFailurePrefix = "edgepulse:login:fail:";    ///< 失败计数键前缀
+        constexpr std::string_view     kTenantStatusPrefix = "edgepulse:tenant:status:"; ///< 租户启停缓存前缀
+        constexpr std::chrono::seconds kTenantStatusTtl{5};                              ///< 跨实例缓存的最长滞后
+
+        [[nodiscard]] std::string tenantStatusKey(const std::int64_t tenantId)
+        {
+            return std::string{kTenantStatusPrefix} + std::to_string(tenantId);
+        }
 
         [[nodiscard]] std::string ipFailureKey(const std::string &clientIp)
         {
@@ -160,7 +167,37 @@ namespace EdgePulse::Auth
         {
             co_return std::nullopt;
         }
-        co_return co_await m_sessions->validateAndTouch(loop, token);
+        std::optional<SessionRecord> session = co_await m_sessions->validateAndTouch(loop, token);
+        if (!session.has_value())
+        {
+            co_return std::nullopt;
+        }
+        if (session->platformAdmin)
+        {
+            co_return session;
+        }
+        // 停用租户后不能等会话自然过期：用短 TTL 缓存租户状态，更新租户时主动失效
+        const std::string                key     = tenantStatusKey(session->tenantId);
+        const std::optional<std::string> cached  = co_await m_cache->get(loop, key);
+        bool                             enabled = cached.has_value() && *cached == "1";
+        if (!cached.has_value() || (*cached != "1" && *cached != "0"))
+        {
+            const auto tenant = co_await m_tenants->findById(loop, session->tenantId);
+            enabled           = tenant.has_value() && tenant->status == 1;
+            static_cast<void>(co_await m_cache->set(loop, key, enabled ? "1" : "0", kTenantStatusTtl));
+        }
+        if (!enabled)
+        {
+            static_cast<void>(co_await m_sessions->remove(loop, token));
+            co_return std::nullopt;
+        }
+        co_return session;
+    }
+
+    AsynGyanis::Core::Task<void> AuthService::invalidateTenant(AsynGyanis::Core::EventLoop &loop, const std::int64_t tenantId)
+    {
+        static_cast<void>(co_await m_cache->erase(loop, tenantStatusKey(tenantId)));
+        co_return;
     }
 
     AsynGyanis::Core::Task<bool> AuthService::logout(AsynGyanis::Core::EventLoop &loop, const std::string_view token)

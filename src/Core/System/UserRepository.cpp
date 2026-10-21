@@ -143,6 +143,23 @@ namespace EdgePulse::System
                 executeStatement(connection, "INSERT INTO sys_user_post (user_id, post_id) VALUES (?, ?)", parameters);
             }
         }
+
+        [[nodiscard]] bool belongsToTenant(DatabaseConnection &connection, const std::string_view table, const std::int64_t id, const TenantScope &tenant)
+        {
+            if (id <= 0)
+            {
+                return false;
+            }
+            std::vector<DatabaseValue> parameters{id};
+            std::string                sql = "SELECT COUNT(*) AS total FROM " + std::string{table} + " WHERE id = ? AND deleted = 0";
+            if (!tenant.allTenants)
+            {
+                sql += " AND tenant_id = ?";
+                parameters.emplace_back(tenant.tenantId);
+            }
+            const std::unique_ptr<DatabaseResult> result = connection.execute(sql, parameters);
+            return result && result->next() && Sql::integer(*result, "total") > 0;
+        }
     } // namespace
 
     UserRepository::UserRepository(std::shared_ptr<Common::Database> database, TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
@@ -298,6 +315,24 @@ namespace EdgePulse::System
                     {
                         return 0;
                     }
+                    if (write.deptId.has_value() && !belongsToTenant(connection, "sys_dept", *write.deptId, tenant))
+                    {
+                        return 0;
+                    }
+                    for (const std::int64_t roleId: write.roleIds.value_or(std::vector<std::int64_t>{}))
+                    {
+                        if (!belongsToTenant(connection, "sys_role", roleId, tenant))
+                        {
+                            return 0;
+                        }
+                    }
+                    for (const std::int64_t postId: write.postIds.value_or(std::vector<std::int64_t>{}))
+                    {
+                        if (!belongsToTenant(connection, "sys_post", postId, tenant))
+                        {
+                            return 0;
+                        }
+                    }
                     const std::int64_t                  userId   = Common::nextIdentifier();
                     const std::string                   now      = Common::nowDateTimeUtc();
                     const std::string                   username = write.username.value_or(std::string{});
@@ -331,6 +366,24 @@ namespace EdgePulse::System
         co_return co_await m_database->withConnection<bool>(loop,
                                                             [userId, write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
+                                                                if (write.deptId.has_value() && !belongsToTenant(connection, "sys_dept", *write.deptId, tenant))
+                                                                {
+                                                                    return false;
+                                                                }
+                                                                for (const std::int64_t roleId: write.roleIds.value_or(std::vector<std::int64_t>{}))
+                                                                {
+                                                                    if (!belongsToTenant(connection, "sys_role", roleId, tenant))
+                                                                    {
+                                                                        return false;
+                                                                    }
+                                                                }
+                                                                for (const std::int64_t postId: write.postIds.value_or(std::vector<std::int64_t>{}))
+                                                                {
+                                                                    if (!belongsToTenant(connection, "sys_post", postId, tenant))
+                                                                    {
+                                                                        return false;
+                                                                    }
+                                                                }
                                                                 std::string                sql = "UPDATE sys_user SET updated_at = ?, updated_by = ?";
                                                                 std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
                                                                 if (write.username.has_value())

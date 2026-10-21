@@ -35,6 +35,10 @@ namespace EdgePulse::Device
 {
     class NodeRepository;
 }
+namespace EdgePulse::System
+{
+    class TenantRepository;
+}
 namespace EdgePulse::Firmware
 {
     class FirmwareRepository;
@@ -53,6 +57,7 @@ namespace EdgePulse::Firmware
         Command::CommandRepository    *commands{nullptr};                        ///< 命令
         Command::AgentChannelRegistry *channels{nullptr};                        ///< Agent 通道
         Command::CommandNotifier       notifier;                                 ///< 浏览器通知
+        System::TenantRepository      *tenants{nullptr};                         ///< 租户，用于校验平台管理员指定的归属
         std::string                    storageDirectory{"var/firmware"};         ///< 落盘目录
         std::size_t                    maximumUploadBytes{256U * 1024U * 1024U}; ///< 上传上限
     };

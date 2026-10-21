@@ -23,10 +23,15 @@ add_library(edgepulse-core STATIC
         Http/AuditMiddleware.cpp
         Http/Authorization.cpp
         Http/MiddlewareSetup.cpp
+        Http/RealtimeBus.cpp
         Http/ReverseProxy.cpp
         Http/RequestId.cpp
         Http/SseBroadcaster.cpp
         Http/WebSocketEndpoints.cpp
+        Notification/NotificationDispatcher.cpp
+        Notification/NotificationRepository.cpp
+        Notification/NotificationService.cpp
+        Notification/SmtpMailer.cpp
         Ops/OpsRepository.cpp
         System/DictionaryRepository.cpp
         System/LogRepository.cpp

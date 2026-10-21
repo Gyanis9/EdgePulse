@@ -10,6 +10,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -64,19 +65,38 @@ namespace EdgePulse::System
         }
     } // namespace
 
-    RoleRepository::RoleRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    RoleRepository::RoleRepository(std::shared_ptr<Common::Database> database, TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
     }
+
+    std::shared_ptr<RoleRepository> RoleRepository::scoped(const TenantScope tenant) const
+    {
+        return std::make_shared<RoleRepository>(m_database, tenant);
+    }
+
+    namespace
+    {
+        [[nodiscard]] std::string tenantClause(const TenantScope &tenant, std::vector<DatabaseValue> &parameters, const std::string_view column)
+        {
+            if (tenant.allTenants)
+            {
+                return {};
+            }
+            parameters.emplace_back(tenant.tenantId);
+            return " AND " + std::string{column} + " = ?";
+        }
+    } // namespace
 
     AsynGyanis::Core::Task<Common::PageRows<RoleRecord>> RoleRepository::list(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status,
                                                                               const Common::PageParameters &page)
     {
         co_return co_await m_database->withConnection<Common::PageRows<RoleRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status), page](DatabaseConnection &connection) -> Common::PageRows<RoleRecord>
+                [keyword = std::move(keyword), status = std::move(status), page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<RoleRecord>
                 {
                     std::string                filter = "WHERE r.deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    filter += tenantClause(tenant, parameters, "r.tenant_id");
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -114,10 +134,11 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<RoleRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status)](DatabaseConnection &connection) -> std::vector<RoleRecord>
+                [keyword = std::move(keyword), status = std::move(status), tenant = m_tenant](DatabaseConnection &connection) -> std::vector<RoleRecord>
                 {
                     std::string                filter = "WHERE r.deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    filter += tenantClause(tenant, parameters, "r.tenant_id");
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -143,28 +164,31 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<std::optional<RoleRecord>> RoleRepository::findById(AsynGyanis::Core::EventLoop &loop, const std::int64_t roleId)
     {
-        co_return co_await m_database->withConnection<std::optional<RoleRecord>>(loop,
-                                                                                 [roleId](DatabaseConnection &connection) -> std::optional<RoleRecord>
-                                                                                 {
-                                                                                     const std::array<DatabaseValue, 1> parameters{roleId};
-                                                                                     const auto                         rows = Sql::executeOrThrow(
-                                                                                             connection, std::string{kSelectRole} + "WHERE r.id = ? AND r.deleted = 0", parameters);
-                                                                                     if (!rows->next())
-                                                                                     {
-                                                                                         return std::nullopt;
-                                                                                     }
-                                                                                     return readRole(*rows);
-                                                                                 });
+        co_return co_await m_database->withConnection<std::optional<RoleRecord>>(
+                loop,
+                [roleId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<RoleRecord>
+                {
+                    std::vector<DatabaseValue> parameters{roleId};
+                    const std::string          clause = tenantClause(tenant, parameters, "r.tenant_id");
+                    const auto                 rows   = Sql::executeOrThrow(connection, std::string{kSelectRole} + "WHERE r.id = ? AND r.deleted = 0" + clause, parameters);
+                    if (!rows->next())
+                    {
+                        return std::nullopt;
+                    }
+                    return readRole(*rows);
+                });
     }
 
     AsynGyanis::Core::Task<bool> RoleRepository::codeExists(AsynGyanis::Core::EventLoop &loop, std::string code, const std::int64_t excludeRoleId)
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [code = std::move(code), excludeRoleId](DatabaseConnection &connection) -> bool
+                [code = std::move(code), excludeRoleId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 2> parameters{code, excludeRoleId};
-                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_role WHERE role_code = ? AND id <> ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{code, excludeRoleId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto                 rows =
+                            Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_role WHERE role_code = ? AND id <> ? AND deleted = 0" + clause, parameters);
                     return rows->next() && Sql::integer(*rows, "total") > 0;
                 });
     }
@@ -173,11 +197,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [write, operatorId](DatabaseConnection &connection) -> std::int64_t
+                [write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 11> parameters{id,
+                    const std::array<DatabaseValue, 12> parameters{id,
+                                                                   tenant.tenantId,
                                                                    write.name.value_or(std::string{}),
                                                                    write.code.value_or(std::string{}),
                                                                    write.dataScope.value_or(std::string{"SELF"}),
@@ -188,10 +213,11 @@ namespace EdgePulse::System
                                                                    now,
                                                                    now,
                                                                    operatorId};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_role (id, role_name, role_code, data_scope, sort, status, builtin, remark, created_at, updated_at, created_by) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO sys_role (id, tenant_id, role_name, role_code, data_scope, sort, status, builtin, remark, created_at, updated_at, created_by) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     replaceMenus(connection, id, write.menuIds.value_or(std::vector<std::int64_t>{}));
                     replaceDepts(connection, id, write.deptIds.value_or(std::vector<std::int64_t>{}));
                     return id;
@@ -201,7 +227,7 @@ namespace EdgePulse::System
     AsynGyanis::Core::Task<bool> RoleRepository::update(AsynGyanis::Core::EventLoop &loop, const std::int64_t roleId, const RoleWrite &write, const std::int64_t operatorId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [roleId, write, operatorId](DatabaseConnection &connection) -> bool
+                                                            [roleId, write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
                                                                 std::string                sql = "UPDATE sys_role SET updated_at = ?, updated_by = ?";
                                                                 std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
@@ -237,6 +263,7 @@ namespace EdgePulse::System
                                                                 }
                                                                 sql += " WHERE id = ? AND deleted = 0";
                                                                 parameters.emplace_back(roleId);
+                                                                sql += tenantClause(tenant, parameters, "tenant_id");
                                                                 const auto updated = Sql::executeOrThrow(connection, sql, parameters);
                                                                 if (updated->affectedRowCount() == 0)
                                                                 {
@@ -256,33 +283,37 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<bool> RoleRepository::remove(AsynGyanis::Core::EventLoop &loop, const std::int64_t roleId)
     {
-        co_return co_await m_database->withConnection<bool>(loop,
-                                                            [roleId](DatabaseConnection &connection) -> bool
-                                                            {
-                                                                const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), roleId};
-                                                                const auto                         rows = Sql::executeOrThrow(
-                                                                        connection, "UPDATE sys_role SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
-                                                                if (rows->affectedRowCount() == 0)
-                                                                {
-                                                                    return false;
-                                                                }
-                                                                const std::array<DatabaseValue, 1> roleParameter{roleId};
-                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_role_menu WHERE role_id = ?", roleParameter);
-                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_user_role WHERE role_id = ?", roleParameter);
-                                                                Sql::executeOrThrowVoid(connection, "DELETE FROM sys_role_dept WHERE role_id = ?", roleParameter);
-                                                                return true;
-                                                            });
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [roleId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), roleId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, "UPDATE sys_role SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
+                    if (rows->affectedRowCount() == 0)
+                    {
+                        return false;
+                    }
+                    const std::array<DatabaseValue, 1> roleParameter{roleId};
+                    Sql::executeOrThrowVoid(connection, "DELETE FROM sys_role_menu WHERE role_id = ?", roleParameter);
+                    Sql::executeOrThrowVoid(connection, "DELETE FROM sys_user_role WHERE role_id = ?", roleParameter);
+                    Sql::executeOrThrowVoid(connection, "DELETE FROM sys_role_dept WHERE role_id = ?", roleParameter);
+                    return true;
+                });
     }
 
     AsynGyanis::Core::Task<std::vector<std::int64_t>> RoleRepository::menuIdsFor(AsynGyanis::Core::EventLoop &loop, const std::int64_t roleId)
     {
         co_return co_await m_database->withConnection<std::vector<std::int64_t>>(
                 loop,
-                [roleId](DatabaseConnection &connection) -> std::vector<std::int64_t>
+                [roleId, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<std::int64_t>
                 {
-                    const std::array<DatabaseValue, 1> parameters{roleId};
-                    const auto                         rows = Sql::executeOrThrow(connection, "SELECT menu_id FROM sys_role_menu WHERE role_id = ? ORDER BY menu_id", parameters);
-                    std::vector<std::int64_t>          ids;
+                    std::vector<DatabaseValue> parameters{roleId};
+                    const std::string          clause = tenantClause(tenant, parameters, "r.tenant_id");
+                    const auto                 rows   = Sql::executeOrThrow(
+                            connection, "SELECT rm.menu_id FROM sys_role_menu rm JOIN sys_role r ON r.id = rm.role_id WHERE rm.role_id = ?" + clause + " ORDER BY rm.menu_id",
+                            parameters);
+                    std::vector<std::int64_t> ids;
                     while (rows->next())
                     {
                         ids.push_back(Sql::integer(*rows, "menu_id"));
@@ -295,11 +326,14 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<std::int64_t>>(
                 loop,
-                [roleId](DatabaseConnection &connection) -> std::vector<std::int64_t>
+                [roleId, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<std::int64_t>
                 {
-                    const std::array<DatabaseValue, 1> parameters{roleId};
-                    const auto                         rows = Sql::executeOrThrow(connection, "SELECT dept_id FROM sys_role_dept WHERE role_id = ? ORDER BY dept_id", parameters);
-                    std::vector<std::int64_t>          ids;
+                    std::vector<DatabaseValue> parameters{roleId};
+                    const std::string          clause = tenantClause(tenant, parameters, "r.tenant_id");
+                    const auto                 rows   = Sql::executeOrThrow(
+                            connection, "SELECT rd.dept_id FROM sys_role_dept rd JOIN sys_role r ON r.id = rd.role_id WHERE rd.role_id = ?" + clause + " ORDER BY rd.dept_id",
+                            parameters);
+                    std::vector<std::int64_t> ids;
                     while (rows->next())
                     {
                         ids.push_back(Sql::integer(*rows, "dept_id"));
@@ -311,8 +345,16 @@ namespace EdgePulse::System
     AsynGyanis::Core::Task<bool> RoleRepository::updateMenus(AsynGyanis::Core::EventLoop &loop, const std::int64_t roleId, std::vector<std::int64_t> menuIds)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [roleId, menuIds = std::move(menuIds)](DatabaseConnection &connection) -> bool
+                                                            [roleId, menuIds = std::move(menuIds), tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
+                                                                std::vector<DatabaseValue> parameters{roleId};
+                                                                const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                                                                const auto                 rows   = Sql::executeOrThrow(
+                                                                        connection, "SELECT COUNT(*) AS total FROM sys_role WHERE id = ? AND deleted = 0" + clause, parameters);
+                                                                if (!rows->next() || Sql::integer(*rows, "total") == 0)
+                                                                {
+                                                                    return false;
+                                                                }
                                                                 replaceMenus(connection, roleId, menuIds);
                                                                 return true;
                                                             });
@@ -322,9 +364,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<RoleRecord>>(
                 loop,
-                [](DatabaseConnection &connection) -> std::vector<RoleRecord>
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::vector<RoleRecord>
                 {
-                    const auto              rows = Sql::executeOrThrow(connection, std::string{kSelectRole} + "WHERE r.deleted = 0 AND r.status = 1 ORDER BY r.sort, r.id");
+                    std::vector<DatabaseValue> parameters;
+                    const std::string          clause = tenantClause(tenant, parameters, "r.tenant_id");
+                    const auto                 rows =
+                            Sql::executeOrThrow(connection, std::string{kSelectRole} + "WHERE r.deleted = 0 AND r.status = 1" + clause + " ORDER BY r.sort, r.id", parameters);
                     std::vector<RoleRecord> result;
                     while (rows->next())
                     {

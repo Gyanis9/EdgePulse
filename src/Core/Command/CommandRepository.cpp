@@ -6,10 +6,12 @@
 #include "Base/Runtime/TimeFormat.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace EdgePulse::Command
@@ -21,7 +23,7 @@ namespace EdgePulse::Command
         using AsynGyanis::Database::DatabaseValue;
 
         constexpr std::string_view kSelectCommand = "SELECT c.id, c.tenant_id, c.node_id, c.type, c.payload, c.status, c.result, c.message, c.created_by, c.created_at, "
-                                                    "c.dispatched_at, c.finished_at, c.timeout_seconds, "
+                                                    "c.dispatched_at, c.finished_at, c.timeout_seconds, c.scheduled_at, c.batch_id, "
                                                     "COALESCE(n.name, '') AS node_name FROM biz_command c LEFT JOIN biz_node n ON n.id = c.node_id ";
 
         [[nodiscard]] CommandRecord readCommand(const DatabaseResult &result)
@@ -41,6 +43,8 @@ namespace EdgePulse::Command
             command.dispatchedAt   = Sql::dateTimeText(result, "dispatched_at");
             command.finishedAt     = Sql::dateTimeText(result, "finished_at");
             command.timeoutSeconds = static_cast<int>(Sql::integer(result, "timeout_seconds"));
+            command.scheduledAt    = Sql::dateTimeText(result, "scheduled_at");
+            command.batchId        = Sql::integer(result, "batch_id");
             return command;
         }
 
@@ -72,11 +76,12 @@ namespace EdgePulse::Command
     }
 
     AsynGyanis::Core::Task<std::optional<CommandRecord>> CommandRepository::create(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string type,
-                                                                                   std::string payload, const std::int64_t createdBy, const int timeoutSeconds)
+                                                                                   std::string payload, const std::int64_t createdBy, const int timeoutSeconds,
+                                                                                   std::string scheduledAt, const std::int64_t batchId)
     {
         co_return co_await m_database->withConnection<std::optional<CommandRecord>>(
                 loop,
-                [nodeId, type = std::move(type), payload = std::move(payload), createdBy, timeoutSeconds,
+                [nodeId, type = std::move(type), payload = std::move(payload), createdBy, timeoutSeconds, scheduledAt = std::move(scheduledAt), batchId,
                  tenant = m_tenant](DatabaseConnection &connection) -> std::optional<CommandRecord>
                 {
                     std::string                nodeSql = "SELECT tenant_id FROM biz_node WHERE id = ? AND deleted = 0";
@@ -92,14 +97,25 @@ namespace EdgePulse::Command
                         return std::nullopt;
                     }
                     // 命令归属目标节点所属租户：平台管理员跨租户下发时也落在节点自己的租户下
-                    const std::int64_t                  ownerTenantId = Sql::integer(*node, "tenant_id");
-                    const std::int64_t                  id            = Common::nextIdentifier();
-                    const std::string                   now           = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 10> parameters{
-                            id, ownerTenantId, nodeId, type, payload, std::string{"pending"}, createdBy, now, static_cast<std::int64_t>(timeoutSeconds), std::string{"pending"}};
+                    const std::int64_t                  ownerTenantId  = Sql::integer(*node, "tenant_id");
+                    const std::int64_t                  id             = Common::nextIdentifier();
+                    const std::string                   now            = Common::nowDateTimeUtc();
+                    const DatabaseValue                 scheduledValue = scheduledAt.empty() ? DatabaseValue{std::monostate{}} : DatabaseValue{scheduledAt};
+                    const std::array<DatabaseValue, 12> parameters{id,
+                                                                   ownerTenantId,
+                                                                   nodeId,
+                                                                   type,
+                                                                   payload,
+                                                                   std::string{"pending"},
+                                                                   createdBy,
+                                                                   now,
+                                                                   static_cast<std::int64_t>(timeoutSeconds),
+                                                                   std::string{"pending"},
+                                                                   scheduledValue,
+                                                                   batchId};
                     Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO biz_command (id, tenant_id, node_id, type, payload, status, created_by, created_at, timeout_seconds, message) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            "INSERT INTO biz_command (id, tenant_id, node_id, type, payload, status, created_by, created_at, timeout_seconds, message, "
+                                            "scheduled_at, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             parameters);
                     return findOnConnection(connection, id, tenant);
                 });
@@ -175,6 +191,8 @@ namespace EdgePulse::Command
                             clause = " AND tenant_id = ?";
                             nodeParameter.emplace_back(tenant.tenantId);
                         }
+                        select += " AND (scheduled_at IS NULL OR scheduled_at <= ?)";
+                        nodeParameter.emplace_back(Common::nowDateTimeUtc());
                         const auto rows = Sql::executeOrThrow(connection, select + " ORDER BY created_at, id LIMIT 1", nodeParameter);
                         if (!rows->next())
                         {
@@ -207,6 +225,33 @@ namespace EdgePulse::Command
                         }
                         throw;
                     }
+                });
+    }
+
+    AsynGyanis::Core::Task<std::vector<CommandRecord>> CommandRepository::listDue(AsynGyanis::Core::EventLoop &loop, const std::size_t limit)
+    {
+        co_return co_await m_database->withConnection<std::vector<CommandRecord>>(
+                loop,
+                [limit, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<CommandRecord>
+                {
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc()};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND c.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    parameters.emplace_back(static_cast<std::int64_t>(limit));
+                    const auto rows = Sql::executeOrThrow(connection,
+                                                          std::string{kSelectCommand} + "WHERE c.status = 'pending' AND c.scheduled_at IS NOT NULL AND c.scheduled_at <= ?" +
+                                                                  clause + " ORDER BY c.scheduled_at, c.id LIMIT ?",
+                                                          parameters);
+                    std::vector<CommandRecord> commands;
+                    while (rows->next())
+                    {
+                        commands.push_back(readCommand(*rows));
+                    }
+                    return commands;
                 });
     }
 

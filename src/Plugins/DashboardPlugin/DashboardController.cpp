@@ -102,7 +102,7 @@ namespace EdgePulse::Dashboard
                        const std::int64_t previousLogins = co_await deps->logs->loginCountBetween(loop, timeText(previous), timeText(start), scope);
                        const std::int64_t previousOps    = co_await deps->logs->operCountBetween(loop, timeText(previous), timeText(start), scope);
                        const std::int64_t onlineUsers    = co_await deps->logs->distinctLoginUsersSince(loop, timeText(now - 3600), scope);
-                       const auto         roles          = co_await deps->roles->listOptions(loop);
+                       const auto         roles          = co_await deps->roles->scoped(session->tenantScope())->listOptions(loop);
                        const auto         recent         = co_await deps->logs->recentLogins(loop, 6, scope);
                        const auto         dailyOps       = co_await deps->logs->dailyOper(loop, 7, scope);
 
@@ -136,9 +136,9 @@ namespace EdgePulse::Dashboard
                            scopeCounts[role.dataScope] += role.userCount;
                        }
                        ConfigValue roleDist = ConfigValue::array();
-                       for (const auto &[scope, count]: scopeCounts)
+                       for (const auto &[dataScopeKey, count]: scopeCounts)
                        {
-                           roleDist.push_back(ConfigValue::object({{"label", scope}, {"value", count}}));
+                           roleDist.push_back(ConfigValue::object({{"label", dataScopeKey}, {"value", count}}));
                        }
                        ConfigValue daily = ConfigValue::array();
                        for (const TimeBucket &bucket: dailyOps)

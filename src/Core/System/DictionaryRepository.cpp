@@ -10,6 +10,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -67,19 +68,38 @@ namespace EdgePulse::System
         }
     } // namespace
 
-    DictionaryRepository::DictionaryRepository(std::shared_ptr<Common::Database> database) : m_database(std::move(database))
+    DictionaryRepository::DictionaryRepository(std::shared_ptr<Common::Database> database, TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
     }
+
+    std::shared_ptr<DictionaryRepository> DictionaryRepository::scoped(const TenantScope tenant) const
+    {
+        return std::make_shared<DictionaryRepository>(m_database, tenant);
+    }
+
+    namespace
+    {
+        [[nodiscard]] std::string tenantClause(const TenantScope &tenant, std::vector<DatabaseValue> &parameters, const std::string_view column)
+        {
+            if (tenant.allTenants)
+            {
+                return {};
+            }
+            parameters.emplace_back(tenant.tenantId);
+            return " AND " + std::string{column} + " = ?";
+        }
+    } // namespace
 
     AsynGyanis::Core::Task<Common::PageRows<DictTypeRecord>> DictionaryRepository::listDictTypes(AsynGyanis::Core::EventLoop &loop, std::string keyword, std::string status,
                                                                                                  const Common::PageParameters &page)
     {
         co_return co_await m_database->withConnection<Common::PageRows<DictTypeRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status), page](DatabaseConnection &connection) -> Common::PageRows<DictTypeRecord>
+                [keyword = std::move(keyword), status = std::move(status), page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<DictTypeRecord>
                 {
                     std::string                filter = "WHERE deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    filter += tenantClause(tenant, parameters, "tenant_id");
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -117,10 +137,11 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<DictTypeRecord>>(
                 loop,
-                [keyword = std::move(keyword), status = std::move(status)](DatabaseConnection &connection) -> std::vector<DictTypeRecord>
+                [keyword = std::move(keyword), status = std::move(status), tenant = m_tenant](DatabaseConnection &connection) -> std::vector<DictTypeRecord>
                 {
                     std::string                filter = "WHERE deleted = 0";
                     std::vector<DatabaseValue> parameters;
+                    filter += tenantClause(tenant, parameters, "tenant_id");
                     if (!keyword.empty())
                     {
                         const std::string pattern = "%" + keyword + "%";
@@ -147,10 +168,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [type = std::move(type), excludeId](DatabaseConnection &connection) -> bool
+                [type = std::move(type), excludeId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 2> parameters{type, excludeId};
-                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_dict_type WHERE dict_type = ? AND id <> ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{type, excludeId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto                 rows =
+                            Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM sys_dict_type WHERE dict_type = ? AND id <> ? AND deleted = 0" + clause, parameters);
                     return rows->next() && Sql::integer(*rows, "total") > 0;
                 });
     }
@@ -159,11 +182,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [write, operatorId](DatabaseConnection &connection) -> std::int64_t
+                [write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 10> parameters{id,
+                    const std::array<DatabaseValue, 11> parameters{id,
+                                                                   tenant.tenantId,
                                                                    write.name.value_or(std::string{}),
                                                                    write.type.value_or(std::string{}),
                                                                    static_cast<std::int64_t>(write.status.value_or(1)),
@@ -173,10 +197,11 @@ namespace EdgePulse::System
                                                                    operatorId,
                                                                    operatorId,
                                                                    std::int64_t{0}};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_dict_type (id, dict_name, dict_type, status, remark, created_at, updated_at, created_by, updated_by, deleted) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO sys_dict_type (id, tenant_id, dict_name, dict_type, status, remark, created_at, updated_at, created_by, updated_by, deleted) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     return id;
                 });
     }
@@ -185,7 +210,7 @@ namespace EdgePulse::System
                                                                       const std::int64_t operatorId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [typeId, write, operatorId](DatabaseConnection &connection) -> bool
+                                                            [typeId, write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
                                                                 std::string                sql = "UPDATE sys_dict_type SET updated_at = ?, updated_by = ?";
                                                                 std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
@@ -211,6 +236,7 @@ namespace EdgePulse::System
                                                                 }
                                                                 sql += " WHERE id = ? AND deleted = 0";
                                                                 parameters.emplace_back(typeId);
+                                                                sql += tenantClause(tenant, parameters, "tenant_id");
                                                                 const auto rows = Sql::executeOrThrow(connection, sql, parameters);
                                                                 return rows->affectedRowCount() > 0;
                                                             });
@@ -220,19 +246,22 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [typeId](DatabaseConnection &connection) -> bool
+                [typeId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 1> parameter{typeId};
-                    const auto                         typeRows = Sql::executeOrThrow(connection, "SELECT dict_type FROM sys_dict_type WHERE id = ? AND deleted = 0", parameter);
+                    std::vector<DatabaseValue> parameter{typeId};
+                    const std::string          typeClause = tenantClause(tenant, parameter, "tenant_id");
+                    const auto typeRows = Sql::executeOrThrow(connection, "SELECT dict_type FROM sys_dict_type WHERE id = ? AND deleted = 0" + typeClause, parameter);
                     if (!typeRows->next())
                     {
                         return false;
                     }
-                    const std::string                  type = Sql::text(*typeRows, "dict_type");
-                    const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), typeId};
-                    const auto rows = Sql::executeOrThrow(connection, "UPDATE sys_dict_type SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
-                    const std::array<DatabaseValue, 1> typeParameter{type};
-                    Sql::executeOrThrowVoid(connection, "DELETE FROM sys_dict_data WHERE dict_type = ?", typeParameter);
+                    const std::string          type = Sql::text(*typeRows, "dict_type");
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), typeId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, "UPDATE sys_dict_type SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
+                    std::vector<DatabaseValue> typeParameter{type};
+                    const std::string          dataClause = tenantClause(tenant, typeParameter, "tenant_id");
+                    Sql::executeOrThrowVoid(connection, "DELETE FROM sys_dict_data WHERE dict_type = ?" + dataClause, typeParameter);
                     return rows->affectedRowCount() > 0;
                 });
     }
@@ -241,10 +270,11 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<DictDataRecord>>(
                 loop,
-                [type = std::move(type)](DatabaseConnection &connection) -> std::vector<DictDataRecord>
+                [type = std::move(type), tenant = m_tenant](DatabaseConnection &connection) -> std::vector<DictDataRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{type};
-                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectData} + "WHERE dict_type = ? AND deleted = 0 ORDER BY sort, id", parameters);
+                    std::vector<DatabaseValue> parameters{type};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectData} + "WHERE dict_type = ? AND deleted = 0" + clause + " ORDER BY sort, id", parameters);
                     std::vector<DictDataRecord> result;
                     while (rows->next())
                     {
@@ -258,15 +288,27 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::vector<DictDataRecord>>(
                 loop,
-                [type = std::move(type)](DatabaseConnection &connection) -> std::vector<DictDataRecord>
+                [type = std::move(type), tenant = m_tenant](DatabaseConnection &connection) -> std::vector<DictDataRecord>
                 {
-                    const std::array<DatabaseValue, 1> parameters{type};
-                    const auto                         rows =
-                            Sql::executeOrThrow(connection, std::string{kSelectData} + "WHERE dict_type = ? AND deleted = 0 AND status = 1 ORDER BY sort, id", parameters);
+                    std::vector<DatabaseValue> parameters{type};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    auto rows = Sql::executeOrThrow(connection, std::string{kSelectData} + "WHERE dict_type = ? AND deleted = 0 AND status = 1" + clause + " ORDER BY sort, id",
+                                                    parameters);
                     std::vector<DictDataRecord> result;
                     while (rows->next())
                     {
                         result.push_back(readData(*rows));
+                    }
+                    if (result.empty() && !tenant.allTenants && tenant.tenantId != 1)
+                    {
+                        // 租户没有自定义该字典时沿用默认租户的平台字典
+                        const std::array<DatabaseValue, 2> fallback{type, std::int64_t{1}};
+                        const auto                         defaults = Sql::executeOrThrow(
+                                connection, std::string{kSelectData} + "WHERE dict_type = ? AND deleted = 0 AND status = 1 AND tenant_id = ? ORDER BY sort, id", fallback);
+                        while (defaults->next())
+                        {
+                            result.push_back(readData(*defaults));
+                        }
                     }
                     return result;
                 });
@@ -276,11 +318,12 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [write, operatorId](DatabaseConnection &connection) -> std::int64_t
+                [write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 12> parameters{id,
+                    const std::array<DatabaseValue, 13> parameters{id,
+                                                                   tenant.tenantId,
                                                                    write.type.value_or(std::string{}),
                                                                    write.label.value_or(std::string{}),
                                                                    write.value.value_or(std::string{}),
@@ -292,10 +335,11 @@ namespace EdgePulse::System
                                                                    now,
                                                                    now,
                                                                    operatorId};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_dict_data (id, dict_type, label, value, sort, status, tone, is_default, remark, created_at, updated_at, created_by) "
-                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                            parameters);
+                    Sql::executeOrThrowVoid(
+                            connection,
+                            "INSERT INTO sys_dict_data (id, tenant_id, dict_type, label, value, sort, status, tone, is_default, remark, created_at, updated_at, created_by) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            parameters);
                     return id;
                 });
     }
@@ -304,7 +348,7 @@ namespace EdgePulse::System
                                                                       const std::int64_t operatorId)
     {
         co_return co_await m_database->withConnection<bool>(loop,
-                                                            [dataId, write, operatorId](DatabaseConnection &connection) -> bool
+                                                            [dataId, write, operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
                                                                 std::string                sql = "UPDATE sys_dict_data SET updated_at = ?, updated_by = ?";
                                                                 std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), operatorId};
@@ -350,6 +394,7 @@ namespace EdgePulse::System
                                                                 }
                                                                 sql += " WHERE id = ? AND deleted = 0";
                                                                 parameters.emplace_back(dataId);
+                                                                sql += tenantClause(tenant, parameters, "tenant_id");
                                                                 const auto rows = Sql::executeOrThrow(connection, sql, parameters);
                                                                 return rows->affectedRowCount() > 0;
                                                             });
@@ -359,10 +404,11 @@ namespace EdgePulse::System
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [dataId](DatabaseConnection &connection) -> bool
+                [dataId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    const std::array<DatabaseValue, 2> parameters{Common::nowDateTimeUtc(), dataId};
-                    const auto rows = Sql::executeOrThrow(connection, "UPDATE sys_dict_data SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
+                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), dataId};
+                    const std::string          clause = tenantClause(tenant, parameters, "tenant_id");
+                    const auto rows = Sql::executeOrThrow(connection, "UPDATE sys_dict_data SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
                     return rows->affectedRowCount() > 0;
                 });
     }

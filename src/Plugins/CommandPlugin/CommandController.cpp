@@ -6,6 +6,8 @@
 #include "Base/Api/QueryParameters.h"
 #include "Base/Api/RequestParsing.h"
 #include "Base/Json/JsonFields.h"
+#include "Base/Runtime/IdGenerator.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Http/RequestAuth.h"
@@ -16,12 +18,14 @@
 
 #include <Core/EventLoop/EventLoop.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace EdgePulse::Command
 {
@@ -42,12 +46,37 @@ namespace EdgePulse::Command
                                         {"createdAt", command.createdAt},
                                         {"dispatchedAt", command.dispatchedAt},
                                         {"finishedAt", command.finishedAt},
-                                        {"timeoutSeconds", command.timeoutSeconds}});
+                                        {"timeoutSeconds", command.timeoutSeconds},
+                                        {"scheduledAt", command.scheduledAt},
+                                        {"batchId", command.batchId}});
         }
 
         void fail(AsynGyanis::Net::HttpResponse &response, const int status, const std::string &message, const std::string_view traceId)
         {
             Common::writeFailure(response, status, status, message, traceId);
+        }
+
+        [[nodiscard]] bool validDateTime(const std::string &text)
+        {
+            if (text.size() != 19)
+            {
+                return false;
+            }
+            for (std::size_t index = 0; index < text.size(); ++index)
+            {
+                const char expected = index == 4 || index == 7 ? '-' : index == 10 ? ' ' : index == 13 || index == 16 ? ':' : '\0';
+                if (expected != '\0')
+                {
+                    if (text[index] != expected)
+                    {
+                        return false;
+                    }
+                } else if (text[index] < '0' || text[index] > '9')
+                {
+                    return false;
+                }
+            }
+            return true;
         }
     } // namespace
 
@@ -129,6 +158,84 @@ namespace EdgePulse::Command
                             static_cast<void>(co_await deps->notifier(*created));
                         }
                         Common::writeSuccess(response, commandJson(*created), traceId);
+                        co_return;
+                    });
+
+        router.post("/api/commands/batch",
+                    [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string traceId = Web::resolveRequestId(request);
+                        const auto        session = co_await Web::requireSession(*deps->auth, loop, request, response, "device:command:send", traceId);
+                        if (!session.has_value())
+                        {
+                            co_return;
+                        }
+                        const auto body = request.jsonBody();
+                        if (!body.has_value() || !body->is_object())
+                        {
+                            fail(response, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
+                            co_return;
+                        }
+                        std::vector<std::int64_t> nodeIds = Json::integerArrayField(*body, "nodeIds");
+                        std::sort(nodeIds.begin(), nodeIds.end());
+                        nodeIds.erase(std::unique(nodeIds.begin(), nodeIds.end()), nodeIds.end());
+                        const std::string type           = Json::stringField(*body, "type");
+                        const std::string payload        = Json::stringField(*body, "payload", "{}");
+                        const int         timeoutSeconds = static_cast<int>(Json::integerField(*body, "timeoutSeconds", 60));
+                        const std::string scheduledAt    = Json::stringField(*body, "scheduledAt");
+                        if (nodeIds.empty() || nodeIds.size() > 100 || type.empty() || timeoutSeconds < 1 || timeoutSeconds > 3600 ||
+                            (!scheduledAt.empty() && !validDateTime(scheduledAt)))
+                        {
+                            fail(response, Common::kCodeBadRequest, "nodeIds（1–100 个）、type、timeoutSeconds 或 scheduledAt 不合法", traceId);
+                            co_return;
+                        }
+                        if (std::any_of(nodeIds.begin(), nodeIds.end(), [](const std::int64_t id) { return id <= 0; }))
+                        {
+                            fail(response, Common::kCodeBadRequest, "nodeIds 必须是正整数", traceId);
+                            co_return;
+                        }
+                        const auto         commands        = deps->commands->scoped(session->tenantScope());
+                        const std::int64_t batchId         = Common::nextIdentifier();
+                        const bool         due             = scheduledAt.empty() || scheduledAt <= Common::nowDateTimeUtc();
+                        ConfigValue        createdCommands = ConfigValue::array();
+                        for (const std::int64_t nodeId: nodeIds)
+                        {
+                            auto created = co_await commands->create(loop, nodeId, type, payload, session->userId, timeoutSeconds, scheduledAt, batchId);
+                            if (!created.has_value())
+                            {
+                                continue;
+                            }
+                            if (due && deps->channels != nullptr && deps->channels->isConnected(nodeId))
+                            {
+                                const ConfigValue commandValue = ConfigValue::object({{"id", created->id},
+                                                                                      {"nodeId", created->nodeId},
+                                                                                      {"type", created->type},
+                                                                                      {"payload", created->payload},
+                                                                                      {"timeoutSeconds", created->timeoutSeconds}});
+                                const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
+                                if (co_await deps->channels->send(nodeId, message))
+                                {
+                                    if (co_await commands->markDispatched(loop, created->id))
+                                    {
+                                        created = co_await commands->find(loop, created->id);
+                                    }
+                                }
+                            }
+                            if (deps->notifier && created.has_value())
+                            {
+                                static_cast<void>(co_await deps->notifier(*created));
+                            }
+                            if (created.has_value())
+                            {
+                                createdCommands.push_back(commandJson(*created));
+                            }
+                        }
+                        if (createdCommands.empty())
+                        {
+                            fail(response, Common::kCodeNotFound, "目标节点不存在", traceId);
+                            co_return;
+                        }
+                        Common::writeSuccess(response, ConfigValue::object({{"batchId", batchId}, {"commands", std::move(createdCommands)}}), traceId);
                         co_return;
                     });
 
