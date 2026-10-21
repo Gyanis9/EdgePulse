@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Field, Select, Switch, Tag, TextInput, type Column } from '@/components/ui'
+import { DataTable, Drawer, Field, Select, Switch, Tag, TextInput, type Column } from '@/components/ui'
 import { FormDialog, ListPage, PermissionButton } from '@/components/business'
-import { systemApi, type NotificationChannelRow } from '@/api'
+import { systemApi, type NotificationChannelRow, type NotificationDeliveryRow } from '@/api'
 import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
@@ -15,6 +15,31 @@ const list = useListPage<NotificationChannelRow, { keyword: string }>({
 })
 
 const platformAdmin = computed(() => Boolean(currentUser.value?.platformAdmin))
+const deliveriesOpen = ref(false)
+const deliveriesLoading = ref(false)
+const deliveries = ref<NotificationDeliveryRow[]>([])
+const deliveryColumns: Column[] = [
+  { key: 'createdAt', title: '时间', width: 170 },
+  { key: 'channelName', title: '渠道', minWidth: 140 },
+  { key: 'alarmLevel', title: '级别', width: 90 },
+  { key: 'target', title: '目标', minWidth: 180 },
+  { key: 'status', title: '结果', width: 90 },
+  { key: 'attempts', title: '尝试', width: 70 },
+  { key: 'error', title: '失败原因', minWidth: 200 },
+]
+
+async function openDeliveries() {
+  deliveriesOpen.value = true
+  deliveriesLoading.value = true
+  try {
+    const page = await systemApi.notifications.deliveries({ pageNum: 1, pageSize: 100 })
+    deliveries.value = page.rows
+  } catch (error) {
+    toastError(error, '投递记录加载失败')
+  } finally {
+    deliveriesLoading.value = false
+  }
+}
 const tenants = ref<Array<{ id: number; name: string; code: string }>>([])
 const tenantOptions = computed(() => tenants.value.map(t => ({ label: `${t.name}（${t.code}）`, value: t.id })))
 
@@ -140,6 +165,7 @@ async function remove(row: NotificationChannelRow) {
 <template>
   <ListPage title="通知渠道" desc="把告警推送到 Webhook 或邮件；密钥只写入不回显。" table-title="渠道列表" :list="list" :columns="columns" :min-width="900">
     <template #actions>
+      <PermissionButton perm="system:notification:list" variant="secondary" icon="activity" label="投递记录" @click="openDeliveries" />
       <PermissionButton perm="system:notification:add" variant="primary" icon="plus" @click="openCreate">新增渠道</PermissionButton>
     </template>
 
@@ -201,5 +227,13 @@ async function remove(row: NotificationChannelRow) {
         <Switch :model-value="form.enabled" :label="form.enabled ? '启用，告警会推送' : '停用，不推送'" @update:model-value="form.enabled = $event" />
       </Field>
     </FormDialog>
+
+    <Drawer :open="deliveriesOpen" title="投递记录" sub="最近 100 条 Webhook / 邮件投递结果" :width="760" @close="deliveriesOpen = false">
+      <DataTable :columns="deliveryColumns" :data="deliveries" :loading="deliveriesLoading" :min-width="760" empty-text="还没有投递记录">
+        <template #cell-status="{ row }"><Tag :tone="row.status === 'succeeded' ? 'success' : 'danger'">{{ row.status === 'succeeded' ? '成功' : '失败' }}</Tag></template>
+        <template #cell-attempts="{ row }"><span class="tnum">{{ row.attempts }}</span></template>
+        <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
+      </DataTable>
+    </Drawer>
   </ListPage>
 </template>

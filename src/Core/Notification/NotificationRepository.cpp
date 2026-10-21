@@ -24,6 +24,27 @@ namespace EdgePulse::Notification
         constexpr std::string_view kSelectChannel = "SELECT id, tenant_id, name, type, endpoint, recipients, username, secret, sender, ca_file, min_level, enabled, created_by, "
                                                     "created_at FROM biz_notification_channel ";
 
+        constexpr std::string_view kSelectDelivery = "SELECT id, tenant_id, channel_id, channel_name, channel_type, alarm_id, alarm_level, target, status, attempts, error, "
+                                                     "created_at FROM biz_notification_delivery ";
+
+        [[nodiscard]] DeliveryRecord readDelivery(const DatabaseResult &result)
+        {
+            DeliveryRecord record;
+            record.id          = Sql::integer(result, "id");
+            record.tenantId    = Sql::integer(result, "tenant_id");
+            record.channelId   = Sql::integer(result, "channel_id");
+            record.channelName = Sql::text(result, "channel_name");
+            record.channelType = Sql::text(result, "channel_type");
+            record.alarmId     = Sql::integer(result, "alarm_id");
+            record.alarmLevel  = Sql::text(result, "alarm_level");
+            record.target      = Sql::text(result, "target");
+            record.status      = Sql::text(result, "status");
+            record.attempts    = static_cast<int>(Sql::integer(result, "attempts"));
+            record.error       = Sql::text(result, "error");
+            record.createdAt   = Sql::dateTimeText(result, "created_at");
+            return record;
+        }
+
         [[nodiscard]] ChannelRecord readChannel(const DatabaseResult &result)
         {
             ChannelRecord record;
@@ -223,6 +244,72 @@ namespace EdgePulse::Notification
                     const auto rows =
                             Sql::executeOrThrow(connection, "UPDATE biz_notification_channel SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0" + clause, parameters);
                     return rows->affectedRowCount() > 0;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> NotificationRepository::recordDelivery(AsynGyanis::Core::EventLoop &loop, DeliveryRecord record)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [record = std::move(record), tenant = m_tenant](DatabaseConnection &connection) mutable -> std::int64_t
+                {
+                    if (record.id == 0)
+                    {
+                        record.id = Common::nextIdentifier();
+                    }
+                    const std::string                   now = record.createdAt.empty() ? Common::nowDateTimeUtc() : record.createdAt;
+                    const std::array<DatabaseValue, 12> parameters{record.id,         tenant.tenantId, record.channelId, record.channelName, record.channelType, record.alarmId,
+                                                                   record.alarmLevel, record.target,   record.status,    record.attempts,    record.error,       now};
+                    Sql::executeOrThrowVoid(connection,
+                                            "INSERT INTO biz_notification_delivery (id, tenant_id, channel_id, channel_name, channel_type, alarm_id, alarm_level, target, status, "
+                                            "attempts, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            parameters);
+                    return record.id;
+                });
+    }
+
+    AsynGyanis::Core::Task<Common::PageRows<DeliveryRecord>> NotificationRepository::listDeliveries(AsynGyanis::Core::EventLoop &loop, std::string status,
+                                                                                                    const std::int64_t channelId, const Common::PageParameters &page)
+    {
+        co_return co_await m_database->withConnection<Common::PageRows<DeliveryRecord>>(
+                loop,
+                [status = std::move(status), channelId, page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<DeliveryRecord>
+                {
+                    std::vector<DatabaseValue> parameters;
+                    std::string                filter = "WHERE 1 = 1";
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    if (status == "succeeded" || status == "failed")
+                    {
+                        filter += " AND status = ?";
+                        parameters.emplace_back(status);
+                    }
+                    if (channelId > 0)
+                    {
+                        filter += " AND channel_id = ?";
+                        parameters.emplace_back(channelId);
+                    }
+                    const auto                       count = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_notification_delivery " + filter, parameters);
+                    Common::PageRows<DeliveryRecord> pageRows;
+                    if (count->next())
+                    {
+                        pageRows.total = Sql::integer(*count, "total");
+                    }
+                    if (pageRows.total == 0)
+                    {
+                        return pageRows;
+                    }
+                    parameters.emplace_back(static_cast<std::int64_t>(page.pageSize));
+                    parameters.emplace_back(static_cast<std::int64_t>(page.offset()));
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectDelivery} + filter + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", parameters);
+                    while (rows->next())
+                    {
+                        pageRows.rows.push_back(readDelivery(*rows));
+                    }
+                    return pageRows;
                 });
     }
 } // namespace EdgePulse::Notification

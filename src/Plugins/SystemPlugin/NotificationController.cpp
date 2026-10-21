@@ -188,6 +188,38 @@ namespace EdgePulse::Notification
                         co_return;
                     });
 
+        router.get("/api/system/notifications/deliveries",
+                   [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string traceId = Web::resolveRequestId(request);
+                       const auto        session = co_await Web::requireSession(*deps->auth, loop, request, response, "system:notification:list", traceId);
+                       if (!session.has_value())
+                       {
+                           co_return;
+                       }
+                       const Common::QueryMap       query     = request.queryParams();
+                       const Common::PageParameters page      = Common::parsePageParameters(query);
+                       const std::int64_t           channelId = Common::queryInteger(query, "channelId").value_or(0);
+                       const auto  result = co_await deps->channels->scoped(session->tenantScope())->listDeliveries(loop, Common::queryText(query, "status"), channelId, page);
+                       ConfigValue rows   = ConfigValue::array();
+                       for (const DeliveryRecord &record: result.rows)
+                       {
+                           rows.push_back(ConfigValue::object({{"id", record.id},
+                                                               {"channelId", record.channelId},
+                                                               {"channelName", record.channelName},
+                                                               {"channelType", record.channelType},
+                                                               {"alarmId", record.alarmId},
+                                                               {"alarmLevel", record.alarmLevel},
+                                                               {"target", record.target},
+                                                               {"status", record.status},
+                                                               {"attempts", record.attempts},
+                                                               {"error", record.error},
+                                                               {"createdAt", record.createdAt}}));
+                       }
+                       Common::writeSuccess(response, Common::makePageResult(page, result.total, std::move(rows)), traceId);
+                       co_return;
+                   });
+
         router.put("/api/system/notifications/:id",
                    [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {

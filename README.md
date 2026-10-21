@@ -25,7 +25,7 @@ src/
 └─ Main/       进程入口
 frontend/      Vue 3 + Vite 管理后台
 third_party/AsynGyanis/  引擎 git submodule，只读
-migrations/    SQL 迁移 V1–V13
+migrations/    SQL 迁移 V1–V14
 config/        非敏感配置样例
 deploy/        Docker、systemd、Prometheus
 scripts/       证书、开发运行、验收
@@ -121,7 +121,7 @@ python scripts/check-docker-stack.py --build
 ## 测试
 
 - 后端单元：密码、验证码、会话、CSV、KV、分页、时间。
-- 后端集成：迁移 V1–V13、认证、租户隔离、租户级角色/部门/岗位/字典、通知渠道、日志与节点的数据范围、遥测、告警、计划/批量命令、固件灰度/回滚、Redis 跨实例扇出、真机 MySQL/Redis（环境变量门控）。
+- 后端集成：迁移 V1–V14、认证、租户隔离、租户级角色/部门/岗位/字典、通知渠道、日志与节点的数据范围、遥测、告警、计划/批量命令、固件灰度/回滚、Redis 跨实例扇出、真机 MySQL/Redis（环境变量门控）。
 - 协议：401/403 矩阵、租户生命周期与跨租户隔离、管理端 CRUD、数据范围、遥测告警、命令往返与 Agent WebSocket 推送、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
 - 前端：API 契约单测；Playwright 用系统 Edge（`channel: 'msedge'`），不下载浏览器。
 - `ExternalStores.*` 需要真实 MySQL/Redis：设置 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 后运行；缺变量时用例 SKIP，不伪造通过。本机已用临时容器跑绿。
@@ -131,6 +131,7 @@ python scripts/check-docker-stack.py --build
 ## 已知边界
 
 - 多租户：用户、节点、分组、遥测、告警、固件、命令、日志、角色、部门、岗位与字典按租户隔离；菜单与参数配置是平台级共享。租户管理员只能创建自己权限范围内的角色，不能管理租户或平台级配置。
+- 通知投递记录落库保留渠道、告警、尝试次数与失败原因，管理端可直接查看。
 - 通知渠道支持 Webhook（HMAC-SHA256 签名）与 SMTP 邮件（smtp://、smtps:// 隐式 TLS 或 starttls://）；私有 CA 可在渠道里指定 PEM 文件。短信通过 Webhook 网关接入。
 - 平台管理员可在节点创建与固件上传时选择目标租户；未指定时落在自己的租户。Agent 注册用 `tenantCode` 声明归属。
 - 停用租户会阻止新登录，并在数秒内拒绝已签发会话（租户状态缓存 5 秒，更新时主动失效）。

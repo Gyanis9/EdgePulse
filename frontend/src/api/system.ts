@@ -90,6 +90,20 @@ export interface NotificationChannelRow {
   createdAt: string
 }
 
+export interface NotificationDeliveryRow {
+  id: number
+  channelId: number
+  channelName: string
+  channelType: string
+  alarmId: number
+  alarmLevel: string
+  target: string
+  status: 'succeeded' | 'failed'
+  attempts: number
+  error: string
+  createdAt: string
+}
+
 export interface NotificationChannelWriteRequest {
   name: string
   type: 'webhook' | 'email'
@@ -256,6 +270,7 @@ export function createSystemApi(client: HttpClient) {
     },
     notifications: {
       ...crudPage<NotificationChannelRow, NotificationChannelWriteRequest>(client, '/system/notifications'),
+      deliveries: (query?: QueryParams) => client.get<PageResult<NotificationDeliveryRow>>('/system/notifications/deliveries', query),
     },
     roles: {
       ...crudPage<Record<string, unknown>, RoleWriteRequest>(client, '/system/roles'),

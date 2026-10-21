@@ -348,14 +348,21 @@ def verify_notification(token: str, state: tuple[ThreadingHTTPServer, threading.
         report("告警邮件收到事件", b"Subject:" in message and b"ops@example.com" in message, message[:120].decode("utf-8", "replace"))
     except queue.Empty:
         report("告警邮件收到事件", False, "5 秒内没有收到")
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
-        smtp.shutdown()
-        smtp_thread.join(timeout=2)
-        for identifier in (channel_id, mail_id):
-            if identifier:
-                request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{identifier}", token=token)
+    delivery_total = 0
+    for _ in range(10):
+        status, page, _ = request_json("GET", HTTP_BASE + "/api/system/notifications/deliveries?pageNum=1&pageSize=10&status=succeeded", token=token)
+        delivery_total = page.get("data", {}).get("total", 0)
+        if status == 200 and delivery_total >= 2:
+            break
+        time.sleep(0.2)
+    report("通知投递记录落库", delivery_total >= 2, f"success={delivery_total}")
+    server.shutdown()
+    thread.join(timeout=2)
+    smtp.shutdown()
+    smtp_thread.join(timeout=2)
+    for identifier in (channel_id, mail_id):
+        if identifier:
+            request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{identifier}", token=token)
 
 
 def check_telemetry_alarm(token: str, node_id: int) -> None:

@@ -27,6 +27,16 @@ namespace EdgePulse::Alarm
 namespace EdgePulse::Notification
 {
     /**
+     * @brief 单次渠道投递结果
+     */
+    struct DeliveryOutcome
+    {
+        bool        ok{false};   ///< 是否送达
+        int         attempts{0}; ///< 尝试次数
+        std::string error;       ///< 失败原因
+    };
+
+    /**
      * @brief 通知投递服务
      * @note 只在服务器所属事件循环上调用
      */
@@ -51,12 +61,17 @@ namespace EdgePulse::Notification
         /**
          * @brief 投递一条 Webhook，失败重试一次
          */
-        AsynGyanis::Core::Task<> sendWebhook(AsynGyanis::Core::EventLoop &loop, const ChannelRecord &channel, const Alarm::AlarmRecord &alarm, std::string payload);
+        AsynGyanis::Core::Task<DeliveryOutcome> sendWebhook(AsynGyanis::Core::EventLoop &loop, const ChannelRecord &channel, const Alarm::AlarmRecord &alarm, std::string payload);
 
         /**
          * @brief 投递一封告警邮件，失败重试一次
          */
-        AsynGyanis::Core::Task<> sendEmail(AsynGyanis::Core::EventLoop &loop, const ChannelRecord &channel, const Alarm::AlarmRecord &alarm);
+        AsynGyanis::Core::Task<DeliveryOutcome> sendEmail(AsynGyanis::Core::EventLoop &loop, const ChannelRecord &channel, const Alarm::AlarmRecord &alarm);
+
+        /**
+         * @brief 写入投递记录；失败只记日志，不影响告警链路
+         */
+        AsynGyanis::Core::Task<> recordDelivery(AsynGyanis::Core::EventLoop &loop, const ChannelRecord &channel, const Alarm::AlarmRecord &alarm, const DeliveryOutcome &outcome);
 
         std::shared_ptr<NotificationRepository> m_repository; ///< 渠道仓储
     };
