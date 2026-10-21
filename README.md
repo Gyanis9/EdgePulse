@@ -94,7 +94,7 @@ npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ## 验收
 
 ```bash
-# 后端：92 条用例（真机存储与 Redis 扇出用例按环境变量门控）
+# 后端：93 条用例（真机存储与 Redis 扇出用例按环境变量门控）
 ctest --preset debug --output-on-failure
 
 # 前端：23 条单测 + 类型检查/构建 + 6 条 Playwright
