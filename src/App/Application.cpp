@@ -507,6 +507,14 @@ namespace EdgePulse::App
         }
         m_commandScheduler = runCommandScheduler(loop);
         loop.scheduler().schedule(m_commandScheduler->handle());
+        if (m_configuration.telemetryRetentionDays > 0)
+        {
+            m_telemetryRetention = runTelemetryRetention(loop);
+            loop.scheduler().schedule(m_telemetryRetention->handle());
+        } else
+        {
+            LOG_WARN_FMT("遥测保留天数不是正数（{}），不启用过期清理", m_configuration.telemetryRetentionDays);
+        }
         m_ready.store(true, std::memory_order_release);
         return true;
     }
@@ -563,6 +571,31 @@ namespace EdgePulse::App
                 {
                     LOG_WARN_FMT("计划命令下发失败：command={} error={}", command.id, failure.what());
                 }
+            }
+        }
+    }
+
+    AsynGyanis::Core::Task<> Application::runTelemetryRetention(AsynGyanis::Core::EventLoop &loop)
+    {
+        AsynGyanis::Core::Timer                               ticker(loop);
+        const std::shared_ptr<Telemetry::TelemetryRepository> allTelemetry = m_telemetryRepository->scoped({0, true});
+        bool                                                  firstRun     = true;
+        while (true)
+        {
+            // 重启后先尽快清一次，避免积压等到首个六小时周期
+            co_await ticker.waitFor(firstRun ? std::chrono::minutes{1} : std::chrono::hours{6});
+            firstRun = false;
+            try
+            {
+                if (!co_await allTelemetry->prune(loop, m_configuration.telemetryRetentionDays))
+                {
+                    LOG_WARN("遥测清理被跳过：保留天数不是正数");
+                    continue;
+                }
+                LOG_INFO_FMT("遥测清理完成：保留 {} 天", m_configuration.telemetryRetentionDays);
+            } catch (const std::exception &failure)
+            {
+                LOG_WARN_FMT("遥测清理失败：{}", failure.what());
             }
         }
     }

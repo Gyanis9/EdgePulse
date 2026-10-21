@@ -52,6 +52,30 @@ TEST(FleetServices, TelemetryInsertLatestAndSeries)
     EXPECT_EQ(2U, series.size());
 }
 
+// 钉住：保留天数只删窗口外的遥测，非正数天数不删任何数据
+TEST(FleetServices, TelemetryPruneRespectsRetentionWindow)
+{
+    EdgePulse::TestSupport::AuthTestContext   context;
+    EdgePulse::TestSupport::EventLoopRunner   runner;
+    EdgePulse::Telemetry::TelemetryRepository repository(context.database);
+    EdgePulse::Device::NodeRepository         nodes(context.database);
+    const std::int64_t                        nodeId = runner.run(nodes.create(runner.loop(), "retention-node", "{}")).id;
+
+    auto stale        = sample("cpu.usage", 10);
+    stale.collectedAt = "2020-01-01 00:00:00";
+    ASSERT_TRUE(runner.run(repository.insertBatch(runner.loop(), nodeId, {stale, sample("cpu.usage", 20)})));
+
+    const auto allTenants = repository.scoped({0, true});
+    EXPECT_FALSE(runner.run(allTenants->prune(runner.loop(), 0)));
+    const auto window = runner.run(repository.series(runner.loop(), nodeId, "cpu.usage", "2019-01-01 00:00:00", EdgePulse::Common::nowDateTimeUtc(), 100));
+    EXPECT_EQ(2U, window.size());
+
+    ASSERT_TRUE(runner.run(allTenants->prune(runner.loop(), 30)));
+    const auto remaining = runner.run(repository.series(runner.loop(), nodeId, "cpu.usage", "2019-01-01 00:00:00", EdgePulse::Common::nowDateTimeUtc(), 100));
+    ASSERT_EQ(1U, remaining.size());
+    EXPECT_DOUBLE_EQ(20.0, remaining.front().value);
+}
+
 // 钉住：阈值触发、自动恢复与冷却窗口
 TEST(FleetServices, AlarmEvaluationTriggersAndResolves)
 {
