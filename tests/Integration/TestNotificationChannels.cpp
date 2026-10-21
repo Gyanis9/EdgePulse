@@ -118,6 +118,7 @@ TEST(NotificationChannels, DeliveryRecordKeepsOnlyWebhookHost)
     ASSERT_EQ(1, deliveries.total);
     EXPECT_EQ("webhook://" + host, deliveries.rows.front().target);
     EXPECT_EQ("failed", deliveries.rows.front().status);
+    EXPECT_EQ(std::string::npos, deliveries.rows.front().error.find("topsecret"));
 }
 
 // 钉住：投递记录保留期只删窗口外的行，非正数天数不删任何数据
