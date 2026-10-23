@@ -6,6 +6,7 @@
 #include "Base/Api/QueryParameters.h"
 #include "Base/Api/RequestParsing.h"
 #include "Base/Json/JsonFields.h"
+#include "Base/Log/LogMacros.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/AuthService.h"
@@ -26,6 +27,7 @@
 #include "Net/Http/Routing/Router.h"
 #include "Platform/IO/MemoryMappedFile.h"
 
+#include <Core/Coroutine/AsyncExecutor.h>
 #include <Core/EventLoop/EventLoop.h>
 
 #include <algorithm>
@@ -82,6 +84,35 @@ namespace EdgePulse::Firmware
         void fail(AsynGyanis::Net::HttpResponse &response, const int status, const std::string &message, const std::string_view traceId)
         {
             Common::writeFailure(response, status, status, message, traceId);
+        }
+
+        /**
+         * @brief 在工作线程上删除被拒绝的固件成品
+         * @param loop 请求所属事件循环，删除尝试结束后把协程恢复到这里
+         * @param path 待删除的成品路径
+         * @return AsynGyanis::Core::Task<> 删除尝试结束即返回，失败只记日志
+         * @note 删除失败不改写响应状态码：请求本来就要失败，成品残留交给运维清理
+         */
+        AsynGyanis::Core::Task<> removeStoredFile(AsynGyanis::Core::EventLoop &loop, std::string path)
+        {
+            try
+            {
+                const bool removed = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop,
+                                                                                                       [path]()
+                                                                                                       {
+                                                                                                           std::error_code error;
+                                                                                                           std::filesystem::remove(path, error);
+                                                                                                           return !error;
+                                                                                                       });
+                if (!removed)
+                {
+                    LOG_WARN_FMT("删除固件成品失败：path={}", path);
+                }
+            } catch (const std::exception &failure)
+            {
+                LOG_WARN_FMT("提交固件成品删除任务失败：path={} reason={}", path, failure.what());
+            }
+            co_return;
         }
 
         [[nodiscard]] bool signatureRequired(const FirmwareDependencies &dependencies) noexcept
@@ -372,8 +403,8 @@ namespace EdgePulse::Firmware
                                      const auto verified = deps->signingPolicy->verifier->verify(*keyIdHeader, *digest, *signatureHeader);
                                      if (!verified.has_value())
                                      {
-                                         std::error_code error;
-                                         std::filesystem::remove(finalPath, error);
+                                         // 验签发生在成品重命名之后；删除要在工作线程上做，事件循环线程不做同步文件 IO
+                                         co_await removeStoredFile(loop, finalPath);
                                          fail(response, Common::kCodeBadRequest, verified.error(), traceId);
                                          co_return;
                                      }
@@ -393,14 +424,19 @@ namespace EdgePulse::Firmware
                                  record.createdBy          = session->userId;
                                  record.createdAt          = Common::nowDateTimeUtc();
                                  record.tenantId           = targetTenantId;
+                                 // co_await 不能写在 catch 里，先把失败原因取出来，出了 catch 再删成品
+                                 std::optional<std::string> createFailure;
                                  try
                                  {
                                      static_cast<void>(co_await firmware->create(loop, record));
                                  } catch (const std::exception &failure)
                                  {
-                                     std::error_code error;
-                                     std::filesystem::remove(finalPath, error);
-                                     fail(response, Common::kCodeInternalServerError, failure.what(), traceId);
+                                     createFailure = failure.what();
+                                 }
+                                 if (createFailure.has_value())
+                                 {
+                                     co_await removeStoredFile(loop, finalPath);
+                                     fail(response, Common::kCodeInternalServerError, *createFailure, traceId);
                                      co_return;
                                  }
                                  Common::writeSuccess(response, firmwareJson(record), traceId);

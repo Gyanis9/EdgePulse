@@ -106,7 +106,6 @@ namespace EdgePulse::Alarm
 namespace EdgePulse::Firmware
 {
     class FirmwareRepository;
-    class FirmwareSignatureVerifier;
     struct FirmwareSigningPolicy;
 } // namespace EdgePulse::Firmware
 namespace EdgePulse::Command

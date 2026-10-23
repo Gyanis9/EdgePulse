@@ -1,10 +1,3 @@
-/**
- * @file Main.cpp
- * @brief 固件验签样例：对本地文件计算 SHA-256 并按信任键目录校验 Ed25519 签名
- * @author Gyanis
- * @date 2026-10-24
- */
-
 #include "Core/Firmware/FirmwareSignatureVerifier.h"
 
 #include <Core/Crypto/Digest.h>

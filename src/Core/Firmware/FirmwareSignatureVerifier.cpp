@@ -87,12 +87,23 @@ namespace EdgePulse::Firmware
 
     std::expected<FirmwareSignatureVerifier, std::string> FirmwareSignatureVerifier::loadFromDirectory(const std::filesystem::path &directory)
     {
-        if (!std::filesystem::exists(directory))
+        std::error_code filesystemError;
+        const bool      directoryExists = std::filesystem::exists(directory, filesystemError);
+        if (filesystemError)
+        {
+            return std::unexpected("检查固件信任键目录失败：" + directory.string() + "：" + filesystemError.message());
+        }
+        if (!directoryExists)
         {
             // 目录不存在等同「没有配置信任键」；是否允许无签名固件由部署策略决定
             return FirmwareSignatureVerifier{};
         }
-        if (!std::filesystem::is_directory(directory))
+        const bool isDirectory = std::filesystem::is_directory(directory, filesystemError);
+        if (filesystemError)
+        {
+            return std::unexpected("检查固件信任键路径失败：" + directory.string() + "：" + filesystemError.message());
+        }
+        if (!isDirectory)
         {
             return std::unexpected("固件信任键路径不是目录：" + directory.string());
         }
@@ -101,7 +112,13 @@ namespace EdgePulse::Firmware
         std::error_code iteratorError;
         for (const auto &entry: std::filesystem::directory_iterator(directory, iteratorError))
         {
-            if (!entry.is_regular_file() || entry.path().extension() != ".pem")
+            std::error_code entryError;
+            const bool      isRegularFile = entry.is_regular_file(entryError);
+            if (entryError)
+            {
+                return std::unexpected("读取固件信任键目录项失败：" + entry.path().string() + "：" + entryError.message());
+            }
+            if (!isRegularFile || entry.path().extension() != ".pem")
             {
                 continue;
             }
@@ -151,7 +168,7 @@ namespace EdgePulse::Firmware
             return std::unexpected("固件摘要必须是 64 位十六进制");
         }
         const std::optional<std::string> signature = AsynGyanis::Base::base64Decode(signatureBase64);
-        // Ed25519 签名固定 32 字节；长度不符时不必进 OpenSSL，先给出可读原因
+        // Ed25519 签名固定 64 字节（覆盖 32 字节摘要）；长度不符时不必进 OpenSSL，先给出可读原因
         if (!signature.has_value() || signature->size() != 64)
         {
             return std::unexpected("固件签名不是合法的 Ed25519 Base64");

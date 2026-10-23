@@ -892,10 +892,35 @@ TEST_F(FleetEndpointsTest, FirmwareSignedUploadDownloadAndPolicy)
     ASSERT_EQ(1, (*policyJson)["data"]["trustedKeyIds"].size());
     EXPECT_EQ("protocol-key", (*policyJson)["data"]["trustedKeyIds"][0].get<std::string>());
 
+    // 下发命令的 payload 必须带上签名三元组，Agent 才能按它复核下载到的文件
+    const auto deployed =
+            m_server->post("/api/firmware/" + std::to_string(firmwareId) + "/deploy",
+                           AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeId})}}).dump(), "application/json", bearer(token));
+    ASSERT_EQ(200, deployed.status) << deployed.body;
+    ASSERT_EQ(1, (*deployed.json())["data"].size());
+    const std::int64_t commandId = (*deployed.json())["data"][0]["commandId"].get<std::int64_t>();
+    const auto         commands  = m_server->get("/api/commands?pageNum=1&pageSize=10&nodeId=" + std::to_string(nodeId), bearer(token));
+    ASSERT_EQ(200, commands.status) << commands.body;
+    const auto commandsJson = commands.json();
+    ASSERT_TRUE(commandsJson.has_value());
+    const auto &rows    = (*commandsJson)["data"]["rows"];
+    const auto  created = std::find_if(rows.begin(), rows.end(), [commandId](const AsynGyanis::Base::ConfigValue &row) { return row["id"].get<std::int64_t>() == commandId; });
+    ASSERT_NE(rows.end(), created) << commands.body;
+    const auto commandPayload = AsynGyanis::Base::parseConfigValue((*created)["payload"].get<std::string>());
+    ASSERT_TRUE(commandPayload.has_value());
+    EXPECT_EQ(signature, (*commandPayload)["signature"].get<std::string>());
+    EXPECT_EQ("protocol-key", (*commandPayload)["signingKeyId"].get<std::string>());
+    EXPECT_EQ("ed25519-sha256", (*commandPayload)["signatureAlgorithm"].get<std::string>());
+
     // 缺少 key id：在收正文前拒绝
     std::vector<std::pair<std::string, std::string>> missingKeyId = bearer(token);
     missingKeyId.emplace_back("X-Firmware-Signature", signature);
     EXPECT_EQ(400, m_server->send("POST", "/api/firmware?name=NoKey&version=2.0.1", bytes, "application/octet-stream", missingKeyId).status);
+
+    // 只给 key id 不给签名：同样在收正文前拒绝，避免留下「未签名却记录 key id」的半套元数据
+    std::vector<std::pair<std::string, std::string>> missingSignature = bearer(token);
+    missingSignature.emplace_back("X-Firmware-Key-Id", "protocol-key");
+    EXPECT_EQ(400, m_server->send("POST", "/api/firmware?name=NoSignature&version=2.0.4", bytes, "application/octet-stream", missingSignature).status);
 
     // 未知 key id 与摘要不符都不能落库
     std::vector<std::pair<std::string, std::string>> unknownKey = bearer(token);
@@ -995,6 +1020,52 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedButAllowsLegacyD
     ASSERT_EQ(200, legacyDownload.status) << legacyDownload.body;
     EXPECT_FALSE(legacyDownload.header("x-firmware-signature").has_value());
     EXPECT_EQ("legacy-bytes", legacyDownload.body);
+}
+
+// 钉住：没有装配签名策略时，带签名头的请求不能静默跳过验签，必须在收正文前拒绝
+TEST_F(FleetEndpointsTest, FirmwareUploadWithoutSigningPolicyRejectsSignedRequest)
+{
+    const std::string token = login();
+    EdgePulse::TestSupport::ServerHarness unpolicedServer(
+            [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+            {
+                EdgePulse::Web::applySecurityHeaders(router);
+                EdgePulse::Auth::registerRoutes(router, loop, *m_context->auth, *m_context->captcha, true);
+                EdgePulse::Firmware::FirmwareDependencies firmware;
+                firmware.auth               = m_context->auth.get();
+                firmware.firmware           = m_firmware.get();
+                firmware.nodes              = m_nodes.get();
+                firmware.commands           = m_commands.get();
+                firmware.channels           = m_channels.get();
+                firmware.storageDirectory   = m_storage.string();
+                firmware.maximumUploadBytes = 8U * 1024U * 1024U;
+                // signingPolicy 保持为空：模拟装配遗漏，策略缺位不等于允许无签名固件
+                EdgePulse::Firmware::registerFirmwareRoutes(router, loop, firmware);
+            });
+
+    const std::string bytes(128, 'P');
+    const auto        unsignedUpload =
+            unpolicedServer.send("POST", "/api/firmware?name=Plain+OS&version=4.0.0&fileName=p.bin", bytes, "application/octet-stream", bearer(token));
+    ASSERT_EQ(200, unsignedUpload.status) << unsignedUpload.body;
+
+    std::vector<std::pair<std::string, std::string>> signedHeaders = bearer(token);
+    signedHeaders.emplace_back("X-Firmware-Signature", AsynGyanis::Base::base64Encode(std::string(64, '\0')));
+    signedHeaders.emplace_back("X-Firmware-Key-Id", "protocol-key");
+    const auto signedUpload =
+            unpolicedServer.send("POST", "/api/firmware?name=Signed+OS&version=4.0.1&fileName=s.bin", bytes, "application/octet-stream", signedHeaders);
+    EXPECT_EQ(400, signedUpload.status) << signedUpload.body;
+    EXPECT_NE(std::string::npos, signedUpload.body.find("信任键"));
+
+    // 被拒请求在收正文前就返回，只留下成功那份固件
+    std::size_t storedFiles = 0;
+    for (const auto &entry: std::filesystem::directory_iterator(m_storage))
+    {
+        if (entry.is_regular_file())
+        {
+            ++storedFiles;
+        }
+    }
+    EXPECT_EQ(1U, storedFiles);
 }
 
 // 钉住：节点分组 CRUD 与占用保护

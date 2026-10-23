@@ -27,6 +27,9 @@ namespace EdgePulse::Firmware
          * @brief 是否强制校验签名
          * @return bool 开启时上传与下发都必须带签名
          */
-        [[nodiscard]] bool signatureRequired() const noexcept;
+        [[nodiscard]] bool signatureRequired() const noexcept
+        {
+            return requireSignature;
+        }
     };
 } // namespace EdgePulse::Firmware

@@ -106,7 +106,7 @@ namespace
     }
 } // namespace
 
-// 钉住：合法签名通过；未知 key、被篡改的摘要、非 Base64 与非 32 字节签名都被拒绝
+// 钉住：合法签名通过；未知 key、被篡改的摘要、非 Base64 与非 64 字节签名都被拒绝
 TEST(FirmwareSignature, VerifiesDigestAndRejectsTampering)
 {
     KeyPair                     pair      = generateEd25519();
@@ -127,6 +127,26 @@ TEST(FirmwareSignature, VerifiesDigestAndRejectsTampering)
     EXPECT_FALSE(verifier->verify("test-key", AsynGyanis::Core::Digest::sha256Hex("other"), signature).has_value());
     EXPECT_FALSE(verifier->verify("test-key", digestHex, "not-base64").has_value());
     EXPECT_FALSE(verifier->verify("test-key", "abcd", signature).has_value());
+
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+}
+
+// 钉住：Ed25519 签名固定 64 字节；Base64 解码后只有 32 字节的输入必须按格式错误拒绝
+TEST(FirmwareSignature, Rejects32ByteSignature)
+{
+    KeyPair                     pair      = generateEd25519();
+    const std::filesystem::path directory = makeTemporaryDirectory("firmware-keys-short-signature");
+    writePublicKey(directory / "test-key.pem", pair.publicKey.get());
+
+    const auto verifier = EdgePulse::Firmware::FirmwareSignatureVerifier::loadFromDirectory(directory);
+    ASSERT_TRUE(verifier.has_value()) << verifier.error();
+
+    const std::string digestHex      = AsynGyanis::Core::Digest::sha256Hex("firmware-bytes");
+    const std::string shortSignature = AsynGyanis::Base::base64Encode(std::string(32, '\0'));
+    const auto        rejected       = verifier->verify("test-key", digestHex, shortSignature);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_NE(std::string::npos, rejected.error().find("固件签名不是合法的 Ed25519 Base64"));
 
     std::error_code error;
     std::filesystem::remove_all(directory, error);
