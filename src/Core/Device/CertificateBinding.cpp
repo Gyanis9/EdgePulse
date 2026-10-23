@@ -1,6 +1,11 @@
 #include "Core/Device/CertificateBinding.h"
 
+#include <openssl/asn1.h>
+#include <openssl/x509.h>
+
 #include <cctype>
+#include <cstdio>
+#include <memory>
 #include <string>
 
 namespace EdgePulse::Device
@@ -50,5 +55,30 @@ namespace EdgePulse::Device
             return "连接证书指纹与节点登记不一致";
         }
         return std::nullopt;
+    }
+
+    std::optional<std::string> certificateNotAfter(const AsynGyanis::Core::TlsPeerIdentityPtr &identity)
+    {
+        if (!identity || identity->certificateDer().empty())
+        {
+            // 测试注入的空 DER 没有可解析的证书；生产 mTLS 一定有
+            return std::string{};
+        }
+        const unsigned char *cursor      = identity->certificateDer().data();
+        X509                *certificate = d2i_X509(nullptr, &cursor, static_cast<long>(identity->certificateDer().size()));
+        if (certificate == nullptr)
+        {
+            return std::nullopt;
+        }
+        std::unique_ptr<X509, decltype(&X509_free)> guard(certificate, &X509_free);
+        tm                                          expires{};
+        if (ASN1_TIME_to_tm(X509_get0_notAfter(certificate), &expires) != 1)
+        {
+            return std::nullopt;
+        }
+        char buffer[32]{};
+        std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", expires.tm_year + 1900, expires.tm_mon + 1, expires.tm_mday, expires.tm_hour, expires.tm_min,
+                      expires.tm_sec);
+        return std::string{buffer};
     }
 } // namespace EdgePulse::Device

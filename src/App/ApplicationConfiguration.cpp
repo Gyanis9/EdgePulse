@@ -137,6 +137,7 @@ namespace EdgePulse::App
         configuration.deliveryRetentionDays  = static_cast<int>(configurationManager.getInt("edgepulse.delivery_retention_days", configuration.deliveryRetentionDays));
         configuration.certificateDirectory   = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
         configuration.agentFingerprint       = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
+        configuration.enrollmentMode         = configurationManager.getString("edgepulse.agent.enrollment_mode", configuration.enrollmentMode);
         configuration.heartbeatIntervalSeconds =
                 static_cast<int>(configurationManager.getInt("edgepulse.agent.heartbeat_interval_seconds", configuration.heartbeatIntervalSeconds));
         configuration.heartbeatTimeoutSeconds = static_cast<int>(configurationManager.getInt("edgepulse.agent.heartbeat_timeout_seconds", configuration.heartbeatTimeoutSeconds));
@@ -198,6 +199,10 @@ namespace EdgePulse::App
         if (configuration.threads < 1 || configuration.threads > 64)
         {
             return std::unexpected(ConfigurationError{"edgepulse.threads 必须在 1 到 64 之间"});
+        }
+        if (configuration.enrollmentMode != "off" && configuration.enrollmentMode != "required")
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.agent.enrollment_mode 只能是 off 或 required，当前值：" + configuration.enrollmentMode});
         }
         if (configuration.heartbeatIntervalSeconds < 1 || configuration.heartbeatIntervalSeconds > 600)
         {

@@ -22,6 +22,8 @@ namespace EdgePulse::Device
                                                       {"status", node.status},
                                                       {"agentVersion", node.agentVersion},
                                                       {"certFingerprint", node.certFingerprint},
+                                                      {"certNotAfter", node.certNotAfter},
+                                                      {"certRevokedAt", node.certRevokedAt},
                                                       {"labels", std::move(labels)},
                                                       {"lastSeen", node.lastSeen},
                                                       {"groupId", node.groupId},

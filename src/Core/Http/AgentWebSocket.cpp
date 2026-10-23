@@ -92,6 +92,12 @@ namespace EdgePulse::Web
                                            co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unknown node");
                                            co_return;
                                        }
+                                       if (!node->certRevokedAt.empty())
+                                       {
+                                           LOG_WARN_FMT("Agent WebSocket 拒绝已吊销证书：node={}", *id);
+                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
+                                           co_return;
+                                       }
                                        // mTLS 只证明对端持有 CA 签发的证书；节点身份还必须与登记的叶证书指纹一致
                                        if (const std::optional<std::string> bindingFailure = Device::certificateBindingFailure(peer.peerIdentity(), node->certFingerprint);
                                            bindingFailure.has_value())

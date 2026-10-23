@@ -60,6 +60,21 @@ TEST(CertificateBinding, UnverifiedCertificateIsRejected)
     EXPECT_NE(std::string::npos, failure->find("未通过"));
 }
 
+// 钉住：空 DER 是测试注入的占位身份，没有可解析的证书；损坏 DER 不能静默当成“无到期时间”
+TEST(CertificateBinding, CertificateNotAfterHandlesEmptyAndMalformedDer)
+{
+    EXPECT_TRUE(EdgePulse::Device::certificateNotAfter(nullptr).has_value());
+    EXPECT_TRUE(EdgePulse::Device::certificateNotAfter(nullptr)->empty());
+
+    const AsynGyanis::Core::TlsPeerIdentityPtr emptyDer = makeIdentity(std::string(64, 'a'));
+    const std::optional<std::string>           empty    = EdgePulse::Device::certificateNotAfter(emptyDer);
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->empty());
+
+    const auto malformed = std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{0xde, 0xad, 0xbe, 0xef}, std::string(64, 'a'));
+    EXPECT_FALSE(EdgePulse::Device::certificateNotAfter(malformed).has_value());
+}
+
 // 钉住：归一化只接受 64 位十六进制，并统一成小写
 TEST(CertificateBinding, FingerprintNormalization)
 {

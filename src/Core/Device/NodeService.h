@@ -98,6 +98,14 @@ namespace EdgePulse::Device
          */
         AsynGyanis::Core::Task<std::optional<NodeRecord>> find(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
 
+        /**
+         * @brief 吊销节点证书
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点标识
+         * @return 成功返回更新后的节点；节点不存在或已删除时为空
+         */
+        AsynGyanis::Core::Task<std::optional<NodeRecord>> revokeCertificate(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
+
     private:
         std::shared_ptr<NodeRepository> m_repository; ///< 节点仓储
     };

@@ -99,6 +99,18 @@ namespace EdgePulse::Device
                                                  traceId);
                             co_return;
                         }
+                        // 令牌字段可省略；一旦出现就必须是字符串，不能把数字或对象当成“没有令牌”
+                        std::string enrollmentToken;
+                        if (body->is_object() && body->contains("enrollmentToken"))
+                        {
+                            const auto tokenIterator = body->find("enrollmentToken");
+                            if (tokenIterator == body->end() || !tokenIterator->is_string())
+                            {
+                                Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "enrollmentToken 必须是字符串", traceId);
+                                co_return;
+                            }
+                            enrollmentToken = tokenIterator->get<std::string>();
+                        }
                         // 注册请求用租户编码声明归属；缺省落在默认租户
                         const std::string tenantCode = stringField(*body, "tenantCode").value_or("default");
                         const auto        tenant     = co_await tenants.findByCode(loop, tenantCode);
@@ -114,6 +126,7 @@ namespace EdgePulse::Device
                         }
                         AgentRegistration registration{*name, *version, *fingerprint, *labels, tenant->id};
                         registration.connectionIdentity = request.tlsPeerIdentity();
+                        registration.enrollmentToken    = std::move(enrollmentToken);
                         const auto result               = co_await registry.registerAgent(loop, std::move(registration));
                         if (!result.has_value())
                         {

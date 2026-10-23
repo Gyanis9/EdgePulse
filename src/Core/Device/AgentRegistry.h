@@ -24,6 +24,8 @@
 
 namespace EdgePulse::Device
 {
+    class EnrollmentService;
+
     /**
      * @brief Agent 注册失败的可恢复原因
      */
@@ -52,6 +54,7 @@ namespace EdgePulse::Device
         std::int64_t tenantId{1};     ///< 节点归属租户，由注册请求的租户编码解析
 
         AsynGyanis::Core::TlsPeerIdentityPtr connectionIdentity{}; ///< 注册请求的 TLS 对端身份；非 TLS 链路为空
+        std::string                          enrollmentToken;      ///< 一次性注册/改绑令牌明文，可空
     };
 
     /// 心跳后的节点状态回调；每次注册或心跳成功后都会调用，becameOnline 表示本次是否把节点拉回在线
@@ -68,8 +71,10 @@ namespace EdgePulse::Device
          */
         struct Options
         {
-            std::vector<std::string> allowedFingerprints; ///< 允许的证书指纹；空表示只依赖 CA 链校验
-            NodeStatusPublisher      publisher;           ///< 心跳钩子，可空；在每次注册与心跳成功后调用，由回调决定是否发布状态
+            std::vector<std::string> allowedFingerprints;   ///< 允许的证书指纹；空表示只依赖 CA 链校验
+            NodeStatusPublisher      publisher;             ///< 心跳钩子，可空；在每次注册与心跳成功后调用，由回调决定是否发布状态
+            std::string              enrollmentMode{"off"}; ///< off 或 required；required 下新节点与改绑必须持令牌
+            EnrollmentService       *enrollments{nullptr};  ///< 令牌服务，用于计算明文摘要；required 模式下必须配置
         };
 
         /**

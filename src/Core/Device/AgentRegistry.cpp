@@ -3,6 +3,7 @@
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogMacros.h"
 #include "Core/Device/CertificateBinding.h"
+#include "Core/Device/EnrollmentService.h"
 
 #include <algorithm>
 #include <exception>
@@ -68,14 +69,47 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "labels 必须是 JSON 对象"});
         }
+        const std::optional<std::string> notAfter = certificateNotAfter(registration.connectionIdentity);
+        if (!notAfter.has_value())
+        {
+            co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "连接证书的到期时间无法解析，请检查证书格式"});
+        }
+        if (m_options.enrollmentMode == "required" && m_options.enrollments == nullptr)
+        {
+            // 配置要求令牌却没人能算摘要：属于装配错误，不能让注册悄悄退回只看指纹
+            co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "注册令牌服务未配置，无法完成 required 模式注册"});
+        }
+
+        // 先看节点当前登记：同指纹重注册放行，异指纹或新节点才需要令牌
+        const std::optional<NodeRecord> current         = co_await m_repository->scoped({registration.tenantId, false})->findByName(loop, registration.name);
+        const bool                      sameCertificate = current.has_value() && current->certFingerprint == *fingerprint;
+        std::string                     action;
+        if (!sameCertificate)
+        {
+            action = current.has_value() ? "rebind" : "enroll";
+        }
+        const bool required = m_options.enrollmentMode == "required" && !sameCertificate;
+        if (required && registration.enrollmentToken.empty())
+        {
+            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, "该节点需要一次性注册令牌，请向管理员申请"});
+        }
+        if (required && current.has_value() && action != "rebind")
+        {
+            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, "该节点已登记其他证书，请使用改绑令牌"});
+        }
 
         AgentUpsert upsert;
-        upsert.tenantId        = registration.tenantId;
-        upsert.name            = registration.name;
-        upsert.agentVersion    = registration.agentVersion;
-        upsert.certFingerprint = *fingerprint;
-        upsert.labelsJson      = *labels;
-        const auto outcome     = co_await m_repository->upsertAgent(loop, std::move(upsert));
+        upsert.tenantId            = registration.tenantId;
+        upsert.name                = registration.name;
+        upsert.agentVersion        = registration.agentVersion;
+        upsert.certFingerprint     = *fingerprint;
+        upsert.labelsJson          = *labels;
+        upsert.enrollmentAction    = action;
+        upsert.requireEnrollment   = required;
+        upsert.allowRebind         = !current.has_value() || action == "rebind";
+        upsert.enrollmentTokenHash = registration.enrollmentToken.empty() ? std::string{} : EnrollmentService::hashToken(registration.enrollmentToken);
+        upsert.certNotAfter        = *notAfter;
+        const auto outcome         = co_await m_repository->upsertAgent(loop, std::move(upsert));
         if (!outcome.has_value())
         {
             // 仓储只会在注册令牌核验失败时拒绝；按授权失败返回 403，而不是伪装成服务端错误

@@ -37,6 +37,8 @@ namespace EdgePulse::Device
         std::string  status;          ///< online / offline
         std::string  agentVersion;    ///< Agent 版本
         std::string  certFingerprint; ///< 自报的证书 SHA-256，小写
+        std::string  certNotAfter;    ///< 叶证书到期时间，可空
+        std::string  certRevokedAt;   ///< 证书吊销时间，可空
         std::string  labelsJson;      ///< 标签 JSON 文本，可空
         std::string  lastSeen;        ///< 最近心跳时间，可空
         std::int64_t groupId{0};      ///< 所属分组
@@ -106,11 +108,16 @@ namespace EdgePulse::Device
      */
     struct AgentUpsert
     {
-        std::string  name;            ///< 节点名
-        std::string  agentVersion;    ///< Agent 版本
-        std::string  certFingerprint; ///< 自报证书指纹
-        std::string  labelsJson;      ///< 标签 JSON 文本，可空
-        std::int64_t tenantId{1};     ///< 归属租户
+        std::string  name;                     ///< 节点名
+        std::string  agentVersion;             ///< Agent 版本
+        std::string  certFingerprint;          ///< 自报证书指纹
+        std::string  labelsJson;               ///< 标签 JSON 文本，可空
+        std::int64_t tenantId{1};              ///< 归属租户
+        std::string  enrollmentTokenHash;      ///< 令牌明文的 SHA-256；空表示没有令牌
+        std::string  enrollmentAction;         ///< enroll / rebind
+        bool         requireEnrollment{false}; ///< 本次注册是否必须消费令牌
+        bool         allowRebind{true};        ///< 已有节点换证书时是否允许改绑
+        std::string  certNotAfter;             ///< 叶证书到期时间，可空
     };
 
     /**
@@ -193,9 +200,26 @@ namespace EdgePulse::Device
          * @brief Agent 注册：按名称更新或新建，并置为在线
          * @param loop 恢复协程用的事件循环
          * @param registration 注册输入
-         * @return 成功返回节点与在线转换标记；令牌校验由注册令牌接入时在同一事务内完成
+         * @return 成功返回节点与在线转换标记；令牌校验在同一事务内完成
+         * @note 名称唯一键被并发注册抢占时，回滚后按已有节点重试一次
          */
         AsynGyanis::Core::Task<std::expected<AgentUpsertOutcome, AgentUpsertFailure>> upsertAgent(AsynGyanis::Core::EventLoop &loop, AgentUpsert registration);
+
+        /**
+         * @brief 吊销节点证书：清空指纹、置为离线并记录吊销时间
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点标识
+         * @return 成功返回更新后的节点；节点不存在或已删除时为空
+         */
+        AsynGyanis::Core::Task<std::optional<NodeRecord>> revokeCertificate(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
+
+        /**
+         * @brief 统计指定天数内到期或已经到期的证书
+         * @param loop 恢复协程用的事件循环
+         * @param withinDays 观察窗口天数
+         * @return 未吊销且未删除节点的证书数
+         */
+        AsynGyanis::Core::Task<std::int64_t> countExpiringCertificates(AsynGyanis::Core::EventLoop &loop, int withinDays);
 
         /**
          * @brief 心跳：更新在线状态与最近时间

@@ -38,6 +38,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestAgentAuthorization.cpp
         Integration/TestAuthService.cpp
         Integration/TestDeviceService.cpp
+        Integration/TestEnrollment.cpp
         Integration/TestExternalStores.cpp
         Integration/TestMigrations.cpp
         Integration/TestNodeLifecycle.cpp
@@ -57,6 +58,7 @@ gtest_discover_tests(edgepulse-integration-tests DISCOVERY_MODE PRE_TEST)
 add_executable(edgepulse-protocol-tests
         Protocol/TestApiResponse.cpp
         Protocol/TestAuthEndpoints.cpp
+        Protocol/TestEnrollmentEndpoints.cpp
         Protocol/TestHealthServer.cpp
         Protocol/TestFleetEndpoints.cpp
         Protocol/TestNodeEndpoints.cpp

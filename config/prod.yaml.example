@@ -44,6 +44,7 @@ edgepulse:
     allowed_origins: https://console.example.com
   agent:
     fingerprint: ""
+    enrollment_mode: "required"
     heartbeat_interval_seconds: 30
     heartbeat_timeout_seconds: 90
     offline_sweep_seconds: 30

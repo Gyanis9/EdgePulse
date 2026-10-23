@@ -64,6 +64,8 @@ namespace EdgePulse::Cache
 namespace EdgePulse::Device
 {
     class AgentRegistry;
+    class EnrollmentRepository;
+    class EnrollmentService;
     class NodeGroupRepository;
     class NodeLifecycleService;
     class NodeRepository;
@@ -214,6 +216,8 @@ namespace EdgePulse::App
         std::shared_ptr<Web::BrowserWebSocket>                    m_browserWebSocket;       ///< 浏览器 WebSocket 与节点扇出
         std::shared_ptr<Device::NodeRepository>                   m_nodeRepository;         ///< 节点仓储
         std::shared_ptr<Device::NodeRepository>                   m_fleetNodes;             ///< 离线扫描用的全租户节点视图
+        std::shared_ptr<Device::EnrollmentRepository>             m_enrollmentRepository;   ///< 一次性注册令牌仓储
+        std::shared_ptr<Device::EnrollmentService>                m_enrollmentService;      ///< 一次性注册令牌服务
         std::shared_ptr<Device::NodeService>                      m_nodeService;            ///< 节点服务
         std::shared_ptr<Device::AgentRegistry>                    m_agentRegistry;          ///< Agent 注册表
         std::shared_ptr<Device::NodeLifecycleService>             m_lifecycle;              ///< 节点在线转换与离线扫描

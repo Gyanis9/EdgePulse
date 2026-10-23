@@ -25,8 +25,11 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Plugins/DevicePlugin/AgentController.h"
 #include "Core/Device/AgentRegistry.h"
+#include "Core/Device/EnrollmentRepository.h"
+#include "Core/Device/EnrollmentService.h"
 #include "Core/Device/NodeLifecycleService.h"
 #include "Plugins/DevicePlugin/DeviceController.h"
+#include "Plugins/DevicePlugin/EnrollmentController.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Metrics/BusinessMetrics.h"
@@ -202,6 +205,8 @@ namespace EdgePulse::App
             m_nodeRepository = std::make_shared<Device::NodeRepository>(m_database);
             // 离线判定按进程汇总；仓储默认只看默认租户，周期扫描必须显式取全租户视图
             m_fleetNodes             = m_nodeRepository->scoped({0, true});
+            m_enrollmentRepository   = std::make_shared<Device::EnrollmentRepository>(m_database);
+            m_enrollmentService      = std::make_shared<Device::EnrollmentService>(m_enrollmentRepository);
             m_nodeService            = std::make_shared<Device::NodeService>(m_nodeRepository);
             m_alarmRepository        = std::make_shared<Alarm::AlarmRepository>(m_database);
             m_notificationRepository = std::make_shared<Notification::NotificationRepository>(m_database);
@@ -237,7 +242,9 @@ namespace EdgePulse::App
             {
                 agentOptions.allowedFingerprints.push_back(m_configuration.agentFingerprint);
             }
-            agentOptions.publisher = [lifecycle = m_lifecycle, &loop](const Device::NodeRecord &node, const bool becameOnline) -> AsynGyanis::Core::Task<>
+            agentOptions.enrollmentMode = m_configuration.enrollmentMode;
+            agentOptions.enrollments    = m_enrollmentService.get();
+            agentOptions.publisher      = [lifecycle = m_lifecycle, &loop](const Device::NodeRecord &node, const bool becameOnline) -> AsynGyanis::Core::Task<>
             { co_await lifecycle->onHeartbeat(loop, node, becameOnline); };
             m_agentRegistry  = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
             m_userRepository = std::make_shared<System::UserRepository>(m_database);
@@ -638,6 +645,7 @@ namespace EdgePulse::App
                 co_await m_lifecycle->sweep(loop, cutoff);
                 const Device::NodeStatusCounts counts = co_await m_fleetNodes->countByStatus(loop);
                 Metrics::BusinessMetrics::instance().setNodeCounts(counts.online, counts.offline);
+                Metrics::BusinessMetrics::instance().setAgentCertificatesExpiring(co_await m_fleetNodes->countExpiringCertificates(loop, 7));
                 Metrics::BusinessMetrics::instance().setAlarmsOpen(co_await allAlarms->openCount(loop));
                 Metrics::BusinessMetrics::instance().setCommandsPending(co_await allCommands->pendingCount(loop));
             } catch (const std::exception &failure)
@@ -770,6 +778,11 @@ namespace EdgePulse::App
                                             session->departmentId, session->roles,    session->permissions};
         };
         Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get());
+        Device::EnrollmentDependencies enrollmentDependencies;
+        enrollmentDependencies.auth        = m_authService.get();
+        enrollmentDependencies.enrollments = m_enrollmentService.get();
+        enrollmentDependencies.tenants     = m_tenantRepository.get();
+        Device::registerEnrollmentRoutes(router, loop, enrollmentDependencies);
         m_browserWebSocket->registerRoute(
                 router,
                 [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<std::optional<Web::BrowserSubscriptionScope>>

@@ -1,9 +1,11 @@
+#include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/NodeService.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 
 #include <Core/Tls/TlsPeerIdentity.h>
+#include <Net/Http/Message/HttpRequest.h>
 
 #include <gtest/gtest.h>
 
@@ -120,6 +122,61 @@ TEST(DeviceService, AgentRegistrationBindsConnectionCertificate)
     const auto registered      = runner.run(registry.registerAgent(runner.loop(), std::move(matched)));
     ASSERT_TRUE(registered.has_value()) << registered.error().message;
     EXPECT_EQ(fingerprint, registered->certFingerprint);
+}
+
+// 钉住：吊销清空指纹并拒绝旧证书；同指纹重新注册会清掉吊销时间
+TEST(DeviceService, CertificateRevocationClearsBindingAndRejectsOldCertificate)
+{
+    EdgePulse::TestSupport::AuthTestContext    context;
+    EdgePulse::TestSupport::EventLoopRunner    runner;
+    const auto                                 repository = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    EdgePulse::Device::AgentRegistry           registry(repository, {});
+    const std::string                          fingerprint(64, 'a');
+    const AsynGyanis::Core::TlsPeerIdentityPtr identity = std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, fingerprint);
+
+    EdgePulse::Device::AgentRegistration registration{"edge-revoke", "1.0.0", fingerprint, ""};
+    registration.connectionIdentity = identity;
+    const auto registered           = runner.run(registry.registerAgent(runner.loop(), registration));
+    ASSERT_TRUE(registered.has_value()) << registered.error().message;
+
+    const auto revoked = runner.run(repository->revokeCertificate(runner.loop(), registered->id));
+    ASSERT_TRUE(revoked.has_value());
+    EXPECT_TRUE(revoked->certFingerprint.empty());
+    EXPECT_FALSE(revoked->certRevokedAt.empty());
+    EXPECT_EQ("offline", revoked->status);
+    EXPECT_EQ(registered->version + 1, revoked->version);
+
+    AsynGyanis::Net::HttpRequest request;
+    request.setTlsPeerIdentity(identity);
+    const auto rejected = runner.run(EdgePulse::Device::requireAgentNode(runner.loop(), *repository, request, registered->id));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(403, rejected.error().httpStatus);
+    EXPECT_NE(std::string::npos, rejected.error().message.find("吊销"));
+
+    // 管理员重新签发证书后，同指纹注册回到 allowed 路径并恢复在线
+    const auto recovered = runner.run(registry.registerAgent(runner.loop(), registration));
+    ASSERT_TRUE(recovered.has_value()) << recovered.error().message;
+    EXPECT_TRUE(recovered->certRevokedAt.empty());
+    EXPECT_EQ("online", recovered->status);
+    const auto allowed = runner.run(EdgePulse::Device::requireAgentNode(runner.loop(), *repository, request, registered->id));
+    ASSERT_TRUE(allowed.has_value()) << allowed.error().message;
+}
+
+// 钉住：非空但无法解析的证书 DER 按 400 拒绝，不能静默丢弃到期时间
+TEST(DeviceService, AgentRegistrationRejectsMalformedCertificate)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              repository = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    EdgePulse::Device::AgentRegistry        registry(repository, {});
+
+    const std::string                    fingerprint(64, 'a');
+    EdgePulse::Device::AgentRegistration registration{"edge-bad-cert", "1.0.0", fingerprint, ""};
+    registration.connectionIdentity = std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{0xde, 0xad, 0xbe, 0xef}, fingerprint);
+    const auto rejected             = runner.run(registry.registerAgent(runner.loop(), registration));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(EdgePulse::Device::AgentError::Reason::InvalidRequest, rejected.error().reason);
+    EXPECT_NE(std::string::npos, rejected.error().message.find("到期时间"));
 }
 
 // 钉住：节点列表按归属部门与创建人过滤，ALL 不受限

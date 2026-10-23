@@ -27,6 +27,12 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::NotFound, 404, "节点不存在或已删除，请先完成注册"});
         }
+        if (!node->certRevokedAt.empty())
+        {
+            // 证书被吊销后，指纹已经失效；必须先重新注册拿回新身份，不能靠旧证书继续发请求
+            Metrics::BusinessMetrics::instance().incrementIdentityRejections();
+            co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::Forbidden, 403, "节点证书已吊销，请重新申请注册令牌并完成注册"});
+        }
 
         const AsynGyanis::Core::TlsPeerIdentityPtr &identity = request.tlsPeerIdentity();
         if (!identity || !identity->isVerified())

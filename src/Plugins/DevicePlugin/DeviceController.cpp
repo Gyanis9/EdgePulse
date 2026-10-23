@@ -237,6 +237,79 @@ namespace EdgePulse::Device
                         co_return;
                     });
 
+        router.get("/api/nodes/:id",
+                   [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string traceId = Web::resolveRequestId(request);
+                       const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kListPermission, traceId);
+                       if (!access.has_value())
+                       {
+                           co_return;
+                       }
+                       const auto                        service = nodeService.scoped({access->tenantId, access->platformAdmin});
+                       const std::optional<std::int64_t> nodeId  = parseIdentifier(request.param("id"));
+                       if (!nodeId.has_value())
+                       {
+                           Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "节点标识不合法", traceId);
+                           co_return;
+                       }
+                       const Auth::DataScope scope    = co_await resolveScope(dataScopes, loop, *access);
+                       const auto            existing = co_await service->find(loop, *nodeId);
+                       if (!existing.has_value() || !nodeInScope(*existing, scope))
+                       {
+                           Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
+                           co_return;
+                       }
+                       Common::writeSuccess(response, nodeToJson(*existing), traceId);
+                       co_return;
+                   });
+
+        router.post("/api/nodes/:id/certificate/revoke",
+                    [&loop, &nodeService, accessResolver, dataScopes, lifecycle](AsynGyanis::Net::HttpRequest  &request,
+                                                                                 AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string traceId = Web::resolveRequestId(request);
+                        const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
+                        if (!access.has_value())
+                        {
+                            co_return;
+                        }
+                        const auto                        service = nodeService.scoped({access->tenantId, access->platformAdmin});
+                        const std::optional<std::int64_t> nodeId  = parseIdentifier(request.param("id"));
+                        if (!nodeId.has_value())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "节点标识不合法", traceId);
+                            co_return;
+                        }
+                        const Auth::DataScope scope    = co_await resolveScope(dataScopes, loop, *access);
+                        const auto            existing = co_await service->find(loop, *nodeId);
+                        if (!existing.has_value() || !nodeInScope(*existing, scope))
+                        {
+                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
+                            co_return;
+                        }
+                        const std::optional<NodeRecord> revoked = co_await service->revokeCertificate(loop, *nodeId);
+                        if (!revoked.has_value())
+                        {
+                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
+                            co_return;
+                        }
+                        // 证书已清空；离线状态要推给实时界面，并收口此前的系统离线告警
+                        if (lifecycle != nullptr)
+                        {
+                            try
+                            {
+                                co_await lifecycle->onCertificateRevoked(loop, *revoked);
+                            } catch (const std::exception &failure)
+                            {
+                                // 吊销已经提交；发布或销案失败只影响界面读数，不能把成功的吊销报成 500
+                                LOG_WARN_FMT("证书吊销后收口节点状态失败：node={} reason={}", *nodeId, failure.what());
+                            }
+                        }
+                        Common::writeSuccess(response, nodeToJson(*revoked), traceId);
+                        co_return;
+                    });
+
         router.put("/api/nodes/:id",
                    [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {

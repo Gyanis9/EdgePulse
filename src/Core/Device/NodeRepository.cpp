@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -21,7 +22,8 @@ namespace EdgePulse::Device
 {
     namespace
     {
-        constexpr const char *kNodeColumns = "id, tenant_id, name, status, agent_version, cert_fingerprint, labels, last_seen, version, group_id, owner_dept_id, created_by, "
+        constexpr const char *kNodeColumns = "id, tenant_id, name, status, agent_version, cert_fingerprint, cert_not_after, cert_revoked_at, labels, last_seen, version, group_id, "
+                                             "owner_dept_id, created_by, "
                                              "(SELECT name FROM biz_node_group g WHERE g.id = biz_node.group_id AND g.deleted = 0) AS group_name";
 
         [[nodiscard]] std::string readText(const AsynGyanis::Database::DatabaseValue &value)
@@ -57,6 +59,8 @@ namespace EdgePulse::Device
             node.status          = readText(result.getValue("status"));
             node.agentVersion    = readText(result.getValue("agent_version"));
             node.certFingerprint = readText(result.getValue("cert_fingerprint"));
+            node.certNotAfter    = readText(result.getValue("cert_not_after"));
+            node.certRevokedAt   = readText(result.getValue("cert_revoked_at"));
             node.labelsJson      = readText(result.getValue("labels"));
             node.lastSeen        = readText(result.getValue("last_seen"));
             node.groupId         = readInteger(result.getValue("group_id"));
@@ -118,7 +122,8 @@ namespace EdgePulse::Device
          */
         [[nodiscard]] NodeRecord insertNode(AsynGyanis::Database::DatabaseConnection &connection, const std::int64_t tenantId, const std::string &name,
                                             const std::string &labelsJson, const std::string &status, const std::string &agentVersion, const std::string &certFingerprint,
-                                            const std::string &lastSeen, const std::int64_t groupId = 200, const std::int64_t ownerDeptId = 0, const std::int64_t createdBy = 0)
+                                            const std::string &certNotAfter, const std::string &lastSeen, const std::int64_t groupId = 200, const std::int64_t ownerDeptId = 0,
+                                            const std::int64_t createdBy = 0)
         {
             const std::int64_t                                          id  = Common::nextIdentifier();
             const std::string                                           now = Common::nowDateTimeUtc();
@@ -128,6 +133,7 @@ namespace EdgePulse::Device
                                                                                    status,
                                                                                    agentVersion,
                                                                                    certFingerprint,
+                                                                                   nullableText(certNotAfter),
                                                                                    nullableText(labelsJson),
                                                                                    lastSeen.empty() ? AsynGyanis::Database::DatabaseValue{std::monostate{}}
                                                                                                     : AsynGyanis::Database::DatabaseValue{lastSeen},
@@ -136,10 +142,11 @@ namespace EdgePulse::Device
                                                                                    createdBy,
                                                                                    groupId,
                                                                                    ownerDeptId};
-            const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
-                    "INSERT INTO biz_node (id, tenant_id, name, status, agent_version, cert_fingerprint, labels, last_seen, version, deleted, created_at, updated_at, created_by, "
-                    "updated_by, group_id, owner_dept_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, 0, ?, ?)",
-                    parameters);
+            const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result =
+                    connection.execute("INSERT INTO biz_node (id, tenant_id, name, status, agent_version, cert_fingerprint, cert_not_after, labels, last_seen, version, deleted, "
+                                       "created_at, updated_at, "
+                                       "created_by, updated_by, group_id, owner_dept_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, 0, ?, ?)",
+                                       parameters);
             if (!result)
             {
                 throw Common::DatabaseException("创建节点失败：" + connection.lastError());
@@ -151,6 +158,7 @@ namespace EdgePulse::Device
             node.status          = status;
             node.agentVersion    = agentVersion;
             node.certFingerprint = certFingerprint;
+            node.certNotAfter    = certNotAfter;
             node.labelsJson      = labelsJson;
             node.lastSeen        = lastSeen;
             node.groupId         = groupId;
@@ -254,7 +262,7 @@ namespace EdgePulse::Device
         co_return co_await m_database->withConnection<NodeRecord>(
                 loop, [name = std::move(name), labelsJson = std::move(labelsJson), groupId, ownerDeptId, createdBy,
                        tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection)
-                { return insertNode(connection, tenant.tenantId, name, labelsJson, "offline", "", "", "", groupId, ownerDeptId, createdBy); });
+                { return insertNode(connection, tenant.tenantId, name, labelsJson, "offline", "", "", "", "", groupId, ownerDeptId, createdBy); });
     }
 
     AsynGyanis::Core::Task<std::expected<NodeRecord, NodeMutationFailure>> NodeRepository::update(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
@@ -332,34 +340,146 @@ namespace EdgePulse::Device
                 loop,
                 [registration = std::move(registration)](AsynGyanis::Database::DatabaseConnection &connection) -> std::expected<AgentUpsertOutcome, AgentUpsertFailure>
                 {
-                    const std::string               now = Common::nowDateTimeUtc();
-                    const System::TenantScope       tenant{registration.tenantId, false};
-                    const std::optional<NodeRecord> current = findByNameOnConnection(connection, registration.name, tenant);
-                    if (!current.has_value())
+                    const std::string         now = Common::nowDateTimeUtc();
+                    const System::TenantScope tenant{registration.tenantId, false};
+                    // 并发注册可能同时判定“节点不存在”；唯一键冲突时回滚重来一次，第二次按已有节点处理
+                    for (int attempt = 0; attempt < 2; ++attempt)
                     {
-                        NodeRecord node = insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
-                                                     registration.certFingerprint, now);
-                        return AgentUpsertOutcome{std::move(node), true, true};
+                        Sql::executeOrThrowVoid(connection, "BEGIN");
+                        try
+                        {
+                            const std::optional<NodeRecord> current         = findByNameOnConnection(connection, registration.name, tenant);
+                            const bool                      sameCertificate = current.has_value() && current->certFingerprint == registration.certFingerprint;
+                            if (registration.requireEnrollment && !sameCertificate)
+                            {
+                                if (registration.enrollmentTokenHash.empty() || (registration.enrollmentAction == "rebind" && current.has_value() && !registration.allowRebind))
+                                {
+                                    Sql::executeOrThrowVoid(connection, "ROLLBACK");
+                                    return std::unexpected(AgentUpsertFailure::RebindNotAllowed);
+                                }
+                                // 令牌消费与节点写入必须同成同败；条件里钉住未使用、未吊销、未过期与节点名
+                                const std::vector<AsynGyanis::Database::DatabaseValue> tokenParameters{
+                                        now, registration.enrollmentTokenHash, registration.tenantId, registration.enrollmentAction, registration.name, now};
+                                const auto tokenUpdate = Sql::executeOrThrow(connection,
+                                                                             "UPDATE biz_agent_enrollment SET used_at = ? "
+                                                                             "WHERE token_hash = ? AND tenant_id = ? AND action = ? AND (node_name = '' OR node_name = ?) "
+                                                                             "AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?",
+                                                                             tokenParameters);
+                                if (tokenUpdate->affectedRowCount() == 0)
+                                {
+                                    Sql::executeOrThrowVoid(connection, "ROLLBACK");
+                                    return std::unexpected(AgentUpsertFailure::TokenRejected);
+                                }
+                            }
+                            if (!current.has_value())
+                            {
+                                NodeRecord node;
+                                try
+                                {
+                                    node = insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
+                                                      registration.certFingerprint, registration.certNotAfter, now);
+                                } catch (const Common::DatabaseException &)
+                                {
+                                    if (attempt == 0)
+                                    {
+                                        // 通常是名称唯一键被并发注册占用；回滚重查一次即可分辨
+                                        Sql::executeOrThrowVoid(connection, "ROLLBACK");
+                                        continue;
+                                    }
+                                    throw;
+                                }
+                                Sql::executeOrThrowVoid(connection, "COMMIT");
+                                return std::expected<AgentUpsertOutcome, AgentUpsertFailure>{AgentUpsertOutcome{std::move(node), true, true}};
+                            }
+                            const bool                                               becameOnline = current->status != "online";
+                            const std::array<AsynGyanis::Database::DatabaseValue, 7> parameters{registration.agentVersion,
+                                                                                                registration.certFingerprint,
+                                                                                                nullableText(registration.certNotAfter),
+                                                                                                nullableText(registration.labelsJson),
+                                                                                                now,
+                                                                                                now,
+                                                                                                current->id};
+                            // 重新注册即恢复身份：清掉旧的吊销时间，并把到期时间换成这次出示证书的
+                            Sql::executeOrThrowVoid(connection,
+                                                    "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
+                                                    "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND deleted = 0",
+                                                    parameters);
+                            Sql::executeOrThrowVoid(connection, "COMMIT");
+                            NodeRecord node      = *current;
+                            node.status          = "online";
+                            node.agentVersion    = registration.agentVersion;
+                            node.certFingerprint = registration.certFingerprint;
+                            node.certNotAfter    = registration.certNotAfter;
+                            node.certRevokedAt.clear();
+                            node.labelsJson = registration.labelsJson;
+                            node.lastSeen   = now;
+                            node.version    = current->version + 1;
+                            return std::expected<AgentUpsertOutcome, AgentUpsertFailure>{AgentUpsertOutcome{std::move(node), becameOnline, false}};
+                        } catch (...)
+                        {
+                            try
+                            {
+                                Sql::executeOrThrowVoid(connection, "ROLLBACK");
+                            } catch (...)
+                            {
+                            }
+                            throw;
+                        }
                     }
-                    const bool                                               becameOnline = current->status != "online";
-                    const std::array<AsynGyanis::Database::DatabaseValue, 6> parameters{
-                            registration.agentVersion, registration.certFingerprint, nullableText(registration.labelsJson), now, now, current->id};
-                    const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
-                            "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, labels = ?, last_seen = ?, version = version + 1, updated_at = ? "
-                            "WHERE id = ? AND deleted = 0",
-                            parameters);
-                    if (!result)
+                    return std::unexpected(AgentUpsertFailure::RebindNotAllowed);
+                });
+    }
+
+    AsynGyanis::Core::Task<std::optional<NodeRecord>> NodeRepository::revokeCertificate(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
+    {
+        co_return co_await m_database->withConnection<std::optional<NodeRecord>>(
+                loop,
+                [nodeId, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<NodeRecord>
+                {
+                    const std::string                                now = Common::nowDateTimeUtc();
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{now, now, nodeId};
+                    std::string                                      clause;
+                    if (!tenant.allTenants)
                     {
-                        throw Common::DatabaseException("注册 Agent 失败：" + connection.lastError());
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
                     }
-                    NodeRecord node      = *current;
-                    node.status          = "online";
-                    node.agentVersion    = registration.agentVersion;
-                    node.certFingerprint = registration.certFingerprint;
-                    node.labelsJson      = registration.labelsJson;
-                    node.lastSeen        = now;
-                    node.version         = current->version + 1;
-                    return AgentUpsertOutcome{std::move(node), becameOnline, false};
+                    // 清空指纹是吊销的核心：之后 requireAgentNode 与 WebSocket hello 都无法再绑定成功
+                    const auto result =
+                            Sql::executeOrThrow(connection,
+                                                "UPDATE biz_node SET cert_fingerprint = '', cert_revoked_at = ?, status = 'offline', version = version + 1, updated_at = ? "
+                                                "WHERE id = ? AND deleted = 0" +
+                                                        clause,
+                                                parameters);
+                    if (result->affectedRowCount() == 0)
+                    {
+                        return std::nullopt;
+                    }
+                    return findByIdOnConnection(connection, nodeId, tenant);
+                });
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> NodeRepository::countExpiringCertificates(AsynGyanis::Core::EventLoop &loop, const int withinDays)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [withinDays, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::int64_t
+                {
+                    const std::string cutoff =
+                            Common::formatDateTimeUtc(std::chrono::system_clock::now() + std::chrono::seconds{static_cast<std::int64_t>(withinDays) * 24 * 3600});
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{cutoff};
+                    std::string                                      clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection,
+                                                          "SELECT COUNT(*) AS total FROM biz_node WHERE deleted = 0 AND cert_revoked_at IS NULL AND cert_not_after IS NOT NULL AND "
+                                                          "cert_not_after <= ?" +
+                                                                  clause,
+                                                          parameters);
+                    return rows->next() ? Sql::integer(*rows, "total") : 0;
                 });
     }
 

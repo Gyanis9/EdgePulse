@@ -34,4 +34,13 @@ namespace EdgePulse::Device
      * @return 不通过时的中文原因；通过为空
      */
     [[nodiscard]] std::optional<std::string> certificateBindingFailure(const AsynGyanis::Core::TlsPeerIdentityPtr &connectionIdentity, std::string_view registeredFingerprint);
+
+    /**
+     * @brief 解析连接证书的到期时间
+     * @details 空 DER 表示测试注入的占位身份，没有可解析的证书，按空串处理；生产 mTLS 链路上
+     *          一定带有 DER。非空但无法解析时返回空，调用方应拒绝注册而不是把到期时间悄悄留空。
+     * @param identity 连接的对端身份；空表示非 TLS 链路
+     * @return 成功返回 UTC 文本 YYYY-MM-DD HH:MM:SS（空 DER 为空串）；无法解析时为空
+     */
+    [[nodiscard]] std::optional<std::string> certificateNotAfter(const AsynGyanis::Core::TlsPeerIdentityPtr &identity);
 } // namespace EdgePulse::Device

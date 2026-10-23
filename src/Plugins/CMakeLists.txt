@@ -6,6 +6,7 @@ add_library(edgepulse-plugins STATIC
         DashboardPlugin/DashboardController.cpp
         DevicePlugin/AgentController.cpp
         DevicePlugin/DeviceController.cpp
+        DevicePlugin/EnrollmentController.cpp
         DevicePlugin/NodeGroupController.cpp
         DevicePlugin/NodeJson.cpp
         FirmwarePlugin/FirmwareController.cpp

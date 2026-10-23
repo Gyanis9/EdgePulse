@@ -141,4 +141,9 @@ namespace EdgePulse::Device
     {
         co_return co_await m_repository->findById(loop, nodeId);
     }
+
+    AsynGyanis::Core::Task<std::optional<NodeRecord>> NodeService::revokeCertificate(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
+    {
+        co_return co_await m_repository->revokeCertificate(loop, nodeId);
+    }
 } // namespace EdgePulse::Device

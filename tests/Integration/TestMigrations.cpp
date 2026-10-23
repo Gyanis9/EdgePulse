@@ -83,7 +83,9 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_user"));
-        EXPECT_EQ(14, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 15"));
+        EXPECT_GE(querySingleInteger(*connection, "SELECT COUNT(*) FROM biz_agent_enrollment"), 0);
+        EXPECT_EQ(15, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }
