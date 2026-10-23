@@ -50,7 +50,8 @@ namespace EdgePulse::Notification
         /**
          * @brief 构造
          * @param repository 通知渠道仓储
-         * @param guard 出站地址安全校验器；投递 Webhook 前用它拒绝私网与元数据地址
+         * @param guard 出站地址安全校验器，不能为空；投递 Webhook 前用它拒绝私网与元数据地址
+         * @throws Base::InvalidArgumentException guard 为空：缺少出站校验时拒绝构造，避免 Webhook 绕过 SSRF 防护
          */
         explicit NotificationService(std::shared_ptr<NotificationRepository> repository, std::shared_ptr<Common::OutboundUrlGuard> guard);
 

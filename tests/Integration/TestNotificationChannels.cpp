@@ -1,9 +1,11 @@
+#include "Base/Exception/InvalidArgumentException.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/Hmac.h"
 #include "Base/Security/OutboundUrlGuard.h"
 #include "Core/Notification/NotificationRepository.h"
 #include "Core/Notification/NotificationService.h"
 #include "Core/Telemetry/TelemetryModels.h"
+#include "Plugins/SystemPlugin/NotificationController.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 #include "TestSupport/HttpClientHarness.h"
@@ -53,6 +55,23 @@ namespace
         return alarm;
     }
 } // namespace
+
+// 钉住：缺少出站校验器时通知服务拒绝构造，避免组合根静默关掉 SSRF 防护
+TEST(NotificationChannels, RejectsMissingGuardAtConstruction)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    const auto                              repository = std::make_shared<EdgePulse::Notification::NotificationRepository>(context.database);
+    EXPECT_THROW(static_cast<void>(EdgePulse::Notification::NotificationService{repository, nullptr}), AsynGyanis::Base::InvalidArgumentException);
+}
+
+// 钉住：通知路由在缺少出站防护时拒绝注册，启动期就失败而不是静默放行
+TEST(NotificationChannels, RoutesRejectMissingGuardAtRegistration)
+{
+    AsynGyanis::Core::EventLoop                       loop;
+    AsynGyanis::Net::Router                           router;
+    EdgePulse::Notification::NotificationDependencies dependencies;
+    EXPECT_THROW(static_cast<void>(EdgePulse::Notification::registerNotificationRoutes(router, loop, dependencies)), AsynGyanis::Base::InvalidArgumentException);
+}
 
 // 钉住：启用的 Webhook 渠道收到告警 JSON 与 HMAC 签名，未达最低级别的告警不投递
 TEST(NotificationChannels, WebhookReceivesSignedAlarm)

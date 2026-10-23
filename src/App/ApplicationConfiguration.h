@@ -66,7 +66,7 @@ namespace EdgePulse::App
         int                      sessionTtlSeconds{7200};                             ///< 会话有效期，单位秒
         bool                     exposeCaptchaCode{false};                            ///< 开发档在响应里带验证码答案
         std::vector<std::string> allowedOrigins;                                      ///< 浏览器 WebSocket 的 Origin 白名单
-        bool                     allowPrivateWebhooks{false};                         ///< 是否允许 Webhook 指向内网与回环地址
+        bool                     allowPrivateWebhooks{false};                         ///< 是否放行 Webhook 指向普通私网与回环地址；云元数据与链路本地地址始终拒绝
         std::string              agentFingerprint;                                    ///< 允许的 Agent 证书 SHA-256 指纹，空表示只校验 CA
         std::string              enrollmentMode{"off"};                               ///< 注册模式：off 或 required
         int                      heartbeatIntervalSeconds{30};                        ///< Agent 期望心跳间隔，随心跳响应下发

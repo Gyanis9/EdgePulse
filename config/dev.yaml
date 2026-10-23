@@ -39,6 +39,7 @@ edgepulse:
     ttl_seconds: 7200
   security:
     allowed_origins: http://127.0.0.1:5173,http://localhost:5173
+    # 只放行普通私网与回环 Webhook；云元数据与链路本地地址始终拒绝
     allow_private_webhooks: true
   agent:
     fingerprint: ""

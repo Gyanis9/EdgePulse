@@ -4,7 +4,6 @@
 
 #include <string_view>
 
-
 namespace
 {
     [[nodiscard]] bool isBlocked(const std::string_view address)
@@ -36,6 +35,8 @@ TEST(OutboundUrlGuard, ClassifiesReservedAddresses)
     EXPECT_TRUE(isBlocked("224.0.0.1"));
     EXPECT_TRUE(isBlocked("240.0.0.1"));
     EXPECT_TRUE(isBlocked("255.255.255.255"));
+    EXPECT_TRUE(isBlocked(""));
+    EXPECT_TRUE(isBlocked("not-an-address"));
     EXPECT_FALSE(isBlocked("1.1.1.1"));
     EXPECT_FALSE(isBlocked("8.8.8.8"));
     EXPECT_FALSE(isBlocked("93.184.216.34"));
@@ -59,7 +60,18 @@ TEST(OutboundUrlGuard, ClassifiesReservedAddresses)
     EXPECT_FALSE(isBlocked("2606:4700:4700::1111"));
 
     EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("169.254.169.254"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("169.254.170.2"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("169.254.0.23"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("169.254.10.10"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("169.254.1.1"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("100.100.100.200"));
     EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("::ffff:169.254.169.254"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("::ffff:169.254.1.1"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("fd00:ec2::254"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("fd20:ce::254"));
+    EXPECT_TRUE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("fe80::1"));
+    EXPECT_FALSE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("fd00:ec2::253"));
+    EXPECT_FALSE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("fd20:ce::253"));
     EXPECT_FALSE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("127.0.0.1"));
     EXPECT_FALSE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("93.184.216.34"));
     EXPECT_FALSE(EdgePulse::Common::OutboundUrlGuard::isMetadataAddress("not-an-address"));

@@ -5,6 +5,7 @@
 #include "Base/Api/Pagination.h"
 #include "Base/Api/QueryParameters.h"
 #include "Base/Api/RequestParsing.h"
+#include "Base/Exception/InvalidArgumentException.h"
 #include "Base/Json/JsonFields.h"
 #include "Base/Security/OutboundUrlGuard.h"
 #include "Core/Auth/AuthService.h"
@@ -126,6 +127,11 @@ namespace EdgePulse::Notification
 
     void registerNotificationRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const NotificationDependencies &dependencyInput)
     {
+        // 路由一旦注册就会接收渠道写入；缺少出站校验时在启动期直接拒绝，不能静默关掉 SSRF 防护
+        if (dependencyInput.guard == nullptr)
+        {
+            throw AsynGyanis::Base::InvalidArgumentException("通知路由的出站防护未配置：拒绝注册，避免 Webhook 绕过 SSRF 校验");
+        }
         const auto deps = std::make_shared<NotificationDependencies>(dependencyInput);
 
         router.get("/api/system/notifications",
@@ -172,7 +178,7 @@ namespace EdgePulse::Notification
                             co_return;
                         }
                         // 地址校验要查 DNS，只能放在协程里做；同步解析器只做格式与长度检查
-                        if (deps->guard != nullptr && record->type == "webhook")
+                        if (record->type == "webhook")
                         {
                             const auto allowed = co_await deps->guard->validate(loop, record->endpoint);
                             if (!allowed.has_value())
@@ -261,7 +267,7 @@ namespace EdgePulse::Notification
                            fail(response, Common::kCodeBadRequest, error, traceId);
                            co_return;
                        }
-                       if (deps->guard != nullptr && record->type == "webhook")
+                       if (record->type == "webhook")
                        {
                            const auto allowed = co_await deps->guard->validate(loop, record->endpoint);
                            if (!allowed.has_value())

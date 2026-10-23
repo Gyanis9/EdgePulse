@@ -46,6 +46,7 @@ edgepulse:
     ttl_seconds: 7200
   security:
     allowed_origins: https://console.example.com
+    # 只放行普通私网与回环 Webhook；云元数据与链路本地地址始终拒绝
     allow_private_webhooks: false
   agent:
     fingerprint: ""

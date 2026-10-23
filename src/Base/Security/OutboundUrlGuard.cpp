@@ -174,27 +174,35 @@ namespace EdgePulse::Common
         [[nodiscard]] bool isMetadataHostName(const std::string_view host)
         {
             const std::string name = canonicalHostName(host);
-            return name == "metadata" || name == "metadata.google.internal" || name == "metadata.goog" || name == "instance-data" || name == "instance-data.ec2.internal";
+            return name == "metadata" || name == "metadata.google.internal" || name == "metadata.goog" || name == "instance-data" || name == "instance-data.ec2.internal" ||
+                   name == "metadata.tencentyun.com";
         }
 
         /**
-         * @brief 判断主机名是否为本机别名
+         * @brief 判断主机名是否为本机或局域网别名
          */
         [[nodiscard]] bool isLocalHostName(const std::string_view host)
         {
             const std::string name = canonicalHostName(host);
-            return name == "localhost" || name == "localhost.localdomain" || name == "ip6-localhost" || name == "ip6-loopback" || name.ends_with(".localhost");
+            // .local 是 mDNS 保留后缀，语义上属于本机或同链路主机，默认不交给外部解析
+            return name == "localhost" || name == "localhost.localdomain" || name == "ip6-localhost" || name == "ip6-loopback" || name.ends_with(".localhost") ||
+                   name.ends_with(".local");
         }
 
         /**
-         * @brief 判定 4 字节 IPv4 是否为已知的云元数据端点
+         * @brief 判定 4 字节 IPv4 是否落在云元数据服务的传输段
          */
         [[nodiscard]] bool isMetadataIpv4(const std::array<std::uint8_t, 16> &bytes)
         {
-            // 169.254.169.254 是主流云厂商共用的实例元数据地址，169.254.170.2 是 ECS 任务元数据，
-            // 100.100.100.200 是阿里云元数据端点
-            return (bytes[0] == 169 && bytes[1] == 254 && bytes[2] == 169 && bytes[3] == 254) || (bytes[0] == 169 && bytes[1] == 254 && bytes[2] == 170 && bytes[3] == 2) ||
-                   (bytes[0] == 100 && bytes[1] == 100 && bytes[2] == 100 && bytes[3] == 200);
+            // 169.254/16 是 IPv4 链路本地段，云厂商的实例元数据端点都落在这里：
+            // 169.254.169.254 为通用地址，169.254.170.2 是 ECS 任务元数据，
+            // 腾讯云使用 169.254.0.23 与 169.254.10.10。整段拦截，避免只认已知端点。
+            if (bytes[0] == 169 && bytes[1] == 254)
+            {
+                return true;
+            }
+            // 100.100.100.200 是阿里云元数据端点，不在链路本地段内，单独列出
+            return bytes[0] == 100 && bytes[1] == 100 && bytes[2] == 100 && bytes[3] == 200;
         }
 
         /**
@@ -256,7 +264,8 @@ namespace EdgePulse::Common
         const std::string_view text = addressText(address);
         if (text.empty())
         {
-            return false;
+            // 空文本不是可用的目标地址；按不可出站处理，避免调用方把缺失值当成公网
+            return true;
         }
         std::array<std::uint8_t, 16> bytes{};
         const std::string            terminated{text};
@@ -296,9 +305,13 @@ namespace EdgePulse::Common
             std::copy(bytes.begin() + 12, bytes.end(), mapped.begin());
             return isMetadataIpv4(mapped);
         }
-        // AWS 的 IPv6 元数据端点是 fd00:ec2::254
+        // fe80::/10 是 IPv6 链路本地段，同样整段视为元数据服务；AWS 的 fd00:ec2::254
+        // 与 GCP 的 fd20:ce::254 落在唯一本地段里，按固定端点补充
+        const std::uint16_t                           first       = static_cast<std::uint16_t>((bytes[0] << 8U) | bytes[1]);
+        const bool                                    isLinkLocal = (first & 0xFFC0U) == 0xFE80U;
         static constexpr std::array<std::uint8_t, 16> kAwsMetadataV6{0xFD, 0x00, 0x0E, 0xC2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x54};
-        return bytes == kAwsMetadataV6;
+        static constexpr std::array<std::uint8_t, 16> kGcpMetadataV6{0xFD, 0x20, 0x00, 0xCE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x54};
+        return isLinkLocal || bytes == kAwsMetadataV6 || bytes == kGcpMetadataV6;
     }
 
     AsynGyanis::Core::Task<std::vector<std::string>> OutboundUrlGuard::resolve(AsynGyanis::Core::EventLoop &loop, std::string host) const
@@ -384,7 +397,8 @@ namespace EdgePulse::Common
         {
             if (isMetadataAddress(address))
             {
-                co_return std::unexpected("Webhook 地址指向云元数据服务，已拒绝：" + address);
+                // 元数据端点与整个链路本地段都属于这一条，开关打开也不放行
+                co_return std::unexpected("Webhook 地址指向云元数据服务或链路本地地址，已拒绝：" + address);
             }
             if (!m_options.allowPrivateNetworks && isPrivateOrReservedAddress(address))
             {

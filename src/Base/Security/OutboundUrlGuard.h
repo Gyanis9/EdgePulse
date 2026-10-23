@@ -33,7 +33,7 @@ namespace EdgePulse::Common
      */
     struct OutboundUrlGuardOptions
     {
-        bool                 allowPrivateNetworks{false}; ///< 是否放行内网与回环地址；云元数据地址始终拒绝
+        bool                 allowPrivateNetworks{false}; ///< 是否放行普通 RFC1918 私网与回环地址；云元数据及链路本地地址始终拒绝
         std::chrono::seconds cacheTtl{60};                ///< 解析结果缓存时长；非正数表示不缓存
     };
 
@@ -46,8 +46,10 @@ namespace EdgePulse::Common
     /**
      * @brief Webhook 出站地址的 SSRF 校验器
      * @details 地址按 RFC 3986 拆开后，对主机名做解析，任何一个解析结果落在私网、回环、
-     *          链路本地、组播、保留段或云元数据地址上就整条拒绝。元数据地址不受
-     *          allowPrivateNetworks 影响：它从来不是合法的 Webhook 目标。
+     *          组播、保留段或云元数据地址上就整条拒绝。localhost、*.localhost 与 *.local
+     *          这类本机或局域网别名默认短路拒绝，allowPrivateNetworks 打开后才交给解析器。
+     *          云元数据主机名、元数据地址以及 169.254.0.0/16、fe80::/10 两个链路本地段
+     *          始终拒绝：链路本地正是元数据服务的传输范围，打开开关也不放行。
      * @note validate 在事件循环上调用，阻塞的 DNS 查询交给 AsyncExecutor；解析结果按
      *       cacheTtl 缓存，避免每次投递都查一次。
      */
@@ -72,14 +74,14 @@ namespace EdgePulse::Common
         /**
          * @brief 判断地址是否属于私网或保留段
          * @param address IPv4 或 IPv6 地址文本；允许带方括号与 IPv6 作用域后缀
-         * @return true 表示不可作为公网 Webhook 目标
+         * @return true 表示不可作为公网 Webhook 目标；空文本或无法解析的文本同样返回 true（失败关闭）
          */
         [[nodiscard]] static bool isPrivateOrReservedAddress(std::string_view address);
 
         /**
-         * @brief 判断地址是否指向云元数据服务
+         * @brief 判断地址是否指向云元数据服务或其链路本地传输段
          * @param address IPv4 或 IPv6 地址文本
-         * @return true 表示该地址永远不可作为 Webhook 目标
+         * @return true 表示该地址永远不可作为 Webhook 目标，即使放行了私网
          */
         [[nodiscard]] static bool isMetadataAddress(std::string_view address);
 

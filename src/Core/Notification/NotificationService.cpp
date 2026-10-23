@@ -1,6 +1,7 @@
 #include "Core/Notification/NotificationService.h"
 
 #include "Base/Config/ConfigValue.h"
+#include "Base/Exception/InvalidArgumentException.h"
 #include "Base/Log/LogMacros.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/Hmac.h"
@@ -92,6 +93,11 @@ namespace EdgePulse::Notification
     NotificationService::NotificationService(std::shared_ptr<NotificationRepository> repository, std::shared_ptr<Common::OutboundUrlGuard> guard) :
         m_repository(std::move(repository)), m_guard(std::move(guard))
     {
+        // 校验器是 Webhook 出站的唯一门禁；为空时拒绝构造，避免组合根静默关掉防护
+        if (m_guard == nullptr)
+        {
+            throw AsynGyanis::Base::InvalidArgumentException("通知服务缺少出站地址校验器：拒绝启动，避免 Webhook 绕过 SSRF 防护");
+        }
     }
 
     AsynGyanis::Core::Task<> NotificationService::dispatch(AsynGyanis::Core::EventLoop &loop, const Alarm::AlarmRecord &alarm)
@@ -118,17 +124,14 @@ namespace EdgePulse::Notification
             DeliveryOutcome outcome;
             if (channel.type == "webhook")
             {
-                if (m_guard != nullptr)
+                // 每次投递前复检：渠道可以在创建后改地址，历史数据也可能绕过了入口校验
+                const auto allowed = co_await m_guard->validate(loop, channel.endpoint);
+                if (!allowed.has_value())
                 {
-                    // 每次投递前复检：渠道可以在创建后改地址，历史数据也可能绕过了入口校验
-                    const auto allowed = co_await m_guard->validate(loop, channel.endpoint);
-                    if (!allowed.has_value())
-                    {
-                        Metrics::BusinessMetrics::instance().incrementWebhookSsrfRejections();
-                        LOG_WARN_FMT("告警 Webhook 地址被安全策略拒绝：channel={} tenant={} node={} error={}", channel.name, alarm.tenantId, alarm.nodeId, allowed.error());
-                        co_await recordDelivery(loop, channel, alarm, DeliveryOutcome{false, 0, allowed.error()});
-                        continue;
-                    }
+                    Metrics::BusinessMetrics::instance().incrementWebhookSsrfRejections();
+                    LOG_WARN_FMT("告警 Webhook 地址被安全策略拒绝：channel={} tenant={} node={} error={}", channel.name, alarm.tenantId, alarm.nodeId, allowed.error());
+                    co_await recordDelivery(loop, channel, alarm, DeliveryOutcome{false, 0, allowed.error()});
+                    continue;
                 }
                 outcome = co_await sendWebhook(loop, channel, alarm, alarmPayload(alarm));
             } else if (channel.type == "email")

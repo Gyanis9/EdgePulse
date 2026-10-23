@@ -48,7 +48,7 @@ namespace EdgePulse::Notification
         Auth::AuthService                        *auth{nullptr};     ///< 认证
         NotificationRepository                   *channels{nullptr}; ///< 渠道仓储
         System::TenantRepository                 *tenants{nullptr};  ///< 租户，用于平台管理员指定归属
-        std::shared_ptr<Common::OutboundUrlGuard> guard;             ///< Webhook 出站地址安全校验器
+        std::shared_ptr<Common::OutboundUrlGuard> guard;             ///< Webhook 出站地址安全校验器；注册路由时不能为空
     };
 
     /**
@@ -56,6 +56,7 @@ namespace EdgePulse::Notification
      * @param router 目标路由器
      * @param loop 服务器所属事件循环
      * @param dependencies 依赖
+     * @throws Base::InvalidArgumentException dependencies.guard 为空：缺少出站校验时拒绝注册
      */
     void registerNotificationRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const NotificationDependencies &dependencies);
 } // namespace EdgePulse::Notification
