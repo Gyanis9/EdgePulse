@@ -23,7 +23,7 @@ watch(() => props.open, (open) => {
 async function submit() {
   errors.value = validate(form, {
     oldPassword: [required('请输入当前密码')],
-    newPassword: [required('请输入新密码'), v => (String(v).length < 6 ? '新密码至少 6 位' : undefined)],
+    newPassword: [required('请输入新密码'), v => (String(v).length < 8 ? '新密码至少 8 位（服务端策略可能更严）' : undefined)],
     confirmPassword: [required('请再次输入新密码'), v => (v !== form.newPassword ? '两次输入的密码不一致' : undefined)],
   })
   if (Object.keys(errors.value).length) return
@@ -45,7 +45,7 @@ async function submit() {
     <Field label="当前密码" required :error="errors.oldPassword" span>
       <TextInput v-model="form.oldPassword" type="password" autocomplete="current-password" :invalid="!!errors.oldPassword" />
     </Field>
-    <Field label="新密码" required :error="errors.newPassword" hint="至少 6 位" span>
+    <Field label="新密码" required :error="errors.newPassword" hint="至少 8 位（服务端策略可能更严）" span>
       <TextInput v-model="form.newPassword" type="password" autocomplete="new-password" :invalid="!!errors.newPassword" />
     </Field>
     <Field label="确认新密码" required :error="errors.confirmPassword" span>

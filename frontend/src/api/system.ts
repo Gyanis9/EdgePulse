@@ -25,6 +25,7 @@ export interface UserRow {
   postName: string
   roleName: string
   status: number
+  lockedUntil: string
   createTime: string
   lastLogin: string
 }

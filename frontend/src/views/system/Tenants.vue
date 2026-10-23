@@ -58,7 +58,7 @@ async function submit() {
     name: [required('请输入租户名称')],
     code: isEdit.value ? [] : [required('请输入租户编码'), pattern(/^[a-z][a-z0-9_]{0,31}$/, '小写字母开头，仅含小写字母、数字与下划线，最长 32 位')],
     adminUsername: isEdit.value ? [] : [required('请输入管理员登录名')],
-    adminPassword: isEdit.value ? [] : [required('请输入管理员初始密码'), v => (String(v).length < 6 ? '密码至少 6 位' : undefined)],
+    adminPassword: isEdit.value ? [] : [required('请输入管理员初始密码'), v => (String(v).length < 8 ? '密码至少 8 位（服务端策略可能更严）' : undefined)],
   })
   if (Object.keys(errors.value).length) return
   saving.value = true
@@ -159,7 +159,7 @@ async function toggleStatus(row: TenantRow) {
           <TextInput v-model="form.adminNickname" placeholder="默认与登录名相同" />
         </Field>
         <Field label="管理员初始密码" required :error="errors.adminPassword" span>
-          <TextInput v-model="form.adminPassword" type="password" placeholder="至少 6 位" :invalid="!!errors.adminPassword" autocomplete="new-password" />
+          <TextInput v-model="form.adminPassword" type="password" placeholder="至少 8 位（服务端策略可能更严）" :invalid="!!errors.adminPassword" autocomplete="new-password" />
         </Field>
       </template>
       <Field label="备注" span>

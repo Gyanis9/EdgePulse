@@ -38,7 +38,7 @@ const columns = computed<Column[]>(() => [
   { key: 'postName', title: '岗位' },
   { key: 'roleName', title: '角色' },
   { key: 'phone', title: '手机号' },
-  { key: 'status', title: '状态', width: 96 },
+  { key: 'status', title: '状态', width: 140 },
   { key: 'createTime', title: '创建时间', width: 150 },
   { key: 'actions', title: '操作', width: 150, className: 'col-actions' },
 ])
@@ -196,7 +196,7 @@ async function submit() {
   errors.value = validate(form, {
     username: [required('请输入登录账号')],
     nickname: [required('请输入用户姓名')],
-    password: isEdit.value ? [] : [required('请输入初始密码'), v => (String(v).length < 6 ? '密码至少 6 位' : undefined)],
+    password: isEdit.value ? [] : [required('请输入初始密码'), v => (String(v).length < 8 ? '密码至少 8 位（服务端策略可能更严）' : undefined)],
     phone: [phone],
     email: [email],
     deptId: [required('请选择所属部门')],
@@ -246,8 +246,8 @@ function openReset(row: UserRow) {
 
 async function submitReset() {
   if (!resetTarget.value) return
-  if (resetPassword.value.length < 6) {
-    resetError.value = '密码至少 6 位'
+  if (resetPassword.value.length < 8) {
+    resetError.value = '密码至少 8 位（服务端策略可能更严）'
     return
   }
   resetting.value = true
@@ -415,7 +415,12 @@ async function batchRemove(ids: (string | number)[]) {
     <template #cell-tenantName="{ row }"><Tag v-if="row.tenantName" tone="info">{{ row.tenantName }}</Tag><span v-else class="faint">—</span></template>
     <template #cell-roleName="{ row }"><Tag v-if="row.roleName" tone="info">{{ row.roleName }}</Tag><span v-else class="faint">未分配</span></template>
     <template #cell-phone="{ row }"><span class="tnum muted">{{ row.phone || '—' }}</span></template>
-    <template #cell-status="{ row }"><StatusTag :status="row.status" /></template>
+    <template #cell-status="{ row }">
+      <div class="flag-row">
+        <StatusTag :status="row.status" />
+        <Tag v-if="row.lockedUntil" tone="danger" dot>已锁定</Tag>
+      </div>
+    </template>
     <template #cell-createTime="{ row }"><span class="tnum soft">{{ row.createTime }}</span></template>
     <template #cell-actions="{ row }">
       <div class="row-actions">
@@ -437,7 +442,7 @@ async function batchRemove(ids: (string | number)[]) {
         <TextInput v-model="form.nickname" placeholder="真实姓名" :invalid="!!errors.nickname" />
       </Field>
       <Field v-if="!isEdit" label="初始密码" required :error="errors.password" hint="默认取自系统参数中的用户初始密码" span>
-        <TextInput v-model="form.password" placeholder="至少 6 位" :invalid="!!errors.password" autocomplete="new-password" />
+        <TextInput v-model="form.password" placeholder="至少 8 位（服务端策略可能更严）" :invalid="!!errors.password" autocomplete="new-password" />
       </Field>
       <Field label="手机号码" :error="errors.phone">
         <TextInput v-model="form.phone" type="tel" placeholder="选填" :invalid="!!errors.phone" />

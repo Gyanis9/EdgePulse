@@ -44,7 +44,7 @@ test('platform admin provisions a tenant and its admin logs in scoped', async ({
   await dialog.getByPlaceholder('例如 示范工厂').fill(name)
   await dialog.getByPlaceholder('租户首个管理员账号').fill(adminUser)
   await dialog.getByPlaceholder('默认与登录名相同').fill('租户管理员')
-  await dialog.getByPlaceholder('至少 6 位').fill('tenant-pass-1')
+  await dialog.getByPlaceholder('至少 8 位（服务端策略可能更严）').fill('tenant-pass-1')
   await dialog.getByRole('button', { name: '保存' }).click()
   await expect(page.getByText('租户已创建，管理员账号可立即登录')).toBeVisible()
 

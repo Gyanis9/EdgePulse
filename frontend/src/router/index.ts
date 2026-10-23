@@ -13,6 +13,7 @@ const staticRoutes: RouteRecordRaw[] = [
     component: AppShell,
     children: [
       { path: 'no-access', name: 'no-access', component: () => import('@/views/NoAccess.vue'), meta: { title: '暂未分配菜单' } },
+      { path: 'device/nodes/:id', name: 'node-detail', component: () => import('@/views/device/NodeDetail.vue'), meta: { title: '节点详情' } },
       { path: ':pathMatch(.*)*', name: 'not-found', component: () => import('@/views/NotFound.vue'), meta: { title: '页面不存在' } },
     ],
   },

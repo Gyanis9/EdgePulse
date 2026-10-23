@@ -96,8 +96,23 @@ export interface FirmwareRow {
   contentType: string
   sizeBytes: number
   sha256: string
+  signed: boolean
+  signatureKeyId: string
+  signatureAlgorithm: string
   createdAt: string
   createdBy: number
+}
+
+export interface FirmwarePolicy {
+  requireSignature: boolean
+  trustedKeyIds: string[]
+}
+
+export interface FirmwareUploadOptions {
+  signature?: string
+  signingKeyId?: string
+  onProgress?: (percent: number) => void
+  tenantId?: number
 }
 
 export interface FirmwareDeployItem {
@@ -157,13 +172,14 @@ export function createFleetApi(client: HttpClient) {
     },
     firmware: {
       list: (query?: QueryParams) => client.get<PageResult<FirmwareRow>>('/firmware', query),
+      policy: () => client.get<FirmwarePolicy>('/firmware/policy'),
       remove: (id: number) => client.delete<void>(`/firmware/${id}`),
       tasks: (id: number) => client.get<FirmwareTaskRow[]>(`/firmware/${id}/tasks`),
       deploy: (id: number, nodeIds: number[], batchSize?: number) =>
         client.post<FirmwareDeployItem[] | { deployed: FirmwareDeployItem[]; deferredNodeIds: number[] }>(`/firmware/${id}/deploy`, batchSize ? { nodeIds, batchSize } : { nodeIds }),
       rollback: (id: number, nodeIds: number[]) =>
         client.post<Array<{ nodeId: number; fromFirmwareId: number; toFirmwareId: number; taskId: number; commandId: number }>>(`/firmware/${id}/rollback`, { nodeIds }),
-      upload: (file: File, name: string, version: string, onProgress?: (percent: number) => void, tenantId?: number) => uploadFirmware(file, name, version, onProgress, tenantId),
+      upload: (file: File, name: string, version: string, options?: FirmwareUploadOptions) => uploadFirmware(file, name, version, options),
     },
     ops: {
       summary: () => client.get<OpsSummary>('/ops/summary'),
@@ -172,7 +188,7 @@ export function createFleetApi(client: HttpClient) {
   }
 }
 
-function uploadFirmware(file: File, name: string, version: string, onProgress?: (percent: number) => void, tenantId?: number): Promise<FirmwareRow> {
+function uploadFirmware(file: File, name: string, version: string, options: FirmwareUploadOptions = {}): Promise<FirmwareRow> {
   return new Promise((resolve, reject) => {
     const token = authSession.token()
     if (!token) {
@@ -180,13 +196,16 @@ function uploadFirmware(file: File, name: string, version: string, onProgress?: 
       return
     }
     const query = new URLSearchParams({ name, version, fileName: file.name })
-    if (tenantId) query.set('tenantId', String(tenantId))
+    if (options.tenantId) query.set('tenantId', String(options.tenantId))
     const request = new XMLHttpRequest()
     request.open('POST', `/api/firmware?${query.toString()}`)
     request.setRequestHeader('Authorization', `Bearer ${token}`)
     request.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
+    // 服务端把签名与密钥 ID 作为请求头读取；两段缺一会直接拒绝上传
+    if (options.signature) request.setRequestHeader('X-Firmware-Signature', options.signature)
+    if (options.signingKeyId) request.setRequestHeader('X-Firmware-Key-Id', options.signingKeyId)
     request.upload.onprogress = event => {
-      if (event.lengthComputable && onProgress) onProgress(Math.round((event.loaded / event.total) * 100))
+      if (event.lengthComputable && options.onProgress) options.onProgress(Math.round((event.loaded / event.total) * 100))
     }
     request.onerror = () => reject(new Error('固件上传失败：网络不可用'))
     request.onload = () => {

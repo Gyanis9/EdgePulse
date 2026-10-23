@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { Checkbox, DataTable, Drawer, Field, Select, Tag, TextInput, type Column } from '@/components/ui'
 import { FormDialog, ListPage, PermissionButton } from '@/components/business'
-import { deviceApi, fleetApi, systemApi, type FirmwareRow, type FirmwareTaskRow, type NodeRow } from '@/api'
+import { deviceApi, fleetApi, systemApi, type FirmwarePolicy, type FirmwareRow, type FirmwareTaskRow, type NodeRow } from '@/api'
 import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
@@ -11,6 +11,7 @@ import { pushToast, toastError } from '@/composables/toast'
 const columns: Column[] = [
   { key: 'name', title: '固件', minWidth: 200 },
   { key: 'version', title: '版本', width: 120 },
+  { key: 'signed', title: '签名', width: 140 },
   { key: 'sizeBytes', title: '大小', width: 110, align: 'right' },
   { key: 'sha256', title: 'SHA-256', minWidth: 260 },
   { key: 'createdAt', title: '上传时间', width: 170 },
@@ -36,14 +37,25 @@ const uploadProgress = ref(0)
 const platformAdmin = Boolean(currentUser.value?.platformAdmin)
 const tenants = ref<Array<{ id: number; name: string; code: string }>>([])
 const tenantOptions = ref<Array<{ label: string; value: number }>>([])
-const uploadForm = reactive({ name: '', version: '', tenantId: currentUser.value?.tenantId ?? null as number | null })
+const policy = ref<FirmwarePolicy | null>(null)
+const uploadForm = reactive({ name: '', version: '', tenantId: currentUser.value?.tenantId ?? null as number | null, signature: '', signingKeyId: '' })
 const uploadError = ref('')
+
+async function loadPolicy() {
+  try {
+    policy.value = await fleetApi.firmware.policy()
+  } catch (error) {
+    toastError(error, '固件签名策略加载失败')
+  }
+}
 
 function openUpload() {
   uploadFile.value = null
   uploadProgress.value = 0
   uploadForm.name = ''
   uploadForm.version = ''
+  uploadForm.signature = ''
+  uploadForm.signingKeyId = ''
   uploadError.value = ''
   uploadOpen.value = true
 }
@@ -57,10 +69,26 @@ async function submitUpload() {
     uploadError.value = '请选择文件并填写名称与版本'
     return
   }
+  const signature = uploadForm.signature.trim()
+  const signingKeyId = uploadForm.signingKeyId.trim()
+  // 服务端要求签名与密钥 ID 成对出现；两者缺一都会在上传开始前被拒绝
+  if (Boolean(signature) !== Boolean(signingKeyId)) {
+    uploadError.value = '签名与签名密钥 ID 必须同时填写或同时留空'
+    return
+  }
+  if (policy.value?.requireSignature && !signature) {
+    uploadError.value = '当前部署要求固件签名，请填写签名与密钥 ID'
+    return
+  }
   uploadSaving.value = true
   uploadError.value = ''
   try {
-    await fleetApi.firmware.upload(uploadFile.value, uploadForm.name.trim(), uploadForm.version.trim(), percent => { uploadProgress.value = percent }, platformAdmin ? uploadForm.tenantId ?? undefined : undefined)
+    await fleetApi.firmware.upload(uploadFile.value, uploadForm.name.trim(), uploadForm.version.trim(), {
+      signature: signature || undefined,
+      signingKeyId: signingKeyId || undefined,
+      onProgress: percent => { uploadProgress.value = percent },
+      tenantId: platformAdmin ? uploadForm.tenantId ?? undefined : undefined,
+    })
     pushToast('固件已上传')
     uploadOpen.value = false
     await list.load()
@@ -184,6 +212,7 @@ async function remove(row: FirmwareRow) {
 
 onMounted(async () => {
   list.load()
+  await loadPolicy()
   if (!platformAdmin) return
   try {
     const page = await systemApi.tenants.list({ pageNum: 1, pageSize: 100, status: '1' })
@@ -197,25 +226,43 @@ onMounted(async () => {
 
 <template>
   <div>
-    <ListPage title="固件管理" desc="上传固件、查看摘要并按节点下发；Agent 通过 mTLS 下载支持 Range 与 ETag。" table-title="固件列表" :list="list" :columns="columns" :min-width="1080">
+    <ListPage title="固件管理" desc="上传固件、查看摘要并按节点下发；Agent 通过 mTLS 下载支持 Range 与 ETag。" table-title="固件列表" :list="list" :columns="columns" :min-width="1220">
       <template #search><TextInput v-model="list.query.keyword" icon="search" placeholder="搜索名称或版本" clearable /></template>
-      <template #tools><PermissionButton perm="device:firmware:upload" icon="upload" label="上传固件" @click="openUpload" /></template>
+      <template #tools>
+        <Tag v-if="policy" :tone="policy.requireSignature ? 'danger' : 'neutral'" dot>
+          {{ policy.requireSignature ? '强制固件签名' : '固件签名可选' }}
+        </Tag>
+        <PermissionButton perm="device:firmware:upload" icon="upload" label="上传固件" @click="openUpload" />
+      </template>
       <template #cell-name="{ row }">
         <div class="cell-title">{{ row.name }}</div>
         <div class="cell-sub">{{ row.fileName }}</div>
+      </template>
+      <template #cell-signed="{ row }">
+        <Tag :tone="row.signed ? 'ok' : (policy?.requireSignature ? 'danger' : 'neutral')" dot>{{ row.signed ? '已签名' : '未签名' }}</Tag>
+        <div v-if="row.signed && row.signatureKeyId" class="cell-sub mono">{{ row.signatureKeyId }}</div>
+        <div v-else-if="policy?.requireSignature" class="cell-sub">策略要求签名，不能下发</div>
       </template>
       <template #cell-sizeBytes="{ row }"><span class="tnum soft">{{ sizeText(row.sizeBytes) }}</span></template>
       <template #cell-sha256="{ row }"><span class="mono faint" style="font-size:11px">{{ row.sha256 }}</span></template>
       <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
       <template #cell-actions="{ row }">
-        <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="send" label="下发" @click="openDeploy(row)" />
+        <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="send" label="下发" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openDeploy(row)" />
         <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="refresh" label="回滚" @click="openRollback(row)" />
         <PermissionButton perm="device:firmware:list" variant="text" size="sm" icon="activity" label="任务" @click="openTasks(row)" />
         <PermissionButton perm="device:firmware:remove" variant="text" size="sm" danger icon="trash" label="删除" @click="remove(row)" />
       </template>
     </ListPage>
 
-    <FormDialog :open="uploadOpen" title="上传固件" sub="支持大文件流式上传；摘要由服务端边收边算。" :saving="uploadSaving" @close="uploadOpen = false" @submit="submitUpload">
+    <FormDialog
+      :open="uploadOpen"
+      title="上传固件"
+      :sub="policy?.requireSignature ? '当前部署强制校验固件签名；签名与密钥 ID 必填。' : '支持大文件流式上传；签名可选，填写时需与密钥 ID 成对。'"
+      :saving="uploadSaving"
+      :width="680"
+      @close="uploadOpen = false"
+      @submit="submitUpload"
+    >
       <Field v-if="platformAdmin" label="所属租户" hint="默认落在当前租户">
         <Select v-model="uploadForm.tenantId" :options="tenantOptions" placeholder="选择租户" />
       </Field>
@@ -224,6 +271,17 @@ onMounted(async () => {
       <Field label="文件" required>
         <input type="file" @change="pickFile" />
         <div v-if="uploadFile" class="faint" style="margin-top:6px">{{ uploadFile.name }} · {{ sizeText(uploadFile.size) }}</div>
+      </Field>
+      <Field
+        label="签名（Base64）"
+        :required="policy?.requireSignature"
+        :hint="policy?.trustedKeyIds.length ? `信任键：${policy.trustedKeyIds.join('、')}` : 'Ed25519 签名的 Base64 文本；部署配置信任键后才能校验'"
+        span
+      >
+        <TextInput v-model="uploadForm.signature" multiline :rows="3" placeholder="粘贴 Base64 签名" />
+      </Field>
+      <Field label="签名密钥 ID" :required="policy?.requireSignature" hint="与签名同时提供" span>
+        <TextInput v-model="uploadForm.signingKeyId" placeholder="例如 firmware-2026" />
       </Field>
       <div v-if="uploadSaving" class="faint" style="margin-top:6px">上传进度 {{ uploadProgress }}%</div>
       <p v-if="uploadError" class="form-error">{{ uploadError }}</p>

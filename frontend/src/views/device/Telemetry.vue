@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { EmptyState, Metric, SectionLabel, Select, Tag } from '@/components/ui'
 import TrendChart from '@/components/charts/TrendChart.vue'
 import { deviceApi, fleetApi, type NodeRow, type TelemetryPoint } from '@/api'
 import { toastError } from '@/composables/toast'
 
+const route = useRoute()
 const nodes = ref<NodeRow[]>([])
-const nodeId = ref<number | null>(null)
+// 从节点详情跳转时带 nodeId；没有合法参数才回落到第一个节点
+const queryNodeId = Number(route.query.nodeId)
+const nodeId = ref<number | null>(Number.isInteger(queryNodeId) && queryNodeId > 0 ? queryNodeId : null)
 const nodeOptions = computed(() => nodes.value.map(node => ({ label: `${node.name} · ${node.status === 'online' ? '在线' : '离线'}`, value: node.id })))
 const latest = ref<TelemetryPoint[]>([])
 const metric = ref('')

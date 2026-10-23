@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Checkbox, Drawer, Field, Select, StatusTag, Tag, TextInput, type Column } from '@/components/ui'
+import { useRoute } from 'vue-router'
+import { Button, Checkbox, Drawer, Field, Select, StatusTag, Tag, TextInput, type Column } from '@/components/ui'
 import { FormDialog, ListPage, PermissionButton } from '@/components/business'
 import { deviceApi, fleetApi, type CommandRow, type NodeRow } from '@/api'
 import { useListPage } from '@/composables/list'
@@ -20,8 +21,10 @@ const STATUSES = [
 const STATUS_LABEL: Record<string, string> = { pending: '待执行', running: '执行中', succeeded: '已成功', failed: '已失败', timeout: '已超时', canceled: '已取消' }
 const STATUS_TONE: Record<string, string> = { pending: 'neutral', running: 'info', succeeded: 'ok', failed: 'danger', timeout: 'danger', canceled: 'neutral' }
 
-const list = useListPage<CommandRow, { status: string }>({
-  query: { status: '' },
+const route = useRoute()
+const queryNodeId = Number(route.query.nodeId)
+const list = useListPage<CommandRow, { status: string; nodeId: number | null }>({
+  query: { status: '', nodeId: Number.isInteger(queryNodeId) && queryNodeId > 0 ? queryNodeId : null },
   fetch: params => fleetApi.commands.list(params),
 })
 const socket = useNodeSocket(() => undefined, { onCommand: () => list.load() })
@@ -129,6 +132,11 @@ async function cancel(row: CommandRow) {
   }
 }
 
+function clearNodeFilter() {
+  list.query.nodeId = null
+  list.search()
+}
+
 function pretty(value: string) {
   if (!value) return '（无）'
   try {
@@ -147,7 +155,11 @@ onMounted(() => {
   <div :data-ws-state="socket.state">
     <ListPage title="命令中心" desc="向 Agent 下发命令并跟踪执行结果；在线通道直推，离线节点走轮询。" table-title="命令记录" :list="list" :columns="columns" :min-width="1050">
       <template #search><Select v-model="list.query.status" :options="STATUSES" placeholder="全部状态" /></template>
-      <template #tools><PermissionButton perm="device:command:send" icon="command" label="下发命令" @click="openCreate" /></template>
+      <template #tools>
+        <Tag v-if="list.query.nodeId" tone="info" dot>仅看节点 #{{ list.query.nodeId }}</Tag>
+        <Button v-if="list.query.nodeId" variant="text" size="sm" @click="clearNodeFilter">清除节点筛选</Button>
+        <PermissionButton perm="device:command:send" icon="command" label="下发命令" @click="openCreate" />
+      </template>
       <template #cell-type="{ row }"><span class="mono">{{ row.type }}</span></template>
       <template #cell-status="{ row }"><Tag :tone="STATUS_TONE[row.status] || 'neutral'" dot>{{ STATUS_LABEL[row.status] || row.status }}</Tag></template>
       <template #cell-message="{ row }"><span class="faint">{{ row.message || '—' }}</span></template>

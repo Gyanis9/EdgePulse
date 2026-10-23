@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { ListPage, FormDialog, PermissionButton } from '@/components/business'
+import { useRouter } from 'vue-router'
+import { EnrollmentTokenDialog, ListPage, FormDialog, PermissionButton } from '@/components/business'
 import { Field, Select, StatusTag, TextInput, type Column } from '@/components/ui'
 import { deviceApi, fleetApi, systemApi, type NodeGroupRow, type NodeRow } from '@/api'
 import { currentUser } from '@/composables/auth'
@@ -16,13 +17,19 @@ const columns: Column[] = [
   { key: 'agentVersion', title: 'Agent 版本', width: 130 },
   { key: 'lastSeen', title: '最后心跳', minWidth: 190 },
   { key: 'labels', title: '标签', minWidth: 200 },
-  { key: 'actions', title: '操作', width: 100, className: 'col-actions' },
+  { key: 'actions', title: '操作', width: 150, className: 'col-actions' },
 ]
 
 const list = useListPage<NodeRow, { keyword: string; groupId: number | null }>({
   query: { keyword: '', groupId: null },
   fetch: params => deviceApi.nodes.list(params),
 })
+const router = useRouter()
+const tokenDialog = ref(false)
+
+function openDetail(node: NodeRow) {
+  router.push(`/device/nodes/${node.id}`)
+}
 
 const platformAdmin = Boolean(currentUser.value?.platformAdmin)
 const tenants = ref<Array<{ id: number; name: string; code: string }>>([])
@@ -134,6 +141,7 @@ async function remove(node: NodeRow) {
         <Select v-model="list.query.groupId" :options="groupOptions" placeholder="全部分组" />
       </template>
       <template #tools>
+        <PermissionButton perm="device:node:write" icon="key" label="注册令牌" @click="tokenDialog = true" />
         <PermissionButton perm="device:node:write" icon="plus" label="新增节点" @click="openCreate" />
       </template>
       <template #cell-status="{ row }">
@@ -149,9 +157,14 @@ async function remove(node: NodeRow) {
         <span class="faint">{{ labelText(row) }}</span>
       </template>
       <template #cell-actions="{ row }">
-        <PermissionButton perm="device:node:write" variant="text" size="sm" danger icon="trash" label="删除" @click="remove(row)" />
+        <div class="row-actions">
+          <PermissionButton perm="device:node:list" variant="text" size="sm" icon="search" label="详情" @click="openDetail(row)" />
+          <PermissionButton perm="device:node:write" variant="text" size="sm" danger icon="trash" label="删除" @click="remove(row)" />
+        </div>
       </template>
     </ListPage>
+
+    <EnrollmentTokenDialog :open="tokenDialog" @close="tokenDialog = false" />
 
     <FormDialog :open="dialog" title="新增节点" sub="名称唯一；标签是可选的 JSON 对象。" :saving="saving" @close="dialog = false" @submit="submit">
       <Field v-if="platformAdmin" label="所属租户" hint="默认落在当前租户">

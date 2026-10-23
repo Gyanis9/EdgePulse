@@ -26,6 +26,7 @@ test('fleet api maps telemetry alarm command firmware and ops endpoints', async 
   await api.commands.cancel(11)
   await api.firmware.deploy(5, [7])
   await api.firmware.tasks(5)
+  await api.firmware.policy()
   await api.ops.summary()
 
   assert.equal(calls[0].url, '/api/node-groups')
@@ -41,5 +42,6 @@ test('fleet api maps telemetry alarm command firmware and ops endpoints', async 
   assert.equal(calls[10].url, '/api/firmware/5/deploy')
   assert.deepEqual(JSON.parse(calls[10].body ?? '{}'), { nodeIds: [7] })
   assert.equal(calls[11].url, '/api/firmware/5/tasks')
-  assert.equal(calls[12].url, '/api/ops/summary')
+  assert.equal(calls[12].url, '/api/firmware/policy')
+  assert.equal(calls[13].url, '/api/ops/summary')
 })
