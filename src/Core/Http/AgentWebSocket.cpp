@@ -102,11 +102,12 @@ namespace EdgePulse::Web
                                        }
                                        nodeId          = *id;
                                        const auto beat = co_await allNodes->heartbeat(loop, nodeId, stringOf(*hello, "agentVersion"));
-                                       if (beat.has_value() && beat->becameOnline && lifecycle != nullptr)
+                                       if (beat.has_value() && lifecycle != nullptr)
                                        {
                                            try
                                            {
-                                               co_await lifecycle->onHeartbeat(loop, beat->node, true);
+                                               // 非在线转换的心跳也要交给生命周期，靠它销案扫描插入的离线告警
+                                               co_await lifecycle->onHeartbeat(loop, beat->node, beat->becameOnline);
                                            } catch (const std::exception &failure)
                                            {
                                                // 状态已落库；发布或销案失败只记日志，不能让 hello 失败

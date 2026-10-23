@@ -207,13 +207,17 @@ protected:
         m_storage          = std::filesystem::temp_directory_path() / ("edgepulse-firmware-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         m_nodes            = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
         m_nodeService      = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
-        m_agentRegistry    = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, EdgePulse::Device::AgentRegistry::Options{});
         m_groups           = std::make_shared<EdgePulse::Device::NodeGroupRepository>(m_context->database);
         m_telemetry        = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
         m_alarmRepo        = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
         m_alarmService     = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
         m_lifecycle        = std::make_unique<EdgePulse::Device::NodeLifecycleService>(
                 *m_nodes, *m_alarmService, [](const EdgePulse::Device::NodeRecord &) -> AsynGyanis::Core::Task<> { co_return; }, 90);
+        // 与 Application 一致：注册表把每次注册与心跳都交给生命周期，是否发布由它按 becameOnline 决定
+        EdgePulse::Device::AgentRegistry::Options agentOptions;
+        agentOptions.publisher = [this](const EdgePulse::Device::NodeRecord &node, const bool becameOnline) -> AsynGyanis::Core::Task<>
+        { co_await m_lifecycle->onHeartbeat(m_server->loop(), node, becameOnline); };
+        m_agentRegistry    = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, std::move(agentOptions));
         m_commands         = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
         m_channels         = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
         m_firmware         = std::make_shared<EdgePulse::Firmware::FirmwareRepository>(m_context->database);
@@ -268,7 +272,7 @@ protected:
                     commands.nodes    = m_nodes.get();
                     EdgePulse::Command::registerCommandRoutes(router, loop, commands);
                     EdgePulse::Command::registerCommandAgentRoutes(router, loop, commands);
-                    EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels);
+                    EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels, m_lifecycle.get());
                     // 浏览器端点只用于首条认证超时的用例：令牌校验器从不被调用，未认证连接必须在 5 秒后收到 1008
                     m_browserWebSocket->registerRoute(router, [](std::string_view) -> AsynGyanis::Core::Task<std::optional<EdgePulse::Web::BrowserSubscriptionScope>>
                                                       { co_return std::nullopt; }, {});
@@ -453,6 +457,35 @@ TEST_F(FleetEndpointsTest, AgentRequestsRequireCertificateBinding)
     const auto        unbound     = runner.run(m_nodes->create(runner.loop(), "agent-unbound", "{}"));
     const std::string unboundBody = R"({"nodeId":)" + std::to_string(unbound.id) + R"(,"agentVersion":"1.0.0"})";
     EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", unboundBody, "application/json", agentHeaders(std::string(64, 'f'))).status);
+}
+
+// 钉住：节点已在线时的心跳不再触发在线转换，但仍要销案扫描在心跳落库后插入的离线告警
+TEST_F(FleetEndpointsTest, HeartbeatWithoutTransitionResolvesSweepInsertedAlarm)
+{
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const std::string                         token  = login();
+    const std::int64_t                        nodeId = createNode(token, "heartbeat-alarm-node");
+    const std::string                         fingerprint(64, '6');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    const std::string heartbeatBody = R"({"nodeId":)" + std::to_string(nodeId) + R"(,"agentVersion":"1.0.0"})";
+    const auto        online        = m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, online.status) << online.body;
+    ASSERT_EQ("online", (*online.json())["data"]["status"].get<std::string>());
+
+    // 模拟离线扫描在心跳落库之后补插的系统告警
+    const auto node = runner.run(m_nodes->findById(runner.loop(), nodeId));
+    ASSERT_TRUE(node.has_value());
+    ASSERT_EQ("online", node->status);
+    ASSERT_TRUE(runner.run(m_alarmService->reportNodeOffline(runner.loop(), *node, 90)).has_value());
+    ASSERT_EQ(1, runner.run(m_alarmRepo->openCount(runner.loop())));
+
+    // 节点已经在线，这次心跳没有离线转在线的转换
+    const auto repeated = m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, repeated.status) << repeated.body;
+
+    EXPECT_EQ(0, runner.run(m_alarmRepo->openCount(runner.loop())));
+    EXPECT_FALSE(runner.run(m_alarmRepo->findOpen(runner.loop(), 0, nodeId)).has_value());
 }
 
 // 钉住：删除节点时同步销案系统离线告警，删除后不留永远未恢复的告警

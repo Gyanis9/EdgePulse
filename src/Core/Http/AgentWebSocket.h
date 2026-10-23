@@ -37,7 +37,7 @@ namespace EdgePulse::Web
      * @param nodes 节点仓储
      * @param commands 命令仓储
      * @param channels 在线通道表
-     * @param lifecycle 节点生命周期服务；hello 把节点拉回在线时用它发布状态与销案告警，可空
+     * @param lifecycle 节点生命周期服务；每次 hello 的心跳都用它发布状态与销案告警，可空
      */
     void registerAgentWebSocket(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, Device::NodeRepository &nodes, Command::CommandRepository &commands,
                                 Command::AgentChannelRegistry &channels, Device::NodeLifecycleService *lifecycle = nullptr);

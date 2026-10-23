@@ -1,6 +1,6 @@
 /**
  * @file AgentRegistry.h
- * @brief mTLS Agent 注册、心跳与节点状态发布
+ * @brief mTLS Agent 注册、心跳与心跳钩子
  * @author Gyanis
  * @date 2026-10-20
  * @version 1.0.0
@@ -54,7 +54,7 @@ namespace EdgePulse::Device
         AsynGyanis::Core::TlsPeerIdentityPtr connectionIdentity{}; ///< 注册请求的 TLS 对端身份；非 TLS 链路为空
     };
 
-    /// 节点状态变化后的发布回调；becameOnline 表示本次注册或心跳是否把节点拉回在线
+    /// 心跳后的节点状态回调；每次注册或心跳成功后都会调用，becameOnline 表示本次是否把节点拉回在线
     using NodeStatusPublisher = std::function<AsynGyanis::Core::Task<>(const NodeRecord &, bool becameOnline)>;
 
     /**
@@ -69,13 +69,13 @@ namespace EdgePulse::Device
         struct Options
         {
             std::vector<std::string> allowedFingerprints; ///< 允许的证书指纹；空表示只依赖 CA 链校验
-            NodeStatusPublisher      publisher;           ///< 状态发布回调，可空
+            NodeStatusPublisher      publisher;           ///< 心跳钩子，可空；在每次注册与心跳成功后调用，由回调决定是否发布状态
         };
 
         /**
          * @brief 构造
          * @param repository 节点仓储
-         * @param options 指纹白名单与发布回调
+         * @param options 指纹白名单与心跳钩子
          */
         AgentRegistry(std::shared_ptr<NodeRepository> repository, Options options);
 
@@ -98,9 +98,9 @@ namespace EdgePulse::Device
 
     private:
         /**
-         * @brief 通知发布回调；回调异常只记日志，不推翻已经落库的状态
+         * @brief 每次注册或心跳成功后调用心跳钩子；回调异常只记日志，不推翻已经落库的状态
          */
-        AsynGyanis::Core::Task<> publish(const NodeRecord &node, bool becameOnline);
+        AsynGyanis::Core::Task<> notifyHeartbeat(const NodeRecord &node, bool becameOnline);
 
         std::shared_ptr<NodeRepository> m_repository; ///< 节点仓储
         Options                         m_options;    ///< 选项

@@ -4,6 +4,7 @@
 #include "Base/Api/ErrorCatalog.h"
 #include "Base/Api/Pagination.h"
 #include "Base/Api/QueryParameters.h"
+#include "Base/Log/LogMacros.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeService.h"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <unordered_map>
 #include <string>
@@ -335,7 +337,14 @@ namespace EdgePulse::Device
                        // 删除后的节点不会再有心跳来销案，必须在这里收口它的系统离线告警
                        if (lifecycle != nullptr)
                        {
-                           co_await lifecycle->onNodeRemoved(loop, *nodeId);
+                           try
+                           {
+                               co_await lifecycle->onNodeRemoved(loop, *nodeId);
+                           } catch (const std::exception &failure)
+                           {
+                               // 删除已经提交；销案失败只影响告警读数，不能把成功的删除报成 500
+                               LOG_WARN_FMT("节点删除后销案离线告警失败：node={} reason={}", *nodeId, failure.what());
+                           }
                        }
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;

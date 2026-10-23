@@ -47,20 +47,20 @@ TEST(DeviceService, CreatesListsUpdatesAndRemovesNode)
     EXPECT_EQ(0, afterRemoval.total);
 }
 
-// 钉住：白名单外指纹被拒；注册与心跳只在离线转在线时发布节点状态
-TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
+// 钉住：白名单外指纹被拒；注册与每次心跳都把结果交给心跳钩子，是否发布由钩子按 becameOnline 决定
+TEST(DeviceService, AgentRegistrationChecksFingerprintAndCallsHeartbeatHook)
 {
     EdgePulse::TestSupport::AuthTestContext context;
     EdgePulse::TestSupport::EventLoopRunner runner;
 
     const auto                                repository = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
     const std::string                         fingerprint(64, 'a');
-    int                                       publishCount = 0;
+    std::vector<bool>                         onlineFlags;
     EdgePulse::Device::AgentRegistry::Options options;
     options.allowedFingerprints = {fingerprint};
-    options.publisher           = [&publishCount](const EdgePulse::Device::NodeRecord &, bool) -> AsynGyanis::Core::Task<>
+    options.publisher           = [&onlineFlags](const EdgePulse::Device::NodeRecord &, const bool becameOnline) -> AsynGyanis::Core::Task<>
     {
-        ++publishCount;
+        onlineFlags.push_back(becameOnline);
         co_return;
     };
     EdgePulse::Device::AgentRegistry registry(repository, options);
@@ -68,11 +68,13 @@ TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
     const auto rejected = runner.run(registry.registerAgent(runner.loop(), EdgePulse::Device::AgentRegistration{"edge-a", "1.0.0", std::string(64, 'b'), ""}));
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(EdgePulse::Device::AgentError::Reason::FingerprintRejected, rejected.error().reason);
+    EXPECT_TRUE(onlineFlags.empty());
 
     const auto registered = runner.run(registry.registerAgent(runner.loop(), EdgePulse::Device::AgentRegistration{"edge-a", "1.0.0", fingerprint, R"({"zone":"edge"})"}));
     ASSERT_TRUE(registered.has_value()) << registered.error().message;
     EXPECT_EQ("online", registered->status);
-    EXPECT_EQ(1, publishCount);
+    ASSERT_EQ(1U, onlineFlags.size());
+    EXPECT_TRUE(onlineFlags[0]);
 
     const auto heartbeated = runner.run(registry.heartbeat(runner.loop(), registered->id, "1.0.1"));
     ASSERT_TRUE(heartbeated.has_value()) << heartbeated.error().message;
@@ -80,15 +82,18 @@ TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
     EXPECT_EQ("1.0.1", heartbeated->node.agentVersion);
     EXPECT_FALSE(heartbeated->node.lastSeen.empty());
     EXPECT_FALSE(heartbeated->becameOnline);
-    EXPECT_EQ(1, publishCount);
+    // 非转换心跳同样进钩子：生命周期要靠这次调用清掉扫描插入的离线告警
+    ASSERT_EQ(2U, onlineFlags.size());
+    EXPECT_FALSE(onlineFlags[1]);
 
-    // 扫描转离线后再心跳才是新的在线转换，状态发布随之增加
+    // 扫描转离线后再心跳是一次新的在线转换
     EXPECT_EQ(1U, runner.run(repository->markStaleOffline(runner.loop(), "9999-12-31 23:59:59", 10)).size());
     const auto recovered = runner.run(registry.heartbeat(runner.loop(), registered->id, "1.0.1"));
     ASSERT_TRUE(recovered.has_value()) << recovered.error().message;
     EXPECT_EQ("online", recovered->node.status);
     EXPECT_TRUE(recovered->becameOnline);
-    EXPECT_EQ(2, publishCount);
+    ASSERT_EQ(3U, onlineFlags.size());
+    EXPECT_TRUE(onlineFlags[2]);
 }
 
 // 钉住：自报指纹必须与这条 mTLS 连接出示的叶证书一致
