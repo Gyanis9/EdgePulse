@@ -26,30 +26,6 @@ namespace EdgePulse::Notification
         constexpr std::chrono::milliseconds kWebhookTimeout{5000};
         constexpr std::chrono::milliseconds kRetryDelay{300};
 
-        [[nodiscard]] std::string maskUrlCredentials(std::string text)
-        {
-            // 引擎报错会回显 authority（可能不带协议名），按 @ 反推前一段口令
-            std::size_t search = 0;
-            while (true)
-            {
-                const std::size_t at = text.find('@', search);
-                if (at == std::string::npos)
-                {
-                    return text;
-                }
-                const std::size_t delimiter = text.find_last_of(" \t\r\n\"'「」([{/", at);
-                const std::size_t begin     = delimiter == std::string::npos ? 0 : delimiter + 1;
-                if (begin < at)
-                {
-                    text.replace(begin, at - begin, "***");
-                    search = begin + 4;
-                } else
-                {
-                    search = at + 1;
-                }
-            }
-        }
-
         [[nodiscard]] int levelRank(const std::string_view level)
         {
             if (level == "critical")
@@ -187,8 +163,8 @@ namespace EdgePulse::Notification
             } catch (const std::exception &failure)
             {
                 // 地址本身被拒（如带 userinfo）重试也不会成功，直接记一条失败；
-                // 引擎的报错会原样回显 URL，落库与日志前先把凭据段打码
-                outcome.error = maskUrlCredentials(failure.what());
+                // 引擎的诊断文本已脱敏 userinfo 与敏感查询参数，原文可以落库
+                outcome.error = failure.what();
                 LOG_WARN_FMT("告警 Webhook 地址被拒：channel={} tenant={} node={} error={}", channel.name, alarm.tenantId, alarm.nodeId, outcome.error);
                 co_return outcome;
             }
