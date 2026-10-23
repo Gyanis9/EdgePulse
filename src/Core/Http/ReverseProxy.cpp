@@ -121,8 +121,10 @@ namespace EdgePulse::Web
             std::string       requestContentType;
 
             AsynGyanis::Net::HttpClientRequest upstreamRequest;
-            upstreamRequest.method = std::string{method};
-            upstreamRequest.body   = requestBody;
+            // 浏览器断开时入站请求的取消令牌会停止；同一份信号交给上游，避免本端继续等一个没人要的响应
+            upstreamRequest.cancelToken = request.cancelToken();
+            upstreamRequest.method      = std::string{method};
+            upstreamRequest.body        = requestBody;
             for (const auto &[name, value]: request.headers())
             {
                 if (!isForwardedRequestHeader(name))
