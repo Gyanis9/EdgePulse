@@ -1,5 +1,7 @@
 #include "Core/Auth/AuthService.h"
 #include "Base/Database/Database.h"
+#include "Base/Security/PasswordHash.h"
+#include "Core/System/UserRepository.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 
@@ -114,4 +116,58 @@ TEST(AuthService, ChangesPasswordAndInvalidatesOldCredential)
 
     const auto newCredential = loginWithCaptcha(context, runner, "new-pass-123");
     ASSERT_TRUE(newCredential.has_value()) << newCredential.error().message;
+}
+
+// 钉住：连续失败达到阈值后账号锁定，正确口令在锁定期内也回 423
+TEST(AuthService, LocksAccountAfterRepeatedFailures)
+{
+    EdgePulse::TestSupport::AuthTestContext context({10, true, 900, 2, 60});
+    EdgePulse::TestSupport::EventLoopRunner runner;
+
+    EXPECT_FALSE(loginWithCaptcha(context, runner, "wrong-1").has_value());
+    EXPECT_FALSE(loginWithCaptcha(context, runner, "wrong-2").has_value());
+    const auto locked = loginWithCaptcha(context, runner, "admin123");
+    ASSERT_FALSE(locked.has_value());
+    EXPECT_EQ(423, locked.error().httpStatus);
+
+    // 管理员重置口令会清空锁定，新口令立即可用
+    EdgePulse::System::UserRepository users(context.database);
+    const auto                        admin = runner.run(users.findByUsername(runner.loop(), "admin"));
+    ASSERT_TRUE(admin.has_value());
+    const std::string hash = EdgePulse::Common::hashPassword("admin123");
+    ASSERT_TRUE(runner.run(users.scoped({1, false})->resetPassword(runner.loop(), admin->id, hash, 1)));
+    const auto recovered = loginWithCaptcha(context, runner, "admin123");
+    ASSERT_TRUE(recovered.has_value()) << recovered.error().message;
+}
+
+// 钉住：成功登录会清空账号失败计数，此前的输错不参与后续累计
+TEST(AuthService, SuccessfulLoginResetsFailureCount)
+{
+    EdgePulse::TestSupport::AuthTestContext context({6, false, 900, 2, 60});
+    EdgePulse::TestSupport::EventLoopRunner runner;
+
+    EXPECT_FALSE(loginWithCaptcha(context, runner, "wrong-1").has_value());
+    ASSERT_TRUE(loginWithCaptcha(context, runner, "admin123").has_value());
+    EXPECT_FALSE(loginWithCaptcha(context, runner, "wrong-2").has_value());
+    const auto success = loginWithCaptcha(context, runner, "admin123");
+    ASSERT_TRUE(success.has_value()) << success.error().message;
+}
+
+// 钉住：改密与建号共用同一口令策略，弱口令在落库前被拒
+TEST(AuthService, RejectsWeakPasswordOnChangeUnderStrictPolicy)
+{
+    EdgePulse::TestSupport::AuthTestContext context({10, true, 900, 5, 900});
+    EdgePulse::TestSupport::EventLoopRunner runner;
+
+    const auto login = loginWithCaptcha(context, runner, "admin123");
+    ASSERT_TRUE(login.has_value()) << login.error().message;
+    const std::optional<EdgePulse::Auth::SessionRecord> session = runner.run(context.auth->authenticate(runner.loop(), login->token));
+    ASSERT_TRUE(session.has_value());
+
+    const auto weak = runner.run(context.auth->changePassword(runner.loop(), *session, "admin123", "weakpass1"));
+    ASSERT_FALSE(weak.has_value());
+    EXPECT_EQ(400, weak.error().httpStatus);
+
+    const auto strong = runner.run(context.auth->changePassword(runner.loop(), *session, "admin123", "Strong-pass1"));
+    ASSERT_TRUE(strong.has_value()) << strong.error().message;
 }

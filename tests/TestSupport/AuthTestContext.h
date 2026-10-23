@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "Core/Auth/AuthService.h"
+
 #include <filesystem>
 #include <memory>
 
@@ -41,7 +43,11 @@ namespace EdgePulse::TestSupport
     class AuthTestContext
     {
     public:
-        AuthTestContext();
+        /**
+         * @brief 建一套临时认证环境
+         * @param options 认证策略；默认沿用宽松档，既有用例的弱口令不必跟着新策略改
+         */
+        explicit AuthTestContext(Auth::AuthOptions options = {6, false, 900, 100, 900});
         ~AuthTestContext();
 
         AuthTestContext(const AuthTestContext &)            = delete;

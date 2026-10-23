@@ -48,6 +48,13 @@ edgepulse:
     allowed_origins: https://console.example.com
     # 只放行普通私网与回环 Webhook；云元数据与链路本地地址始终拒绝
     allow_private_webhooks: false
+    # 建号、重置与改密共用：至少 10 位且同时包含大写、小写、数字与符号
+    password_min_length: 10
+    password_require_complexity: true
+    # 账号在窗口内连续失败 5 次锁定 15 分钟
+    login_failure_window_seconds: 900
+    login_max_failures: 5
+    login_lock_seconds: 900
   agent:
     fingerprint: ""
     enrollment_mode: "required"
@@ -89,7 +96,7 @@ server:
   parser_limits:
     maximum_body_size: 268435456
   rate_limit:
-    requests_per_second: 0.0
+    requests_per_second: 0
     burst_capacity: 1.0
 
 metrics:

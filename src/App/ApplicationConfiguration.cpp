@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <expected>
 #include <string_view>
@@ -174,6 +175,19 @@ namespace EdgePulse::App
         configuration.allowedOrigins           = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
         configuration.allowPrivateWebhooks     = configurationManager.getBool("edgepulse.security.allow_private_webhooks", configuration.allowPrivateWebhooks);
 
+        configuration.requestsPerSecond         = configurationManager.getInt("server.rate_limit.requests_per_second", configuration.requestsPerSecond);
+        configuration.rateLimitBurstCapacity    = configurationManager.getDouble("server.rate_limit.burst_capacity", configuration.rateLimitBurstCapacity);
+        configuration.idleTimeoutMs             = configurationManager.getInt("server.limits.idle_timeout_ms", configuration.idleTimeoutMs);
+        configuration.readTimeoutMs             = configurationManager.getInt("server.limits.read_timeout_ms", configuration.readTimeoutMs);
+        configuration.writeTimeoutMs            = configurationManager.getInt("server.limits.write_timeout_ms", configuration.writeTimeoutMs);
+        configuration.maximumRequestBodyBytes   = configurationManager.getInt("server.parser_limits.maximum_body_size", configuration.maximumRequestBodyBytes);
+        configuration.passwordMinimumLength     = static_cast<int>(configurationManager.getInt("edgepulse.security.password_min_length", configuration.passwordMinimumLength));
+        configuration.passwordRequireComplexity = configurationManager.getBool("edgepulse.security.password_require_complexity", configuration.passwordRequireComplexity);
+        configuration.loginFailureWindowSeconds =
+                static_cast<int>(configurationManager.getInt("edgepulse.security.login_failure_window_seconds", configuration.loginFailureWindowSeconds));
+        configuration.loginMaximumFailures = static_cast<int>(configurationManager.getInt("edgepulse.security.login_max_failures", configuration.loginMaximumFailures));
+        configuration.loginLockSeconds     = static_cast<int>(configurationManager.getInt("edgepulse.security.login_lock_seconds", configuration.loginLockSeconds));
+
         if (const auto password = Common::environmentValue("EDGEPULSE_DB_PASSWORD"); password.has_value())
         {
             configuration.databasePassword = *password;
@@ -278,6 +292,40 @@ namespace EdgePulse::App
         if (configuration.captchaTtlSeconds < kMinimumTtl || configuration.sessionTtlSeconds < kMinimumTtl)
         {
             return std::unexpected(ConfigurationError{"captcha/session 的 TTL 必须是正数"});
+        }
+        if (configuration.requestsPerSecond < 0)
+        {
+            return std::unexpected(ConfigurationError{"server.rate_limit.requests_per_second 不能为负数；关闭限流请写 0"});
+        }
+        // 令牌桶容量小于 1 时任何请求都取不到令牌，那是配置错误而不是更严格的限流
+        if (!std::isfinite(configuration.rateLimitBurstCapacity) || configuration.rateLimitBurstCapacity < 1.0)
+        {
+            return std::unexpected(ConfigurationError{"server.rate_limit.burst_capacity 必须不小于 1.0"});
+        }
+        if (configuration.idleTimeoutMs < 0 || configuration.readTimeoutMs < 0 || configuration.writeTimeoutMs < 0)
+        {
+            return std::unexpected(ConfigurationError{"server.limits 下的超时毫秒数不能为负数；0 表示关闭该项保护"});
+        }
+        if (configuration.maximumRequestBodyBytes <= 0)
+        {
+            return std::unexpected(ConfigurationError{"server.parser_limits.maximum_body_size 必须是正数"});
+        }
+        if (configuration.passwordMinimumLength < 6 || configuration.passwordMinimumLength > 64)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.security.password_min_length 必须在 6 到 64 之间"});
+        }
+        if (configuration.loginFailureWindowSeconds < 60 || configuration.loginFailureWindowSeconds > 86400)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.security.login_failure_window_seconds 必须在 60 到 86400 之间"});
+        }
+        if (configuration.loginMaximumFailures < 1 || configuration.loginMaximumFailures > 100)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.security.login_max_failures 必须在 1 到 100 之间"});
+        }
+        // 锁定提示按分钟展示，短于 60 秒会让用户看到「请 0 分钟后再试」
+        if (configuration.loginLockSeconds < 60 || configuration.loginLockSeconds > 86400)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.security.login_lock_seconds 必须在 60 到 86400 之间"});
         }
 
         const auto httpPort = readPort(configurationManager, "edgepulse.http_port", configuration.httpPort);

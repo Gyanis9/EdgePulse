@@ -5,6 +5,7 @@
 #include "Base/Api/ErrorCatalog.h"
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
+#include "Net/Http/Routing/Middleware.h"
 #include "Net/Http/Routing/Router.h"
 #include "Core/Http/RequestId.h"
 
@@ -42,5 +43,14 @@ namespace EdgePulse::Web
                     }
                     co_return;
                 });
+    }
+
+    void applyRateLimit(AsynGyanis::Net::Router &router, const std::shared_ptr<AsynGyanis::Net::TokenBucket> &bucket)
+    {
+        // 空桶代表运维显式关闭限流：不注册比注册一个恒放行的中间件更容易从路由表上确认
+        if (bucket != nullptr)
+        {
+            router.addMiddleware(AsynGyanis::Net::tokenBucketRateLimiterMiddleware(bucket));
+        }
     }
 } // namespace EdgePulse::Web

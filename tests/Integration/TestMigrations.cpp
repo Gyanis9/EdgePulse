@@ -99,7 +99,8 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_node_config_revision') WHERE name = 'idx_node_config_revision_tenant'"));
         EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_node_config_revision') AS il, pragma_index_info(il.name) AS ii "
                                                      "WHERE il.\"unique\" = 1 AND ii.name IN ('node_id', 'version')"));
-        EXPECT_EQ(17, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 18"));
+        EXPECT_EQ(18, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }

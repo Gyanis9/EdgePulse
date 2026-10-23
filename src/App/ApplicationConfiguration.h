@@ -98,6 +98,18 @@ namespace EdgePulse::App
         std::int64_t             oidcDefaultDepartmentId{101};                        ///< 自动建号部门
         std::string              oidcTenantCode{"default"};                           ///< 外部身份绑定租户
 
+        std::int64_t             requestsPerSecond{0};                                ///< 每个实例的全局请求速率上限，0 表示关闭
+        double                   rateLimitBurstCapacity{1.0};                         ///< 令牌桶容量，即允许的瞬时突发量
+        std::int64_t             idleTimeoutMs{75000};                                ///< HTTP 连接空闲超时，0 表示关闭
+        std::int64_t             readTimeoutMs{60000};                                ///< HTTP 连接相邻两次读取的最长间隔，0 表示关闭
+        std::int64_t             writeTimeoutMs{60000};                               ///< HTTP 响应产出时限，0 表示关闭
+        std::int64_t             maximumRequestBodyBytes{16LL * 1024 * 1024};         ///< HTTP 解析器正文上限
+        int                      passwordMinimumLength{10};                           ///< 新建、重置与修改口令的最短长度
+        bool                     passwordRequireComplexity{true};                     ///< 是否要求口令同时包含四类字符
+        int                      loginFailureWindowSeconds{900};                      ///< 账号失败计数的滑动窗口，单位秒
+        int                      loginMaximumFailures{5};                             ///< 触发账号锁定的连续失败次数
+        int                      loginLockSeconds{900};                               ///< 账号锁定时长，单位秒
+
         /**
          * @brief 读取 YAML 并组装配置；同目录存在 logging.yaml 时一并载入
          * @param configurationPath 主配置路径

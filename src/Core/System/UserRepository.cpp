@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -27,6 +28,7 @@ namespace EdgePulse::System
         using AsynGyanis::Database::DatabaseValue;
 
         constexpr std::string_view kSelectUser = "SELECT u.id, u.tenant_id, u.platform_admin, u.username, u.password, u.nickname, u.phone, u.email, u.dept_id, u.status, "
+                                                 "u.failed_login_count, u.locked_until, "
                                                  "u.last_login_time, u.created_at, COALESCE(t.tenant_code, '') AS tenant_code, COALESCE(t.tenant_name, '') AS tenant_name, "
                                                  "COALESCE(d.name, '') AS dept_name, "
                                                  "COALESCE((SELECT GROUP_CONCAT(DISTINCT r.role_name) FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id "
@@ -53,23 +55,25 @@ namespace EdgePulse::System
         [[nodiscard]] UserRecord readUser(const DatabaseResult &result)
         {
             UserRecord user;
-            user.id             = Sql::integer(result, "id");
-            user.tenantId       = Sql::integer(result, "tenant_id");
-            user.platformAdmin  = Sql::boolean(result, "platform_admin");
-            user.tenantCode     = Sql::text(result, "tenant_code");
-            user.tenantName     = Sql::text(result, "tenant_name");
-            user.username       = Sql::text(result, "username");
-            user.passwordHash   = Sql::text(result, "password");
-            user.nickname       = Sql::text(result, "nickname");
-            user.phone          = Sql::text(result, "phone");
-            user.email          = Sql::text(result, "email");
-            user.departmentId   = Sql::integer(result, "dept_id");
-            user.departmentName = Sql::text(result, "dept_name");
-            user.status         = static_cast<int>(Sql::integer(result, "status"));
-            user.lastLoginTime  = Sql::dateTimeText(result, "last_login_time");
-            user.createTime     = Sql::dateTimeText(result, "created_at");
-            user.roleNames      = Sql::text(result, "role_names");
-            user.postNames      = Sql::text(result, "post_names");
+            user.id               = Sql::integer(result, "id");
+            user.tenantId         = Sql::integer(result, "tenant_id");
+            user.platformAdmin    = Sql::boolean(result, "platform_admin");
+            user.tenantCode       = Sql::text(result, "tenant_code");
+            user.tenantName       = Sql::text(result, "tenant_name");
+            user.username         = Sql::text(result, "username");
+            user.passwordHash     = Sql::text(result, "password");
+            user.nickname         = Sql::text(result, "nickname");
+            user.phone            = Sql::text(result, "phone");
+            user.email            = Sql::text(result, "email");
+            user.departmentId     = Sql::integer(result, "dept_id");
+            user.departmentName   = Sql::text(result, "dept_name");
+            user.status           = static_cast<int>(Sql::integer(result, "status"));
+            user.failedLoginCount = static_cast<int>(Sql::integer(result, "failed_login_count"));
+            user.lockedUntil      = Sql::dateTimeText(result, "locked_until");
+            user.lastLoginTime    = Sql::dateTimeText(result, "last_login_time");
+            user.createTime       = Sql::dateTimeText(result, "created_at");
+            user.roleNames        = Sql::text(result, "role_names");
+            user.postNames        = Sql::text(result, "post_names");
             return user;
         }
 
@@ -485,19 +489,104 @@ namespace EdgePulse::System
     AsynGyanis::Core::Task<bool> UserRepository::resetPassword(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string passwordHash,
                                                                const std::int64_t operatorId)
     {
-        co_return co_await m_database->withConnection<bool>(loop,
-                                                            [userId, passwordHash = std::move(passwordHash), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
-                                                            {
-                                                                std::vector<DatabaseValue> parameters{passwordHash, Common::nowDateTimeUtc(), operatorId, userId};
-                                                                std::string sql = "UPDATE sys_user SET password = ?, updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0";
-                                                                if (!tenant.allTenants)
-                                                                {
-                                                                    sql += " AND tenant_id = ?";
-                                                                    parameters.emplace_back(tenant.tenantId);
-                                                                }
-                                                                const auto result = execute(connection, sql, parameters);
-                                                                return result->affectedRowCount() > 0;
-                                                            });
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [userId, passwordHash = std::move(passwordHash), operatorId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{passwordHash, Common::nowDateTimeUtc(), operatorId, userId};
+                    // 管理员重置口令同时解除锁定：用户拿不到新口令前的失败次数不应继续生效
+                    std::string sql = "UPDATE sys_user SET password = ?, failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, "
+                                      "updated_at = ?, updated_by = ? WHERE id = ? AND deleted = 0";
+                    if (!tenant.allTenants)
+                    {
+                        sql += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto result = execute(connection, sql, parameters);
+                    return result->affectedRowCount() > 0;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::optional<std::string>> UserRepository::recordLoginFailure(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, const int windowSeconds,
+                                                                                          const int maximumFailures, const int lockSeconds)
+    {
+        co_return co_await m_database->withConnection<std::optional<std::string>>(
+                loop,
+                [userId, windowSeconds, maximumFailures, lockSeconds, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<std::string>
+                {
+                    const auto rollbackQuietly = [&connection] { static_cast<void>(connection.execute("ROLLBACK")); };
+                    if (!connection.execute("BEGIN"))
+                    {
+                        throw Common::DatabaseException("开启登录失败计数事务失败：" + connection.lastError());
+                    }
+                    try
+                    {
+                        std::vector<DatabaseValue> parameters{userId};
+                        std::string                clause;
+                        if (!tenant.allTenants)
+                        {
+                            clause = " AND tenant_id = ?";
+                            parameters.emplace_back(tenant.tenantId);
+                        }
+                        const auto row = execute(connection, "SELECT failed_login_count, last_failed_login_at FROM sys_user WHERE id = ? AND deleted = 0" + clause, parameters);
+                        if (!row->next())
+                        {
+                            rollbackQuietly();
+                            return std::nullopt;
+                        }
+                        const int         previousCount = static_cast<int>(Sql::integer(*row, "failed_login_count"));
+                        const std::string lastFailedAt  = Sql::dateTimeText(*row, "last_failed_login_at");
+                        const auto        now           = std::chrono::system_clock::now();
+                        const std::string nowText       = Common::formatDateTimeUtc(now);
+                        const std::string windowStart   = Common::formatDateTimeUtc(now - std::chrono::seconds{windowSeconds});
+
+                        // 窗口外的旧失败不再累计；窗口内接着上次的次数加一
+                        const int                        currentCount = (!lastFailedAt.empty() && lastFailedAt >= windowStart) ? previousCount + 1 : 1;
+                        const std::optional<std::string> lockedUntil =
+                                currentCount >= maximumFailures ? std::optional<std::string>{Common::formatDateTimeUtc(now + std::chrono::seconds{lockSeconds})} : std::nullopt;
+
+                        std::vector<DatabaseValue> updateParameters{static_cast<std::int64_t>(currentCount), nowText};
+                        std::string                updateSql = "UPDATE sys_user SET failed_login_count = ?, last_failed_login_at = ?";
+                        // 未触发锁定时不碰 locked_until：并发失败的另一个请求可能刚写入锁定，这里不能把它清掉
+                        if (lockedUntil.has_value())
+                        {
+                            updateSql += ", locked_until = ?";
+                            updateParameters.emplace_back(*lockedUntil);
+                        }
+                        updateSql += " WHERE id = ? AND deleted = 0";
+                        updateParameters.emplace_back(userId);
+                        if (!tenant.allTenants)
+                        {
+                            updateSql += " AND tenant_id = ?";
+                            updateParameters.emplace_back(tenant.tenantId);
+                        }
+                        executeStatement(connection, updateSql, updateParameters);
+                        executeStatement(connection, "COMMIT", {});
+                        return lockedUntil;
+                    } catch (...)
+                    {
+                        rollbackQuietly();
+                        throw;
+                    }
+                });
+    }
+
+    AsynGyanis::Core::Task<bool> UserRepository::clearLoginFailures(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
+    {
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [userId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{userId};
+                    std::string                sql = "UPDATE sys_user SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL WHERE id = ? AND deleted = 0";
+                    if (!tenant.allTenants)
+                    {
+                        sql += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto result = execute(connection, sql, parameters);
+                    return result->affectedRowCount() > 0;
+                });
     }
 
     AsynGyanis::Core::Task<std::vector<std::int64_t>> UserRepository::roleIdsFor(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)

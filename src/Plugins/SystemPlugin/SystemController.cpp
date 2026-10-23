@@ -130,6 +130,7 @@ namespace EdgePulse::System
                                         {"postName", user.postNames},
                                         {"roleName", user.roleNames},
                                         {"status", user.status},
+                                        {"lockedUntil", user.lockedUntil},
                                         {"createTime", user.createTime},
                                         {"lastLogin", user.lastLoginTime},
                                         {"roleIds", Json::integerArray(user.roleIds)},
@@ -621,9 +622,9 @@ namespace EdgePulse::System
                         co_return;
                     }
                     const std::string password = stringField(*body, "password");
-                    if (password.size() < 6 || password.size() > 64)
+                    if (const auto validation = deps->auth->validatePassword(password); !validation)
                     {
-                        fail(response, Common::kCodeBadRequest, "初始密码长度必须是 6 到 64 个字符", traceId);
+                        fail(response, Common::kCodeBadRequest, validation.error(), traceId);
                         co_return;
                     }
                     if (!session->platformAdmin && write.roleIds.has_value() && std::find(write.roleIds->begin(), write.roleIds->end(), std::int64_t{1}) != write.roleIds->end())
@@ -754,9 +755,14 @@ namespace EdgePulse::System
                        const auto        userId   = Common::parsePositiveIdentifier(request.param("id"));
                        const auto        body     = request.jsonBody();
                        const std::string password = body.has_value() ? stringField(*body, "password") : std::string{};
-                       if (!userId.has_value() || password.size() < 6 || password.size() > 64)
+                       if (!userId.has_value())
                        {
-                           fail(response, Common::kCodeBadRequest, "用户标识不合法，或密码长度不是 6 到 64 个字符", traceId);
+                           fail(response, Common::kCodeBadRequest, "用户标识不合法", traceId);
+                           co_return;
+                       }
+                       if (const auto validation = deps->auth->validatePassword(password); !validation)
+                       {
+                           fail(response, Common::kCodeBadRequest, validation.error(), traceId);
                            co_return;
                        }
                        const std::string hash = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::string>(loop, [password] { return Common::hashPassword(password); });

@@ -9,6 +9,7 @@ add_library(edgepulse-base STATIC
         Runtime/TimeFormat.cpp
         Security/Hmac.cpp
         Security/PasswordHash.cpp
+        Security/PasswordPolicy.cpp
         Security/RandomBytes.cpp
         Security/RandomToken.cpp
         Security/OutboundUrlGuard.cpp)

@@ -26,6 +26,7 @@ add_executable(edgepulse-unit-tests
         Unit/TestOutboundUrlGuard.cpp
         Unit/TestPagination.cpp
         Unit/TestPasswordHash.cpp
+        Unit/TestPasswordPolicy.cpp
         Unit/TestSessionStore.cpp
         Unit/TestSseBroadcaster.cpp
         Unit/TestTimeFormat.cpp
@@ -68,6 +69,7 @@ add_executable(edgepulse-protocol-tests
         Protocol/TestFleetEndpoints.cpp
         Protocol/TestNodeConfigEndpoints.cpp
         Protocol/TestNodeEndpoints.cpp
+        Protocol/TestRateLimit.cpp
         Protocol/TestReverseProxy.cpp
         Protocol/TestSystemEndpoints.cpp)
 target_link_libraries(edgepulse-protocol-tests PRIVATE EdgePulse::App edgepulse-test-support GTest::gtest_main)

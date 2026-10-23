@@ -35,6 +35,7 @@ namespace AsynGyanis::Net
     class OtlpHttpMetricsExporter;
     class QuicServer;
     class Router;
+    class TokenBucket;
 } // namespace AsynGyanis::Net
 namespace AsynGyanis::Core
 {
@@ -264,6 +265,7 @@ namespace EdgePulse::App
         std::shared_ptr<Web::SseBroadcaster>                      m_sseBroadcaster;         ///< 告警 SSE
         std::unique_ptr<Web::RealtimeBus>                         m_realtimeBus;            ///< 实时事件跨实例总线
         std::unique_ptr<AsynGyanis::Net::Router>                  m_h3Router;               ///< h3 专属路由器
+        std::shared_ptr<AsynGyanis::Net::TokenBucket>             m_rateLimitBucket;        ///< 所有公开监听器共享的令牌桶
         std::unique_ptr<AsynGyanis::Net::HttpServer>              m_httpServer;             ///< 8080 开发口
         std::optional<AsynGyanis::Core::Task<>>                   m_acceptTask;             ///< 8080 接受协程
         std::unique_ptr<AsynGyanis::Net::HttpsServer>             m_httpsServer;            ///< 8443 控制台

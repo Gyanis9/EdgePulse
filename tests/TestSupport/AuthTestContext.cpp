@@ -25,7 +25,7 @@ namespace EdgePulse::TestSupport
         }
     } // namespace
 
-    AuthTestContext::AuthTestContext() : m_databasePath(makeTemporaryDatabasePath())
+    AuthTestContext::AuthTestContext(const Auth::AuthOptions options) : m_databasePath(makeTemporaryDatabasePath())
     {
         {
             const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirectSqlite(m_databasePath.string());
@@ -37,7 +37,7 @@ namespace EdgePulse::TestSupport
         captcha  = std::make_shared<Auth::CaptchaService>(cache, Auth::CaptchaOptions{120, 30});
         audit    = std::make_shared<Auth::LoginAudit>(database);
         tenants  = std::make_shared<System::TenantRepository>(database);
-        auth     = std::make_shared<Auth::AuthService>(database, sessions, captcha, audit, cache, tenants);
+        auth     = std::make_shared<Auth::AuthService>(database, sessions, captcha, audit, cache, tenants, options);
     }
 
     AuthTestContext::~AuthTestContext()

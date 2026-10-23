@@ -14,6 +14,7 @@
 #include "Core/Auth/SessionStore.h"
 #include "Core/Cache/KeyValueStore.h"
 #include "Base/Database/Database.h"
+#include "Base/Security/PasswordPolicy.h"
 #include "Core/System/MenuRepository.h"
 #include "Core/System/UserRepository.h"
 
@@ -68,6 +69,19 @@ namespace EdgePulse::Auth
     };
 
     /**
+     * @brief 认证行为的可配置策略
+     * @note 默认值即生产档：建号与改密至少 10 位且要求四类字符，账号连续失败 5 次锁定 15 分钟
+     */
+    struct AuthOptions
+    {
+        int  passwordMinimumLength{10};       ///< 口令最短长度
+        bool passwordRequireComplexity{true}; ///< 是否要求大写、小写、数字与符号
+        int  loginFailureWindowSeconds{900};  ///< 账号失败计数的滑动窗口，单位秒
+        int  loginMaximumFailures{5};         ///< 触发锁定的连续失败次数
+        int  loginLockSeconds{900};           ///< 锁定时长，单位秒
+    };
+
+    /**
      * @brief 认证服务
      * @note 依赖的会话、验证码与审计对象都必须比本对象活得久
      */
@@ -81,9 +95,11 @@ namespace EdgePulse::Auth
          * @param captcha 验证码服务
          * @param audit 登录审计
          * @param cache 登录失败计数使用的键值存储
+         * @param tenants 租户注册表
+         * @param options 口令策略与账号锁定参数
          */
         AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha, std::shared_ptr<LoginAudit> audit,
-                    std::shared_ptr<Cache::KeyValueStore> cache, std::shared_ptr<System::TenantRepository> tenants);
+                    std::shared_ptr<Cache::KeyValueStore> cache, std::shared_ptr<System::TenantRepository> tenants, AuthOptions options = {});
 
         /**
          * @brief 验证码 + 口令登录
@@ -138,11 +154,19 @@ namespace EdgePulse::Auth
         AsynGyanis::Core::Task<std::vector<System::MenuNode>> routes(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session);
 
         /**
+         * @brief 按当前策略校验一条新口令
+         * @param password 待校验明文
+         * @return 成功为空；失败为中文可操作说明
+         * @note 建号、重置与改密共用同一策略，调用方负责把错误文案交给用户
+         */
+        [[nodiscard]] std::expected<void, std::string> validatePassword(std::string_view password) const;
+
+        /**
          * @brief 修改口令
          * @param loop 恢复协程用的事件循环
          * @param session 已认证身份
          * @param oldPassword 原口令
-         * @param newPassword 新口令，长度 6..64
+         * @param newPassword 新口令，长度与字符类别由策略决定
          * @return 成功为空；失败为可恢复错误
          */
         AsynGyanis::Core::Task<std::expected<void, AuthError>> changePassword(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session, std::string oldPassword,
@@ -180,12 +204,14 @@ namespace EdgePulse::Auth
          */
         AsynGyanis::Core::Task<> recordAudit(AsynGyanis::Core::EventLoop &loop, LoginAuditEntry entry);
 
-        std::shared_ptr<SessionStore>             m_sessions;   ///< 会话表
-        std::shared_ptr<CaptchaService>           m_captcha;    ///< 验证码
-        std::shared_ptr<LoginAudit>               m_loginAudit; ///< 登录审计
-        std::shared_ptr<Cache::KeyValueStore>     m_cache;      ///< 登录失败计数
-        std::shared_ptr<System::TenantRepository> m_tenants;    ///< 租户注册表
-        System::UserRepository                    m_users;      ///< 用户仓储
-        System::MenuRepository                    m_menus;      ///< 菜单仓储
+        std::shared_ptr<SessionStore>             m_sessions;       ///< 会话表
+        std::shared_ptr<CaptchaService>           m_captcha;        ///< 验证码
+        std::shared_ptr<LoginAudit>               m_loginAudit;     ///< 登录审计
+        std::shared_ptr<Cache::KeyValueStore>     m_cache;          ///< 登录失败计数
+        std::shared_ptr<System::TenantRepository> m_tenants;        ///< 租户注册表
+        System::UserRepository                    m_users;          ///< 用户仓储
+        System::MenuRepository                    m_menus;          ///< 菜单仓储
+        AuthOptions                               m_options;        ///< 口令与锁定策略
+        Common::PasswordPolicy                    m_passwordPolicy; ///< 由 m_options 构造的校验器
     };
 } // namespace EdgePulse::Auth

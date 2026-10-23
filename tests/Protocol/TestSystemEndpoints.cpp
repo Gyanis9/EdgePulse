@@ -41,7 +41,7 @@ class SystemEndpointsTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        m_context       = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
+        m_context       = std::make_unique<EdgePulse::TestSupport::AuthTestContext>(m_authOptions);
         m_users         = std::make_shared<EdgePulse::System::UserRepository>(m_context->database);
         m_roles         = std::make_shared<EdgePulse::System::RoleRepository>(m_context->database);
         m_menus         = std::make_shared<EdgePulse::System::MenuRepository>(m_context->database);
@@ -156,6 +156,7 @@ protected:
     }
 
     std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>         m_context;
+    EdgePulse::Auth::AuthOptions                                     m_authOptions{6, false, 900, 100, 900};
     std::shared_ptr<EdgePulse::System::UserRepository>               m_users;
     std::shared_ptr<EdgePulse::System::RoleRepository>               m_roles;
     std::shared_ptr<EdgePulse::System::MenuRepository>               m_menus;
@@ -167,6 +168,19 @@ protected:
     std::shared_ptr<EdgePulse::Notification::NotificationRepository> m_notifications;
     std::shared_ptr<EdgePulse::Common::OutboundUrlGuard>             m_guard;
     std::unique_ptr<EdgePulse::TestSupport::ServerHarness>           m_server;
+};
+
+/**
+ * @brief 严格口令档的同一套管理端夹具
+ */
+class StrictSystemEndpointsTest : public SystemEndpointsTest
+{
+protected:
+    void SetUp() override
+    {
+        m_authOptions = EdgePulse::Auth::AuthOptions{10, true, 900, 5, 900};
+        SystemEndpointsTest::SetUp();
+    }
 };
 
 // 钉住：管理端各列表、角色/用户写入、审计落库与导出都走真实 HTTP 与数据库
@@ -211,6 +225,39 @@ TEST_F(SystemEndpointsTest, ManagementEndpointsAndAudit)
 
     EXPECT_EQ(200, m_server->send("DELETE", "/api/system/users/" + std::to_string(userId), "", "", bearer(token)).status);
     EXPECT_EQ(200, m_server->send("DELETE", "/api/system/roles/" + std::to_string(roleId), "", "", bearer(token)).status);
+}
+
+// 钉住：严格口令档下短口令在建号与重置两处都被拒，符合策略的口令正常落库
+TEST_F(StrictSystemEndpointsTest, RejectsWeakPasswordOnCreateAndReset)
+{
+    const std::string token          = login("admin", "admin123");
+    const auto        weakCreateBody = AsynGyanis::Base::ConfigValue::object({{"username", "strict-user"},
+                                                                              {"password", "short"},
+                                                                              {"nickname", "严格用户"},
+                                                                              {"deptId", 101},
+                                                                              {"status", 1},
+                                                                              {"roleIds", std::vector<std::int64_t>{3}},
+                                                                              {"postIds", std::vector<std::int64_t>{}}})
+                                               .dump();
+    const auto        weakCreate     = m_server->post("/api/system/users", weakCreateBody, "application/json", bearer(token));
+    EXPECT_EQ(400, weakCreate.status) << weakCreate.body;
+    EXPECT_NE(std::string::npos, weakCreate.body.find("口令长度"));
+
+    const auto strongCreateBody = AsynGyanis::Base::ConfigValue::object({{"username", "strict-user"},
+                                                                         {"password", "Strong-pass1"},
+                                                                         {"nickname", "严格用户"},
+                                                                         {"deptId", 101},
+                                                                         {"status", 1},
+                                                                         {"roleIds", std::vector<std::int64_t>{3}},
+                                                                         {"postIds", std::vector<std::int64_t>{}}})
+                                          .dump();
+    const auto strongCreate     = m_server->post("/api/system/users", strongCreateBody, "application/json", bearer(token));
+    ASSERT_EQ(200, strongCreate.status) << strongCreate.body;
+    const std::int64_t userId = (*strongCreate.json())["data"]["id"].get<std::int64_t>();
+
+    const std::string resetPath = "/api/system/users/" + std::to_string(userId) + "/password";
+    EXPECT_EQ(400, m_server->send("PUT", resetPath, R"({"password":"short"})", "application/json", bearer(token)).status);
+    EXPECT_EQ(200, m_server->send("PUT", resetPath, R"({"password":"Another-pass1"})", "application/json", bearer(token)).status);
 }
 
 // 钉住：匿名 401、无权限 403；低权限账号无法读取用户列表，但可访问工作台

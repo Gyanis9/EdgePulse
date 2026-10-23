@@ -43,6 +43,8 @@ namespace EdgePulse::System
         std::int64_t              departmentId{0};      ///< 部门标识
         std::string               departmentName;       ///< 部门名
         int                       status{0};            ///< 1 启用、0 停用
+        int                       failedLoginCount{0};  ///< 当前失败窗口内的连续失败次数
+        std::string               lockedUntil;          ///< 锁定截止时刻，空表示未锁定
         std::string               lastLoginTime;        ///< 最近登录时间
         std::string               createTime;           ///< 创建时间
         std::string               roleNames;            ///< 角色名，逗号分隔
@@ -168,6 +170,27 @@ namespace EdgePulse::System
          * @return bool 是否命中一行
          */
         AsynGyanis::Core::Task<bool> resetPassword(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string passwordHash, std::int64_t operatorId);
+
+        /**
+         * @brief 记录一次口令校验失败，必要时锁定账号
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         * @param windowSeconds 失败计数的滑动窗口，单位秒
+         * @param maximumFailures 触发锁定的失败次数
+         * @param lockSeconds 锁定时长，单位秒
+         * @return 本次达到阈值时返回锁定截止时刻；未触发锁定返回空
+         * @note 读计数、判窗口与写回在同一条连接的事务里完成；写入失败时整体回滚
+         */
+        AsynGyanis::Core::Task<std::optional<std::string>> recordLoginFailure(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, int windowSeconds, int maximumFailures,
+                                                                              int lockSeconds);
+
+        /**
+         * @brief 清空账号的失败计数与锁定
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         * @return bool 是否命中一行
+         */
+        AsynGyanis::Core::Task<bool> clearLoginFailures(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
         /**
          * @brief 取用户角色标识

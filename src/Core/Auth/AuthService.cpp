@@ -18,9 +18,7 @@ namespace EdgePulse::Auth
 {
     namespace
     {
-        constexpr std::size_t          kMinimumPasswordLength = 6;                       ///< 新口令最短长度
-        constexpr std::size_t          kMaximumPasswordLength = 64;                      ///< 新口令最长长度
-        constexpr int                  kMaximumLoginFailures  = 10;                      ///< 单 IP 每分钟失败上限
+        constexpr int                  kMaximumLoginFailures = 10;                       ///< 单 IP 每分钟失败上限
         constexpr std::chrono::seconds kLoginFailureWindow{60};                          ///< 失败计数窗口
         constexpr std::string_view     kLoginFailurePrefix = "edgepulse:login:fail:";    ///< 失败计数键前缀
         constexpr std::string_view     kTenantStatusPrefix = "edgepulse:tenant:status:"; ///< 租户启停缓存前缀
@@ -38,9 +36,10 @@ namespace EdgePulse::Auth
     } // namespace
 
     AuthService::AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha,
-                             std::shared_ptr<LoginAudit> audit, std::shared_ptr<Cache::KeyValueStore> cache, std::shared_ptr<System::TenantRepository> tenants) :
+                             std::shared_ptr<LoginAudit> audit, std::shared_ptr<Cache::KeyValueStore> cache, std::shared_ptr<System::TenantRepository> tenants,
+                             AuthOptions options) :
         m_sessions(std::move(sessions)), m_captcha(std::move(captcha)), m_loginAudit(std::move(audit)), m_cache(std::move(cache)), m_tenants(std::move(tenants)), m_users(database),
-        m_menus(std::move(database))
+        m_menus(std::move(database)), m_options(options), m_passwordPolicy(options.passwordMinimumLength, options.passwordRequireComplexity)
     {
     }
 
@@ -100,21 +99,36 @@ namespace EdgePulse::Auth
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
         }
 
+        // 锁定先于口令校验：锁定期内连 PBKDF2 都不跑，避免把锁定账号变成计算资源消耗点
+        if (!user->lockedUntil.empty() && user->lockedUntil > Common::nowDateTimeUtc())
+        {
+            co_await recordAudit(loop,
+                                 LoginAuditEntry{credentials.username, credentials.clientIp, false, "账号已锁定", credentials.traceId, user->id, user->departmentId, tenantId});
+            co_return std::unexpected(AuthError{423, 423, "账号已锁定，请 " + std::to_string(m_options.loginLockSeconds / 60) + " 分钟后再试"});
+        }
+
         // PBKDF2 是 CPU 密集操作，放到工作线程，避免 210000 次迭代占住事件循环
         const std::string storedHash = user->passwordHash;
         const std::string password   = credentials.password;
         const bool isMatch = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop, [storedHash, password] { return Common::verifyPassword(storedHash, password); });
         if (!isMatch)
         {
-            co_await recordAudit(loop,
-                                 LoginAuditEntry{credentials.username, credentials.clientIp, false, "口令不匹配", credentials.traceId, user->id, user->departmentId, tenantId});
+            // 锁定的那次失败仍回统一 401：攻击者不能借状态码差异判断账号存在或已触发锁定
+            const auto lockedUntil = co_await m_users.scoped({tenantId, false})
+                                             ->recordLoginFailure(loop, user->id, m_options.loginFailureWindowSeconds, m_options.loginMaximumFailures, m_options.loginLockSeconds);
+            co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, lockedUntil.has_value() ? "连续失败已锁定" : "口令不匹配",
+                                                       credentials.traceId, user->id, user->departmentId, tenantId});
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
         }
 
         auto issued = co_await createSessionForUser(loop, *user, credentials.clientIp, credentials.traceId, "登录成功");
         if (issued.has_value())
         {
-            // 成功登录清空该来源的失败计数，避免此前几次输错影响后续正常使用
+            // 成功登录同时清空按账号与按 IP 的失败计数，避免此前几次输错影响后续正常使用
+            if (!co_await m_users.scoped({user->tenantId, false})->clearLoginFailures(loop, user->id))
+            {
+                LOG_WARN_FMT("登录失败计数未清空：user={}", user->username);
+            }
             static_cast<void>(co_await m_cache->erase(loop, failureKey));
         }
         co_return issued;
@@ -210,12 +224,17 @@ namespace EdgePulse::Auth
         co_return co_await m_menus.treeForUser(loop, session.userId);
     }
 
+    std::expected<void, std::string> AuthService::validatePassword(const std::string_view password) const
+    {
+        return m_passwordPolicy.validate(password);
+    }
+
     AsynGyanis::Core::Task<std::expected<void, AuthError>> AuthService::changePassword(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session, std::string oldPassword,
                                                                                        std::string newPassword)
     {
-        if (newPassword.size() < kMinimumPasswordLength || newPassword.size() > kMaximumPasswordLength)
+        if (const auto validation = validatePassword(newPassword); !validation)
         {
-            co_return std::unexpected(AuthError{Common::kCodeBadRequest, Common::kCodeBadRequest, "新密码长度必须是 6 到 64 个字符"});
+            co_return std::unexpected(AuthError{Common::kCodeBadRequest, Common::kCodeBadRequest, validation.error()});
         }
         const std::optional<System::UserRecord> user = co_await m_users.findById(loop, session.userId);
         if (!user.has_value())
