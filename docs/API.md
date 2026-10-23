@@ -74,7 +74,7 @@
 
 通知渠道：`GET/POST /api/system/notifications`、`PUT/DELETE /api/system/notifications/{id}`，权限码 `system:notification:list/add/edit/remove`。写入 `{name,type('webhook'|'email'),endpoint,recipients?,username?,sender?,secret?,minLevel,enabled}`；Webhook 地址为 http(s)，邮件为 `smtp://`、`smtps://` 或 `starttls://`；私有 CA 用 `caFile` 指定 PEM。`secret` 只写不回显，响应仅给 `secretConfigured`。投递记录：`GET /api/system/notifications/deliveries?status=&channelId=`，返回渠道、告警、目标、尝试次数与失败原因。
 
-Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、CGNAT、组播、保留或文档示例段默认拒绝；云元数据主机名、已知元数据端点与 IPv4/IPv6 链路本地段始终拒绝，`allow_private_webhooks=true` 也只放行普通私网与保留段。命中校验返回 400，错误文案说明命中的地址或主机。
+Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、CGNAT、组播、保留或文档示例段默认拒绝；云元数据主机名、已知元数据端点与 IPv4/IPv6 链路本地段始终拒绝。`allow_private_webhooks=true` 会跳过整个私网/保留段分类，普通私网、回环、CGNAT、组播、保留与文档示例段（含 IPv6 唯一本地地址）都会放行，云元数据与链路本地地址仍拒绝；它只适合受信的自托管网关，不是只放行 RFC1918 的窄开关。命中校验返回 400，错误文案说明命中的地址或主机。
 
 命令批次取消：`PUT /api/commands/batch/{batchId}/cancel`，取消批次内 pending/running 命令并返回被取消列表。
 
@@ -202,7 +202,7 @@ Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、
 
 注册模式由 `edgepulse.agent.enrollment_mode` 决定：`required` 时新节点必须带 `enroll` 令牌、已有节点换证书必须带 `rebind` 令牌，同指纹重注册不需要令牌；`off` 只校验 mTLS CA 链与可选指纹白名单。令牌条件还校验租户、动作与 `nodeName`，缺令牌或令牌不可用统一返回 403，不区分过期、已用或名字不符。
 
-所有 `/api/agent/*` 请求都要求连接叶证书指纹等于节点登记的 `certFingerprint`；指纹不符或证书已吊销返回 403，节点不存在返回 404。固件下载还要求固件与节点同租户。注册响应带 `certNotAfter`，心跳响应带节点状态；节点超过 `heartbeat_timeout_seconds` 未心跳会被判离线并产生 `node.online` 系统告警。
+除 `/api/agent/register` 这条注册入口外，所有 `/api/agent/*` 请求都要求连接叶证书指纹等于节点登记的 `certFingerprint`；注册接口本身没有可比的登记指纹，改为校验正文 `certFingerprint` 与本次连接出示的叶证书一致。指纹不符或证书已吊销返回 403，节点不存在返回 404。固件下载还要求固件与节点同租户。注册响应带 `certNotAfter`，心跳响应带节点状态；节点超过 `heartbeat_timeout_seconds` 未心跳会被判离线并产生 `node.online` 系统告警。
 
 Agent 请求没有会话：命令、固件任务、遥测都按目标节点/固件的租户归属落库，跨租户标识会被拒绝。
 

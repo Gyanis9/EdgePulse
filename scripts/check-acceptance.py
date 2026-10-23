@@ -36,8 +36,8 @@ HTTPS_BASE = "https://127.0.0.1:8443"
 AGENT_BASE = "https://127.0.0.1:9443"
 OPS_BASE = "http://127.0.0.1:9100"
 RUN_ID = str(time.time_ns())[-8:]
-# 开发档 heartbeat_timeout_seconds=30、offline_sweep_seconds=5，再留 5 秒给扫描周期与落库
-OFFLINE_WAIT_SECONDS = 30 + 5 + 5
+# 开发档 heartbeat_timeout_seconds=30、offline_sweep_seconds=5，再留 10 秒给扫描周期与落库，上限 45 秒
+OFFLINE_WAIT_SECONDS = 30 + 5 + 10
 failures: list[str] = []
 skips: list[str] = []
 passed = 0
@@ -158,14 +158,16 @@ def prepare_firmware_signing() -> tuple[FirmwareSigning | None, str]:
     public_key_path = key_dir / "acceptance.pem"
     if public_key_path.exists():
         return None, f"{public_key_path.relative_to(ROOT)} 已存在，拒绝覆盖"
-    created_key_dir = not key_dir.exists()
-    key_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir = Path(tempfile.mkdtemp(prefix="acceptance-signing-", dir=str(ROOT / "var")))
-    key_path = temp_dir / "acceptance-key.pem"
-    digest_path = temp_dir / "firmware-digest.bin"
-    signature_path = temp_dir / "firmware-signature.bin"
-    payload = b"EdgePulse acceptance signed firmware\n" * 2048
+    created_key_dir = False
+    temp_dir: Path | None = None
     try:
+        created_key_dir = not key_dir.exists()
+        key_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="acceptance-signing-", dir=str(ROOT / "var")))
+        key_path = temp_dir / "acceptance-key.pem"
+        digest_path = temp_dir / "firmware-digest.bin"
+        signature_path = temp_dir / "firmware-signature.bin"
+        payload = b"EdgePulse acceptance signed firmware\n" * 2048
         payload_path = temp_dir / "signed-firmware.bin"
         payload_path.write_bytes(payload)
         subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(key_path)], check=True, capture_output=True)
@@ -175,7 +177,8 @@ def prepare_firmware_signing() -> tuple[FirmwareSigning | None, str]:
                        check=True, capture_output=True)
         signature = base64.b64encode(signature_path.read_bytes()).decode("ascii")
     except (OSError, subprocess.SubprocessError) as failure:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         public_key_path.unlink(missing_ok=True)
         if created_key_dir:
             try:
@@ -671,8 +674,9 @@ def check_node_config(token: str, agent_node_id: int) -> None:
 
 
 def check_webhook_ssrf(token: str) -> None:
+    channel_name = "验收元数据 Webhook"
     status, payload, _ = request_json("POST", HTTP_BASE + "/api/system/notifications",
-                                      {"name": "验收元数据 Webhook", "type": "webhook",
+                                      {"name": channel_name, "type": "webhook",
                                        "endpoint": "http://169.254.169.254/latest/meta-data",
                                        "minLevel": "warning", "enabled": True}, token=token)
     message = str(payload.get("message", ""))
@@ -682,6 +686,15 @@ def check_webhook_ssrf(token: str) -> None:
     if channel_id:
         # 守卫被绕过时宁可先删掉渠道，也不能把失败改写成通过
         request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{channel_id}", token=token)
+        return
+    # 错误响应通常带 data=null；守卫若意外放行却又没回显标识，按名字找回渠道再删，避免留下启用的测试渠道
+    query = urllib.parse.urlencode({"keyword": channel_name, "pageNum": 1, "pageSize": 50})
+    status, listing, _ = request_json("GET", HTTP_BASE + f"/api/system/notifications?{query}", token=token)
+    if status != 200:
+        return
+    for row in (listing.get("data") or {}).get("rows", []):
+        if row.get("name") == channel_name and row.get("id") is not None:
+            request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{row['id']}", token=token)
 
 
 def check_signed_firmware(token: str, node_id: int, signing: FirmwareSigning | None, unavailable_detail: str) -> None:
@@ -725,7 +738,9 @@ def check_signed_firmware(token: str, node_id: int, signing: FirmwareSigning | N
                f"HTTP {download.status}")
     finally:
         if firmware_id:
-            request_json("DELETE", HTTP_BASE + f"/api/firmware/{firmware_id}", token=token)
+            status, _, _ = request_json("DELETE", HTTP_BASE + f"/api/firmware/{firmware_id}", token=token)
+            if status != 200:
+                print(f"WARN 删除验收签名固件 {firmware_id} 失败：HTTP {status}，请手工清理")
 
 
 def check_offline(token: str, agent_node_id: int) -> None:

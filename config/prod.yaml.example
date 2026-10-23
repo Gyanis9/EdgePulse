@@ -46,7 +46,8 @@ edgepulse:
     ttl_seconds: 7200
   security:
     allowed_origins: https://console.example.com
-    # 打开后放行普通私网、回环与保留段 Webhook；云元数据与链路本地地址始终拒绝
+    # 打开后跳过整个私网/保留段分类：普通私网、回环、CGNAT、组播、保留与文档示例段（含 IPv6 唯一本地）
+    # 都会放行；云元数据与链路本地地址始终拒绝
     allow_private_webhooks: false
     # 建号、重置与改密共用：至少 10 位且同时包含大写、小写、数字与符号
     password_min_length: 10
