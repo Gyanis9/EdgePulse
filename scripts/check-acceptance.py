@@ -3,19 +3,23 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import http.client
 import json
 import os
 import queue
+import shutil
 import socketserver
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,9 +36,27 @@ HTTPS_BASE = "https://127.0.0.1:8443"
 AGENT_BASE = "https://127.0.0.1:9443"
 OPS_BASE = "http://127.0.0.1:9100"
 RUN_ID = str(time.time_ns())[-8:]
+# 开发档 heartbeat_timeout_seconds=30、offline_sweep_seconds=5，再留 5 秒给扫描周期与落库
+OFFLINE_WAIT_SECONDS = 30 + 5 + 5
 failures: list[str] = []
+skips: list[str] = []
+passed = 0
 webhook_events: queue.Queue = queue.Queue()
 mail_events: queue.Queue = queue.Queue()
+
+
+class FirmwareSigning:
+    """一次验收运行使用的临时固件签名材料，公钥放在服务启动时读取的信任键目录。"""
+
+    def __init__(self, key_id: str, key_dir: Path, public_key_path: Path, temp_dir: Path, payload: bytes, signature: str,
+                 created_key_dir: bool) -> None:
+        self.key_id = key_id
+        self.key_dir = key_dir
+        self.public_key_path = public_key_path
+        self.temp_dir = temp_dir
+        self.payload = payload
+        self.signature = signature
+        self.created_key_dir = created_key_dir
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -114,9 +136,67 @@ def start_webhook_receiver() -> tuple[ThreadingHTTPServer, threading.Thread]:
 
 
 def report(name: str, ok: bool, detail: str = "") -> None:
+    global passed
     print(("PASS " if ok else "FAIL ") + name + (("：" + detail) if detail else ""))
-    if not ok:
+    if ok:
+        passed += 1
+    else:
         failures.append(name)
+
+
+def skip(name: str, detail: str = "") -> None:
+    """记录本次无法构造的检查；跳过不是通过，也不让退出码变成失败。"""
+    print("SKIP " + name + (("：" + detail) if detail else ""))
+    skips.append(name)
+
+
+def prepare_firmware_signing() -> tuple[FirmwareSigning | None, str]:
+    """服务由脚本自己启动时生成本次运行专用的 Ed25519 密钥，并在启动前放入信任键目录。"""
+    if shutil.which("openssl") is None:
+        return None, "缺少 openssl，无法生成临时签名密钥"
+    key_dir = ROOT / "config" / "firmware-keys"
+    public_key_path = key_dir / "acceptance.pem"
+    if public_key_path.exists():
+        return None, f"{public_key_path.relative_to(ROOT)} 已存在，拒绝覆盖"
+    created_key_dir = not key_dir.exists()
+    key_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="acceptance-signing-", dir=str(ROOT / "var")))
+    key_path = temp_dir / "acceptance-key.pem"
+    digest_path = temp_dir / "firmware-digest.bin"
+    signature_path = temp_dir / "firmware-signature.bin"
+    payload = b"EdgePulse acceptance signed firmware\n" * 2048
+    try:
+        payload_path = temp_dir / "signed-firmware.bin"
+        payload_path.write_bytes(payload)
+        subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(key_path)], check=True, capture_output=True)
+        subprocess.run(["openssl", "pkey", "-in", str(key_path), "-pubout", "-out", str(public_key_path)], check=True, capture_output=True)
+        digest_path.write_bytes(subprocess.run(["openssl", "dgst", "-sha256", "-binary", str(payload_path)], check=True, capture_output=True).stdout)
+        subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", str(key_path), "-rawin", "-in", str(digest_path), "-out", str(signature_path)],
+                       check=True, capture_output=True)
+        signature = base64.b64encode(signature_path.read_bytes()).decode("ascii")
+    except (OSError, subprocess.SubprocessError) as failure:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        public_key_path.unlink(missing_ok=True)
+        if created_key_dir:
+            try:
+                key_dir.rmdir()
+            except OSError:
+                pass
+        return None, f"生成签名密钥失败：{failure}"
+    return FirmwareSigning("acceptance", key_dir, public_key_path, temp_dir, payload, signature, created_key_dir), ""
+
+
+def cleanup_firmware_signing(signing: FirmwareSigning | None) -> None:
+    if signing is None:
+        return
+    shutil.rmtree(signing.temp_dir, ignore_errors=True)
+    signing.public_key_path.unlink(missing_ok=True)
+    if signing.created_key_dir:
+        try:
+            signing.key_dir.rmdir()
+        except OSError:
+            # 目录里还有别的公钥时保持原样，只清理本次写入的 acceptance.pem
+            pass
 
 
 def request_json(method: str, url: str, payload: dict | None = None, token: str | None = None, context: ssl.SSLContext | None = None,
@@ -373,7 +453,7 @@ def check_telemetry_alarm(token: str, node_id: int) -> None:
     observed = False
     while time.time() - started < 2.0:
         status, alarms, _ = request_json("GET", HTTP_BASE + f"/api/alarms?pageNum=1&pageSize=20&nodeId={node_id}", token=token)
-        if status == 200 and any(row.get("metric") == "cpu.usage" and row.get("status") == "open" for row in alarms.get("data", {}).get("rows", [])):
+        if status == 200 and any(row.get("metric") == "cpu.usage" and row.get("status") == "open" for row in (alarms.get("data") or {}).get("rows", [])):
             observed = True
             break
         time.sleep(0.1)
@@ -522,8 +602,9 @@ def check_firmware(token: str, node_id: int) -> None:
     report("100 MiB 固件上传", response.status == 200 and firmware.get("sizeBytes") == size and firmware.get("sha256") == digest.hexdigest(), f"HTTP {response.status}")
     firmware_id = firmware["id"]
 
+    download_path = f"/api/agent/firmware/{firmware_id}/download?nodeId={node_id}"
     connection = http.client.HTTPSConnection("127.0.0.1", 9443, context=agent_context(), timeout=300)
-    connection.request("GET", f"/api/agent/firmware/{firmware_id}/download", headers={"Range": "bytes=0-1023"})
+    connection.request("GET", download_path, headers={"Range": "bytes=0-1023"})
     range_response = connection.getresponse()
     range_body = range_response.read()
     headers = {key.lower(): value for key, value in range_response.getheaders()}
@@ -532,7 +613,7 @@ def check_firmware(token: str, node_id: int) -> None:
            f"HTTP {range_response.status}")
 
     connection = http.client.HTTPSConnection("127.0.0.1", 9443, context=agent_context(), timeout=60)
-    connection.request("GET", f"/api/agent/firmware/{firmware_id}/download", headers={"If-None-Match": headers.get("etag", "")})
+    connection.request("GET", download_path, headers={"If-None-Match": headers.get("etag", "")})
     cached = connection.getresponse()
     cached.read()
     connection.close()
@@ -543,6 +624,143 @@ def check_firmware(token: str, node_id: int) -> None:
     status, tasks, _ = request_json("GET", HTTP_BASE + f"/api/firmware/{firmware_id}/tasks", token=token)
     report("固件任务可读", status == 200 and len(tasks.get("data", [])) == 1, f"HTTP {status}")
     request_json("DELETE", HTTP_BASE + f"/api/firmware/{firmware_id}", token=token)
+
+
+def check_enrollment_tokens(token: str) -> None:
+    status, created, _ = request_json("POST", HTTP_BASE + "/api/enrollment-tokens",
+                                      {"action": "enroll", "expiresInSeconds": 3600, "nodeName": f"enroll-{RUN_ID}"}, token=token)
+    row = created.get("data") or {}
+    token_id = row.get("id")
+    plaintext = str(row.get("token", ""))
+    report("注册令牌创建并只回显一次", status == 200 and plaintext.startswith("ep_enroll_") and bool(token_id), f"HTTP {status}")
+    status, listing, _ = request_json("GET", HTTP_BASE + "/api/enrollment-tokens", token=token)
+    rows = listing.get("data", [])
+    # 列表是数组而不是分页对象；明文与哈希都不得出现在任何一行
+    listed = isinstance(rows, list) and any(item.get("id") == token_id for item in rows)
+    report("注册令牌列表不回显明文", status == 200 and listed and all("token" not in item and "tokenHash" not in item for item in rows), f"HTTP {status}")
+    if token_id:
+        status, _, _ = request_json("DELETE", HTTP_BASE + f"/api/enrollment-tokens/{token_id}", token=token)
+        report("注册令牌吊销", status == 200, f"HTTP {status}")
+
+
+def check_agent_identity(agent_node_id: int) -> None:
+    status, _, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat",
+                                {"nodeId": agent_node_id, "agentVersion": "0.1.0"},
+                                context=client_context(CERTS / "agent-foreign.pem", CERTS / "agent-foreign-key.pem"))
+    report("Agent 冒名心跳被拒", status == 403, f"HTTP {status}")
+
+
+def check_node_config(token: str, agent_node_id: int) -> None:
+    content = {"sample_interval": 30}
+    status, config, _ = request_json("PUT", HTTP_BASE + f"/api/nodes/{agent_node_id}/config",
+                                     {"content": content, "expectedVersion": 0, "note": "验收"}, token=token)
+    report("配置下发", status == 200 and (config.get("data") or {}).get("desired", {}).get("version") == 1, f"HTTP {status}")
+    status, fetched, _ = request_json("GET", AGENT_BASE + f"/api/agent/nodes/{agent_node_id}/config", context=agent_context())
+    report("Agent 拉取配置", status == 200 and (fetched.get("data") or {}).get("version") == 1 and (fetched.get("data") or {}).get("content") == content,
+           f"HTTP {status}")
+    status, reported, _ = request_json("POST", AGENT_BASE + f"/api/agent/nodes/{agent_node_id}/config/report",
+                                       {"version": 1, "content": content, "status": "applied"}, context=agent_context())
+    report("Agent 回报配置", status == 200 and (reported.get("data") or {}).get("inSync") is True, f"HTTP {status}")
+    status, admin_config, _ = request_json("GET", HTTP_BASE + f"/api/nodes/{agent_node_id}/config", token=token)
+    report("管理端看到配置同步", status == 200 and (admin_config.get("data") or {}).get("inSync") is True, f"HTTP {status}")
+    status, heartbeat, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat",
+                                        {"nodeId": agent_node_id, "agentVersion": "0.1.0"}, context=agent_context())
+    interval = (heartbeat.get("data") or {}).get("heartbeatIntervalSeconds")
+    report("心跳下发期望配置版本", status == 200 and (heartbeat.get("data") or {}).get("desiredConfigVersion") == 1 and isinstance(interval, int) and interval > 0,
+           f"HTTP {status}")
+
+
+def check_webhook_ssrf(token: str) -> None:
+    status, payload, _ = request_json("POST", HTTP_BASE + "/api/system/notifications",
+                                      {"name": "验收元数据 Webhook", "type": "webhook",
+                                       "endpoint": "http://169.254.169.254/latest/meta-data",
+                                       "minLevel": "warning", "enabled": True}, token=token)
+    message = str(payload.get("message", ""))
+    report("Webhook 元数据地址被拒", status == 400 and "元数据" in message, f"HTTP {status}：{message}")
+    data = payload.get("data")
+    channel_id = data.get("id") if isinstance(data, dict) else None
+    if channel_id:
+        # 守卫被绕过时宁可先删掉渠道，也不能把失败改写成通过
+        request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{channel_id}", token=token)
+
+
+def check_signed_firmware(token: str, node_id: int, signing: FirmwareSigning | None, unavailable_detail: str) -> None:
+    if signing is None:
+        skip("签名固件上传与下载", unavailable_detail or "未生成临时签名密钥")
+        return
+    query = urllib.parse.urlencode({"name": "EdgePulse OS Signed", "version": f"9.{RUN_ID}-signed", "fileName": "edge-os-signed.bin"})
+    connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=120)
+    connection.putrequest("POST", f"/api/firmware?{query}")
+    connection.putheader("Authorization", "Bearer " + token)
+    connection.putheader("Content-Type", "application/octet-stream")
+    connection.putheader("Content-Length", str(len(signing.payload)))
+    connection.putheader("X-Firmware-Signature", signing.signature)
+    connection.putheader("X-Firmware-Key-Id", signing.key_id)
+    connection.endheaders()
+    connection.send(signing.payload)
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+    try:
+        firmware = json.loads(body).get("data") or {}
+    except (json.JSONDecodeError, AttributeError):
+        report("签名固件上传", False, body[:200].decode("utf-8", "replace"))
+        return
+    firmware_id = firmware.get("id")
+    report("签名固件上传", response.status == 200 and firmware.get("signed") is True and firmware.get("signatureKeyId") == signing.key_id
+           and firmware.get("signatureAlgorithm") == "ed25519-sha256", f"HTTP {response.status}")
+    try:
+        if not firmware_id:
+            report("签名固件下载回传签名头", False, "上传未返回固件标识")
+            return
+        connection = http.client.HTTPSConnection("127.0.0.1", 9443, context=agent_context(), timeout=60)
+        connection.request("GET", f"/api/agent/firmware/{firmware_id}/download?nodeId={node_id}")
+        download = connection.getresponse()
+        downloaded = download.read()
+        headers = {key.lower(): value for key, value in download.getheaders()}
+        connection.close()
+        report("签名固件下载回传签名头",
+               download.status == 200 and downloaded == signing.payload and headers.get("x-firmware-signature") == signing.signature
+               and headers.get("x-firmware-key-id") == signing.key_id and headers.get("x-firmware-signature-algorithm") == "ed25519-sha256",
+               f"HTTP {download.status}")
+    finally:
+        if firmware_id:
+            request_json("DELETE", HTTP_BASE + f"/api/firmware/{firmware_id}", token=token)
+
+
+def check_offline(token: str, agent_node_id: int) -> None:
+    status, heartbeat, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat",
+                                        {"nodeId": agent_node_id, "agentVersion": "0.1.0"}, context=agent_context())
+    report("离线检查前心跳在线", status == 200 and (heartbeat.get("data") or {}).get("status") == "online", f"HTTP {status}")
+    deadline = time.time() + OFFLINE_WAIT_SECONDS
+    node_status = ""
+    alarm_seen = False
+    while time.time() < deadline:
+        status, node, _ = request_json("GET", HTTP_BASE + f"/api/nodes/{agent_node_id}", token=token)
+        node_status = str((node.get("data") or {}).get("status", "")) if status == 200 else f"HTTP {status}"
+        status, alarms, _ = request_json("GET", HTTP_BASE + f"/api/alarms?pageNum=1&pageSize=50&status=open&nodeId={agent_node_id}", token=token)
+        alarm_seen = status == 200 and any(row.get("metric") == "node.online" for row in (alarms.get("data") or {}).get("rows", []))
+        if node_status == "offline" and alarm_seen:
+            break
+        time.sleep(1)
+    report("心跳超时节点转离线", node_status == "offline", f"{OFFLINE_WAIT_SECONDS}s 内状态 {node_status}")
+    report("离线生成系统告警", alarm_seen, "metric=node.online")
+
+    status, heartbeat, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat",
+                                        {"nodeId": agent_node_id, "agentVersion": "0.1.0"}, context=agent_context())
+    report("心跳恢复节点在线", status == 200 and (heartbeat.get("data") or {}).get("status") == "online", f"HTTP {status}")
+    resolved = False
+    alarm_status = ""
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        status, alarms, _ = request_json("GET", HTTP_BASE + f"/api/alarms?pageNum=1&pageSize=50&nodeId={agent_node_id}", token=token)
+        row = next((item for item in (alarms.get("data") or {}).get("rows", []) if item.get("metric") == "node.online"), None)
+        alarm_status = str(row.get("status", "")) if row else ""
+        if alarm_status == "resolved":
+            resolved = True
+            break
+        time.sleep(0.2)
+    report("恢复在线后系统告警销案", resolved, alarm_status or "未找到 node.online 告警")
 
 
 def check_h3() -> None:
@@ -566,7 +784,7 @@ def check_h3() -> None:
     report("H3Probe 真实 h3", result.returncode == 0 and "h3" in result.stdout, result.stdout.strip() or result.stderr.strip())
 
 
-def check_mtls() -> None:
+def check_mtls() -> int | None:
     try:
         request_json("GET", AGENT_BASE + "/api/agent/heartbeat", context=client_context())
         report("9443 无客户端证书被拒", False, "请求意外成功")
@@ -579,9 +797,13 @@ def check_mtls() -> None:
         capture_output=True, text=True, timeout=60, check=False,
     )
     report("9443 正确证书注册并心跳", result.returncode == 0 and "heartbeats=3" in result.stdout, result.stdout.strip() or result.stderr.strip())
-    status, _, _ = request_json("POST", AGENT_BASE + "/api/agent/register",
-                                {"name": "edgepulse-agent-http", "agentVersion": "0.1.0", "certFingerprint": fingerprint}, context=agent_context())
-    report("9443 正确证书走 HTTP 注册", status == 200, f"HTTP {status}")
+    # 每次验收用独立节点名，保证设备影子从版本 0 开始；同一张证书可以登记多个节点
+    status, registered, _ = request_json("POST", AGENT_BASE + "/api/agent/register",
+                                         {"name": f"edgepulse-agent-http-{RUN_ID}", "agentVersion": "0.1.0", "certFingerprint": fingerprint},
+                                         context=agent_context())
+    agent_node_id = (registered.get("data") or {}).get("id")
+    report("9443 正确证书走 HTTP 注册", status == 200 and bool(agent_node_id), f"HTTP {status}")
+    return int(agent_node_id) if agent_node_id else None
 
 
 def check_ops() -> None:
@@ -653,21 +875,25 @@ def main() -> int:
     if not CERTS.exists():
         subprocess.run(["bash", "scripts/dev-certs.sh"], cwd=ROOT, check=False)
     process: subprocess.Popen[bytes] | None = None
+    signing: FirmwareSigning | None = None
+    signing_detail = ""
+    already_running = False
     try:
-        request_json("GET", HTTP_BASE + "/api/health", timeout=1.0)
-        already_running = True
-    except Exception:  # noqa: BLE001
-        already_running = False
-        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        process = subprocess.Popen(["bash", "scripts/run-dev.sh"], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   creationflags=creation_flags)
-        if not wait_for_health(process):
-            print("FAIL 开发服务未在时限内就绪")
-            return 1
-    try:
+        try:
+            request_json("GET", HTTP_BASE + "/api/health", timeout=1.0)
+            already_running = True
+        except Exception:  # noqa: BLE001
+            # 信任键目录只在启动时加载，所以密钥必须在启动之前就位
+            signing, signing_detail = prepare_firmware_signing()
+            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            process = subprocess.Popen(["bash", "scripts/run-dev.sh"], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       creationflags=creation_flags)
+            if not wait_for_health(process):
+                print("FAIL 开发服务未在时限内就绪")
+                return 1
         token = check_authentication()
         check_h3()
-        check_mtls()
+        agent_node_id = check_mtls()
         check_ops()
         check_otlp()
         check_udp_telemetry()
@@ -675,26 +901,40 @@ def main() -> int:
         if token:
             check_system(token)
             check_tenancy(token)
-            node_id = check_nodes(token)
+            check_nodes(token)
             check_websocket(token)
-            if node_id:
+            check_enrollment_tokens(token)
+            check_webhook_ssrf(token)
+            if agent_node_id:
                 notification_state = check_notifications(token)
-                check_telemetry_alarm(token, node_id)
+                check_telemetry_alarm(token, agent_node_id)
                 verify_notification(token, notification_state)
-                check_sse_alarm(token, node_id)
-                check_commands(token, node_id)
+                check_sse_alarm(token, agent_node_id)
+                check_commands(token, agent_node_id)
                 check_agent_websocket(token)
-                check_firmware(token, node_id)
+                check_firmware(token, agent_node_id)
+                check_signed_firmware(token, agent_node_id, signing, "服务已在运行，信任键目录只在启动时加载" if already_running else signing_detail)
+                check_agent_identity(agent_node_id)
+                check_node_config(token, agent_node_id)
+                # 离线检查会故意让 Agent 节点离线并产生系统告警，必须放在最后
+                check_offline(token, agent_node_id)
+            else:
+                report("Agent 节点检查", False, "mTLS 注册未返回节点标识，无法继续")
         else:
             report("系统、节点与设备域检查", False, "登录失败，无法继续")
     finally:
         if process is not None and not already_running:
             stop_process(process)
+        cleanup_firmware_signing(signing)
     print()
+    print(f"验收汇总：通过 {passed} 项，失败 {len(failures)} 项，跳过 {len(skips)} 项")
     if failures:
         print(f"验收失败：{len(failures)} 项 -> " + ", ".join(failures))
         return 1
-    print("全量验收全部通过")
+    if skips:
+        print("验收通过，跳过项不计入通过：" + ", ".join(skips))
+    else:
+        print("全量验收全部通过")
     return 0
 
 

@@ -33,7 +33,7 @@ namespace EdgePulse::Common
      */
     struct OutboundUrlGuardOptions
     {
-        bool                 allowPrivateNetworks{false}; ///< 是否放行普通 RFC1918 私网与回环地址；云元数据及链路本地地址始终拒绝
+        bool                 allowPrivateNetworks{false}; ///< 是否放行普通私网、回环、CGNAT、组播、保留与文档示例段；云元数据及链路本地地址始终拒绝
         std::chrono::seconds cacheTtl{60};                ///< 解析结果缓存时长；非正数表示不缓存
     };
 

@@ -39,7 +39,7 @@ edgepulse:
     ttl_seconds: 7200
   security:
     allowed_origins: http://127.0.0.1:5173,http://localhost:5173
-    # 只放行普通私网与回环 Webhook；云元数据与链路本地地址始终拒绝
+    # 打开后放行普通私网、回环与保留段 Webhook；云元数据与链路本地地址始终拒绝
     allow_private_webhooks: true
     # 开发档放宽口令策略，保留历史种子账号与本地验收脚本的弱口令
     password_min_length: 8

@@ -1,6 +1,7 @@
 # EdgePulse API
 
 - 基础路径：`/api`
+- 版本前缀：当前没有 `/v1`，`/api` 直接承载现行契约；版本化前缀、OpenAPI 与幂等键在 Roadmap 中
 - 认证：除匿名端点外，`Authorization: Bearer <token>`
 - 响应包络：`{ "code": 200, "message": "ok", "data": ..., "traceId": "..." }`
 - 分页：`{ "pageNum": 1, "pageSize": 10, "total": 0, "rows": [] }`；`pageSize` 上限 100
@@ -24,7 +25,7 @@
 | GET | `/api/auth/oidc/callback?code=&state=` | 匿名 | 302 回前端，带一次性 `oidcCode` 或 `oidcError` |
 | POST | `/api/auth/oidc/exchange` | 匿名 | `{code}` → `{token,expiresIn,returnPath}`；code 一次性 |
 
-登录失败按 IP 计数，超过 10 次/分钟返回 429；验证码一次性、2 分钟过期。
+登录失败按 IP 计数，超过 10 次/分钟返回 429；账号在窗口内连续失败达到阈值后锁定，锁定期间返回 423 并提示等待分钟数，成功登录或管理员重置会清空失败计数。验证码一次性、2 分钟过期。新建、重置与改密共用口令策略（最小长度 8–64，可要求大小写、数字与符号）。
 
 ## 2. 系统管理
 
@@ -73,6 +74,8 @@
 
 通知渠道：`GET/POST /api/system/notifications`、`PUT/DELETE /api/system/notifications/{id}`，权限码 `system:notification:list/add/edit/remove`。写入 `{name,type('webhook'|'email'),endpoint,recipients?,username?,sender?,secret?,minLevel,enabled}`；Webhook 地址为 http(s)，邮件为 `smtp://`、`smtps://` 或 `starttls://`；私有 CA 用 `caFile` 指定 PEM。`secret` 只写不回显，响应仅给 `secretConfigured`。投递记录：`GET /api/system/notifications/deliveries?status=&channelId=`，返回渠道、告警、目标、尝试次数与失败原因。
 
+Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、CGNAT、组播、保留或文档示例段默认拒绝；云元数据主机名、已知元数据端点与 IPv4/IPv6 链路本地段始终拒绝，`allow_private_webhooks=true` 也只放行普通私网与保留段。命中校验返回 400，错误文案说明命中的地址或主机。
+
 命令批次取消：`PUT /api/commands/batch/{batchId}/cancel`，取消批次内 pending/running 命令并返回被取消列表。
 
 命令批量与计划：`POST /api/commands/batch`，正文 `{nodeIds[1-100],type,payload,timeoutSeconds,scheduledAt?}`，返回 `{batchId,commands}`；`scheduledAt` 为 `YYYY-MM-DD HH:MM:SS`（UTC），到点前 Agent 轮询取不到。
@@ -111,12 +114,37 @@
 | 方法 | 路径 | 权限/说明 |
 |---|---|---|
 | GET/POST | `/api/nodes` | `device:node:list` / `device:node:write` |
+| GET | `/api/nodes/{id}` | `device:node:list`；节点字段另带 `desiredConfigVersion`、`reportedConfigVersion`、`configInSync` |
 | PUT/DELETE | `/api/nodes/{id}` | `device:node:write`；更新需 `version`，冲突 409 |
+| POST | `/api/nodes/{id}/certificate/revoke` | `device:node:write`；清空指纹、置离线、销案系统离线告警，并以 1008 关闭该节点的 Agent WebSocket |
 | GET/POST | `/api/node-groups` | `device:node:list` / `device:node:write` |
 | PUT/DELETE | `/api/node-groups/{id}` | `device:node:write`；仍有子分组或节点时 409 |
 | GET | `/api/ws` | WebSocket；升级后首条消息认证 |
 
-节点字段：`id,name,status,agentVersion,certFingerprint,labels,lastSeen,groupId,groupName,version`。
+节点字段：`id,name,status,agentVersion,certFingerprint,certNotAfter,certRevokedAt,labels,lastSeen,groupId,groupName,version`。`status` 为 `online` 或 `offline`；证书字段可空，吊销后指纹为空且 `certRevokedAt` 有值。
+
+节点生命周期：超过 `edgepulse.agent.heartbeat_timeout_seconds` 未心跳的在线节点会被后台扫描置为 `offline`，并生成 `metric=node.online`、级别 `critical` 的系统告警；恢复心跳后节点回到 `online`，告警自动置为 `resolved`。手工建节点在首次心跳前不参与离线扫描。
+
+### 4.1 注册令牌
+
+| 方法 | 路径 | 权限/说明 |
+|---|---|---|
+| GET | `/api/enrollment-tokens?status=` | `device:node:write`；返回数组（不分页），`status` 可取 `active/used/expired/revoked` |
+| POST | `/api/enrollment-tokens` | `device:node:write`；`{action:'enroll'|'rebind',nodeName?,expiresInSeconds?,tenantId?}` |
+| DELETE | `/api/enrollment-tokens/{id}` | `device:node:write`；吊销未使用的令牌；不存在、已使用或已吊销返回 404 |
+
+签发响应的 `data` 为令牌记录并额外带明文 `token`（以 `ep_enroll_` 开头）；明文只出现这一次，列表行只有 `id,tenantId,nodeName,action,expiresAt,usedAt,revokedAt,createdBy,createdAt,status`，不含 `token` 或 `tokenHash`。`expiresInSeconds` 默认 3600，允许 300 到 2592000。平台管理员可用 `tenantId` 指定归属租户；租户管理员只能为本租户签发，显式指定别家租户返回 403。
+
+### 4.2 节点配置（设备影子）
+
+| 方法 | 路径 | 权限/说明 |
+|---|---|---|
+| GET | `/api/nodes/{id}/config` | `device:node:list`；`{desired{version,content,hash,updatedAt,updatedBy},reported{version,content,hash,status,message,at},inSync}` |
+| PUT | `/api/nodes/{id}/config` | `device:node:write`；`{content:对象或JSON字符串,expectedVersion,note?}`；版本冲突 409 |
+| GET | `/api/nodes/{id}/config/revisions` | `device:node:list`；分页，按版本倒序保留不可变修订 |
+| POST | `/api/nodes/{id}/config/rollback` | `device:node:write`；`{revisionId,note?}`，把历史修订作为新版本重新下发 |
+
+`expectedVersion` 必须与实际 `desired.version` 一致，首次下发用 0；成功后版本加一。服务端把 `content` 规范化为紧凑 JSON 并重算 SHA-256，`inSync` 只有在期望/上报版本、摘要与 `applied` 状态同时相符时为 true。下发与回滚都会创建一条 `config.apply` 命令，在线 Agent 走 WebSocket 直推，离线 Agent 轮询取回。
 
 ## 5. 遥测、告警、固件、命令
 
@@ -132,9 +160,11 @@
 | PUT/DELETE | `/api/alarm-rules/{id}` | `device:alarm:edit` / `device:alarm:remove` |
 | GET | `/api/events/alarms` | 登录；SSE，事件名 `alarm` 与 `ready` |
 | GET | `/api/firmware` | `device:firmware:list` |
-| POST | `/api/firmware?name=&version=&fileName=` | `device:firmware:upload`；流式二进制正文 |
+| GET | `/api/firmware/policy` | `device:firmware:list`；`{requireSignature,trustedKeyIds}` |
+| POST | `/api/firmware?name=&version=&fileName=` | `device:firmware:upload`；流式二进制正文；可带固件签名头 |
 | GET | `/api/firmware/{id}/tasks` | `device:firmware:list` |
-| POST | `/api/firmware/{id}/deploy` | `device:firmware:upload`；`{nodeIds:[...]}` |
+| POST | `/api/firmware/{id}/deploy` | `device:firmware:upload`；`{nodeIds:[...],batchSize?}` |
+| POST | `/api/firmware/{id}/rollback` | `device:firmware:upload`；`{nodeIds:[...]}` |
 | DELETE | `/api/firmware/{id}` | `device:firmware:remove` |
 | GET | `/api/commands` | `device:command:list`；`status,nodeId` |
 | POST | `/api/commands` | `device:command:send`；`{nodeId,type,payload,timeoutSeconds}` |
@@ -142,20 +172,37 @@
 | GET | `/api/ops/summary` | `monitor:operlog:list`；节点/告警/遥测/命令读数 |
 | GET | `/api/ops/protocols` | `monitor:operlog:list`；监听与协议开关 |
 
+上传响应带 `signed`、`signatureKeyId`、`signatureAlgorithm`；未签名固件三者分别为 `false`、空串、空串。
+
+固件签名请求头：
+
+| 头 | 说明 |
+|---|---|
+| `X-Firmware-Signature` | 对文件 SHA-256 的 32 字节原始摘要做 Ed25519 签名后的标准 Base64 |
+| `X-Firmware-Key-Id` | 信任键目录里公钥文件的 stem，例如 `prod-2026` |
+
+两个头必须成对出现。`requireSignature=true` 时缺任一头在收正文前返回 400；key id 未加载、摘要不符或签名格式错误在写完文件后返回 400 并删除成品。`requireSignature=true` 时未签名固件也不能部署或回滚。历史未签名固件仍可被 Agent 下载，但下载不带签名头。
+
 告警规则字段：`name,nodeId(0=全部),metric,comparison,threshold,level,enabled,cooldownSeconds`。
 
 ## 6. Agent 通道（只挂 9443 mTLS）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?,tenantCode?}`；tenantCode 缺省 `default`；`certFingerprint` 必须与这条 mTLS 连接出示的叶证书一致 |
-| POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}` |
+| POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?,tenantCode?,enrollmentToken?}`；tenantCode 缺省 `default`；`certFingerprint` 必须与这条 mTLS 连接出示的叶证书一致 |
+| POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}`；响应是节点记录并加 `desiredConfigVersion` 与 `heartbeatIntervalSeconds` |
 | POST | `/api/agent/telemetry` | `{nodeId,samples:[{metric,value,unit?,collectedAt?,labels?}]}`，1–500 条 |
 | GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
 | POST | `/api/agent/commands/{id}/result` | `{nodeId,status,result,message}` |
-| GET | `/api/agent/firmware/{id}/download` | 支持 `ETag`/`If-None-Match` 与单段 `Range` |
+| GET | `/api/agent/nodes/{id}/config` | `{version,content,hash}`；从未下发时为 `{version:0,content:{},hash:""}` |
+| POST | `/api/agent/nodes/{id}/config/report` | `{version,content?,status:'applied'|'failed'|'pending',message?}`；返回完整配置视图与 `inSync` |
+| GET | `/api/agent/firmware/{id}/download?nodeId=` | 必须带 `nodeId`；支持 `ETag`/`If-None-Match` 与单段 `Range`；签名固件回传三个 `X-Firmware-*` 头 |
 | POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message}` |
 | GET | `/api/agent/ws` | WebSocket；首条 `{"type":"hello","nodeId":...}`；接收 `command.result` |
+
+注册模式由 `edgepulse.agent.enrollment_mode` 决定：`required` 时新节点必须带 `enroll` 令牌、已有节点换证书必须带 `rebind` 令牌，同指纹重注册不需要令牌；`off` 只校验 mTLS CA 链与可选指纹白名单。令牌条件还校验租户、动作与 `nodeName`，缺令牌或令牌不可用统一返回 403，不区分过期、已用或名字不符。
+
+所有 `/api/agent/*` 请求都要求连接叶证书指纹等于节点登记的 `certFingerprint`；指纹不符或证书已吊销返回 403，节点不存在返回 404。固件下载还要求固件与节点同租户。注册响应带 `certNotAfter`，心跳响应带节点状态；节点超过 `heartbeat_timeout_seconds` 未心跳会被判离线并产生 `node.online` 系统告警。
 
 Agent 请求没有会话：命令、固件任务、遥测都按目标节点/固件的租户归属落库，跨租户标识会被拒绝。
 
@@ -200,13 +247,14 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 
 | HTTP | 场景 |
 |---|---|
-| 400 | 参数缺失、JSON 不合法、Range 不可满足以外的请求错误 |
+| 400 | 参数缺失、JSON 不合法、配置正文不合法；Webhook 地址被 SSRF 校验拒绝；缺固件签名头、验签失败；固件下载缺 `nodeId` |
 | 401 | 未登录、会话过期、Redis/数据库不可用导致的认证失败 |
-| 403 | 已登录但缺权限；Agent 命令不属于该节点 |
-| 404 | 资源不存在；`/api/*` 未命中 |
-| 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；乐观锁冲突；仍被占用的删除 |
+| 403 | 已登录但缺权限；Agent 连接证书与节点登记指纹不一致或证书已吊销；`required` 模式缺注册/改绑令牌；命令或固件不属于该节点/租户；租户管理员跨租户签发令牌 |
+| 404 | 资源不存在；注册令牌不存在、已使用或已吊销；配置修订或节点不存在；固件文件缺失；`/api/*` 未命中 |
+| 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；节点或配置 `expectedVersion` 乐观锁冲突；并发注册冲突；仍被占用的删除 |
 | 413 | 固件超过上传上限 |
 | 416 | Range 越界 |
-| 429 | 验证码签发过频、登录失败过频 |
+| 423 | 账号因窗口内连续登录失败被锁定 |
+| 429 | 验证码签发过频、登录失败过频、公开 API 全局限流 |
 | 500 | 数据库/文件/未知内部故障 |
 | 503 | 服务未就绪或停机排空 |
