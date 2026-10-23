@@ -158,7 +158,7 @@ namespace EdgePulse::Device
                             expiresInSeconds = iterator->get<std::int64_t>();
                         }
                         // 先按 int 能安全承载的范围校验，再交给服务做业务范围判断
-                        if (expiresInSeconds < 300 || expiresInSeconds > 2592000)
+                        if (expiresInSeconds < kEnrollmentMinimumExpirySeconds || expiresInSeconds > kEnrollmentMaximumExpirySeconds)
                         {
                             fail(response, Common::kCodeBadRequest, "有效期必须在 300 到 2592000 秒之间", traceId);
                             co_return;

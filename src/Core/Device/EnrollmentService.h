@@ -24,6 +24,12 @@
 
 namespace EdgePulse::Device
 {
+    /// 令牌有效期下界，秒；服务与管理端共用同一份范围
+    inline constexpr int kEnrollmentMinimumExpirySeconds = 300;
+
+    /// 令牌有效期上界，秒；服务与管理端共用同一份范围
+    inline constexpr int kEnrollmentMaximumExpirySeconds = 2592000;
+
     /**
      * @brief 签发结果：明文只在这里出现一次
      */

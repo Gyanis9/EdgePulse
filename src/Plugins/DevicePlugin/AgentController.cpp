@@ -72,6 +72,9 @@ namespace EdgePulse::Device
                 case AgentError::Reason::NotFound:
                     Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, error.message, traceId);
                     break;
+                case AgentError::Reason::Conflict:
+                    Common::writeFailure(response, Common::kCodeConflict, Common::kCodeConflict, error.message, traceId);
+                    break;
             }
         }
     } // namespace

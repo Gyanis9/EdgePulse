@@ -28,6 +28,25 @@ namespace EdgePulse::Command
         return m_peers.contains(nodeId);
     }
 
+    AsynGyanis::Core::Task<> AgentChannelRegistry::closeNode(const std::int64_t nodeId, const std::uint16_t code, const std::string_view reason)
+    {
+        AsynGyanis::Net::WebSocketPeer *peer = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (const auto iterator = m_peers.find(nodeId); iterator != m_peers.end())
+            {
+                peer = iterator->second;
+                // 先摘表再关闭：命令路由在协程挂起期间也不能再拿到这条通道
+                m_peers.erase(iterator);
+            }
+        }
+        if (peer != nullptr && peer->isOpen())
+        {
+            static_cast<void>(co_await peer->close(code, reason));
+        }
+        co_return;
+    }
+
     AsynGyanis::Core::Task<bool> AgentChannelRegistry::send(const std::int64_t nodeId, std::string_view text)
     {
         AsynGyanis::Net::WebSocketPeer *peer = nullptr;

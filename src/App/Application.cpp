@@ -777,7 +777,7 @@ namespace EdgePulse::App
             co_return Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                             session->departmentId, session->roles,    session->permissions};
         };
-        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get());
+        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get(), m_agentChannels.get());
         Device::EnrollmentDependencies enrollmentDependencies;
         enrollmentDependencies.auth        = m_authService.get();
         enrollmentDependencies.enrollments = m_enrollmentService.get();

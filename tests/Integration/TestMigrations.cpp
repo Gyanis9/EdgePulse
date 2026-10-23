@@ -84,7 +84,9 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_user"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 15"));
-        EXPECT_GE(querySingleInteger(*connection, "SELECT COUNT(*) FROM biz_agent_enrollment"), 0);
+        // 只断存在与空表：表缺失时 COUNT(*) 会因查询失败返回 -1，两种情况都不会被放过
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'biz_agent_enrollment'"));
+        EXPECT_EQ(0, querySingleInteger(*connection, "SELECT COUNT(*) FROM biz_agent_enrollment"));
         EXPECT_EQ(15, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);

@@ -6,6 +6,7 @@
 #include "Base/Api/QueryParameters.h"
 #include "Base/Log/LogMacros.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
+#include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Auth/DataScopeService.h"
@@ -13,6 +14,7 @@
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
 #include "Net/Http/Routing/Router.h"
+#include "Net/WebSocket/WebSocketPeer.h"
 #include "Core/Http/RequestId.h"
 
 #include <Core/EventLoop/EventLoop.h>
@@ -157,7 +159,7 @@ namespace EdgePulse::Device
     } // namespace
 
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants, NodeLifecycleService *lifecycle)
+                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants, NodeLifecycleService *lifecycle, Command::AgentChannelRegistry *channels)
     {
         router.get("/api/nodes",
                    [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -265,8 +267,8 @@ namespace EdgePulse::Device
                    });
 
         router.post("/api/nodes/:id/certificate/revoke",
-                    [&loop, &nodeService, accessResolver, dataScopes, lifecycle](AsynGyanis::Net::HttpRequest  &request,
-                                                                                 AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, &nodeService, accessResolver, dataScopes, lifecycle, channels](AsynGyanis::Net::HttpRequest  &request,
+                                                                                           AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string traceId = Web::resolveRequestId(request);
                         const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
@@ -294,7 +296,11 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                             co_return;
                         }
-                        // 证书已清空；离线状态要推给实时界面，并收口此前的系统离线告警
+                        // 证书已清空；先掐断仍在线的 Agent WebSocket，再收口实时状态与告警
+                        if (channels != nullptr)
+                        {
+                            co_await channels->closeNode(*nodeId, AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
+                        }
                         if (lifecycle != nullptr)
                         {
                             try

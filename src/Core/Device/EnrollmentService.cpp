@@ -13,8 +13,6 @@ namespace EdgePulse::Device
 {
     namespace
     {
-        constexpr int         kMinimumExpirySeconds  = 300;
-        constexpr int         kMaximumExpirySeconds  = 2592000;
         constexpr std::size_t kMaximumNodeNameLength = 128;
         constexpr const char *kPlaintextPrefix       = "ep_enroll_";
     } // namespace
@@ -44,7 +42,7 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected("节点名不能超过 128 个字符");
         }
-        if (expiresInSeconds < kMinimumExpirySeconds || expiresInSeconds > kMaximumExpirySeconds)
+        if (expiresInSeconds < kEnrollmentMinimumExpirySeconds || expiresInSeconds > kEnrollmentMaximumExpirySeconds)
         {
             co_return std::unexpected("有效期必须在 300 到 2592000 秒之间");
         }

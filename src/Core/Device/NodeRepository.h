@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace EdgePulse::Device
@@ -81,9 +82,16 @@ namespace EdgePulse::Device
      */
     enum class AgentUpsertFailure
     {
-        TokenRejected,    ///< 注册/改绑令牌无效、过期、已用或与节点名不符
-        RebindNotAllowed, ///< 已有节点换了证书但没有改绑令牌
+        TokenRejected,          ///< 注册/改绑令牌无效、过期、已用或与节点名不符
+        ConcurrentRegistration, ///< 整段事务在有限次重试后仍撞上并发锁或唯一键
     };
+
+    /**
+     * @brief 判断数据库失败是否属于并发注册可重试的一类
+     * @param message 驱动或仓储给出的错误文本
+     * @return true 表示锁冲突、死锁或唯一键冲突，可在新事务里重试
+     */
+    [[nodiscard]] bool isRetryableRegistrationFailure(std::string_view message);
 
     /**
      * @brief 按状态统计的节点数
@@ -108,16 +116,14 @@ namespace EdgePulse::Device
      */
     struct AgentUpsert
     {
-        std::string  name;                     ///< 节点名
-        std::string  agentVersion;             ///< Agent 版本
-        std::string  certFingerprint;          ///< 自报证书指纹
-        std::string  labelsJson;               ///< 标签 JSON 文本，可空
-        std::int64_t tenantId{1};              ///< 归属租户
-        std::string  enrollmentTokenHash;      ///< 令牌明文的 SHA-256；空表示没有令牌
-        std::string  enrollmentAction;         ///< enroll / rebind
-        bool         requireEnrollment{false}; ///< 本次注册是否必须消费令牌
-        bool         allowRebind{true};        ///< 已有节点换证书时是否允许改绑
-        std::string  certNotAfter;             ///< 叶证书到期时间，可空
+        std::string  name;                  ///< 节点名
+        std::string  agentVersion;          ///< Agent 版本
+        std::string  certFingerprint;       ///< 自报证书指纹
+        std::string  labelsJson;            ///< 标签 JSON 文本，可空
+        std::int64_t tenantId{1};           ///< 归属租户
+        std::string  enrollmentMode{"off"}; ///< off 或 required；事务内据此决定是否消费令牌
+        std::string  enrollmentTokenHash;   ///< 令牌明文的 SHA-256；空表示没有带令牌
+        std::string  certNotAfter;          ///< 叶证书到期时间，可空
     };
 
     /**
@@ -201,7 +207,7 @@ namespace EdgePulse::Device
          * @param loop 恢复协程用的事件循环
          * @param registration 注册输入
          * @return 成功返回节点与在线转换标记；令牌校验在同一事务内完成
-         * @note 名称唯一键被并发注册抢占时，回滚后按已有节点重试一次
+         * @note 新建、改绑与同指纹重注册的判定只信事务内读到的节点状态；整段事务在可重试的并发失败后重来一次
          */
         AsynGyanis::Core::Task<std::expected<AgentUpsertOutcome, AgentUpsertFailure>> upsertAgent(AsynGyanis::Core::EventLoop &loop, AgentUpsert registration);
 

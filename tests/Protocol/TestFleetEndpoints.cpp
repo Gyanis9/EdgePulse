@@ -159,6 +159,70 @@ namespace
         std::string   error;         ///< 失败原因
     };
 
+    struct AgentCloseProbeResult
+    {
+        bool          connected{false}; ///< hello 握手成功
+        bool          closed{false};    ///< 收到了服务端关闭帧
+        std::uint16_t closeCode{0};     ///< 关闭帧状态码
+        std::string   error;            ///< 失败原因
+    };
+
+    AsynGyanis::Core::Task<> probeAgentSocketUntilClosed(AsynGyanis::Core::EventLoop &loop, std::uint16_t port, std::int64_t nodeId,
+                                                         std::shared_ptr<std::promise<AgentCloseProbeResult>> completion)
+    {
+        AgentCloseProbeResult result;
+        try
+        {
+            AsynGyanis::Net::WebSocketClient::Configuration configuration;
+            configuration.hostName      = "127.0.0.1";
+            configuration.port          = port;
+            configuration.requestTarget = "/api/agent/ws";
+            auto connection             = co_await AsynGyanis::Net::WebSocketClient::connect(loop, configuration);
+            if (!connection)
+            {
+                result.error = "升级失败：" + connection.error().message;
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            std::unique_ptr<AsynGyanis::Net::WebSocketClient> client = std::move(*connection);
+
+            const AsynGyanis::Base::ConfigValue hello = AsynGyanis::Base::ConfigValue::object({{"type", "hello"}, {"nodeId", nodeId}, {"agentVersion", "protocol-test"}});
+            if (!co_await client->sendText(hello.dump()))
+            {
+                result.error = "hello 发送失败";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            const auto reply = co_await client->receive();
+            if (!reply || reply->opCode != AsynGyanis::Net::WebSocketOpCode::Text || reply->payload.find("\"ok\":true") == std::string::npos)
+            {
+                result.error = "未收到 hello 确认";
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            result.connected = true;
+
+            // 服务端吊销证书后应主动以 1008 关闭；这里等到关闭帧或时限到点
+            const auto frame = co_await client->receiveFor(std::chrono::seconds{10});
+            if (!frame.has_value())
+            {
+                result.error = "未在时限内收到关闭帧";
+            } else
+            {
+                result.closed = frame->opCode == AsynGyanis::Net::WebSocketOpCode::Close;
+                if (result.closed && frame->payload.size() >= 2)
+                {
+                    result.closeCode = static_cast<std::uint16_t>((static_cast<std::uint8_t>(frame->payload[0]) << 8) | static_cast<std::uint8_t>(frame->payload[1]));
+                }
+            }
+        } catch (const std::exception &failure)
+        {
+            result.error = failure.what();
+        }
+        completion->set_value(std::move(result));
+        co_return;
+    }
+
     AsynGyanis::Core::Task<> probeUnauthenticatedBrowserSocket(AsynGyanis::Core::EventLoop &loop, std::uint16_t port,
                                                                std::shared_ptr<std::promise<AuthTimeoutProbeResult>> completion)
     {
@@ -245,7 +309,7 @@ protected:
                         co_return EdgePulse::Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                                                    session->departmentId, session->roles,    session->permissions};
                     };
-                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), m_lifecycle.get());
+                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), m_lifecycle.get(), m_channels.get());
                     EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants, 30);
                     EdgePulse::Device::NodeGroupDependencies groups;
                     groups.auth   = m_context->auth.get();
@@ -538,6 +602,42 @@ TEST_F(FleetEndpointsTest, CommandOverAgentWebSocket)
         status = (*json)["data"]["rows"][0]["status"].get<std::string>();
     }
     EXPECT_EQ("succeeded", status);
+}
+
+// 钉住：吊销证书要摘除在线通道并以 1008 关闭已建立的 Agent WebSocket，不能只拦下一次 hello
+TEST_F(FleetEndpointsTest, CertificateRevocationClosesAgentWebSocket)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "ws-revoke-node");
+
+    auto                               promise = std::make_shared<std::promise<AgentCloseProbeResult>>();
+    std::future<AgentCloseProbeResult> future  = promise->get_future();
+    AsynGyanis::Core::Task<>           probe   = probeAgentSocketUntilClosed(m_server->loop(), m_server->port(), nodeId, promise);
+    m_server->loop().scheduler().scheduleRemote(probe.handle());
+    m_probeTasks.push_back(std::move(probe));
+
+    // 先等 hello 把通道登记进表，再发吊销；否则关闭可能落在注册之前
+    bool connected = false;
+    for (int attempt = 0; attempt < 500 && !connected; ++attempt)
+    {
+        connected = m_channels->isConnected(nodeId);
+        if (!connected)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+    }
+    ASSERT_TRUE(connected) << "Agent WebSocket 未在时限内完成 hello 注册";
+
+    const auto revoked = m_server->post("/api/nodes/" + std::to_string(nodeId) + "/certificate/revoke", "", "application/json", bearer(token));
+    ASSERT_EQ(200, revoked.status) << revoked.body;
+    EXPECT_FALSE(m_channels->isConnected(nodeId));
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{10})) << "Agent WebSocket 未在吊销后收口";
+    const AgentCloseProbeResult result = future.get();
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.connected);
+    EXPECT_TRUE(result.closed);
+    EXPECT_EQ(1008, result.closeCode);
 }
 
 // 钉住：浏览器连接 5 秒内不认证即被 1008 收口，且不依赖额外的计时线程

@@ -10,8 +10,12 @@
 #include <Core/Tls/TlsPeerIdentity.h>
 #include <gtest/gtest.h>
 
+#include <barrier>
+#include <expected>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -164,4 +168,154 @@ TEST(Enrollment, RejectsTokenActionMismatch)
     const auto active = runner.run(service->list(runner.loop(), "active"));
     ASSERT_EQ(1U, active.size());
     EXPECT_EQ(issued->record.id, active[0].id);
+}
+
+// 钉住：enroll/rebind 由仓储在事务内判定；调用方给的旧快照不能当放行依据，吊销节点必须重新持令牌
+TEST(Enrollment, TransactionOwnsEnrollRebindDecision)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    auto                                    nodes   = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    auto                                    repo    = std::make_shared<EdgePulse::Device::EnrollmentRepository>(context.database);
+    auto                                    service = std::make_shared<EdgePulse::Device::EnrollmentService>(repo);
+
+    const std::string              fingerprintA(64, 'a');
+    const std::string              fingerprintB(64, 'b');
+    EdgePulse::Device::AgentUpsert seed;
+    seed.name            = "edge-txn";
+    seed.agentVersion    = "1.0.0";
+    seed.certFingerprint = fingerprintA;
+    seed.labelsJson      = "{}";
+    seed.enrollmentMode  = "off";
+    const auto seeded    = runner.run(nodes->upsertAgent(runner.loop(), seed));
+    ASSERT_TRUE(seeded.has_value());
+    EXPECT_TRUE(seeded->created);
+
+    // 已存在的节点只接受 rebind：enroll 令牌即使明面上有效也不能消费
+    const auto enrollToken = runner.run(service->create(runner.loop(), 1, "edge-txn", "enroll", 3600, 1));
+    ASSERT_TRUE(enrollToken.has_value());
+    EdgePulse::Device::AgentUpsert enrollAttempt = seed;
+    enrollAttempt.certFingerprint                = fingerprintB;
+    enrollAttempt.enrollmentMode                 = "required";
+    enrollAttempt.enrollmentTokenHash            = EdgePulse::Device::EnrollmentService::hashToken(enrollToken->plaintext);
+    const auto rejected                          = runner.run(nodes->upsertAgent(runner.loop(), enrollAttempt));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(EdgePulse::Device::AgentUpsertFailure::TokenRejected, rejected.error());
+    const auto stillActive = runner.run(service->list(runner.loop(), "active"));
+    ASSERT_EQ(1U, stillActive.size());
+    EXPECT_EQ(enrollToken->record.id, stillActive[0].id);
+
+    const auto rebindToken = runner.run(service->create(runner.loop(), 1, "edge-txn", "rebind", 3600, 1));
+    ASSERT_TRUE(rebindToken.has_value());
+    enrollAttempt.enrollmentTokenHash = EdgePulse::Device::EnrollmentService::hashToken(rebindToken->plaintext);
+    const auto rebound                = runner.run(nodes->upsertAgent(runner.loop(), enrollAttempt));
+    ASSERT_TRUE(rebound.has_value());
+    EXPECT_FALSE(rebound->created);
+    EXPECT_EQ(fingerprintB, rebound->node.certFingerprint);
+
+    // 吊销清空指纹并写下吊销时间；required 模式下即使报同指纹也不能无令牌恢复
+    const auto revoked = runner.run(nodes->revokeCertificate(runner.loop(), rebound->node.id));
+    ASSERT_TRUE(revoked.has_value());
+    EXPECT_FALSE(revoked->certRevokedAt.empty());
+    EdgePulse::Device::AgentUpsert withoutToken = enrollAttempt;
+    withoutToken.enrollmentTokenHash.clear();
+    const auto denied = runner.run(nodes->upsertAgent(runner.loop(), withoutToken));
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(EdgePulse::Device::AgentUpsertFailure::TokenRejected, denied.error());
+    const auto afterDenial = runner.run(nodes->findById(runner.loop(), rebound->node.id));
+    ASSERT_TRUE(afterDenial.has_value());
+    EXPECT_FALSE(afterDenial->certRevokedAt.empty());
+    EXPECT_EQ("offline", afterDenial->status);
+}
+
+// 钉住：两条连接同时注册同名节点不抛异常、不产生第二行；冲突只以可重试的并发失败返回
+TEST(Enrollment, ConcurrentRegistrationsShareOneNode)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    auto                                    nodesA = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    auto                                    nodesB = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    EdgePulse::TestSupport::EventLoopRunner runnerA;
+    EdgePulse::TestSupport::EventLoopRunner runnerB;
+
+    const std::string              fingerprint(64, 'a');
+    EdgePulse::Device::AgentUpsert upsert;
+    upsert.name            = "edge-race";
+    upsert.agentVersion    = "1.0.0";
+    upsert.certFingerprint = fingerprint;
+    upsert.labelsJson      = "{}";
+    upsert.enrollmentMode  = "off";
+
+    using UpsertResult   = std::expected<EdgePulse::Device::AgentUpsertOutcome, EdgePulse::Device::AgentUpsertFailure>;
+    using OptionalResult = std::optional<UpsertResult>;
+    OptionalResult     resultA;
+    OptionalResult     resultB;
+    std::exception_ptr failureA;
+    std::exception_ptr failureB;
+
+    // 两条线程都到齐后才发起注册，避免退化成先后执行
+    std::barrier barrier{2};
+    const auto   worker =
+            [&barrier, &upsert](EdgePulse::TestSupport::EventLoopRunner &runner, EdgePulse::Device::NodeRepository &repository, OptionalResult &result, std::exception_ptr &failure)
+    {
+        barrier.arrive_and_wait();
+        try
+        {
+            result = runner.run(repository.upsertAgent(runner.loop(), upsert));
+        } catch (...)
+        {
+            failure = std::current_exception();
+        }
+    };
+    std::thread threadA(worker, std::ref(runnerA), std::ref(*nodesA), std::ref(resultA), std::ref(failureA));
+    std::thread threadB(worker, std::ref(runnerB), std::ref(*nodesB), std::ref(resultB), std::ref(failureB));
+    threadA.join();
+    threadB.join();
+
+    for (const std::exception_ptr &failure: {failureA, failureB})
+    {
+        if (failure != nullptr)
+        {
+            try
+            {
+                std::rethrow_exception(failure);
+            } catch (const std::exception &error)
+            {
+                FAIL() << "并发注册抛出异常，注册路径不能把冲突升级成 500：" << error.what();
+            } catch (...)
+            {
+                FAIL() << "并发注册抛出未知异常";
+            }
+        }
+    }
+    ASSERT_TRUE(resultA.has_value());
+    ASSERT_TRUE(resultB.has_value());
+
+    int successCount = 0;
+    int createdCount = 0;
+    for (const OptionalResult *result: {&resultA, &resultB})
+    {
+        if (result->has_value())
+        {
+            ++successCount;
+            if (result->value()->created)
+            {
+                ++createdCount;
+            }
+            continue;
+        }
+        // 数据库仍忙时只允许返回可重试的并发失败，不能是令牌拒绝或未捕获异常
+        EXPECT_EQ(EdgePulse::Device::AgentUpsertFailure::ConcurrentRegistration, result->value().error());
+    }
+    EXPECT_GE(successCount, 1);
+    if (successCount == 2)
+    {
+        EXPECT_EQ(1, createdCount);
+    }
+
+    // 无论哪条线程先落库，最终只能存在一行
+    const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+    const auto                                                      rows       = connection->execute("SELECT COUNT(*) FROM biz_node WHERE name = 'edge-race' AND deleted = 0");
+    ASSERT_NE(nullptr, rows) << connection->lastError();
+    ASSERT_TRUE(rows->next());
+    EXPECT_EQ(1, std::get<std::int64_t>(rows->getValue(0)));
 }

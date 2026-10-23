@@ -53,6 +53,15 @@ namespace EdgePulse::Command
         [[nodiscard]] bool isConnected(std::int64_t nodeId) const;
 
         /**
+         * @brief 从通道表摘除节点并以指定状态码关闭连接
+         * @param nodeId 节点
+         * @param code 关闭状态码，证书吊销按策略违规使用 1008
+         * @param reason 关闭原因，按「指针 + 长度」取，必须活到本次协程结束
+         * @return AsynGyanis::Core::Task<> 完成时通道已摘除；连接不存在或已关闭时只摘表
+         */
+        AsynGyanis::Core::Task<> closeNode(std::int64_t nodeId, std::uint16_t code, std::string_view reason);
+
+        /**
          * @brief 向节点推送一条文本
          * @param nodeId 节点
          * @param text 文本

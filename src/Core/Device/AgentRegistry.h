@@ -34,8 +34,9 @@ namespace EdgePulse::Device
         enum class Reason
         {
             InvalidRequest,      ///< 字段不合法
-            FingerprintRejected, ///< 指纹不在白名单
+            FingerprintRejected, ///< 指纹不在白名单或注册令牌被拒
             NotFound,            ///< 心跳的节点不存在
+            Conflict,            ///< 并发注册在有限次重试后仍冲突，可稍后重试
         };
 
         Reason      reason{Reason::InvalidRequest}; ///< 机器可判的原因

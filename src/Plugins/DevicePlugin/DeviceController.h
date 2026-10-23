@@ -32,6 +32,11 @@ namespace EdgePulse::Auth
     class DataScopeService;
 }
 
+namespace EdgePulse::Command
+{
+    class AgentChannelRegistry;
+}
+
 namespace EdgePulse::System
 {
     class TenantRepository;
@@ -68,7 +73,9 @@ namespace EdgePulse::Device
      * @param dataScopes 数据范围解析；空表示不限制
      * @param tenants 租户仓储，平台管理员按 tenantId 指定节点归属
      * @param lifecycle 节点生命周期服务，删除节点后用它销案系统离线告警；可空
+     * @param channels Agent WebSocket 通道表，吊销证书后用它关闭在线连接；可空
      */
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes = nullptr, System::TenantRepository *tenants = nullptr, NodeLifecycleService *lifecycle = nullptr);
+                        Auth::DataScopeService *dataScopes = nullptr, System::TenantRepository *tenants = nullptr, NodeLifecycleService *lifecycle = nullptr,
+                        Command::AgentChannelRegistry *channels = nullptr);
 } // namespace EdgePulse::Device

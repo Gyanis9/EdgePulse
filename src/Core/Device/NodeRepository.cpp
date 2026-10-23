@@ -9,11 +9,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -48,6 +51,35 @@ namespace EdgePulse::Device
         {
             // 空标签按 SQL NULL 落库，读取时才能区分“没有标签”与“标签是空串”
             return text.empty() ? AsynGyanis::Database::DatabaseValue{std::monostate{}} : AsynGyanis::Database::DatabaseValue{text};
+        }
+
+        constexpr int                             kRegistrationAttempts = 2; ///< 并发注册最多尝试几次
+        constexpr std::chrono::milliseconds       kRegistrationBackoff{2};   ///< 两次尝试之间的退避，只在工作线程上等
+        constexpr std::array<std::string_view, 5> kRetryableRegistrationMarkers{"locked", "busy", "deadlock", "unique", "duplicate entry"}; ///< SQLite 与 MySQL 的并发失败原文
+
+        /**
+         * @brief 回滚当前事务；回滚本身失败时不让它盖过真正的失败原因
+         */
+        void rollbackQuietly(AsynGyanis::Database::DatabaseConnection &connection)
+        {
+            try
+            {
+                Sql::executeOrThrowVoid(connection, "ROLLBACK");
+            } catch (...)
+            {
+            }
+        }
+
+        [[nodiscard]] bool containsRetryableMarker(const std::string_view message)
+        {
+            std::string lowered;
+            lowered.reserve(message.size());
+            for (const char character: message)
+            {
+                lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+            }
+            return std::any_of(kRetryableRegistrationMarkers.begin(), kRetryableRegistrationMarkers.end(),
+                               [&lowered](const std::string_view marker) { return lowered.find(marker) != std::string::npos; });
         }
 
         [[nodiscard]] NodeRecord readNode(const AsynGyanis::Database::DatabaseResult &result)
@@ -168,6 +200,11 @@ namespace EdgePulse::Device
             return node;
         }
     } // namespace
+
+    bool isRetryableRegistrationFailure(const std::string_view message)
+    {
+        return containsRetryableMarker(message);
+    }
 
     NodeRepository::NodeRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
@@ -340,26 +377,30 @@ namespace EdgePulse::Device
                 loop,
                 [registration = std::move(registration)](AsynGyanis::Database::DatabaseConnection &connection) -> std::expected<AgentUpsertOutcome, AgentUpsertFailure>
                 {
-                    const std::string         now = Common::nowDateTimeUtc();
                     const System::TenantScope tenant{registration.tenantId, false};
-                    // 并发注册可能同时判定“节点不存在”；唯一键冲突时回滚重来一次，第二次按已有节点处理
-                    for (int attempt = 0; attempt < 2; ++attempt)
+                    // 新建、改绑与同指纹重注册的判定必须在事务里完成：调用方读到的是旧快照，
+                    // 只有把令牌消费和节点写入放进同一笔事务，才能挡住两次读之间的改绑或吊销
+                    for (int attempt = 0; attempt < kRegistrationAttempts; ++attempt)
                     {
-                        Sql::executeOrThrowVoid(connection, "BEGIN");
                         try
                         {
+                            Sql::executeOrThrowVoid(connection, "BEGIN");
+                            const std::string               now             = Common::nowDateTimeUtc();
                             const std::optional<NodeRecord> current         = findByNameOnConnection(connection, registration.name, tenant);
-                            const bool                      sameCertificate = current.has_value() && current->certFingerprint == registration.certFingerprint;
-                            if (registration.requireEnrollment && !sameCertificate)
+                            const bool                      revoked         = current.has_value() && !current->certRevokedAt.empty();
+                            const bool                      sameCertificate = current.has_value() && !revoked && current->certFingerprint == registration.certFingerprint;
+                            if (!sameCertificate && registration.enrollmentMode == "required")
                             {
-                                if (registration.enrollmentTokenHash.empty() || (registration.enrollmentAction == "rebind" && current.has_value() && !registration.allowRebind))
+                                // 动作由事务内读到的节点状态决定：enroll 只给新节点，rebind 只给已有节点
+                                const std::string action = current.has_value() ? "rebind" : "enroll";
+                                if (registration.enrollmentTokenHash.empty())
                                 {
-                                    Sql::executeOrThrowVoid(connection, "ROLLBACK");
-                                    return std::unexpected(AgentUpsertFailure::RebindNotAllowed);
+                                    rollbackQuietly(connection);
+                                    return std::unexpected(AgentUpsertFailure::TokenRejected);
                                 }
-                                // 令牌消费与节点写入必须同成同败；条件里钉住未使用、未吊销、未过期与节点名
+                                // 令牌消费与节点写入必须同成同败；条件里钉住未使用、未吊销、未过期、动作与节点名
                                 const std::vector<AsynGyanis::Database::DatabaseValue> tokenParameters{
-                                        now, registration.enrollmentTokenHash, registration.tenantId, registration.enrollmentAction, registration.name, now};
+                                        now, registration.enrollmentTokenHash, registration.tenantId, action, registration.name, now};
                                 const auto tokenUpdate = Sql::executeOrThrow(connection,
                                                                              "UPDATE biz_agent_enrollment SET used_at = ? "
                                                                              "WHERE token_hash = ? AND tenant_id = ? AND action = ? AND (node_name = '' OR node_name = ?) "
@@ -367,27 +408,14 @@ namespace EdgePulse::Device
                                                                              tokenParameters);
                                 if (tokenUpdate->affectedRowCount() == 0)
                                 {
-                                    Sql::executeOrThrowVoid(connection, "ROLLBACK");
+                                    rollbackQuietly(connection);
                                     return std::unexpected(AgentUpsertFailure::TokenRejected);
                                 }
                             }
                             if (!current.has_value())
                             {
-                                NodeRecord node;
-                                try
-                                {
-                                    node = insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
-                                                      registration.certFingerprint, registration.certNotAfter, now);
-                                } catch (const Common::DatabaseException &)
-                                {
-                                    if (attempt == 0)
-                                    {
-                                        // 通常是名称唯一键被并发注册占用；回滚重查一次即可分辨
-                                        Sql::executeOrThrowVoid(connection, "ROLLBACK");
-                                        continue;
-                                    }
-                                    throw;
-                                }
+                                NodeRecord node = insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
+                                                             registration.certFingerprint, registration.certNotAfter, now);
                                 Sql::executeOrThrowVoid(connection, "COMMIT");
                                 return std::expected<AgentUpsertOutcome, AgentUpsertFailure>{AgentUpsertOutcome{std::move(node), true, true}};
                             }
@@ -399,11 +427,22 @@ namespace EdgePulse::Device
                                                                                                 now,
                                                                                                 now,
                                                                                                 current->id};
-                            // 重新注册即恢复身份：清掉旧的吊销时间，并把到期时间换成这次出示证书的
-                            Sql::executeOrThrowVoid(connection,
-                                                    "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
-                                                    "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND deleted = 0",
-                                                    parameters);
+                            // 走到这里说明本次出示的证书已被事务内确认允许写入（同指纹、已消费令牌或 off 模式），才清掉旧的吊销时间
+                            const auto update = Sql::executeOrThrow(
+                                    connection,
+                                    "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
+                                    "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND deleted = 0",
+                                    parameters);
+                            if (update->affectedRowCount() == 0)
+                            {
+                                // 节点在读取后被软删除：不能提交并返回一条指向已消失节点的成功记录，重来一次会走新建路径
+                                rollbackQuietly(connection);
+                                if (attempt + 1 < kRegistrationAttempts)
+                                {
+                                    continue;
+                                }
+                                return std::unexpected(AgentUpsertFailure::ConcurrentRegistration);
+                            }
                             Sql::executeOrThrowVoid(connection, "COMMIT");
                             NodeRecord node      = *current;
                             node.status          = "online";
@@ -415,18 +454,28 @@ namespace EdgePulse::Device
                             node.lastSeen   = now;
                             node.version    = current->version + 1;
                             return std::expected<AgentUpsertOutcome, AgentUpsertFailure>{AgentUpsertOutcome{std::move(node), becameOnline, false}};
+                        } catch (const Common::DatabaseException &failure)
+                        {
+                            rollbackQuietly(connection);
+                            if (!isRetryableRegistrationFailure(failure.what()))
+                            {
+                                throw;
+                            }
+                            if (attempt + 1 < kRegistrationAttempts)
+                            {
+                                // 工作线程上的短暂退避，避开另一条注册刚拿到的写锁；不能在事件循环线程上睡
+                                std::this_thread::sleep_for(kRegistrationBackoff);
+                                continue;
+                            }
+                            return std::unexpected(AgentUpsertFailure::ConcurrentRegistration);
                         } catch (...)
                         {
-                            try
-                            {
-                                Sql::executeOrThrowVoid(connection, "ROLLBACK");
-                            } catch (...)
-                            {
-                            }
+                            rollbackQuietly(connection);
                             throw;
                         }
                     }
-                    return std::unexpected(AgentUpsertFailure::RebindNotAllowed);
+                    // 循环体要么返回，要么在最后一次失败后返回；这里只兜住理论上的落空
+                    return std::unexpected(AgentUpsertFailure::ConcurrentRegistration);
                 });
     }
 
@@ -505,12 +554,17 @@ namespace EdgePulse::Device
                     }
                     const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
                             "UPDATE biz_node SET status = 'online', last_seen = ?, agent_version = CASE WHEN ? = '' THEN agent_version ELSE ? END, version = version + 1, "
-                            "updated_at = ? WHERE id = ? AND deleted = 0" +
+                            "updated_at = ? WHERE id = ? AND deleted = 0 AND cert_revoked_at IS NULL" +
                                     clause,
                             parameters);
                     if (!result)
                     {
                         throw Common::DatabaseException("更新节点心跳失败：" + connection.lastError());
+                    }
+                    // 读取之后证书被吊销：这条在途心跳不能把节点重新拉回在线
+                    if (result->affectedRowCount() == 0)
+                    {
+                        return std::nullopt;
                     }
                     const std::optional<NodeRecord> updated = findByIdOnConnection(connection, nodeId, tenant);
                     if (!updated.has_value())

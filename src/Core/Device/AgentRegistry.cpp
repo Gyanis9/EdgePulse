@@ -80,22 +80,17 @@ namespace EdgePulse::Device
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "注册令牌服务未配置，无法完成 required 模式注册"});
         }
 
-        // 先看节点当前登记：同指纹重注册放行，异指纹或新节点才需要令牌
-        const std::optional<NodeRecord> current         = co_await m_repository->scoped({registration.tenantId, false})->findByName(loop, registration.name);
-        const bool                      sameCertificate = current.has_value() && current->certFingerprint == *fingerprint;
-        std::string                     action;
-        if (!sameCertificate)
+        // 先看节点当前登记做一次友好的提前拒绝；真正的 enroll/rebind 判定在仓储事务里完成，
+        // 这里读到的快照可能已经过期，不能作为放行依据
+        if (m_options.enrollmentMode == "required" && registration.enrollmentToken.empty())
         {
-            action = current.has_value() ? "rebind" : "enroll";
-        }
-        const bool required = m_options.enrollmentMode == "required" && !sameCertificate;
-        if (required && registration.enrollmentToken.empty())
-        {
-            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, "该节点需要一次性注册令牌，请向管理员申请"});
-        }
-        if (required && current.has_value() && action != "rebind")
-        {
-            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, "该节点已登记其他证书，请使用改绑令牌"});
+            const std::optional<NodeRecord> current         = co_await m_repository->scoped({registration.tenantId, false})->findByName(loop, registration.name);
+            const bool                      sameCertificate = current.has_value() && current->certRevokedAt.empty() && current->certFingerprint == *fingerprint;
+            if (!sameCertificate)
+            {
+                const std::string message = current.has_value() ? "该节点已登记其他证书，请使用改绑令牌" : "该节点需要一次性注册令牌，请向管理员申请";
+                co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, message});
+            }
         }
 
         AgentUpsert upsert;
@@ -104,17 +99,18 @@ namespace EdgePulse::Device
         upsert.agentVersion        = registration.agentVersion;
         upsert.certFingerprint     = *fingerprint;
         upsert.labelsJson          = *labels;
-        upsert.enrollmentAction    = action;
-        upsert.requireEnrollment   = required;
-        upsert.allowRebind         = !current.has_value() || action == "rebind";
+        upsert.enrollmentMode      = m_options.enrollmentMode;
         upsert.enrollmentTokenHash = registration.enrollmentToken.empty() ? std::string{} : EnrollmentService::hashToken(registration.enrollmentToken);
         upsert.certNotAfter        = *notAfter;
         const auto outcome         = co_await m_repository->upsertAgent(loop, std::move(upsert));
         if (!outcome.has_value())
         {
-            // 仓储只会在注册令牌核验失败时拒绝；按授权失败返回 403，而不是伪装成服务端错误
-            const std::string message = outcome.error() == AgentUpsertFailure::TokenRejected ? "注册令牌无效、过期、已用或与节点名不符" : "已有节点更换证书必须提供改绑令牌";
-            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, message});
+            // 仓储拒绝分两类：令牌/改绑不通过按授权失败返回 403；整段事务仍撞并发返回 409 让 Agent 稍后重试
+            if (outcome.error() == AgentUpsertFailure::ConcurrentRegistration)
+            {
+                co_return std::unexpected(AgentError{AgentError::Reason::Conflict, "并发注册冲突，请稍后重试"});
+            }
+            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, "注册令牌无效、过期、已用或与节点名不符"});
         }
         co_await notifyHeartbeat(outcome->node, outcome->becameOnline);
         co_return outcome->node;
