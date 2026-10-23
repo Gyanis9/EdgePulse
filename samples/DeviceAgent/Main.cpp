@@ -143,10 +143,10 @@ namespace
             result.error = "WebSocket hello 发送失败";
             co_return;
         }
-        const auto reply = co_await client->receive();
+        const auto reply = co_await client->receiveFor(std::chrono::seconds{10});
         if (!reply || reply->opCode != AsynGyanis::Net::WebSocketOpCode::Text)
         {
-            result.error = "WebSocket 未收到 hello 应答";
+            result.error = "WebSocket 未在时限内收到 hello 应答";
             co_return;
         }
         const auto replyJson = AsynGyanis::Base::parseConfigValue(reply->payload);
@@ -158,8 +158,18 @@ namespace
         result.websocket = true;
         std::cout << "ws-ready nodeId=" << nodeId << std::endl;
 
-        while (const auto frame = co_await client->receive())
+        for (;;)
         {
+            const auto frame = co_await client->receiveFor(std::chrono::seconds{30});
+            if (!frame.has_value())
+            {
+                // 超时只结束等待：连接还开着就报超时，已断开则按正常收口处理
+                if (client->isOpen())
+                {
+                    result.error = "等待命令超时";
+                }
+                break;
+            }
             if (frame->opCode == AsynGyanis::Net::WebSocketOpCode::Close)
             {
                 break;
