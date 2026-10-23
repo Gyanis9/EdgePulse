@@ -25,6 +25,11 @@ CHUNK_SIZE = 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 DATABASE_ARCHIVE = {"sqlite": "db/edgepulse.db", "mysql": "db/edgepulse.sql"}
 SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+WINDOWS_FORBIDDEN_CHARACTERS = '<>:"|?*'
+WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10)
+}
 
 
 class RestoreError(Exception):
@@ -34,8 +39,18 @@ class RestoreError(Exception):
 def mysql_environment() -> dict[str, str]:
     """把数据库口令放进子进程环境，避免出现在命令行与日志里。"""
     environment = os.environ.copy()
-    environment["MYSQL_PWD"] = os.environ.get("EDGEPULSE_DB_PASSWORD", "")
+    password = os.environ.get("EDGEPULSE_DB_PASSWORD")
+    if password is None:
+        environment.pop("MYSQL_PWD", None)
+    else:
+        environment["MYSQL_PWD"] = password
     return environment
+
+
+def warn_if_mysql_password_missing() -> None:
+    """口令环境变量缺失时说明将按免密方式连接，避免静默套用空口令。"""
+    if "EDGEPULSE_DB_PASSWORD" not in os.environ:
+        print("提示：未设置 EDGEPULSE_DB_PASSWORD，MySQL 将按免密方式连接。", file=sys.stderr)
 
 
 def mysql_connection_arguments(args: argparse.Namespace) -> list[str]:
@@ -140,8 +155,18 @@ def validate_archive_path(value: object) -> PurePosixPath:
     path = PurePosixPath(value)
     if str(path) != value or path.is_absolute():
         raise RestoreError(f"manifest.json 中的路径未规范化：{value}")
-    if any(part in ("", ".", "..") for part in path.parts):
-        raise RestoreError(f"manifest.json 中的路径越出归档目录：{value}")
+    for part in path.parts:
+        if part in ("", ".", ".."):
+            raise RestoreError(f"manifest.json 中的路径越出归档目录：{value}")
+        if any(
+            character in WINDOWS_FORBIDDEN_CHARACTERS or ord(character) < 32
+            for character in part
+        ):
+            raise RestoreError(f"manifest.json 中的路径含 Windows 非法字符：{value}")
+        if part.endswith((".", " ")):
+            raise RestoreError(f"manifest.json 中的路径分段以点或空格结尾：{value}")
+        if part.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+            raise RestoreError(f"manifest.json 中的路径使用 Windows 保留设备名：{value}")
     if path.parts[0] not in ("db", "firmware", "config"):
         raise RestoreError(f"manifest.json 中的路径不在允许的目录下：{value}")
     return path
@@ -238,6 +263,17 @@ def verify_entries(
             raise RestoreError(f"文件校验失败：{name} 的 SHA-256 与清单不符")
 
 
+def clamp_mode(mode: int) -> int:
+    """把归档权限收敛到 0600 或 0644，不保留执行位与组/其他写位。"""
+    return 0o600 if mode & 0o077 == 0 else 0o644
+
+
+def ensure_target_within(destination: Path, target: Path, name: str) -> None:
+    """确认落点仍在暂存目录内，拦截盘符与备选数据流写法。"""
+    if not target.resolve().is_relative_to(destination.resolve()):
+        raise RestoreError(f"归档路径越出暂存目录：{name}")
+
+
 def extract_entries(
     tar: tarfile.TarFile,
     regular: dict[str, tarfile.TarInfo],
@@ -247,6 +283,7 @@ def extract_entries(
     for name, expected in entries:
         member = regular[name]
         target = destination.joinpath(*PurePosixPath(name).parts)
+        ensure_target_within(destination, target, name)
         target.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256()
         size = 0
@@ -266,7 +303,7 @@ def extract_entries(
                 raise RestoreError(f"归档文件长度与头部记录不符：{name}")
             if digest.hexdigest() != expected:
                 raise RestoreError(f"解包时校验失败：{name} 的 SHA-256 与清单不符")
-            os.chmod(target, (member.mode & 0o777) or 0o600)
+            os.chmod(target, clamp_mode(member.mode))
         except OSError as exc:
             raise RestoreError(f"解包文件失败 {name}：{exc}") from exc
 
@@ -321,6 +358,32 @@ def inspect_targets(
     return target_version, conflicts, firmware_entries, config_entries
 
 
+def sqlite_sidecar_paths(target: Path) -> list[Path]:
+    return [target.with_name(target.name + suffix) for suffix in SQLITE_SIDECAR_SUFFIXES]
+
+
+def remove_sqlite_sidecars(target: Path) -> None:
+    """删除目标库旁的 WAL、共享内存与回滚日志。"""
+    for sidecar in sqlite_sidecar_paths(target):
+        try:
+            sidecar.unlink(missing_ok=True)
+        except OSError as exc:
+            raise RestoreError(
+                f"无法删除目标数据库的边车文件 {sidecar}：{exc}；"
+                "请先停止 EdgePulse 服务再重试"
+            ) from exc
+
+
+def ensure_sqlite_sidecars_absent(target: Path) -> None:
+    remaining = [sidecar for sidecar in sqlite_sidecar_paths(target) if sidecar.exists()]
+    if remaining:
+        raise RestoreError(
+            "恢复后仍存在数据库边车文件："
+            + "、".join(str(path) for path in remaining)
+            + "；请停止 EdgePulse 服务后重试"
+        )
+
+
 def replace_sqlite(source: Path, target: Path, force: bool) -> None:
     if target.exists():
         if not target.is_file():
@@ -336,8 +399,12 @@ def replace_sqlite(source: Path, target: Path, force: bool) -> None:
             shutil.copyfileobj(handle, output, CHUNK_SIZE)
             output.flush()
             os.fsync(output.fileno())
-        os.chmod(temporary, mode)
+        os.chmod(temporary, clamp_mode(mode))
+        # 引擎固定 journal_mode=WAL。残留的 -wal/-shm/-journal 会在下次打开时按旧日志重放，
+        # 把恢复前的页盖回刚替换的快照；删不掉说明服务仍在运行，必须直接失败。
+        remove_sqlite_sidecars(target)
         os.replace(temporary, target)
+        ensure_sqlite_sidecars_absent(target)
     except OSError as exc:
         raise RestoreError(f"替换 SQLite 数据库失败：{exc}") from exc
     finally:
@@ -408,6 +475,7 @@ def restore_config(
     force: bool,
 ) -> int:
     staged: list[tuple[Path, Path]] = []
+    replaced: list[Path] = []
     try:
         for name, _ in entries:
             relative = PurePosixPath(name).relative_to("config")
@@ -427,9 +495,16 @@ def restore_config(
                 shutil.copyfileobj(handle, output, CHUNK_SIZE)
                 output.flush()
                 os.fsync(output.fileno())
-            os.chmod(temporary, (source.stat().st_mode & 0o777) or 0o600)
+            os.chmod(temporary, clamp_mode(source.stat().st_mode))
         for temporary, destination in staged:
-            os.replace(temporary, destination)
+            try:
+                os.replace(temporary, destination)
+            except OSError as exc:
+                raise RestoreError(
+                    f"恢复配置失败：无法替换 {destination}：{exc}；"
+                    f"已替换 {len(replaced)} 个文件，请核对后重跑恢复"
+                ) from exc
+            replaced.append(destination)
     except OSError as exc:
         raise RestoreError(f"恢复配置失败：{exc}") from exc
     finally:
@@ -472,6 +547,10 @@ def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace
             parser.error("--driver mysql 需要 " + "、".join(missing))
     if args.db_port <= 0 or args.db_port > 65535:
         parser.error("--db-port 必须在 1 到 65535 之间")
+    if args.firmware_dir:
+        firmware_dir = Path(args.firmware_dir)
+        if not firmware_dir.name or firmware_dir.name in (".", ".."):
+            parser.error("--firmware-dir 不能是当前目录、上级目录或根目录，请指定专用目录")
 
 
 def restore(args: argparse.Namespace) -> int:
@@ -488,8 +567,6 @@ def restore(args: argparse.Namespace) -> int:
         target_version, conflicts, firmware_entries, config_entries = inspect_targets(
             args, manifest, entries
         )
-        if conflicts and not args.force:
-            raise RestoreError("目标非空，需要 --force 才能覆盖：" + "、".join(conflicts))
 
         version = int(manifest["migrationVersion"])
         print(
@@ -500,8 +577,12 @@ def restore(args: argparse.Namespace) -> int:
         if conflicts:
             print("将覆盖非空目标：" + "、".join(conflicts))
         if args.dry_run:
+            if conflicts and not args.force:
+                print("目标非空且未给 --force，正式恢复会拒绝覆盖。")
             print("dry-run 仅校验，未修改任何文件。")
             return 0
+        if conflicts and not args.force:
+            raise RestoreError("目标非空，需要 --force 才能覆盖：" + "、".join(conflicts))
 
         with tempfile.TemporaryDirectory(prefix="edgepulse-restore-") as directory:
             payload = Path(directory) / "payload"
@@ -543,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_arguments(parser, args)
+    if args.driver == "mysql":
+        warn_if_mysql_password_missing()
     try:
         return restore(args)
     except RestoreError as exc:

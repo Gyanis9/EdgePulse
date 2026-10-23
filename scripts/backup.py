@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -22,11 +23,21 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 FORMAT_VERSION = 1
-CHUNK_SIZE = 1024 * 1024
 DATABASE_ARCHIVE = {"sqlite": "db/edgepulse.db", "mysql": "db/edgepulse.sql"}
 SKIPPED_DIRECTORIES = {".git", "logs", "log", "__pycache__"}
 SENSITIVE_SUFFIXES = {".key", ".p12", ".pfx", ".jks", ".keystore"}
 PRIVATE_KEY_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+PRIVATE_KEY_MARKER = b"PRIVATE KEY-----"
+CONFIG_SCAN_CHUNK_SIZE = 64 * 1024
+
+
+@dataclass
+class SkippedCounts:
+    """记录备份时主动跳过的条目数量。"""
+
+    links: int = 0
+    logs: int = 0
+    sensitive: int = 0
 
 
 class BackupError(Exception):
@@ -64,8 +75,18 @@ class HashingReader:
 def mysql_environment() -> dict[str, str]:
     """把数据库口令放进子进程环境，避免出现在命令行与日志里。"""
     environment = os.environ.copy()
-    environment["MYSQL_PWD"] = os.environ.get("EDGEPULSE_DB_PASSWORD", "")
+    password = os.environ.get("EDGEPULSE_DB_PASSWORD")
+    if password is None:
+        environment.pop("MYSQL_PWD", None)
+    else:
+        environment["MYSQL_PWD"] = password
     return environment
+
+
+def warn_if_mysql_password_missing() -> None:
+    """口令环境变量缺失时说明将按免密方式连接，避免静默套用空口令。"""
+    if "EDGEPULSE_DB_PASSWORD" not in os.environ:
+        print("提示：未设置 EDGEPULSE_DB_PASSWORD，MySQL 将按免密方式连接。", file=sys.stderr)
 
 
 def mysql_connection_arguments(args: argparse.Namespace) -> list[str]:
@@ -162,6 +183,23 @@ def raise_walk_error(error: OSError) -> None:
     raise error
 
 
+def contains_private_key(path: Path) -> bool:
+    """分块扫描整个文件，证书在前时也不能把私钥漏出检测窗口。"""
+    try:
+        with path.open("rb") as handle:
+            tail = b""
+            while True:
+                chunk = handle.read(CONFIG_SCAN_CHUNK_SIZE)
+                if not chunk:
+                    return False
+                window = tail + chunk
+                if PRIVATE_KEY_MARKER in window:
+                    return True
+                tail = window[-(len(PRIVATE_KEY_MARKER) - 1):]
+    except OSError as exc:
+        raise BackupError(f"无法读取配置候选文件 {path}：{exc}") from exc
+
+
 def is_sensitive_config(path: Path) -> bool:
     name = path.name.lower()
     if name == "prod.yaml" or name == ".env" or name.endswith(".env"):
@@ -170,15 +208,16 @@ def is_sensitive_config(path: Path) -> bool:
         return True
     if name in PRIVATE_KEY_NAMES:
         return True
-    try:
-        with path.open("rb") as handle:
-            head = handle.read(256)
-    except OSError as exc:
-        raise BackupError(f"无法读取配置候选文件 {path}：{exc}") from exc
-    return b"PRIVATE KEY-----" in head
+    return contains_private_key(path)
 
 
-def collect_tree(root: Path, prefix: str, *, filter_config: bool) -> list[tuple[Path, str]]:
+def collect_tree(
+    root: Path,
+    prefix: str,
+    *,
+    filter_config: bool,
+    skipped: SkippedCounts,
+) -> list[tuple[Path, str]]:
     if not root.is_dir():
         raise BackupError(f"目录不存在或不是目录：{root}")
     entries: list[tuple[Path, str]] = []
@@ -187,18 +226,29 @@ def collect_tree(root: Path, prefix: str, *, filter_config: bool) -> list[tuple[
             root, followlinks=False, onerror=raise_walk_error
         ):
             current_path = Path(current)
-            directories[:] = sorted(
-                name
-                for name in directories
-                if name not in SKIPPED_DIRECTORIES and not (current_path / name).is_symlink()
-            )
+            kept_directories: list[str] = []
+            for name in sorted(directories):
+                if name in SKIPPED_DIRECTORIES:
+                    continue
+                if (current_path / name).is_symlink():
+                    skipped.links += 1
+                    continue
+                kept_directories.append(name)
+            directories[:] = kept_directories
             for name in sorted(files):
                 path = current_path / name
-                if name == ".git" or path.is_symlink() or not path.is_file():
+                if name == ".git":
+                    continue
+                if path.is_symlink():
+                    skipped.links += 1
+                    continue
+                if not path.is_file():
                     continue
                 if name.endswith(".log") or name.endswith(".log.gz"):
+                    skipped.logs += 1
                     continue
                 if filter_config and is_sensitive_config(path):
+                    skipped.sensitive += 1
                     continue
                 relative = path.relative_to(root).as_posix()
                 entries.append((path, f"{prefix}/{relative}"))
@@ -207,7 +257,7 @@ def collect_tree(root: Path, prefix: str, *, filter_config: bool) -> list[tuple[
     return entries
 
 
-def create_archive(args: argparse.Namespace) -> tuple[Path, int, int]:
+def create_archive(args: argparse.Namespace) -> tuple[Path, int, int, SkippedCounts]:
     output = Path(args.output)
     if output.exists():
         raise BackupError(f"归档文件已存在，拒绝覆盖：{output}")
@@ -223,9 +273,18 @@ def create_archive(args: argparse.Namespace) -> tuple[Path, int, int]:
             version = query_mysql_version(args)
             dump_mysql(args, database_file)
         entries: list[tuple[Path, str]] = [(database_file, database_arcname)]
-        entries.extend(collect_tree(Path(args.firmware_dir), "firmware", filter_config=False))
+        skipped = SkippedCounts()
+        entries.extend(
+            collect_tree(
+                Path(args.firmware_dir), "firmware", filter_config=False, skipped=skipped
+            )
+        )
         if args.config_dir:
-            entries.extend(collect_tree(Path(args.config_dir), "config", filter_config=True))
+            entries.extend(
+                collect_tree(
+                    Path(args.config_dir), "config", filter_config=True, skipped=skipped
+                )
+            )
 
         manifest_files: list[dict[str, str]] = []
         descriptor, temporary_name = tempfile.mkstemp(
@@ -272,7 +331,7 @@ def create_archive(args: argparse.Namespace) -> tuple[Path, int, int]:
         except (OSError, tarfile.TarError, ValueError) as exc:
             temporary_output.unlink(missing_ok=True)
             raise BackupError(f"写入归档失败：{exc}") from exc
-    return output, len(entries), version
+    return output, len(entries), version, skipped
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -313,8 +372,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_arguments(parser, args)
+    if args.driver == "mysql":
+        warn_if_mysql_password_missing()
     try:
-        output, file_count, version = create_archive(args)
+        output, file_count, version, skipped = create_archive(args)
     except BackupError as exc:
         print(f"备份失败：{exc}", file=sys.stderr)
         return 1
@@ -323,6 +384,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"备份完成：{output}")
     print(f"文件数：{file_count}，迁移版本：{version}，驱动：{args.driver}")
+    print(
+        f"已跳过：符号链接 {skipped.links} 个，日志 {skipped.logs} 个，"
+        f"敏感配置 {skipped.sensitive} 个"
+    )
     return 0
 
 
