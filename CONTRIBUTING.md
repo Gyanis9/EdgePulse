@@ -20,7 +20,7 @@ cmake --build --preset debug
 ctest --preset debug --output-on-failure
 ```
 
-`debug` 预设是 RelWithDebInfo 加 `/MD`，与 Release 引擎包共用 CRT。改了 `CMakeLists.txt`、依赖或公开头后重新执行 `conan install .`，不要手工改 `build/generators`。
+`debug` 预设是 RelWithDebInfo；Windows/MSVC 下强制 `/MD` 运行期库，与 Release 引擎包共用 CRT。改了 `CMakeLists.txt`、依赖或公开头后重新执行 `conan install .`，不要手工改 `build/generators`。
 
 ## 后端测试
 

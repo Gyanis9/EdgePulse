@@ -34,8 +34,8 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 - Agent 身份：Agent 只通过 9443 的 mTLS 通道通信。TLS 层要求客户端证书由配置的 CA 签发；注册时自报的 SHA-256 叶证书指纹必须与这条连接出示的叶证书一致；心跳、遥测、命令结果、固件状态与固件下载都复核同一份叶证书，防止已注册节点被其他证书冒充。证书被吊销后指纹清空、节点置离线，已建立的 Agent WebSocket 以 1008 关闭。
 - 注册令牌：`enroll` 用于新节点，`rebind` 用于已有节点换证；令牌一次性消费，数据库只存 SHA-256，明文只在签发响应出现一次。有效期限制在 300 到 2592000 秒。生产使用 `enrollment_mode=required`，新注册与换证都必须持对应令牌。
 - 固件签名：固件签名覆盖文件 SHA-256 的 32 字节原始摘要，算法为 Ed25519，传输标识 `ed25519-sha256`。服务端只从 `trusted_keys_dir` 加载 Ed25519 公钥；`require_signature=true` 时缺签名、未知 key id、摘要不符或签名格式错误的固件不能上传、部署或回滚。公钥变更后重启加载，`GET /api/firmware/policy` 可确认已加载的 key id。
-- 运维口：`/metrics`、`/debug/loops`、`/debug/connections` 与 `/debug/log-level` 需要 Bearer；`/healthz` 与 `/readyz` 只暴露进程与就绪状态。默认监听回环，跨网络抓取时才显式改绑并配合网络策略。
-- 出站 SSRF：租户填写的 Webhook 地址在创建/修改与每次投递前都要通过地址检查。默认拒绝回环、RFC1918 私网、CGNAT、组播、保留与文档示例段、IPv4/IPv6 链路本地段以及云元数据地址和主机名；`allow_private_webhooks` 只放行普通私网与回环，不放行元数据或链路本地目标。
+- 运维口：`/metrics`、`/debug/loops`、`/debug/connections` 与 `/debug/log-level` 需要 Bearer；`/healthz` 与 `/readyz` 只暴露进程与就绪状态。代码默认监听回环；生产样例与 Compose 为容器抓取绑 `0.0.0.0`，必须用主机防火墙或容器网络策略限制来源。
+- 出站 SSRF：租户填写的 Webhook 地址在创建/修改与每次投递前都要通过地址检查。默认拒绝回环、RFC1918 私网、CGNAT、组播、保留与文档示例段、IPv4/IPv6 链路本地段以及云元数据地址和主机名。开启 `allow_private_webhooks` 会跳过整个私网/保留段分类，只保留云元数据主机名与地址、链路本地元数据段（169.254.0.0/16、fe80::/10 及已知 IPv6 元数据端点）的拒绝；CGNAT、0.0.0.0/8、文档与基准测试段、组播、240/4、IPv6 ULA 等其余私网与保留地址都会放行，只应在受信的自托管网关开启，不能当作通用的 SSRF 豁免。
 - 登录加固：建号、重置与改密共用口令策略；窗口内连续失败达到阈值后锁定账号；登录入口有按 IP 的频率限制，公开 HTTP/HTTPS/h3 可启用共享令牌桶。审计日志对 `password`、`token`、`captcha` 等字段脱敏。
 
 ## 已知边界
@@ -50,7 +50,7 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 
 ## 密钥与证书管理
 
-- 不提交私钥、证书、令牌、`.env`、日志或任何明文凭据。`var/`、`config/prod.yaml`、`config/firmware-keys/` 与证书目录在 `.gitignore` 中；`var/`、`config/prod.yaml` 与 `deploy/prometheus/ops-token` 同时在 `.dockerignore` 中。
+- 不提交私钥、证书、令牌、`.env`、日志或任何明文凭据。`.gitignore` 只覆盖开发证书所在的 `var/`（含 `var/certs/`）、`config/prod.yaml`、`config/firmware-keys/` 与部署令牌；生产 `cert_dir`（如 `/etc/edgepulse/tls`）在仓库之外，不受仓库忽略规则保护，必须由主机文件权限与备份策略单独保护。`var/`、`config/prod.yaml` 与 `deploy/prometheus/ops-token` 同时在 `.dockerignore` 中。
 - 数据库、Redis、运维口、UDP 遥测、OIDC 与初始口令提示只从环境变量读取：`EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`、`EDGEPULSE_INITIAL_PASSWORD`。
 - 固件签名私钥留在签名工作站或密钥管理系统，只把公钥分发到各实例的 `trusted_keys_dir`；不要复用历史 key id 覆盖公钥，轮换时使用新文件名并在确认旧固件不再需要后移除旧公钥。
 - 服务器证书与私钥放在 `cert_dir` 指向的目录，Agent 客户端证书的信任锚是同一目录的 `ca.pem`。证书文件权限只给服务账号读取。

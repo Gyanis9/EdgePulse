@@ -30,8 +30,8 @@
 
 - 设备身份是一等公民：Agent 走 mTLS，注册与每次数据面上报都绑定叶证书指纹；一次性注册/改绑令牌负责准入，证书到期与吊销可查、可断链。
 - 运维动作形成闭环：心跳超时自动离线并生成系统告警，期望配置有版本、漂移检测、修订历史与回滚，固件在 Ed25519 验签通过后才允许下发。
-- 部署形态克制：控制面是单个 C++23 可执行体，开发档用 SQLite，生产档用 MySQL，Redis 只承担跨实例会话与实时扇出，前端是可由后端直接托管的 Vue 3 静态站点。
-- 默认值偏安全：生产样例要求注册令牌、固件签名、强口令与登录锁定；运维口默认只监听回环（容器抓取时需显式放开）；Webhook 出站默认拒绝私网与云元数据地址。
+- 部署形态克制：控制面是单个 C++23 可执行体，开发档用 SQLite，生产档用 MySQL，Redis 承担跨实例会话、验证码挑战与限流计数、登录失败计数、租户状态缓存与实时扇出，前端是可由后端直接托管的 Vue 3 静态站点。
+- 默认值偏安全：生产样例要求注册令牌、固件签名、强口令与登录锁定；运维口代码默认只监听回环，生产样例与 Compose 为容器抓取显式绑 0.0.0.0；Webhook 出站默认拒绝私网与云元数据地址。
 
 ## 特性
 
@@ -63,7 +63,7 @@ flowchart LR
     Core --> Database[("SQLite / MySQL")]
     Core --> Cache[("Redis（可选）")]
     Core --> Storage[("固件与信任键目录")]
-    Core --> Ops["9100 运维口<br/>回环 + Bearer"]
+    Core --> Ops["9100 运维口<br/>默认回环 + Bearer"]
 ```
 
 依赖方向固定为 `Base ← Core ← Plugins ← App ← Main`：`Base` 不碰业务，`Core` 承载领域服务与 HTTP 交付原语，`Plugins` 只做参数解析、权限校验与响应组装，`App` 负责监听器与工作线程装配，`Main` 只剩进程入口。引擎 `3rd/AsynGyanis` 只读，以 Conan 包消费。
@@ -89,9 +89,10 @@ conan create 3rd/AsynGyanis/packaging/conan --build=missing \
 conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
 cmake --preset debug
 cmake --build --preset debug
+ctest --preset debug --output-on-failure
 ```
 
-`debug` 预设使用 RelWithDebInfo 并强制 `/MD` 运行期库，与 Release 引擎包保持同一 CRT；混用 `/MDd` 会在链接期报 LNK2038。
+`debug` 预设使用 RelWithDebInfo；Windows/MSVC 下强制 `/MD` 运行期库，与 Release 引擎包保持同一 CRT，混用 `/MDd` 会在链接期报 LNK2038。
 
 ### 启动开发实例
 
@@ -143,7 +144,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `EDGEPULSE_DB_PASSWORD` | MySQL 口令 |
 | `EDGEPULSE_REDIS_PASSWORD` | Redis 口令 |
 | `EDGEPULSE_OPS_BEARER_TOKEN` | 运维口 Bearer |
-| `EDGEPULSE_AGENT_FINGERPRINT` | 可选的 Agent 证书固定指纹白名单 |
+| `EDGEPULSE_AGENT_FINGERPRINT` | 可选的单个 Agent 证书固定指纹；为空时只校验证书链 |
 | `EDGEPULSE_INITIAL_PASSWORD` | 用户表单的初始口令提示，不落库、不写日志 |
 | `EDGEPULSE_UDP_TELEMETRY_SECRET` | UDP 遥测 HMAC 密钥；启用时至少 16 字节 |
 | `EDGEPULSE_OIDC_CLIENT_SECRET` | OIDC 客户端密钥；公共客户端可留空 |
@@ -163,7 +164,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `edgepulse.security.login_failure_window_seconds` | `900` | `900` | 账号失败计数窗口 |
 | `edgepulse.security.login_max_failures` | `5` | `5` | 窗口内达到该次数后锁定 |
 | `edgepulse.security.login_lock_seconds` | `900` | `900` | 锁定时长 |
-| `edgepulse.security.allow_private_webhooks` | `true` | `false` | 只放行普通 RFC1918 私网与回环；云元数据与链路本地地址始终拒绝 |
+| `edgepulse.security.allow_private_webhooks` | `true` | `false` | 打开后跳过整个私网/保留段分类，仅云元数据主机名/地址与链路本地元数据段（169.254/16、fe80::/10）仍拒绝；CGNAT、文档/基准测试段、组播、240/4、IPv6 ULA 等也会放行，只用于受信的自托管网关 |
 | `server.rate_limit.requests_per_second` | `0.0` | `0.0`（建议按容量设置） | 全局限流，整数或小数均可，`0` 关闭 |
 | `server.rate_limit.burst_capacity` | `1.0` | `1.0`（建议覆盖并发突发） | 令牌桶容量，必须不小于 `1` |
 
@@ -184,10 +185,10 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 | 8443/TCP | HTTPS + h2 | 控制台与 API；`Alt-Svc` 通告 h3 |
 | 8443/UDP | HTTP/3 | 与公开 API 相同的路由 |
 | 9443/TCP | HTTPS + mTLS | Agent 注册、心跳、遥测、命令、固件下载与 Agent WebSocket |
-| 9100/TCP | HTTP/1.1 | 运维口，默认仅回环；`/metrics` 与调试端点需 Bearer |
+| 9100/TCP | HTTP/1.1 | 运维口；代码默认 `127.0.0.1`，生产样例与 Compose 绑 `0.0.0.0`；`/metrics` 与调试端点需 Bearer |
 | 9555/UDP | UDP | HMAC 签名的遥测数据报，默认关闭 |
 
-`/healthz` 与 `/readyz` 匿名可读；`/metrics`、`/debug/*` 必须带 `EDGEPULSE_OPS_BEARER_TOKEN`。容器或 Prometheus 需要跨网络抓取时，才把 `ops_address` 改为 `0.0.0.0`，并配合网络策略限制来源。
+`/healthz` 与 `/readyz` 匿名可读；`/metrics`、`/debug/*` 必须带 `EDGEPULSE_OPS_BEARER_TOKEN`。`ops_address` 的代码默认是 `127.0.0.1`；`config/prod.yaml.example` 与 Compose 为容器抓取显式设为 `0.0.0.0`，此时必须用主机防火墙或容器网络策略限制来源，只在本机抓取时改回回环并核对监听地址。
 
 ## API 与实时通道
 
@@ -218,8 +219,8 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 - Agent 身份：9443 在 TLS 层校验客户端证书；注册自报的 SHA-256 指纹必须等于本条连接出示的叶证书；心跳、遥测、命令与固件状态都按叶证书绑定节点。吊销会清空指纹、置离线并以 1008 关闭已建立的 Agent WebSocket。
 - 注册令牌：`enroll` 与 `rebind` 一次性使用，数据库只存 SHA-256，明文只在签发响应出现一次；有效期限制在 300 到 2592000 秒。
 - 固件真实性：Ed25519 对文件 SHA-256 的 32 字节摘要签名，算法标识 `ed25519-sha256`；`require_signature=true` 时未签名固件不能上传、部署或回滚。
-- 运维口：默认只监听回环；`/metrics` 与 `/debug/*` 需要 Bearer，`/healthz` 与 `/readyz` 匿名。
-- 出站 SSRF：Webhook 默认拒绝回环、私网、链路本地与云元数据地址，每次投递前复检；`allow_private_webhooks` 只放行普通私网与回环。
+- 运维口：代码默认只监听回环；生产样例与 Compose 绑 `0.0.0.0`，须由防火墙或网络策略限制来源。`/metrics` 与 `/debug/*` 需要 Bearer，`/healthz` 与 `/readyz` 匿名。
+- 出站 SSRF：Webhook 默认拒绝回环、私网、链路本地与云元数据地址，每次投递前复检；开启 `allow_private_webhooks` 会跳过整个私网/保留段分类，只保留云元数据主机名/地址与链路本地元数据段的拒绝，CGNAT、文档/基准测试段、组播、`240/4`、IPv6 ULA 等也会放行，只应在受信的自托管网关开启。
 - 登录加固：口令策略、按账号失败锁定、按 IP 登录限频与全局令牌桶限流；审计日志对 `password`、`token`、`captcha` 等字段脱敏。
 
 完整报告渠道、轮换步骤与已知边界见 [SECURITY.md](SECURITY.md)。
@@ -259,7 +260,7 @@ python scripts/check-docker-stack.py --build
 - Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌后 `docker compose up -d`。样例含 MySQL 8、Redis 7 与 Prometheus。
 - systemd：`deploy/systemd/edgepulse.service` 是单实例模板，二进制、`web/`、`migrations/` 与配置分目录放置，秘密走 `EnvironmentFile`。
 - 静态站点：`bash scripts/build-web.sh`，由后端直接托管。
-- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话与实时扇出）、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流、运维口回环、`allow_private_webhooks=false`、可用备份。
+- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、实时扇出）、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、可用备份。
 
 备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。完整步骤见 [docs/部署.md](docs/部署.md)。
 
@@ -286,7 +287,7 @@ docs/          架构、API、部署、验收与覆盖率
 
 ## Roadmap
 
-已明确延后、暂不纳入默认运行形态的能力与理由见 [docs/ROADMAP.md](docs/ROADMAP.md)，包括生产 `edgepulse-agent` 守护进程、API v1/OpenAPI/幂等键、OTLP tracing、HA 选主、MFA、通用事件订阅、OTA 自动灰度、CSV 导入与 API Token。
+已明确延后、暂不纳入默认运行形态的能力与理由见 [docs/ROADMAP.md](docs/ROADMAP.md)，包括生产 `edgepulse-agent` 守护进程、API v1/OpenAPI/幂等键、OTLP tracing、HA 选主、MFA、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入与 API Token。
 
 ## 贡献
 

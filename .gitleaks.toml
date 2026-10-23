@@ -1,0 +1,10 @@
+# 保留 gitleaks 内置规则，只豁免备份恢复用例里拼出的假私钥 PEM。
+# 该 PEM 只用于验证备份会过滤私钥，不是可用密钥；豁免范围限定到单个测试文件。
+[extend]
+useDefault = true
+
+[allowlist]
+description = "备份恢复测试的假私钥 PEM fixture，非真实密钥"
+paths = [
+  '''(^|/)scripts/backup_restore_test[.]py$''',
+]
