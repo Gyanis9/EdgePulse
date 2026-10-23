@@ -40,3 +40,8 @@
 - 登录失败计数与租户开通共用事务，避免失败记录丢失或半开通租户。
 - 节点配置并发写入按版本收口，Agent 上报的失败说明正确落库。
 - 注册事务在并发下重试并保持一次性令牌语义，吊销证书会关闭该节点已建立的 Agent WebSocket。
+
+### Migration
+
+- 新增 `V15__agent_identity.sql`（Agent 证书到期/吊销列与一次性注册令牌表）、`V16__node_config.sql`（设备影子、配置修订与漂移判定）、`V17__firmware_signature.sql`（固件签名字节、信任键标识与算法）、`V18__login_hardening.sql`（登录失败计数与锁定时刻）。
+- 已应用的迁移不可修改；升级时按版本升序应用 V15–V18，迁移总数变为 18，`TestMigrations` 按 18 个版本校验。
