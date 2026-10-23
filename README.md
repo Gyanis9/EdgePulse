@@ -1,52 +1,84 @@
 # EdgePulse
 
-EdgePulse 是面向边缘节点与设备的运维平台：控制面是 Vue 3 管理后台，数据面是运行在边缘节点上的 `edgepulse-agent`。后端是 C++23 + AsynGyanis 异步引擎，前后端通过统一的 `/api` 契约分离。
+> 边缘节点与设备运维平台：C++23 控制面 + Vue 3 管理后台 + mTLS Agent 数据面。
 
-当前状态：P0–P4 已落地并通过验收（2026-10-21）。
-
-- 认证与权限：验证码、PBKDF2 登录、OIDC 授权码登录、不透明会话、动态菜单、权限码、数据范围、操作审计。
-- 多租户：租户编码登录、平台管理员跨租户、租户管理员本租户隔离；用户、节点、分组、遥测、告警、固件、命令、日志、角色、部门、岗位与字典按租户隔离，实时 WebSocket/SSE 按租户分区；菜单与参数配置保持平台级共享。
-- 系统管理：用户、角色、菜单、部门、岗位、字典、参数、租户、通知渠道、操作日志、登录日志、CSV 导出。
-- 设备域：节点、节点分组、Agent mTLS 注册/心跳、遥测、告警规则与告警生命周期、Webhook/邮件告警通知、固件上传/下载/分批灰度下发与回滚、命令批量与计划执行。
-- 实时：浏览器 WebSocket（节点、告警、命令主题）、告警 SSE、Redis 跨实例事件扇出、Agent 命令长连接与轮询兜底、HMAC 签名的 UDP 遥测入口。
-- 边缘入口：可选的 HTTP 反向代理前缀，把受控请求转发到上游服务。
-- 运行时：SQLite 本地档、MySQL 生产档、Redis 可选会话/验证码后端、配置热重载、数据库健康探针。
-- 可观测：Prometheus 指标、`/readyz`、业务运维总览、OTLP 指标出口开关。
-- 交付：生产静态站点回退、Docker Compose、systemd、Prometheus 抓取配置。
+[![CI](https://github.com/Gyanis9/EdgePulse/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Gyanis9/EdgePulse/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![C++](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
+[![Vue](https://img.shields.io/badge/Vue-3-42b883.svg)](https://vuejs.org/)
 
 ## 目录
 
-```text
-src/
-├─ Base/       技术基座：响应、分页、CSV、数据库、密码、随机数、时间、JSON
-├─ Core/       领域与交付原语：认证、系统、设备、遥测、告警、固件、命令、缓存、HTTP、插件契约
-├─ Plugins/    功能插件：认证、系统、监控、工作台、设备、遥测、告警、固件、命令、运维
-├─ App/        配置、生命周期、监听器与工作线程装配
-└─ Main/       进程入口
-frontend/      Vue 3 + Vite 管理后台
-3rd/AsynGyanis/  引擎 git submodule，只读
-migrations/    SQL 迁移 V1–V14
-config/        非敏感配置样例
-deploy/        Docker、systemd、Prometheus
-scripts/       证书、开发运行、验收
-docs/          架构、API、部署、验收与覆盖率
+- [为什么是 EdgePulse](#为什么是-edgepulse)
+- [特性](#特性)
+- [架构](#架构)
+- [快速开始](#快速开始)
+- [配置](#配置)
+- [运行与端口](#运行与端口)
+- [API 与实时通道](#api-与实时通道)
+- [安全模型](#安全模型)
+- [测试与验收](#测试与验收)
+- [部署](#部署)
+- [项目结构](#项目结构)
+- [Roadmap](#roadmap)
+- [贡献](#贡献)
+- [许可证](#许可证)
+
+## 为什么是 EdgePulse
+
+边缘节点分散、网络不稳定、证书与固件容易失去追踪。EdgePulse 把这些环节放进同一套控制面：
+
+- 设备身份是一等公民：Agent 走 mTLS，注册与每次数据面上报都绑定叶证书指纹；一次性注册/改绑令牌负责准入，证书到期与吊销可查、可断链。
+- 运维动作形成闭环：心跳超时自动离线并生成系统告警，期望配置有版本、漂移检测、修订历史与回滚，固件在 Ed25519 验签通过后才允许下发。
+- 部署形态克制：控制面是单个 C++23 可执行体，开发档用 SQLite，生产档用 MySQL，Redis 只承担跨实例会话与实时扇出，前端是可由后端直接托管的 Vue 3 静态站点。
+- 默认值偏安全：生产样例要求注册令牌、固件签名、强口令与登录锁定；运维口默认只监听回环（容器抓取时需显式放开）；Webhook 出站默认拒绝私网与云元数据地址。
+
+## 特性
+
+| 领域 | 能力 |
+|---|---|
+| 认证与权限 | 图形验证码、PBKDF2 登录、OIDC 授权码 + PKCE、不透明 Bearer 会话、动态菜单、权限码、数据范围、操作与登录审计、口令策略、账号锁定、全局限流 |
+| 多租户 | 租户编码登录、平台管理员跨租户、租户级 RBAC/部门/岗位/字典、节点与遥测/告警/固件/命令按租户隔离、停用租户阻断新登录、实时主题按租户分区 |
+| 设备生命周期 | Agent mTLS 注册、叶证书指纹绑定、一次性 `enroll`/`rebind` 令牌、证书到期与吊销、心跳超时离线、系统离线告警、节点详情与分组 |
+| 遥测与告警 | HTTP 与 UDP 遥测（HMAC-SHA256 防重放）、告警规则与确认/恢复生命周期、Webhook（HMAC 签名）与 SMTP 通知、投递记录与失败原因 |
+| 固件与命令 | 流式上传、ETag 与单段 Range 下载、Ed25519 签名与验签门禁、分批灰度与回滚、命令批量/计划/取消、Agent WebSocket 推送与轮询兜底 |
+| 实时 | 浏览器 WebSocket 的节点/告警/命令主题、告警 SSE、Redis 跨实例事件扇出、Agent 命令长连接 |
+| 可观测 | Prometheus HTTP 与业务指标、`/readyz`、运维总览、OTLP 指标出口、操作/登录统计与热力图 |
+| 交付与运维 | 设备影子配置（期望/实际/漂移/修订/回滚）、备份与恢复工具、Docker Compose、systemd、生产静态站点、Windows/Linux/前端/密钥扫描 CI |
+
+## 架构
+
+```mermaid
+flowchart LR
+    Browser["浏览器<br/>Vue 3 管理后台"]
+    Agent["edgepulse-agent<br/>边缘节点"]
+    Plugins["Plugins<br/>控制器、路由与权限校验"]
+    Core["Core<br/>认证、设备、遥测、告警、固件、命令"]
+    Base["Base<br/>数据库、密码、JSON、响应、时间"]
+
+    Browser -->|"8080 HTTP<br/>8443 HTTPS + h2 / h3"| Plugins
+    Plugins --> Core
+    Agent -->|"9443 mTLS<br/>叶证书指纹绑定"| Core
+    Core --> Base
+    Core --> Database[("SQLite / MySQL")]
+    Core --> Cache[("Redis（可选）")]
+    Core --> Storage[("固件与信任键目录")]
+    Core --> Ops["9100 运维口<br/>回环 + Bearer"]
 ```
 
-依赖方向固定为 `Base ← Core ← Plugins ← App ← Main`：基础件不碰业务，Core 承载领域服务与 HTTP 交付原语，Plugins 只放控制器与路由，App 负责装配，Main 只剩入口。
+依赖方向固定为 `Base ← Core ← Plugins ← App ← Main`：`Base` 不碰业务，`Core` 承载领域服务与 HTTP 交付原语，`Plugins` 只做参数解析、权限校验与响应组装，`App` 负责监听器与工作线程装配，`Main` 只剩进程入口。引擎 `3rd/AsynGyanis` 只读，以 Conan 包消费。
 
-## 引擎版本
+更细的模块、存储表与协议说明见 [docs/架构.md](docs/架构.md)。
 
-引擎使用重构后的 AsynGyanis 1.0.0 线。该线源码已重组为 Platform/Base/Core/Net/Database 五库，子模块钉在提交 `1830e6eb`（上游 `v1.0.0` 标签指向该提交）；本地 Conan 包版本为 `asyngyanis/1.0.0`，构建时打开 MySQL 驱动。
+## 快速开始
 
-引擎只作为 Conan 包消费：不修改、不复制进 `src/`、不 `add_subdirectory`。
+### 前置条件
 
-## 前置条件
-
-- Windows + MSVC ≥ 19.40 或 Linux + GCC ≥ 13 / Clang ≥ 17
+- Windows + MSVC ≥ 19.40，或 Linux + GCC ≥ 13 / Clang ≥ 17
 - CMake ≥ 3.25、Ninja、Conan 2、Python 3、Node.js ≥ 20
-- Git（含 submodule）、OpenSSL（生成开发证书）
+- Git（含 submodule）、OpenSSL（开发证书与固件签名）
 
-## 构建
+### 构建后端
 
 ```bash
 git submodule update --init --recursive
@@ -57,31 +89,20 @@ conan create 3rd/AsynGyanis/packaging/conan --build=missing \
 conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
 cmake --preset debug
 cmake --build --preset debug
-ctest --preset debug --output-on-failure
 ```
 
-`debug` 预设使用 RelWithDebInfo，并强制 `/MD` 运行期库：引擎包只有 Release 档，混用 `/MDd` 会在链接期报 LNK2038。
+`debug` 预设使用 RelWithDebInfo 并强制 `/MD` 运行期库，与 Release 引擎包保持同一 CRT；混用 `/MDd` 会在链接期报 LNK2038。
 
-## 运行
+### 启动开发实例
 
 ```bash
-bash scripts/dev-certs.sh          # CA、服务器、Agent 与对照证书（var/certs，未跟踪）
-bash scripts/run-dev.sh            # 生成/读取运维令牌并启动 edgepulse-server
+bash scripts/dev-certs.sh     # CA、服务器、Agent 与对照证书，写入未跟踪的 var/certs
+bash scripts/run-dev.sh       # 生成/读取运维令牌并前台启动 edgepulse-server
 ```
 
-默认监听：
+打开 `http://127.0.0.1:8080`。开发种子账号为 `admin` / `admin123`，只存在于开发迁移，部署后必须改密。
 
-| 端口 | 用途 |
-|---|---|
-| 8080/TCP | 开发档 HTTP + API + WebSocket；生产档可托管 SPA |
-| 8443/TCP | HTTPS + h2 控制台，Alt-Svc 通告 h3 |
-| 8443/UDP | HTTP/3 |
-| 9443/TCP | Agent mTLS（要求客户端证书） |
-| 9100/TCP | 运维口，仅回环；`/metrics`、`/debug/*` 需 Bearer，`/readyz` 匿名 |
-
-开发种子账号：`admin` / `admin123`（只在开发迁移里，部署后必须改密）。
-
-前端开发：
+### 前端开发
 
 ```bash
 cd frontend
@@ -89,72 +110,191 @@ npm ci
 npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ```
 
-生产静态站点：`bash scripts/build-web.sh` 会把 `frontend/dist` 刷新到未跟踪的 `web/`；后端启动时若发现 `web/index.html`，自动提供静态文件与 SPA 深链回退。
-
-## 验收
+生产静态站点：
 
 ```bash
-# 后端：104 条用例（真机存储与 Redis 扇出用例按环境变量门控）
+bash scripts/build-web.sh
+```
+
+脚本把 `frontend/dist` 刷新到未跟踪的 `web/`。后端发现 `web/index.html` 后会自动托管静态文件，并为非 API 深链回退到 SPA 入口。
+
+### 备份与恢复
+
+SQLite 档可在服务运行中取一致快照；恢复前必须停止服务：
+
+```bash
+python scripts/backup.py --driver sqlite --db-path var/edgepulse.db \
+  --firmware-dir var/firmware --config-dir config \
+  --output backups/edgepulse.tar.gz
+
+python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
+  --db-path var/edgepulse.db --firmware-dir var/firmware --config-dir config \
+  --force --dry-run
+```
+
+去掉 `--dry-run` 才会真正写入。归档内的 `manifest.json` 会逐文件核对 SHA-256；MySQL 档与更多参数见 [docs/部署.md](docs/部署.md#11-备份与恢复)。
+
+## 配置
+
+`config/dev.yaml` 只放非敏感项；生产从 `config/prod.yaml.example` 复制一份未跟踪的 `config/prod.yaml`。口令与密钥只从环境变量读取：
+
+| 变量 | 用途 |
+|---|---|
+| `EDGEPULSE_DB_PASSWORD` | MySQL 口令 |
+| `EDGEPULSE_REDIS_PASSWORD` | Redis 口令 |
+| `EDGEPULSE_OPS_BEARER_TOKEN` | 运维口 Bearer |
+| `EDGEPULSE_AGENT_FINGERPRINT` | 可选的 Agent 证书固定指纹白名单 |
+| `EDGEPULSE_INITIAL_PASSWORD` | 用户表单的初始口令提示，不落库、不写日志 |
+| `EDGEPULSE_UDP_TELEMETRY_SECRET` | UDP 遥测 HMAC 密钥；启用时至少 16 字节 |
+| `EDGEPULSE_OIDC_CLIENT_SECRET` | OIDC 客户端密钥；公共客户端可留空 |
+
+关键配置项（默认值按开发档 / 生产样例列出）：
+
+| 配置键 | 开发档 | 生产样例 | 说明 |
+|---|---|---|---|
+| `edgepulse.agent.enrollment_mode` | `off` | `required` | `required` 时新节点必须持 `enroll` 令牌，换证书必须持 `rebind` 令牌 |
+| `edgepulse.agent.heartbeat_interval_seconds` | `10` | `30` | Agent 心跳周期 |
+| `edgepulse.agent.heartbeat_timeout_seconds` | `30` | `90` | 超过该时长未心跳即转离线 |
+| `edgepulse.agent.offline_sweep_seconds` | `5` | `30` | 离线扫描周期，必须小于心跳超时 |
+| `edgepulse.firmware.require_signature` | `false` | `true` | 开启后未签名固件不能上传、部署或回滚 |
+| `edgepulse.firmware.trusted_keys_dir` | `config/firmware-keys` | `/etc/edgepulse/firmware-keys` | 只放公钥；启用签名时不能为空，生产样例使用绝对路径 |
+| `edgepulse.security.password_min_length` | `8` | `10` | 建号、重置与改密共用 |
+| `edgepulse.security.password_require_complexity` | `false` | `true` | 要求同时包含大写、小写、数字与符号 |
+| `edgepulse.security.login_failure_window_seconds` | `900` | `900` | 账号失败计数窗口 |
+| `edgepulse.security.login_max_failures` | `5` | `5` | 窗口内达到该次数后锁定 |
+| `edgepulse.security.login_lock_seconds` | `900` | `900` | 锁定时长 |
+| `edgepulse.security.allow_private_webhooks` | `true` | `false` | 只放行普通 RFC1918 私网与回环；云元数据与链路本地地址始终拒绝 |
+| `server.rate_limit.requests_per_second` | `0.0` | `0.0`（建议按容量设置） | 全局限流，整数或小数均可，`0` 关闭 |
+| `server.rate_limit.burst_capacity` | `1.0` | `1.0`（建议覆盖并发突发） | 令牌桶容量，必须不小于 `1` |
+
+固件签名密钥只把公钥放进信任键目录，私钥留在签名工作站：
+
+```bash
+bash scripts/firmware-signing-keygen.sh prod-2026
+bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
+```
+
+上传时带 `X-Firmware-Signature` 与 `X-Firmware-Key-Id`。启用门禁前，先重新上传历史未签名固件的签名版本。热重载只覆盖会话与验证码相关项；监听地址、端口与 `server.*` 限流参数需要重启生效。
+
+## 运行与端口
+
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| 8080/TCP | HTTP/1.1 | 开发档控制台、API、WebSocket、SSE；生产档可托管 SPA |
+| 8443/TCP | HTTPS + h2 | 控制台与 API；`Alt-Svc` 通告 h3 |
+| 8443/UDP | HTTP/3 | 与公开 API 相同的路由 |
+| 9443/TCP | HTTPS + mTLS | Agent 注册、心跳、遥测、命令、固件下载与 Agent WebSocket |
+| 9100/TCP | HTTP/1.1 | 运维口，默认仅回环；`/metrics` 与调试端点需 Bearer |
+| 9555/UDP | UDP | HMAC 签名的遥测数据报，默认关闭 |
+
+`/healthz` 与 `/readyz` 匿名可读；`/metrics`、`/debug/*` 必须带 `EDGEPULSE_OPS_BEARER_TOKEN`。容器或 Prometheus 需要跨网络抓取时，才把 `ops_address` 改为 `0.0.0.0`，并配合网络策略限制来源。
+
+## API 与实时通道
+
+- 基础路径 `/api`；除匿名端点外使用 `Authorization: Bearer <token>`。
+- 响应包络 `{ code, message, data, traceId }`；分页 `{ pageNum, pageSize, total, rows }`，`pageSize` 上限 100。
+- 写接口先过 `requireSession(..., 权限码)`，数据查询带租户边界与数据范围。
+
+| 分组 | 代表端点 | 说明 |
+|---|---|---|
+| 认证 | `/api/auth/login`、`/api/auth/me`、`/api/auth/oidc/*` | 验证码、会话、OIDC 一次性 code 换会话 |
+| 设备 | `/api/nodes`、`/api/nodes/:id`、`/api/node-groups` | 节点 CRUD 与分组；更新带 `version` 乐观锁 |
+| 注册令牌 | `/api/enrollment-tokens` | 列表不回显明文；签发响应只出现一次 `token` |
+| 证书 | `/api/nodes/:id/certificate/revoke` | 吊销后清空指纹、置离线并关闭该节点 Agent WebSocket |
+| 设备影子 | `/api/nodes/:id/config`、`/revisions`、`/rollback` | 期望配置、漂移、不可变修订与回滚 |
+| 遥测告警 | `/api/telemetry/*`、`/api/alarms`、`/api/alarm-rules` | 最新值、序列、告警确认与恢复 |
+| 固件命令 | `/api/firmware/*`、`/api/commands/*` | 上传、验签策略、灰度、回滚、批量与计划命令 |
+| Agent | `/api/agent/*` | 只挂 9443 mTLS；WebSocket 首条 `hello` 复核叶证书 |
+| 实时 | `/api/ws`、`/api/events/alarms` | 浏览器 WebSocket 与告警 SSE |
+| 运维 | `:9100/metrics`、`/readyz`、`/debug/*` | Prometheus、就绪与诊断 |
+
+完整字段与状态码见 [docs/API.md](docs/API.md)。
+
+浏览器 WebSocket 升级后 5 秒内发送 `{"type":"auth","token":"..."}`，成功后订阅 `nodes`、`alarms`、`commands` 主题。告警 SSE 用 `event: alarm` 推送，每 15 秒注释保活。
+
+## 安全模型
+
+- 浏览器会话：32 字节不透明 Bearer token，存在 Redis 或进程内存储，TTL 默认 7200 秒并滑动续期；不使用 Cookie 承载会话。
+- Agent 身份：9443 在 TLS 层校验客户端证书；注册自报的 SHA-256 指纹必须等于本条连接出示的叶证书；心跳、遥测、命令与固件状态都按叶证书绑定节点。吊销会清空指纹、置离线并以 1008 关闭已建立的 Agent WebSocket。
+- 注册令牌：`enroll` 与 `rebind` 一次性使用，数据库只存 SHA-256，明文只在签发响应出现一次；有效期限制在 300 到 2592000 秒。
+- 固件真实性：Ed25519 对文件 SHA-256 的 32 字节摘要签名，算法标识 `ed25519-sha256`；`require_signature=true` 时未签名固件不能上传、部署或回滚。
+- 运维口：默认只监听回环；`/metrics` 与 `/debug/*` 需要 Bearer，`/healthz` 与 `/readyz` 匿名。
+- 出站 SSRF：Webhook 默认拒绝回环、私网、链路本地与云元数据地址，每次投递前复检；`allow_private_webhooks` 只放行普通私网与回环。
+- 登录加固：口令策略、按账号失败锁定、按 IP 登录限频与全局令牌桶限流；审计日志对 `password`、`token`、`captcha` 等字段脱敏。
+
+完整报告渠道、轮换步骤与已知边界见 [SECURITY.md](SECURITY.md)。
+
+## 测试与验收
+
+```bash
+# 后端：单元、集成与协议用例
 ctest --preset debug --output-on-failure
 
-# 前端：23 条单测 + 类型检查/构建 + 6 条 Playwright
-cd frontend && npm run test:unit && npm run build && npm run test:e2e
+# 按名称过滤
+ctest --preset debug -R "Enrollment|NodeConfig|NodeLifecycle" --output-on-failure
 
-# 全量协议与安全验收：认证、租户隔离、系统管理、节点、遥测告警、SSE、命令、100 MiB 固件、h3、mTLS、metrics、readyz
+# 前端：API/工具单测 + 类型检查与构建
+cd frontend
+npm run test:unit
+npm run build
+
+# E2E：使用本机已安装的 Edge，不下载浏览器；先准备开发证书，Playwright 会启动后端与 Vite
+npm run test:e2e
+cd ..
+
+# 全量协议与安全验收
 python scripts/check-acceptance.py
 
-# Docker 全栈：镜像 + MySQL/Redis + Prometheus + 真实 OTel collector + 优雅停机
+# Docker 全栈：镜像、MySQL/Redis、Prometheus、OTel collector 与优雅停机
 python scripts/check-docker-stack.py --build
 ```
 
-结果与证据见 [docs/验收.md](docs/验收.md)。
+- `ExternalStores.*` 需要真实 MySQL/Redis，用 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 门控；缺变量时用例 SKIP，不伪造通过。
+- 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
+- CI 只跑后端构建/ctest、前端单测/构建与密钥扫描；Playwright 在本地用系统 Edge 运行。
+- 验收证据与逐项输出见 [docs/验收.md](docs/验收.md)。
 
-## 配置与秘密
+## 部署
 
-- `config/dev.yaml` 只放非敏感项；生产从 `config/prod.yaml.example` 复制一份未跟踪的配置。
-- 数据库/Redis 口令、运维令牌、Agent 指纹、初始口令提示只从环境变量读取：
-  `EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、
-  `EDGEPULSE_AGENT_FINGERPRINT`、`EDGEPULSE_INITIAL_PASSWORD`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`。
-- 开发脚本把运维令牌写进 `var/ops-token`，证书写进 `var/certs`，两者都在 `.gitignore` 中。
-- 仓库零明文凭据；日志不回显 Authorization、Cookie、口令与 token。
+- Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌后 `docker compose up -d`。样例含 MySQL 8、Redis 7 与 Prometheus。
+- systemd：`deploy/systemd/edgepulse.service` 是单实例模板，二进制、`web/`、`migrations/` 与配置分目录放置，秘密走 `EnvironmentFile`。
+- 静态站点：`bash scripts/build-web.sh`，由后端直接托管。
+- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话与实时扇出）、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流、运维口回环、`allow_private_webhooks=false`、可用备份。
 
-## 测试
+备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。完整步骤见 [docs/部署.md](docs/部署.md)。
 
-- 后端单元：密码、验证码、会话、CSV、KV、分页、时间。
-- 后端集成：迁移 V1–V14、认证、租户隔离、租户级角色/部门/岗位/字典、通知渠道、日志与节点的数据范围、遥测、告警、计划/批量命令、固件灰度/回滚、Redis 跨实例扇出、真机 MySQL/Redis（环境变量门控）。
-- 协议：401/403 矩阵、租户生命周期与跨租户隔离、管理端 CRUD、数据范围、遥测告警、命令往返与 Agent WebSocket 推送、固件 Range/ETag、节点分组、WebSocket 首条认证、h3、mTLS。
-- 前端：API 契约单测；Playwright 用系统 Edge（`channel: 'msedge'`），不下载浏览器。
-- `ExternalStores.*` 需要真实 MySQL/Redis：设置 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 后运行；缺变量时用例 SKIP，不伪造通过。本机已用临时容器跑绿。
-- Docker：`scripts/check-docker-stack.py` 起 MySQL 8.4、Redis 7、Prometheus 与真实 OTel collector，验证登录、自定义角色、节点、审计落库、会话跨重启、指标抓取与 SIGTERM 优雅停机。
-- UDP 遥测：`scripts/check-udp-telemetry.py` 用真实数据报验证 HMAC 签名、重放拒绝、落库与回读。
+## 项目结构
 
-## 已知边界
+```text
+src/
+├─ Base/       技术基座：响应、分页、CSV、数据库、密码、随机数、时间、JSON、安全原语
+├─ Core/       领域与交付原语：认证、系统、设备、遥测、告警、固件、命令、缓存、HTTP、插件契约
+├─ Plugins/    功能插件：认证、系统、监控、工作台、设备、遥测、告警、固件、命令、运维
+├─ App/        配置、生命周期、监听器与工作线程装配
+└─ Main/       进程入口
+frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
+3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
+migrations/    SQL 迁移 V1–V18，已应用文件不可修改
+config/        非敏感配置样例；生产配置与信任键目录不入库
+deploy/        Docker、systemd、Prometheus
+scripts/       证书、开发运行、固件签名、备份恢复与验收
+samples/       DeviceAgent、FirmwareVerifier、H3Probe 样例
+tests/         GoogleTest 单元、集成与协议用例
+docs/          架构、API、部署、验收与覆盖率
+.github/       CI 工作流、Issue 与 PR 模板
+```
 
-- 多租户：用户、节点、分组、遥测、告警、固件、命令、日志、角色、部门、岗位与字典按租户隔离；菜单与参数配置是平台级共享。租户管理员只能创建自己权限范围内的角色，不能管理租户或平台级配置。
-- 通知投递记录落库保留渠道、告警、尝试次数与失败原因，管理端可直接查看。
-- 通知渠道支持 Webhook（HMAC-SHA256 签名）与 SMTP 邮件（smtp://、smtps:// 隐式 TLS 或 starttls://）；私有 CA 可在渠道里指定 PEM 文件。短信通过 Webhook 网关接入。
-- 平台管理员可在节点创建与固件上传时选择目标租户；未指定时落在自己的租户。Agent 注册用 `tenantCode` 声明归属。
-- 停用租户会阻止新登录，并在数秒内拒绝已签发会话（租户状态缓存 5 秒，更新时主动失效）。
-- 固件灰度按批次手动推进，不做自动健康门控；回滚依赖任务里记录的上一版本。
-- 命令批次可在列表里整批取消；已取消命令不会再被 Agent 取走。
-- Redis 跨实例扇出只在启用 Redis 时生效；单实例未启用 Redis 时仍走进程内扇出。
-- 监听器目前统一绑定事件循环 0；`edgepulse.threads` 只创建额外循环，不会分担监听。多 worker 监听分发与多进程编排未作为本次交付形态。
-- mTLS 注册时自报的指纹必须与连接出示的叶证书一致；Agent WebSocket 升级后也用同一份对端身份复核节点登记值，明文链路（开发与测试）不做绑定。
-- 浏览器 WebSocket 首条认证的 5 秒预算由引擎的 `receiveFor()` 实现，不再为每条未认证连接占用计时线程。
-- OTLP 出口已用 mock collector 与真实 OTel collector 容器验证；外部生产采集端的网络与鉴权仍需部署环境复核。
-- Docker 镜像、Compose 全栈与 systemd 服务已在本机 Docker 中真机启动验证；systemd 验证使用特权容器，未覆盖真实主机的内核与 cgroup 差异。
+## Roadmap
 
-## 编码与提交
+已明确延后、暂不纳入默认运行形态的能力与理由见 [docs/ROADMAP.md](docs/ROADMAP.md)，包括生产 `edgepulse-agent` 守护进程、API v1/OpenAPI/幂等键、OTLP tracing、HA 选主、MFA、通用事件订阅、OTA 自动灰度、CSV 导入与 API Token。
 
-- C++23；类/文件 PascalCase，函数/成员 camelCase，成员变量 `m_` 前缀；中文 Doxygen 注释。
-- 代码格式以仓库根 `.clang-format`、`.clang-tidy` 为准（与引擎同一份）。
-- 提交信息遵循约定式提交，首行 ≤ 72 列，正文写动机；按模块分批提交。
-- 引擎目录只读；发现引擎缺陷时记录复现步骤，在应用层绕过。
+## 贡献
 
-## 文档
+- 先读 [CONTRIBUTING.md](CONTRIBUTING.md)：构建、测试过滤、迁移编号、提交规范与秘密卫生。
+- 参与即表示同意 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
+- 安全问题不要开公开 Issue，按 [SECURITY.md](SECURITY.md) 的私密渠道报告。
+- 引擎目录只读；发现引擎缺陷时记录最小复现，在应用层绕过，不修改 submodule。
 
-- [架构](docs/架构.md)
-- [API](docs/API.md)
-- [部署](docs/部署.md)
-- [验收](docs/验收.md)
-- [覆盖率](docs/覆盖率.md)
+## 许可证
+
+[Apache License 2.0](LICENSE)，Copyright 2026 EdgePulse contributors。

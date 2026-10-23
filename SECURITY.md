@@ -1,0 +1,65 @@
+# 安全策略
+
+EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令牌与固件签名。安全问题请按下面的私密渠道报告，不要先公开。
+
+## 支持的版本
+
+| 版本 | 支持状态 |
+|---|---|
+| 1.x | 接收安全报告，修复进入最新补丁版本 |
+| 1.0 之前 | 不再支持 |
+
+安全修复默认只进入最新发布线。部署时请记录实际运行的版本或提交号，报告里一并给出。
+
+## 报告漏洞
+
+优先使用仓库托管平台的私密安全报告功能。若代码托管在 GitHub，从仓库的 **Security → Advisories → Report a vulnerability** 提交。
+
+如果平台不提供私密入口，先在仓库开一个不含漏洞细节的 Issue，请求维护者提供私密渠道；不要在公开 Issue、讨论区、Pull Request 或聊天记录里贴 PoC、利用步骤、受影响地址、令牌、证书或日志原文。
+
+报告尽量包含：
+
+- 受影响版本、提交号与部署形态（Docker Compose、systemd、本地开发或其他）。
+- 受影响组件与前置条件（是否需要有效会话、Agent 证书、特定租户或配置）。
+- 最小复现步骤或 PoC；能稳定复现的输入比截图更有用。
+- 实际影响与攻击者能获得的能力。
+- 相关日志或抓包，先删除 `Authorization`、Cookie、会话令牌、注册令牌明文、私钥、证书口令、数据库口令与个人信息。
+- 是否已向其他人披露、是否计划公开。
+
+维护者会确认收到、评估影响并在修复可用后与报告者协调披露时间。未修复前请不要公开漏洞细节。
+
+## 安全模型
+
+- 浏览器会话：登录成功后签发 32 字节不透明 Bearer token，服务端只保存会话记录；默认 TTL 7200 秒并滑动续期。浏览器不使用 Cookie 承载会话，跨站请求不能自动携带凭据。会话存储可落在 Redis，供多实例共享。
+- Agent 身份：Agent 只通过 9443 的 mTLS 通道通信。TLS 层要求客户端证书由配置的 CA 签发；注册时自报的 SHA-256 叶证书指纹必须与这条连接出示的叶证书一致；心跳、遥测、命令结果、固件状态与固件下载都复核同一份叶证书，防止已注册节点被其他证书冒充。证书被吊销后指纹清空、节点置离线，已建立的 Agent WebSocket 以 1008 关闭。
+- 注册令牌：`enroll` 用于新节点，`rebind` 用于已有节点换证；令牌一次性消费，数据库只存 SHA-256，明文只在签发响应出现一次。有效期限制在 300 到 2592000 秒。生产使用 `enrollment_mode=required`，新注册与换证都必须持对应令牌。
+- 固件签名：固件签名覆盖文件 SHA-256 的 32 字节原始摘要，算法为 Ed25519，传输标识 `ed25519-sha256`。服务端只从 `trusted_keys_dir` 加载 Ed25519 公钥；`require_signature=true` 时缺签名、未知 key id、摘要不符或签名格式错误的固件不能上传、部署或回滚。公钥变更后重启加载，`GET /api/firmware/policy` 可确认已加载的 key id。
+- 运维口：`/metrics`、`/debug/loops`、`/debug/connections` 与 `/debug/log-level` 需要 Bearer；`/healthz` 与 `/readyz` 只暴露进程与就绪状态。默认监听回环，跨网络抓取时才显式改绑并配合网络策略。
+- 出站 SSRF：租户填写的 Webhook 地址在创建/修改与每次投递前都要通过地址检查。默认拒绝回环、RFC1918 私网、CGNAT、组播、保留与文档示例段、IPv4/IPv6 链路本地段以及云元数据地址和主机名；`allow_private_webhooks` 只放行普通私网与回环，不放行元数据或链路本地目标。
+- 登录加固：建号、重置与改密共用口令策略；窗口内连续失败达到阈值后锁定账号；登录入口有按 IP 的频率限制，公开 HTTP/HTTPS/h3 可启用共享令牌桶。审计日志对 `password`、`token`、`captcha` 等字段脱敏。
+
+## 已知边界
+
+- DNS 重绑定窗口：Webhook 地址校验与实际连接之间存在时间差，引擎客户端会再次解析域名，可能拿到与校验时不同的地址。高安全环境不能只依赖 `allow_private_webhooks`，应在主机、容器或出口网关配置出站防火墙与域名白名单。
+- 生产 Agent 仍是样例：仓库里的 `samples/DeviceAgent` 是验证协议与命令通道的探针，不是可直接部署的守护进程。它没有守护进程安装包、系统服务托管、凭据安全存储、长期断线重连与自动升级，生产接入需要自行实现或等待正式的 `edgepulse-agent`。
+- 单实例调度：离线扫描、生命周期处理与保留期清理依赖进程内定时器，没有 HA 选主或分布式租约；计划命令的到点判断在查询侧，也没有跨实例协调。多实例部署时不要假设只有一个实例在扫描，需要明确的活动实例或外部协调。
+- h3 空闲超时：HTTP/3 的空闲计时由 QUIC 传输层配置决定，当前使用引擎默认值，不跟随 `server.limits.idle_timeout_ms`。调大该配置不会延长 h3 连接。
+- 备份与恢复：恢复必须停止服务，运行中的进程会持有数据库、WAL 或固件文件句柄；SQLite 备份支持在线快照，但一致性归档仍建议放在维护窗口。证书、运维令牌与固件签名私钥不要和数据库备份放在同一份未加密介质里。
+- Agent 身份绑定只存在于 mTLS 通道：开发与测试的明文链路不做叶证书绑定，不要把 Agent 路由暴露到明文监听器。
+- 开启固件签名门禁后，历史已入库的未签名固件仍可被 Agent 下载。需要继续下发时，先重新上传带签名的同版本固件，再按新记录部署。
+
+## 密钥与证书管理
+
+- 不提交私钥、证书、令牌、`.env`、日志或任何明文凭据。`var/`、`config/prod.yaml`、`config/firmware-keys/` 与证书目录在 `.gitignore` 中；`var/`、`config/prod.yaml` 与 `deploy/prometheus/ops-token` 同时在 `.dockerignore` 中。
+- 数据库、Redis、运维口、UDP 遥测、OIDC 与初始口令提示只从环境变量读取：`EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`、`EDGEPULSE_INITIAL_PASSWORD`。
+- 固件签名私钥留在签名工作站或密钥管理系统，只把公钥分发到各实例的 `trusted_keys_dir`；不要复用历史 key id 覆盖公钥，轮换时使用新文件名并在确认旧固件不再需要后移除旧公钥。
+- 服务器证书与私钥放在 `cert_dir` 指向的目录，Agent 客户端证书的信任锚是同一目录的 `ca.pem`。证书文件权限只给服务账号读取。
+
+### 证书轮换
+
+1. 用同一 CA 或受信 CA 为 Agent 签发新证书；不要在旧证书过期后才开始。
+2. 管理员用 `POST /api/enrollment-tokens` 签发 `rebind` 令牌，`nodeName` 限定目标节点；令牌只交付给该节点。
+3. Agent 用新证书连接 9443，并在 `/api/agent/register` 带上 `enrollmentToken`；注册成功会更新指纹与 `certNotAfter`。
+4. 用 `GET /api/nodes/:id` 核对 `certFingerprint`、`certNotAfter` 与 `certRevokedAt`，确认新证书已生效。
+5. 怀疑私钥泄露时，先调用 `POST /api/nodes/:id/certificate/revoke` 清空指纹并断开该节点的 Agent 连接，再按新节点或 `rebind` 流程重新准入；不要继续使用旧证书。
+6. CA 轮换时先把旧 CA 与新 CA 一起放入 `ca.pem`（或部署支持的信任 bundle），确认新 CA 签发的证书能通过校验，再逐节点换证；全部切换完成后再移除旧 CA。若当前部署只能放单个 CA，先安排维护窗口，不要直接替换。

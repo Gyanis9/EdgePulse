@@ -2,6 +2,7 @@
   "name": "edgepulse-web",
   "version": "1.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "EdgePulse 边缘节点与设备运维平台前端（Vue 3 + Vite + TS）",
   "type": "module",
   "scripts": {
