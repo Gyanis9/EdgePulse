@@ -39,6 +39,7 @@ namespace EdgePulse::System
 
 namespace EdgePulse::Device
 {
+    class NodeLifecycleService;
     class NodeService;
 
     /**
@@ -66,7 +67,8 @@ namespace EdgePulse::Device
      * @param accessResolver 身份解析回调，由 App 用认证服务注入
      * @param dataScopes 数据范围解析；空表示不限制
      * @param tenants 租户仓储，平台管理员按 tenantId 指定节点归属
+     * @param lifecycle 节点生命周期服务，删除节点后用它销案系统离线告警；可空
      */
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes = nullptr, System::TenantRepository *tenants = nullptr);
+                        Auth::DataScopeService *dataScopes = nullptr, System::TenantRepository *tenants = nullptr, NodeLifecycleService *lifecycle = nullptr);
 } // namespace EdgePulse::Device

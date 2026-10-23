@@ -408,7 +408,7 @@ namespace EdgePulse::Device
                 [cutoff = std::move(cutoff), limit, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::vector<NodeRecord>
                 {
                     std::vector<AsynGyanis::Database::DatabaseValue> parameters{cutoff};
-                    std::string                                      filter = " WHERE status = 'online' AND last_seen IS NOT NULL AND last_seen < ?";
+                    std::string                                      filter = " WHERE status = 'online' AND deleted = 0 AND last_seen IS NOT NULL AND last_seen < ?";
                     if (!tenant.allTenants)
                     {
                         filter += " AND tenant_id = ?";
@@ -430,7 +430,7 @@ namespace EdgePulse::Device
                         const std::array<AsynGyanis::Database::DatabaseValue, 2> updateParameters{Common::nowDateTimeUtc(), id};
                         const auto update = Sql::executeOrThrow(connection,
                                                                 "UPDATE biz_node SET status = 'offline', version = version + 1, updated_at = ? "
-                                                                "WHERE id = ? AND status = 'online'",
+                                                                "WHERE id = ? AND status = 'online' AND deleted = 0",
                                                                 updateParameters);
                         if (update->affectedRowCount() == 0)
                         {
@@ -442,6 +442,37 @@ namespace EdgePulse::Device
                         }
                     }
                     return changed;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::vector<NodeRecord>> NodeRepository::listOfflineWithoutSystemAlarm(AsynGyanis::Core::EventLoop &loop, const std::size_t limit)
+    {
+        co_return co_await m_database->withConnection<std::vector<NodeRecord>>(
+                loop,
+                [limit, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::vector<NodeRecord>
+                {
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters;
+                    std::string                                      filter = " WHERE status = 'offline' AND deleted = 0 AND last_seen IS NOT NULL";
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    // LIMIT 占位符在筛选条件之后，参数必须按语句里的出现顺序追加
+                    parameters.emplace_back(static_cast<std::int64_t>(limit));
+                    const auto rows = Sql::executeOrThrow(
+                            connection,
+                            std::string{"SELECT "} + kNodeColumns + " FROM biz_node" + filter +
+                                    " AND NOT EXISTS (SELECT 1 FROM biz_alarm a WHERE a.node_id = biz_node.id AND a.rule_id = 0 AND a.metric = 'node.online' AND a.status "
+                                    "<> 'resolved')"
+                                    " ORDER BY last_seen LIMIT ?",
+                            parameters);
+                    std::vector<NodeRecord> nodes;
+                    while (rows->next())
+                    {
+                        nodes.push_back(readNode(*rows));
+                    }
+                    return nodes;
                 });
     }
 

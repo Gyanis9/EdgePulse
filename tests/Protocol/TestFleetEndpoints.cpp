@@ -9,6 +9,7 @@
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/NodeGroupRepository.h"
+#include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Firmware/FirmwareRepository.h"
@@ -211,6 +212,8 @@ protected:
         m_telemetry        = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
         m_alarmRepo        = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
         m_alarmService     = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
+        m_lifecycle        = std::make_unique<EdgePulse::Device::NodeLifecycleService>(
+                *m_nodes, *m_alarmService, [](const EdgePulse::Device::NodeRecord &) -> AsynGyanis::Core::Task<> { co_return; }, 90);
         m_commands         = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
         m_channels         = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
         m_firmware         = std::make_shared<EdgePulse::Firmware::FirmwareRepository>(m_context->database);
@@ -238,7 +241,7 @@ protected:
                         co_return EdgePulse::Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                                                    session->departmentId, session->roles,    session->permissions};
                     };
-                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get());
+                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), m_lifecycle.get());
                     EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants, 30);
                     EdgePulse::Device::NodeGroupDependencies groups;
                     groups.auth   = m_context->auth.get();
@@ -289,6 +292,7 @@ protected:
         m_server.reset();
         m_firmware.reset();
         m_commands.reset();
+        m_lifecycle.reset();
         m_alarmService.reset();
         m_alarmRepo.reset();
         m_telemetry.reset();
@@ -358,6 +362,7 @@ protected:
     std::shared_ptr<EdgePulse::Telemetry::TelemetryRepository> m_telemetry;
     std::shared_ptr<EdgePulse::Alarm::AlarmRepository>         m_alarmRepo;
     std::shared_ptr<EdgePulse::Alarm::AlarmService>            m_alarmService;
+    std::unique_ptr<EdgePulse::Device::NodeLifecycleService>   m_lifecycle;
     std::shared_ptr<EdgePulse::Command::CommandRepository>     m_commands;
     std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>  m_channels;
     std::shared_ptr<EdgePulse::Firmware::FirmwareRepository>   m_firmware;
@@ -437,12 +442,34 @@ TEST_F(FleetEndpointsTest, AgentRequestsRequireCertificateBinding)
     const std::string heartbeatBody = R"({"nodeId":)" + std::to_string(node.id) + R"(,"agentVersion":"1.0.0"})";
     EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", heartbeatBody).status);
     EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(std::string(64, 'b'))).status);
-    EXPECT_EQ(200, m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(fingerprint)).status);
+    const auto heartbeat = m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, heartbeat.status) << heartbeat.body;
+    const auto heartbeatJson = heartbeat.json();
+    ASSERT_TRUE(heartbeatJson.has_value());
+    // 心跳响应要带回服务端下发的节奏，Agent 不需要自己猜间隔
+    EXPECT_EQ(30, (*heartbeatJson)["data"]["heartbeatIntervalSeconds"].get<std::int64_t>());
 
     // 未登记指纹的节点不接受任何证书，即使证书格式合法
     const auto        unbound     = runner.run(m_nodes->create(runner.loop(), "agent-unbound", "{}"));
     const std::string unboundBody = R"({"nodeId":)" + std::to_string(unbound.id) + R"(,"agentVersion":"1.0.0"})";
     EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", unboundBody, "application/json", agentHeaders(std::string(64, 'f'))).status);
+}
+
+// 钉住：删除节点时同步销案系统离线告警，删除后不留永远未恢复的告警
+TEST_F(FleetEndpointsTest, DeletingNodeResolvesSystemOfflineAlarm)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "alarm-delete-node");
+    const auto         node   = m_runner.run(m_nodes->findById(m_runner.loop(), nodeId));
+    ASSERT_TRUE(node.has_value());
+    ASSERT_TRUE(m_runner.run(m_alarmService->reportNodeOffline(m_runner.loop(), *node, 90)).has_value());
+    ASSERT_EQ(1, m_runner.run(m_alarmRepo->openCount(m_runner.loop())));
+
+    const auto removed = m_server->send("DELETE", "/api/nodes/" + std::to_string(nodeId), "", "", bearer(token));
+    ASSERT_EQ(200, removed.status) << removed.body;
+
+    EXPECT_EQ(0, m_runner.run(m_alarmRepo->openCount(m_runner.loop())));
+    EXPECT_FALSE(m_runner.run(m_alarmRepo->findOpen(m_runner.loop(), 0, nodeId)).has_value());
 }
 
 // 钉住：Agent 走 WebSocket 时 hello 注册成功，命令由长连接推送、结果回写为 succeeded

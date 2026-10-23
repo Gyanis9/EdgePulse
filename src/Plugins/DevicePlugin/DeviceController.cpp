@@ -5,6 +5,7 @@
 #include "Base/Api/Pagination.h"
 #include "Base/Api/QueryParameters.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
+#include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Auth/DataScopeService.h"
 #include "Core/System/TenantRepository.h"
@@ -154,7 +155,7 @@ namespace EdgePulse::Device
     } // namespace
 
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants)
+                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants, NodeLifecycleService *lifecycle)
     {
         router.get("/api/nodes",
                    [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -303,7 +304,8 @@ namespace EdgePulse::Device
                    });
 
         router.del("/api/nodes/:id",
-                   [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodeService, accessResolver, dataScopes, lifecycle](AsynGyanis::Net::HttpRequest  &request,
+                                                                                AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
                        const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
@@ -329,6 +331,11 @@ namespace EdgePulse::Device
                        {
                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                            co_return;
+                       }
+                       // 删除后的节点不会再有心跳来销案，必须在这里收口它的系统离线告警
+                       if (lifecycle != nullptr)
+                       {
+                           co_await lifecycle->onNodeRemoved(loop, *nodeId);
                        }
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;

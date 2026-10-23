@@ -18,7 +18,6 @@ namespace EdgePulse::Device
         // 非正标识不可能是合法节点：按客户端错误拒绝，避免把 -1 之类的输入当成仓储里的“查不到”
         if (nodeId <= 0)
         {
-            Metrics::BusinessMetrics::instance().incrementIdentityRejections();
             co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::InvalidRequest, 400, "nodeId 必须是正整数，请检查请求参数"});
         }
 
@@ -26,7 +25,6 @@ namespace EdgePulse::Device
         const std::optional<NodeRecord> node = co_await nodes.scoped(System::TenantScope{0, true})->findById(loop, nodeId);
         if (!node.has_value())
         {
-            Metrics::BusinessMetrics::instance().incrementIdentityRejections();
             co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::NotFound, 404, "节点不存在或已删除，请先完成注册"});
         }
 

@@ -16,6 +16,7 @@
 #include <Core/EventLoop/EventLoop.h>
 
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -103,7 +104,14 @@ namespace EdgePulse::Web
                                        const auto beat = co_await allNodes->heartbeat(loop, nodeId, stringOf(*hello, "agentVersion"));
                                        if (beat.has_value() && beat->becameOnline && lifecycle != nullptr)
                                        {
-                                           co_await lifecycle->onHeartbeat(loop, beat->node, true);
+                                           try
+                                           {
+                                               co_await lifecycle->onHeartbeat(loop, beat->node, true);
+                                           } catch (const std::exception &failure)
+                                           {
+                                               // 状态已落库；发布或销案失败只记日志，不能让 hello 失败
+                                               LOG_ERROR_FMT("节点在线状态处理失败：node={} reason={}", nodeId, failure.what());
+                                           }
                                        }
                                        channels.registerNode(nodeId, &peer);
                                        static_cast<void>(co_await peer.sendText(R"({"type":"hello","ok":true})"));

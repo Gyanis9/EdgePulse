@@ -216,6 +216,14 @@ namespace EdgePulse::Device
         AsynGyanis::Core::Task<std::vector<NodeRecord>> markStaleOffline(AsynGyanis::Core::EventLoop &loop, std::string cutoff, std::size_t limit);
 
         /**
+         * @brief 查找已离线但缺少系统离线告警的节点
+         * @param loop 恢复协程用的事件循环
+         * @param limit 本次最多返回多少个节点
+         * @return 需要补告警的节点；按仓储自身的租户视图查询
+         */
+        AsynGyanis::Core::Task<std::vector<NodeRecord>> listOfflineWithoutSystemAlarm(AsynGyanis::Core::EventLoop &loop, std::size_t limit);
+
+        /**
          * @brief 按状态统计未删除节点
          * @param loop 恢复协程用的事件循环
          * @return 在线与离线节点数

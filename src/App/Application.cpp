@@ -769,7 +769,7 @@ namespace EdgePulse::App
             co_return Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                             session->departmentId, session->roles,    session->permissions};
         };
-        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get());
+        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get());
         m_browserWebSocket->registerRoute(
                 router,
                 [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<std::optional<Web::BrowserSubscriptionScope>>
