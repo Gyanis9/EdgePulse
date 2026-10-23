@@ -23,6 +23,7 @@ add_executable(edgepulse-unit-tests
         Unit/TestOidcJwt.cpp
         Unit/TestMigrationSqlSplitter.cpp
         Unit/TestNodeRepositoryRetry.cpp
+        Unit/TestOutboundUrlGuard.cpp
         Unit/TestPagination.cpp
         Unit/TestPasswordHash.cpp
         Unit/TestSessionStore.cpp
@@ -46,6 +47,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestNodeConfig.cpp
         Integration/TestNodeLifecycle.cpp
         Integration/TestNotificationChannels.cpp
+        Integration/TestOutboundUrlGuard.cpp
         Integration/TestRealtimeBus.cpp
         Integration/TestFleetServices.cpp
         Integration/TestSystemServices.cpp

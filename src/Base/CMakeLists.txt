@@ -10,7 +10,8 @@ add_library(edgepulse-base STATIC
         Security/Hmac.cpp
         Security/PasswordHash.cpp
         Security/RandomBytes.cpp
-        Security/RandomToken.cpp)
+        Security/RandomToken.cpp
+        Security/OutboundUrlGuard.cpp)
 add_library(EdgePulse::Base ALIAS edgepulse-base)
 
 target_include_directories(edgepulse-base PUBLIC ${PROJECT_SOURCE_DIR}/src)
@@ -18,5 +19,6 @@ target_link_libraries(edgepulse-base
         PUBLIC AsynGyanis::Database
                AsynGyanis::Core
                AsynGyanis::Base
-               OpenSSL::Crypto)
+               OpenSSL::Crypto
+        PRIVATE AsynGyanis::Net)
 edgepulse_enable_warnings(edgepulse-base)

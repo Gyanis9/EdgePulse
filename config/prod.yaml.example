@@ -46,6 +46,7 @@ edgepulse:
     ttl_seconds: 7200
   security:
     allowed_origins: https://console.example.com
+    allow_private_webhooks: false
   agent:
     fingerprint: ""
     enrollment_mode: "required"

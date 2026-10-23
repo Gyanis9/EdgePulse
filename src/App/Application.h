@@ -54,7 +54,8 @@ namespace EdgePulse::Auth
 namespace EdgePulse::Common
 {
     class Database;
-}
+    class OutboundUrlGuard;
+} // namespace EdgePulse::Common
 
 namespace EdgePulse::Cache
 {
@@ -249,6 +250,7 @@ namespace EdgePulse::App
         std::shared_ptr<Alarm::AlarmRepository>                   m_alarmRepository;        ///< 告警
         std::shared_ptr<Alarm::AlarmService>                      m_alarmService;           ///< 告警评估
         std::shared_ptr<Notification::NotificationRepository>     m_notificationRepository; ///< 通知渠道
+        std::shared_ptr<Common::OutboundUrlGuard>                 m_outboundUrlGuard;       ///< Webhook 出站地址校验
         std::shared_ptr<Notification::NotificationService>        m_notificationService;    ///< 通知投递
         std::shared_ptr<Notification::NotificationDispatcher>     m_notificationDispatcher; ///< 通知队列
         std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;     ///< 固件

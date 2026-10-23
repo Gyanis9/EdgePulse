@@ -1,4 +1,5 @@
 #include "Base/Config/ConfigValue.h"
+#include "Base/Security/OutboundUrlGuard.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Auth/DataScopeService.h"
 #include "Core/Http/AuditMiddleware.h"
@@ -50,7 +51,10 @@ protected:
         m_dataScopes    = std::make_shared<EdgePulse::Auth::DataScopeService>(m_context->database);
         m_tenants       = std::make_shared<EdgePulse::System::TenantRepository>(m_context->database);
         m_notifications = std::make_shared<EdgePulse::Notification::NotificationRepository>(m_context->database);
-        m_server        = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
+        // 注入解析器把示例域名固定到公网地址，渠道创建用例不必依赖本机 DNS
+        m_guard  = std::make_shared<EdgePulse::Common::OutboundUrlGuard>(EdgePulse::Common::OutboundUrlGuardOptions{},
+                                                                         [](std::string_view) { return std::vector<std::string>{"93.184.216.34"}; });
+        m_server = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
                     EdgePulse::Web::applySecurityHeaders(router);
@@ -74,6 +78,7 @@ protected:
                     notificationDependencies.auth     = m_context->auth.get();
                     notificationDependencies.channels = m_notifications.get();
                     notificationDependencies.tenants  = m_tenants.get();
+                    notificationDependencies.guard    = m_guard;
                     EdgePulse::Notification::registerNotificationRoutes(router, loop, notificationDependencies);
                     EdgePulse::Monitor::MonitorDependencies monitorDependencies;
                     monitorDependencies.auth       = m_context->auth.get();
@@ -160,6 +165,7 @@ protected:
     std::shared_ptr<EdgePulse::Auth::DataScopeService>               m_dataScopes;
     std::shared_ptr<EdgePulse::System::TenantRepository>             m_tenants;
     std::shared_ptr<EdgePulse::Notification::NotificationRepository> m_notifications;
+    std::shared_ptr<EdgePulse::Common::OutboundUrlGuard>             m_guard;
     std::unique_ptr<EdgePulse::TestSupport::ServerHarness>           m_server;
 };
 
@@ -405,7 +411,7 @@ TEST_F(SystemEndpointsTest, NotificationChannelCrudMasksSecret)
     EXPECT_EQ("warning", row["minLevel"].get<std::string>());
 
     const auto injected = m_server->post("/api/system/notifications",
-                                         R"({"name":"换行注入","type":"email","endpoint":"smtp://127.0.0.1:25","recipients":"ops@example.com
+                                         R"({"name":"换行注入","type":"email","endpoint":"smtp://127.0.0.1:25","recipients":"ops@example.com
 Bcc:evil@example.com","sender":"edgepulse@example.com","minLevel":"info","enabled":true})",
                                          "application/json", bearer(token));
     EXPECT_EQ(400, injected.status) << injected.body;
@@ -420,6 +426,31 @@ Bcc:evil@example.com","sender":"edgepulse@example.com","minLevel":"info","enable
     const auto empty = m_server->get("/api/system/notifications?pageNum=1&pageSize=10", bearer(token));
     ASSERT_EQ(200, empty.status);
     EXPECT_EQ(0, (*empty.json())["data"]["total"].get<std::int64_t>());
+}
+
+// 钉住：渠道创建拦截云元数据与私网地址，错误文案说明命中的地址类型
+TEST_F(SystemEndpointsTest, NotificationChannelRejectsUnsafeWebhookTargets)
+{
+    const std::string token    = login("admin", "admin123");
+    const auto        metadata = m_server->post("/api/system/notifications",
+                                                R"({"name":"元数据探测","type":"webhook","endpoint":"http://169.254.169.254/latest/meta-data","minLevel":"info","enabled":true})",
+                                                "application/json", bearer(token));
+    ASSERT_EQ(400, metadata.status) << metadata.body;
+    const auto metadataJson = metadata.json();
+    ASSERT_TRUE(metadataJson.has_value()) << metadata.body;
+    EXPECT_NE(std::string::npos, (*metadataJson)["message"].get<std::string>().find("元数据"));
+
+    const auto privateTarget =
+            m_server->post("/api/system/notifications", R"({"name":"内网探测","type":"webhook","endpoint":"http://127.0.0.1/hook","minLevel":"info","enabled":true})",
+                           "application/json", bearer(token));
+    ASSERT_EQ(400, privateTarget.status) << privateTarget.body;
+    const auto privateJson = privateTarget.json();
+    ASSERT_TRUE(privateJson.has_value()) << privateTarget.body;
+    EXPECT_NE(std::string::npos, (*privateJson)["message"].get<std::string>().find("私网或保留地址"));
+
+    const auto list = m_server->get("/api/system/notifications?pageNum=1&pageSize=10", bearer(token));
+    ASSERT_EQ(200, list.status);
+    EXPECT_EQ(0, (*list.json())["data"]["total"].get<std::int64_t>());
 }
 
 // 钉住：租户可自建角色、部门、岗位与字典；跨租户不可见，且不能授予自己没有的菜单权限

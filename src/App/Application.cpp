@@ -57,6 +57,7 @@
 #include "Core/Ops/OpsRepository.h"
 #include "Core/Http/SseBroadcaster.h"
 #include "Core/Http/AlarmEventStream.h"
+#include "Base/Security/OutboundUrlGuard.h"
 #include "Core/Http/AgentWebSocket.h"
 #include "Plugins/DevicePlugin/NodeGroupController.h"
 #include "Plugins/TelemetryPlugin/TelemetryController.h"
@@ -216,7 +217,8 @@ namespace EdgePulse::App
             m_nodeService            = std::make_shared<Device::NodeService>(m_nodeRepository);
             m_alarmRepository        = std::make_shared<Alarm::AlarmRepository>(m_database);
             m_notificationRepository = std::make_shared<Notification::NotificationRepository>(m_database);
-            m_notificationService    = std::make_shared<Notification::NotificationService>(m_notificationRepository);
+            m_outboundUrlGuard       = std::make_shared<Common::OutboundUrlGuard>(Common::OutboundUrlGuardOptions{.allowPrivateNetworks = m_configuration.allowPrivateWebhooks});
+            m_notificationService    = std::make_shared<Notification::NotificationService>(m_notificationRepository, m_outboundUrlGuard);
             m_notificationDispatcher = std::make_shared<Notification::NotificationDispatcher>(loop, m_notificationService);
             m_alarmService           = std::make_shared<Alarm::AlarmService>(
                     m_alarmRepository,
@@ -737,6 +739,7 @@ namespace EdgePulse::App
         notificationDependencies.auth     = m_authService.get();
         notificationDependencies.channels = m_notificationRepository.get();
         notificationDependencies.tenants  = m_tenantRepository.get();
+        notificationDependencies.guard    = m_outboundUrlGuard;
         Notification::registerNotificationRoutes(router, loop, notificationDependencies);
         Monitor::MonitorDependencies monitorDependencies;
         monitorDependencies.auth       = m_authService.get();

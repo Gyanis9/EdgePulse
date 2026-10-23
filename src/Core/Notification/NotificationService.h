@@ -23,6 +23,10 @@ namespace EdgePulse::Alarm
 {
     struct AlarmRecord;
 }
+namespace EdgePulse::Common
+{
+    class OutboundUrlGuard;
+}
 
 namespace EdgePulse::Notification
 {
@@ -46,8 +50,9 @@ namespace EdgePulse::Notification
         /**
          * @brief 构造
          * @param repository 通知渠道仓储
+         * @param guard 出站地址安全校验器；投递 Webhook 前用它拒绝私网与元数据地址
          */
-        explicit NotificationService(std::shared_ptr<NotificationRepository> repository);
+        explicit NotificationService(std::shared_ptr<NotificationRepository> repository, std::shared_ptr<Common::OutboundUrlGuard> guard);
 
         /**
          * @brief 按告警租户投递到所有启用渠道
@@ -73,6 +78,7 @@ namespace EdgePulse::Notification
          */
         AsynGyanis::Core::Task<> recordDelivery(AsynGyanis::Core::EventLoop &loop, const ChannelRecord &channel, const Alarm::AlarmRecord &alarm, const DeliveryOutcome &outcome);
 
-        std::shared_ptr<NotificationRepository> m_repository; ///< 渠道仓储
+        std::shared_ptr<NotificationRepository>   m_repository; ///< 渠道仓储
+        std::shared_ptr<Common::OutboundUrlGuard> m_guard;      ///< Webhook 出站地址校验器
     };
 } // namespace EdgePulse::Notification

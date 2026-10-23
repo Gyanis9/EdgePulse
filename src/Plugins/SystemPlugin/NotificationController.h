@@ -11,6 +11,8 @@
 
 #include <Core/Coroutine/Task.h>
 
+#include <memory>
+
 namespace AsynGyanis::Core
 {
     class EventLoop;
@@ -31,6 +33,10 @@ namespace EdgePulse::Notification
 {
     class NotificationRepository;
 }
+namespace EdgePulse::Common
+{
+    class OutboundUrlGuard;
+}
 
 namespace EdgePulse::Notification
 {
@@ -39,9 +45,10 @@ namespace EdgePulse::Notification
      */
     struct NotificationDependencies
     {
-        Auth::AuthService        *auth{nullptr};     ///< 认证
-        NotificationRepository   *channels{nullptr}; ///< 渠道仓储
-        System::TenantRepository *tenants{nullptr};  ///< 租户，用于平台管理员指定归属
+        Auth::AuthService                        *auth{nullptr};     ///< 认证
+        NotificationRepository                   *channels{nullptr}; ///< 渠道仓储
+        System::TenantRepository                 *tenants{nullptr};  ///< 租户，用于平台管理员指定归属
+        std::shared_ptr<Common::OutboundUrlGuard> guard;             ///< Webhook 出站地址安全校验器
     };
 
     /**

@@ -1,5 +1,6 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/Hmac.h"
+#include "Base/Security/OutboundUrlGuard.h"
 #include "Core/Notification/NotificationRepository.h"
 #include "Core/Notification/NotificationService.h"
 #include "Core/Telemetry/TelemetryModels.h"
@@ -27,6 +28,13 @@ namespace
         std::promise<std::string> signature;
         std::atomic<int>          count{0};
     };
+
+    [[nodiscard]] std::shared_ptr<EdgePulse::Common::OutboundUrlGuard> permissiveGuard()
+    {
+        // 本文件用 127.0.0.1 承接投递，只有地址段放行即可；JSON 与签名路径不受影响
+        return std::make_shared<EdgePulse::Common::OutboundUrlGuard>(EdgePulse::Common::OutboundUrlGuardOptions{.allowPrivateNetworks = true},
+                                                                     EdgePulse::Common::HostAddressResolver{});
+    }
 
     [[nodiscard]] EdgePulse::Alarm::AlarmRecord sampleAlarm(const std::int64_t tenantId)
     {
@@ -77,7 +85,7 @@ TEST(NotificationChannels, WebhookReceivesSignedAlarm)
     const std::int64_t channelId = runner.run(repository->create(runner.loop(), channel));
     ASSERT_GT(channelId, 0);
 
-    EdgePulse::Notification::NotificationService service(repository);
+    EdgePulse::Notification::NotificationService service(repository, permissiveGuard());
     runner.run(service.dispatch(runner.loop(), sampleAlarm(1)));
 
     auto bodyFuture = probe->body.get_future();
@@ -111,7 +119,7 @@ TEST(NotificationChannels, DeliveryRecordKeepsOnlyWebhookHost)
     const std::int64_t channelId                         = runner.run(repository.create(runner.loop(), channel));
     ASSERT_GT(channelId, 0);
 
-    EdgePulse::Notification::NotificationService service(std::make_shared<EdgePulse::Notification::NotificationRepository>(context.database));
+    EdgePulse::Notification::NotificationService service(std::make_shared<EdgePulse::Notification::NotificationRepository>(context.database), permissiveGuard());
     runner.run(service.dispatch(runner.loop(), sampleAlarm(1)));
 
     const auto deliveries = runner.run(repository.scoped({1, false})->listDeliveries(runner.loop(), "", channelId, {1, 10}));
@@ -119,6 +127,32 @@ TEST(NotificationChannels, DeliveryRecordKeepsOnlyWebhookHost)
     EXPECT_EQ("webhook://" + host, deliveries.rows.front().target);
     EXPECT_EQ("failed", deliveries.rows.front().status);
     EXPECT_EQ(std::string::npos, deliveries.rows.front().error.find("topsecret"));
+}
+
+// 钉住：投递前复检地址，元数据目标不发请求就记一条失败投递
+TEST(NotificationChannels, DeliveryRejectsUnsafeWebhookWithoutSending)
+{
+    EdgePulse::TestSupport::AuthTestContext         context;
+    EdgePulse::TestSupport::EventLoopRunner         runner;
+    EdgePulse::Notification::NotificationRepository repository(context.database);
+    EdgePulse::Notification::ChannelRecord          channel;
+    channel.name                 = "元数据探测";
+    channel.type                 = "webhook";
+    channel.endpoint             = "http://169.254.169.254/latest/meta-data";
+    channel.enabled              = true;
+    const std::int64_t channelId = runner.run(repository.create(runner.loop(), channel));
+    ASSERT_GT(channelId, 0);
+
+    auto guard = std::make_shared<EdgePulse::Common::OutboundUrlGuard>(EdgePulse::Common::OutboundUrlGuardOptions{}, EdgePulse::Common::HostAddressResolver{});
+    EdgePulse::Notification::NotificationService service(std::make_shared<EdgePulse::Notification::NotificationRepository>(context.database), guard);
+    runner.run(service.dispatch(runner.loop(), sampleAlarm(1)));
+
+    const auto deliveries = runner.run(repository.scoped({1, false})->listDeliveries(runner.loop(), "", channelId, {1, 10}));
+    ASSERT_EQ(1, deliveries.total);
+    EXPECT_EQ("failed", deliveries.rows.front().status);
+    EXPECT_EQ(0, deliveries.rows.front().attempts);
+    EXPECT_NE(std::string::npos, deliveries.rows.front().error.find("元数据"));
+    EXPECT_EQ("webhook://169.254.169.254", deliveries.rows.front().target);
 }
 
 // 钉住：投递记录保留期只删窗口外的行，非正数天数不删任何数据

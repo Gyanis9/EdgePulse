@@ -6,6 +6,7 @@
 #include "Base/Api/QueryParameters.h"
 #include "Base/Api/RequestParsing.h"
 #include "Base/Json/JsonFields.h"
+#include "Base/Security/OutboundUrlGuard.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
@@ -170,6 +171,16 @@ namespace EdgePulse::Notification
                             fail(response, Common::kCodeBadRequest, error, traceId);
                             co_return;
                         }
+                        // 地址校验要查 DNS，只能放在协程里做；同步解析器只做格式与长度检查
+                        if (deps->guard != nullptr && record->type == "webhook")
+                        {
+                            const auto allowed = co_await deps->guard->validate(loop, record->endpoint);
+                            if (!allowed.has_value())
+                            {
+                                fail(response, Common::kCodeBadRequest, allowed.error(), traceId);
+                                co_return;
+                            }
+                        }
                         std::int64_t targetTenant = session->tenantId;
                         if (session->platformAdmin && body->contains("tenantId"))
                         {
@@ -249,6 +260,15 @@ namespace EdgePulse::Notification
                        {
                            fail(response, Common::kCodeBadRequest, error, traceId);
                            co_return;
+                       }
+                       if (deps->guard != nullptr && record->type == "webhook")
+                       {
+                           const auto allowed = co_await deps->guard->validate(loop, record->endpoint);
+                           if (!allowed.has_value())
+                           {
+                               fail(response, Common::kCodeBadRequest, allowed.error(), traceId);
+                               co_return;
+                           }
                        }
                        if (!co_await scoped->update(loop, *id, std::move(*record)))
                        {

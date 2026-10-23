@@ -172,6 +172,7 @@ namespace EdgePulse::App
         configuration.sessionTtlSeconds        = static_cast<int>(configurationManager.getInt("edgepulse.session.ttl_seconds", configuration.sessionTtlSeconds));
         configuration.exposeCaptchaCode        = configurationManager.getBool("edgepulse.captcha.expose_code", configuration.exposeCaptchaCode);
         configuration.allowedOrigins           = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
+        configuration.allowPrivateWebhooks     = configurationManager.getBool("edgepulse.security.allow_private_webhooks", configuration.allowPrivateWebhooks);
 
         if (const auto password = Common::environmentValue("EDGEPULSE_DB_PASSWORD"); password.has_value())
         {

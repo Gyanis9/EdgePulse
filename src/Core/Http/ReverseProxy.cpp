@@ -74,9 +74,15 @@ namespace EdgePulse::Web
         {
             throw std::invalid_argument("反向代理 prefix 必须以 / 开头，且不能是 / 或 /api");
         }
-        if (!configuration.upstream.starts_with("http://") && !configuration.upstream.starts_with("https://"))
+        // 上游是运维配置而不是租户输入：只校验协议与 userinfo，不套用 Webhook 的私网拦截，
+        // 否则部署在回环或内网的设备 API 会被一并挡住
+        try
         {
-            throw std::invalid_argument("反向代理 upstream 必须是 http(s) 地址");
+            const AsynGyanis::Net::ParsedUrl upstream = AsynGyanis::Net::parseUrl(configuration.upstream);
+            static_cast<void>(upstream);
+        } catch (const std::exception &failure)
+        {
+            throw std::invalid_argument(std::string{"反向代理 upstream 必须是合法的 http(s) 地址："} + failure.what());
         }
         if (configuration.requireSession && auth == nullptr)
         {

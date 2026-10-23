@@ -4,6 +4,8 @@
 #include "Base/Log/LogMacros.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/Hmac.h"
+#include "Base/Security/OutboundUrlGuard.h"
+#include "Core/Metrics/BusinessMetrics.h"
 #include "Core/Notification/SmtpMailer.h"
 #include "Core/Telemetry/TelemetryModels.h"
 #include "Net/Http/Client/HttpClient.h"
@@ -87,7 +89,8 @@ namespace EdgePulse::Notification
         }
     } // namespace
 
-    NotificationService::NotificationService(std::shared_ptr<NotificationRepository> repository) : m_repository(std::move(repository))
+    NotificationService::NotificationService(std::shared_ptr<NotificationRepository> repository, std::shared_ptr<Common::OutboundUrlGuard> guard) :
+        m_repository(std::move(repository)), m_guard(std::move(guard))
     {
     }
 
@@ -115,6 +118,18 @@ namespace EdgePulse::Notification
             DeliveryOutcome outcome;
             if (channel.type == "webhook")
             {
+                if (m_guard != nullptr)
+                {
+                    // 每次投递前复检：渠道可以在创建后改地址，历史数据也可能绕过了入口校验
+                    const auto allowed = co_await m_guard->validate(loop, channel.endpoint);
+                    if (!allowed.has_value())
+                    {
+                        Metrics::BusinessMetrics::instance().incrementWebhookSsrfRejections();
+                        LOG_WARN_FMT("告警 Webhook 地址被安全策略拒绝：channel={} tenant={} node={} error={}", channel.name, alarm.tenantId, alarm.nodeId, allowed.error());
+                        co_await recordDelivery(loop, channel, alarm, DeliveryOutcome{false, 0, allowed.error()});
+                        continue;
+                    }
+                }
                 outcome = co_await sendWebhook(loop, channel, alarm, alarmPayload(alarm));
             } else if (channel.type == "email")
             {
