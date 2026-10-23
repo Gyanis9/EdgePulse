@@ -694,7 +694,9 @@ def check_webhook_ssrf(token: str) -> None:
         return
     for row in (listing.get("data") or {}).get("rows", []):
         if row.get("name") == channel_name and row.get("id") is not None:
-            request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{row['id']}", token=token)
+            delete_status, _, _ = request_json("DELETE", HTTP_BASE + f"/api/system/notifications/{row['id']}", token=token)
+            if delete_status != 200:
+                print(f"WARN 删除验收 Webhook 渠道 {row['id']} 失败：HTTP {delete_status}，请手工清理")
 
 
 def check_signed_firmware(token: str, node_id: int, signing: FirmwareSigning | None, unavailable_detail: str) -> None:

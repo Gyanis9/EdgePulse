@@ -12,7 +12,7 @@ namespace
     }
 } // namespace
 
-// 钉住：私网、回环、链路本地、云元数据与 IPv4-mapped IPv6 全部判为不可出站
+// 钉住：私网、回环、链路本地、云元数据，以及内嵌私网或保留 IPv4 的 IPv4-mapped IPv6 判为不可出站
 TEST(OutboundUrlGuard, ClassifiesReservedAddresses)
 {
     EXPECT_TRUE(isBlocked("0.0.0.0"));
