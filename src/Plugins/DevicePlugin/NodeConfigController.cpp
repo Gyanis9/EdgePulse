@@ -5,7 +5,9 @@
 #include "Base/Api/Pagination.h"
 #include "Base/Api/QueryParameters.h"
 #include "Base/Api/RequestParsing.h"
+#include "Base/Exception/EdgePulseException.h"
 #include "Base/Json/JsonFields.h"
+#include "Base/Log/LogMacros.h"
 #include "Core/Auth/DataScopeService.h"
 #include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/NodeConfigRepository.h"
@@ -39,16 +41,23 @@ namespace EdgePulse::Device
         /**
          * @brief 把存储的配置正文还原成响应里的 content
          * @param text 规范化 JSON 文本
-         * @return 解析成功且为对象时返回对象；否则返回空对象
+         * @param field 正文所属字段，供日志定位
+         * @return 解析成功且为对象时返回对象；空文本返回空对象
+         * @throws Common::EdgePulseException 非空正文不是合法 JSON 对象；存储内容只由服务端写入，解析失败说明数据被外部改写，不能当成空配置交给界面
          */
-        [[nodiscard]] ConfigValue contentOf(const std::string &text)
+        [[nodiscard]] ConfigValue contentOf(const std::string &text, const std::string_view field)
         {
+            if (text.empty())
+            {
+                return ConfigValue::object();
+            }
             const std::optional<ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(text);
             if (parsed.has_value() && parsed->is_object())
             {
                 return *parsed;
             }
-            return ConfigValue::object();
+            LOG_ERROR_FMT("存储的配置正文不是合法 JSON 对象：field={}", field);
+            throw Common::EdgePulseException("存储的配置正文不是合法 JSON 对象：" + std::string{field});
         }
 
         /**
@@ -84,14 +93,15 @@ namespace EdgePulse::Device
         [[nodiscard]] ConfigValue configJson(const NodeConfigRecord &record)
         {
             return ConfigValue::object({{"desired", ConfigValue::object({{"version", record.desiredVersion},
-                                                                         {"content", contentOf(record.desiredJson)},
+                                                                         {"content", contentOf(record.desiredJson, "desired.content")},
                                                                          {"hash", record.desiredHash},
                                                                          {"updatedAt", record.desiredUpdatedAt},
                                                                          {"updatedBy", record.desiredUpdatedBy}})},
                                         {"reported", ConfigValue::object({{"version", record.reportedVersion},
-                                                                          {"content", contentOf(record.reportedJson)},
+                                                                          {"content", contentOf(record.reportedJson, "reported.content")},
                                                                           {"hash", record.reportedHash},
                                                                           {"status", record.reportedStatus},
+                                                                          {"message", record.reportedMessage},
                                                                           {"at", record.reportedAt}})},
                                         {"inSync", record.inSync}});
         }
@@ -112,7 +122,7 @@ namespace EdgePulse::Device
             return ConfigValue::object({{"id", revision.id},
                                         {"nodeId", revision.nodeId},
                                         {"version", revision.version},
-                                        {"content", contentOf(revision.contentJson)},
+                                        {"content", contentOf(revision.contentJson, "revision.content")},
                                         {"hash", revision.contentHash},
                                         {"note", revision.note},
                                         {"createdBy", revision.createdBy},
@@ -347,9 +357,11 @@ namespace EdgePulse::Device
                            Common::writeSuccess(response, ConfigValue::object({{"version", 0}, {"content", ConfigValue::object()}, {"hash", ""}}), traceId);
                            co_return;
                        }
-                       Common::writeSuccess(response,
-                                            ConfigValue::object({{"version", record->desiredVersion}, {"content", contentOf(record->desiredJson)}, {"hash", record->desiredHash}}),
-                                            traceId);
+                       Common::writeSuccess(
+                               response,
+                               ConfigValue::object(
+                                       {{"version", record->desiredVersion}, {"content", contentOf(record->desiredJson, "desired.content")}, {"hash", record->desiredHash}}),
+                               traceId);
                        co_return;
                    });
 

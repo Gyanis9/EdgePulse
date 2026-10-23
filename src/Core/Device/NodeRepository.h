@@ -22,7 +22,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace EdgePulse::Device
@@ -85,13 +84,6 @@ namespace EdgePulse::Device
         TokenRejected,          ///< 注册/改绑令牌无效、过期、已用或与节点名不符
         ConcurrentRegistration, ///< 整段事务在有限次重试后仍撞上并发锁或唯一键
     };
-
-    /**
-     * @brief 判断数据库失败是否属于并发注册可重试的一类
-     * @param message 驱动或仓储给出的错误文本
-     * @return true 表示锁冲突、死锁或唯一键冲突，可在新事务里重试
-     */
-    [[nodiscard]] bool isRetryableRegistrationFailure(std::string_view message);
 
     /**
      * @brief 按状态统计的节点数

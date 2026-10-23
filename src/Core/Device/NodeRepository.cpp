@@ -2,20 +2,18 @@
 
 #include "Base/Database/SqlExecution.h"
 #include "Base/Database/SqlHelpers.h"
+#include "Base/Database/SqlRetry.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Database/Common/DatabaseResult.h"
 #include "Database/Common/DatabaseValue.h"
 
-#include <algorithm>
 #include <array>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -53,9 +51,8 @@ namespace EdgePulse::Device
             return text.empty() ? AsynGyanis::Database::DatabaseValue{std::monostate{}} : AsynGyanis::Database::DatabaseValue{text};
         }
 
-        constexpr int                             kRegistrationAttempts = 2; ///< 并发注册最多尝试几次
-        constexpr std::chrono::milliseconds       kRegistrationBackoff{2};   ///< 两次尝试之间的退避，只在工作线程上等
-        constexpr std::array<std::string_view, 5> kRetryableRegistrationMarkers{"locked", "busy", "deadlock", "unique", "duplicate entry"}; ///< SQLite 与 MySQL 的并发失败原文
+        constexpr int                       kRegistrationAttempts = 2; ///< 并发注册最多尝试几次
+        constexpr std::chrono::milliseconds kRegistrationBackoff{2};   ///< 两次尝试之间的退避，只在工作线程上等
 
         /**
          * @brief 回滚当前事务；回滚本身失败时不让它盖过真正的失败原因
@@ -68,18 +65,6 @@ namespace EdgePulse::Device
             } catch (...)
             {
             }
-        }
-
-        [[nodiscard]] bool containsRetryableMarker(const std::string_view message)
-        {
-            std::string lowered;
-            lowered.reserve(message.size());
-            for (const char character: message)
-            {
-                lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
-            }
-            return std::any_of(kRetryableRegistrationMarkers.begin(), kRetryableRegistrationMarkers.end(),
-                               [&lowered](const std::string_view marker) { return lowered.find(marker) != std::string::npos; });
         }
 
         [[nodiscard]] NodeRecord readNode(const AsynGyanis::Database::DatabaseResult &result)
@@ -200,11 +185,6 @@ namespace EdgePulse::Device
             return node;
         }
     } // namespace
-
-    bool isRetryableRegistrationFailure(const std::string_view message)
-    {
-        return containsRetryableMarker(message);
-    }
 
     NodeRepository::NodeRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
     {
@@ -457,7 +437,7 @@ namespace EdgePulse::Device
                         } catch (const Common::DatabaseException &failure)
                         {
                             rollbackQuietly(connection);
-                            if (!isRetryableRegistrationFailure(failure.what()))
+                            if (!Sql::isRetryableSqlFailure(failure.what()))
                             {
                                 throw;
                             }

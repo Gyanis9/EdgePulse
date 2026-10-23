@@ -2,19 +2,19 @@
 
 #include "Base/Database/SqlExecution.h"
 #include "Base/Database/SqlHelpers.h"
+#include "Base/Database/SqlRetry.h"
 #include "Base/Exception/EdgePulseException.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Database/Common/DatabaseResult.h"
 #include "Database/Common/DatabaseValue.h"
 
-#include <algorithm>
-#include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -27,11 +27,15 @@ namespace EdgePulse::Device
         using AsynGyanis::Database::DatabaseValue;
 
         constexpr const char *kConfigColumns   = "node_id, tenant_id, desired_json, desired_version, desired_hash, desired_updated_at, desired_updated_by, reported_json, "
-                                                 "reported_version, reported_hash, reported_status, reported_at";
+                                                 "reported_version, reported_hash, reported_status, reported_message, reported_at";
         constexpr const char *kRevisionColumns = "id, node_id, version, content_json, content_hash, note, created_by, created_at";
 
-        /// 修订保留窗口：版本号小于最新版本减该值的修订在同一事务内删除
+        /// 修订保留窗口：每个节点只保留最新该数量的修订
         constexpr std::int64_t kRevisionRetentionWindow = 100;
+        /// 整段写入在可重试的 SQL 并发失败后最多尝试几次
+        constexpr int kApplyDesiredAttempts = 2;
+        /// 两次尝试之间的退避，只在工作线程上等
+        constexpr std::chrono::milliseconds kApplyDesiredBackoff{2};
 
         /**
          * @brief 回滚当前事务；回滚本身失败时不让它盖过真正的失败原因
@@ -44,22 +48,6 @@ namespace EdgePulse::Device
             } catch (...)
             {
             }
-        }
-
-        /**
-         * @brief 判断数据库失败是否来自唯一键冲突
-         * @param message 驱动原文
-         * @return true 表示 SQLite 的 UNIQUE 或 MySQL 的 duplicate entry
-         */
-        [[nodiscard]] bool isUniqueViolation(const std::string_view message)
-        {
-            std::string lowered;
-            lowered.reserve(message.size());
-            for (const char character: message)
-            {
-                lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
-            }
-            return lowered.find("unique") != std::string::npos || lowered.find("duplicate") != std::string::npos;
         }
 
         [[nodiscard]] NodeConfigRecord readConfig(const DatabaseResult &result)
@@ -76,6 +64,7 @@ namespace EdgePulse::Device
             record.reportedVersion  = Sql::integer(result, "reported_version");
             record.reportedHash     = Sql::text(result, "reported_hash");
             record.reportedStatus   = Sql::text(result, "reported_status");
+            record.reportedMessage  = Sql::text(result, "reported_message");
             record.reportedAt       = Sql::dateTimeText(result, "reported_at");
             // 版本、内容摘要与上报状态三者同时相符才算同步；只比版本会漏掉“同版本改了内容”
             record.inSync = record.desiredVersion == record.reportedVersion && record.desiredHash == record.reportedHash && record.reportedStatus == "applied";
@@ -178,96 +167,116 @@ namespace EdgePulse::Device
                 [nodeId, contentJson = std::move(contentJson), contentHash = std::move(contentHash), expectedVersion, note = std::move(note), operatorId,
                  tenant = m_tenant](DatabaseConnection &connection) -> std::expected<NodeConfigRecord, NodeConfigFailure>
                 {
-                    try
+                    for (int attempt = 0; attempt < kApplyDesiredAttempts; ++attempt)
                     {
-                        Sql::executeOrThrowVoid(connection, "BEGIN");
-                        const std::optional<std::int64_t> nodeTenant = findNodeTenantOnConnection(connection, nodeId, tenant);
-                        if (!nodeTenant.has_value())
-                        {
-                            rollbackQuietly(connection);
-                            return std::unexpected(NodeConfigFailure::NotFound);
-                        }
-                        // 配置行只认节点自己的租户：全租户视图写入时也不能落在调用方的默认租户
-                        const System::TenantScope ownerScope{*nodeTenant, false};
-                        const auto                current = Sql::executeOrThrow(connection, "SELECT desired_version FROM biz_node_config WHERE node_id = ? AND tenant_id = ?",
-                                                                                std::vector<DatabaseValue>{nodeId, *nodeTenant});
-                        const bool                exists  = current->next();
-                        std::int64_t              currentVersion = exists ? Sql::integer(*current, "desired_version") : 0;
-                        if (expectedVersion != currentVersion)
-                        {
-                            rollbackQuietly(connection);
-                            return std::unexpected(NodeConfigFailure::VersionConflict);
-                        }
-                        const std::string  now        = Common::nowDateTimeUtc();
-                        const std::int64_t newVersion = currentVersion + 1;
                         try
                         {
-                            if (!exists)
+                            Sql::executeOrThrowVoid(connection, "BEGIN");
+                            const std::optional<std::int64_t> nodeTenant = findNodeTenantOnConnection(connection, nodeId, tenant);
+                            if (!nodeTenant.has_value())
                             {
-                                const std::vector<DatabaseValue> parameters{nodeId,     *nodeTenant,   contentJson,   contentHash,  now,
-                                                                            operatorId, std::string{}, std::string{}, std::string{}};
-                                Sql::executeOrThrowVoid(connection,
-                                                        "INSERT INTO biz_node_config (node_id, tenant_id, desired_json, desired_version, desired_hash, desired_updated_at, "
-                                                        "desired_updated_by, reported_json, reported_version, reported_hash, reported_status) "
-                                                        "VALUES (?, ?, ?, 1, ?, ?, ?, ?, 0, ?, ?)",
-                                                        parameters);
-                            } else
-                            {
-                                const std::vector<DatabaseValue> parameters{contentJson, contentHash, now, operatorId, nodeId, *nodeTenant, currentVersion};
-                                const auto                       updated =
-                                        Sql::executeOrThrow(connection,
-                                                            "UPDATE biz_node_config SET desired_json = ?, desired_version = desired_version + 1, desired_hash = ?, "
-                                                            "desired_updated_at = ?, desired_updated_by = ? WHERE node_id = ? AND tenant_id = ? AND desired_version = ?",
-                                                            parameters);
-                                // 条件更新是乐观锁的最后一道：读与写之间版本被推进时不能覆盖别人的配置
-                                if (updated->affectedRowCount() == 0)
-                                {
-                                    rollbackQuietly(connection);
-                                    return std::unexpected(NodeConfigFailure::VersionConflict);
-                                }
+                                rollbackQuietly(connection);
+                                return std::unexpected(NodeConfigFailure::NotFound);
                             }
-                            const std::vector<DatabaseValue> revisionParameters{
-                                    Common::nextIdentifier(), *nodeTenant, nodeId, newVersion, contentJson, contentHash, note, operatorId, now};
-                            Sql::executeOrThrowVoid(connection,
-                                                    "INSERT INTO biz_node_config_revision (id, tenant_id, node_id, version, content_json, content_hash, note, created_by, "
-                                                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                                    revisionParameters);
-                        } catch (const Common::DatabaseException &failure)
-                        {
-                            // 唯一约束兜底两次首次写入或同一版本修订的并发竞争
-                            rollbackQuietly(connection);
-                            if (isUniqueViolation(failure.what()))
+                            // 配置行只认节点自己的租户：全租户视图写入时也不能落在调用方的默认租户
+                            const System::TenantScope ownerScope{*nodeTenant, false};
+                            const auto                current = Sql::executeOrThrow(connection, "SELECT desired_version FROM biz_node_config WHERE node_id = ? AND tenant_id = ?",
+                                                                                    std::vector<DatabaseValue>{nodeId, *nodeTenant});
+                            const bool                exists  = current->next();
+                            std::int64_t              currentVersion = exists ? Sql::integer(*current, "desired_version") : 0;
+                            if (expectedVersion != currentVersion)
                             {
+                                rollbackQuietly(connection);
                                 return std::unexpected(NodeConfigFailure::VersionConflict);
                             }
-                            throw;
-                        }
-                        // 版本号小于新版本减窗口宽度的修订已出保留期，和写入同成同败
-                        Sql::executeOrThrowVoid(connection, "DELETE FROM biz_node_config_revision WHERE node_id = ? AND tenant_id = ? AND version < ?",
-                                                std::vector<DatabaseValue>{nodeId, *nodeTenant, newVersion - kRevisionRetentionWindow});
-                        const std::optional<NodeConfigRecord> record = findConfigOnConnection(connection, nodeId, ownerScope);
-                        if (!record.has_value())
+                            const std::string  now        = Common::nowDateTimeUtc();
+                            const std::int64_t newVersion = currentVersion + 1;
+                            try
+                            {
+                                if (!exists)
+                                {
+                                    const std::vector<DatabaseValue> parameters{nodeId,     *nodeTenant,   contentJson,   contentHash,  now,
+                                                                                operatorId, std::string{}, std::string{}, std::string{}};
+                                    Sql::executeOrThrowVoid(connection,
+                                                            "INSERT INTO biz_node_config (node_id, tenant_id, desired_json, desired_version, desired_hash, desired_updated_at, "
+                                                            "desired_updated_by, reported_json, reported_version, reported_hash, reported_status) "
+                                                            "VALUES (?, ?, ?, 1, ?, ?, ?, ?, 0, ?, ?)",
+                                                            parameters);
+                                } else
+                                {
+                                    const std::vector<DatabaseValue> parameters{contentJson, contentHash, now, operatorId, nodeId, *nodeTenant, currentVersion};
+                                    const auto                       updated =
+                                            Sql::executeOrThrow(connection,
+                                                                "UPDATE biz_node_config SET desired_json = ?, desired_version = desired_version + 1, desired_hash = ?, "
+                                                                "desired_updated_at = ?, desired_updated_by = ? WHERE node_id = ? AND tenant_id = ? AND desired_version = ?",
+                                                                parameters);
+                                    // 条件更新是乐观锁的最后一道：读与写之间版本被推进时不能覆盖别人的配置
+                                    if (updated->affectedRowCount() == 0)
+                                    {
+                                        rollbackQuietly(connection);
+                                        return std::unexpected(NodeConfigFailure::VersionConflict);
+                                    }
+                                }
+                                const std::vector<DatabaseValue> revisionParameters{
+                                        Common::nextIdentifier(), *nodeTenant, nodeId, newVersion, contentJson, contentHash, note, operatorId, now};
+                                Sql::executeOrThrowVoid(connection,
+                                                        "INSERT INTO biz_node_config_revision (id, tenant_id, node_id, version, content_json, content_hash, note, created_by, "
+                                                        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                                        revisionParameters);
+                            } catch (const Common::DatabaseException &failure)
+                            {
+                                // 唯一约束兜底两次首次写入或同一版本修订的并发竞争
+                                rollbackQuietly(connection);
+                                if (Sql::isUniqueViolation(failure.what()))
+                                {
+                                    return std::unexpected(NodeConfigFailure::VersionConflict);
+                                }
+                                throw;
+                            }
+                            // 保留最新一条在内共 100 条修订；更早的版本和本次写入同成同败
+                            Sql::executeOrThrowVoid(connection, "DELETE FROM biz_node_config_revision WHERE node_id = ? AND tenant_id = ? AND version <= ?",
+                                                    std::vector<DatabaseValue>{nodeId, *nodeTenant, newVersion - kRevisionRetentionWindow});
+                            const std::optional<NodeConfigRecord> record = findConfigOnConnection(connection, nodeId, ownerScope);
+                            if (!record.has_value())
+                            {
+                                rollbackQuietly(connection);
+                                throw Common::DatabaseException("配置写入后读回失败：节点 " + std::to_string(nodeId));
+                            }
+                            Sql::executeOrThrowVoid(connection, "COMMIT");
+                            return *record;
+                        } catch (const Common::DatabaseException &failure)
                         {
                             rollbackQuietly(connection);
-                            throw Common::DatabaseException("配置写入后读回失败：节点 " + std::to_string(nodeId));
+                            if (!Sql::isRetryableSqlFailure(failure.what()))
+                            {
+                                throw;
+                            }
+                            if (attempt + 1 < kApplyDesiredAttempts)
+                            {
+                                // 工作线程上的短暂退避，避开另一条写入刚拿到的写锁；不能在事件循环线程上睡
+                                std::this_thread::sleep_for(kApplyDesiredBackoff);
+                                continue;
+                            }
+                            // 重试用尽：两个写入者都没能推进版本，按冲突收口让 HTTP 回 409 而不是 500
+                            return std::unexpected(NodeConfigFailure::VersionConflict);
+                        } catch (...)
+                        {
+                            rollbackQuietly(connection);
+                            throw;
                         }
-                        Sql::executeOrThrowVoid(connection, "COMMIT");
-                        return *record;
-                    } catch (...)
-                    {
-                        rollbackQuietly(connection);
-                        throw;
                     }
+                    // 循环体要么返回，要么在最后一次失败后返回；这里只兜住理论上的落空
+                    return std::unexpected(NodeConfigFailure::VersionConflict);
                 });
     }
 
     AsynGyanis::Core::Task<std::expected<NodeConfigRecord, NodeConfigFailure>> NodeConfigRepository::report(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
                                                                                                             const std::int64_t version, std::string contentJson,
-                                                                                                            std::string contentHash, std::string status)
+                                                                                                            std::string contentHash, std::string status, std::string message)
     {
         co_return co_await m_database->withConnection<std::expected<NodeConfigRecord, NodeConfigFailure>>(
                 loop,
-                [nodeId, version, contentJson = std::move(contentJson), contentHash = std::move(contentHash), status = std::move(status),
+                [nodeId, version, contentJson = std::move(contentJson), contentHash = std::move(contentHash), status = std::move(status), message = std::move(message),
                  tenant = m_tenant](DatabaseConnection &connection) -> std::expected<NodeConfigRecord, NodeConfigFailure>
                 {
                     try
@@ -290,16 +299,17 @@ namespace EdgePulse::Device
                         const std::string now = Common::nowDateTimeUtc();
                         if (contentJson.empty())
                         {
-                            // 失败上报通常不带内容：保留上次上报正文与摘要，只推进状态
+                            // 失败上报通常不带内容：保留上次上报正文与摘要，只推进状态与说明
                             Sql::executeOrThrowVoid(connection,
-                                                    "UPDATE biz_node_config SET reported_version = ?, reported_status = ?, reported_at = ? WHERE node_id = ? AND tenant_id = ?",
-                                                    std::vector<DatabaseValue>{version, status, now, nodeId, *nodeTenant});
+                                                    "UPDATE biz_node_config SET reported_version = ?, reported_status = ?, reported_message = ?, reported_at = ? "
+                                                    "WHERE node_id = ? AND tenant_id = ?",
+                                                    std::vector<DatabaseValue>{version, status, message, now, nodeId, *nodeTenant});
                         } else
                         {
                             Sql::executeOrThrowVoid(connection,
-                                                    "UPDATE biz_node_config SET reported_json = ?, reported_version = ?, reported_hash = ?, reported_status = ?, reported_at = ? "
-                                                    "WHERE node_id = ? AND tenant_id = ?",
-                                                    std::vector<DatabaseValue>{contentJson, version, contentHash, status, now, nodeId, *nodeTenant});
+                                                    "UPDATE biz_node_config SET reported_json = ?, reported_version = ?, reported_hash = ?, reported_status = ?, "
+                                                    "reported_message = ?, reported_at = ? WHERE node_id = ? AND tenant_id = ?",
+                                                    std::vector<DatabaseValue>{contentJson, version, contentHash, status, message, now, nodeId, *nodeTenant});
                         }
                         const std::optional<NodeConfigRecord> record = findConfigOnConnection(connection, nodeId, ownerScope);
                         if (!record.has_value())

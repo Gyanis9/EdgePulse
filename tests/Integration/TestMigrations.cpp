@@ -92,6 +92,10 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(0, querySingleInteger(*connection, "SELECT COUNT(*) FROM biz_node_config"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'biz_node_config_revision'"));
         EXPECT_EQ(0, querySingleInteger(*connection, "SELECT COUNT(*) FROM biz_node_config_revision"));
+        // 修订表必须同时有租户索引与节点/版本唯一约束，否则分页与并发兜底都会退化成全表扫描
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_node_config_revision') WHERE name = 'idx_node_config_revision_tenant'"));
+        EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_node_config_revision') AS il, pragma_index_info(il.name) AS ii "
+                                                     "WHERE il.\"unique\" = 1 AND ii.name IN ('node_id', 'version')"));
         EXPECT_EQ(16, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);

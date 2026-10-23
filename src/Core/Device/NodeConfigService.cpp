@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <optional>
 #include <string>
@@ -145,12 +146,11 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(NodeConfigError{NodeConfigFailure::NotFound, "节点不存在或已删除"});
         }
-        const auto reported = co_await m_repository->scoped(tenant)->report(loop, nodeId, version, std::move(canonical), std::move(hash), status);
+        const auto reported = co_await m_repository->scoped(tenant)->report(loop, nodeId, version, std::move(canonical), std::move(hash), status, message);
         if (!reported.has_value())
         {
             co_return std::unexpected(repositoryError(reported.error()));
         }
-        // 配置表没有上报说明列；说明只进日志，状态本身已落库
         if (message.empty())
         {
             LOG_INFO_FMT("配置上报：node={} version={} status={}", nodeId, version, status);
@@ -209,34 +209,44 @@ namespace EdgePulse::Device
         {
             co_return;
         }
-        const auto                            scopedCommands = m_commands->scoped(System::TenantScope{node.tenantId, false});
-        const std::string                     payload        = ConfigValue::object({{"version", version}}).dump();
-        std::optional<Command::CommandRecord> created        = co_await scopedCommands->create(loop, node.id, "config.apply", payload, operatorId, kConfigApplyTimeoutSeconds);
-        if (!created.has_value())
+        try
         {
-            // 节点在配置落库与命令创建之间被删除：期望版本仍保留，Agent 重连后按心跳版本自行拉取
-            co_return;
-        }
-        if (m_channels != nullptr && m_channels->isConnected(node.id))
-        {
-            const ConfigValue commandValue = ConfigValue::object(
-                    {{"id", created->id}, {"nodeId", created->nodeId}, {"type", created->type}, {"payload", created->payload}, {"timeoutSeconds", created->timeoutSeconds}});
-            const std::string message = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-            if (co_await m_channels->send(node.id, message))
+            const auto                            scopedCommands = m_commands->scoped(System::TenantScope{node.tenantId, false});
+            const std::string                     payload        = ConfigValue::object({{"version", version}}).dump();
+            std::optional<Command::CommandRecord> created        = co_await scopedCommands->create(loop, node.id, "config.apply", payload, operatorId, kConfigApplyTimeoutSeconds);
+            if (!created.has_value())
             {
-                if (co_await scopedCommands->markDispatched(loop, created->id))
+                // 节点在配置落库与命令创建之间被删除：期望版本仍保留，Agent 重连后按心跳版本自行拉取
+                co_return;
+            }
+            if (m_channels != nullptr && m_channels->isConnected(node.id))
+            {
+                const ConfigValue commandValue = ConfigValue::object(
+                        {{"id", created->id}, {"nodeId", created->nodeId}, {"type", created->type}, {"payload", created->payload}, {"timeoutSeconds", created->timeoutSeconds}});
+                const std::string message = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
+                if (co_await m_channels->send(node.id, message))
                 {
-                    const auto refreshed = co_await scopedCommands->find(loop, created->id);
-                    if (refreshed.has_value())
+                    if (co_await scopedCommands->markDispatched(loop, created->id))
                     {
-                        created = refreshed;
+                        const auto refreshed = co_await scopedCommands->find(loop, created->id);
+                        if (refreshed.has_value())
+                        {
+                            created = refreshed;
+                        }
                     }
                 }
             }
-        }
-        if (m_notifier)
+            if (m_notifier)
+            {
+                static_cast<void>(co_await m_notifier(*created));
+            }
+        } catch (const std::exception &failure)
         {
-            static_cast<void>(co_await m_notifier(*created));
+            // 配置已经提交；下发只是加速通道，失败不能再让接口报 500，Agent 会按心跳里的版本自行拉取
+            LOG_ERROR_FMT("配置命令下发失败：node={} version={} reason={}", node.id, version, failure.what());
+        } catch (...)
+        {
+            LOG_ERROR_FMT("配置命令下发失败：node={} version={} reason=未知异常", node.id, version);
         }
         co_return;
     }

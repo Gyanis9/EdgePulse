@@ -3,6 +3,7 @@ add_library(edgepulse-base STATIC
         Api/CsvWriter.cpp
         Api/Pagination.cpp
         Database/Database.cpp
+        Database/SqlRetry.cpp
         Runtime/Environment.cpp
         Runtime/IdGenerator.cpp
         Runtime/TimeFormat.cpp

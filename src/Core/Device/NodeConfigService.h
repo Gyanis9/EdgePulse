@@ -84,7 +84,7 @@ namespace EdgePulse::Device
          * @param version 上报的版本，必须非负
          * @param content 可选的上报内容；空表示只更新状态
          * @param status applied / failed / pending
-         * @param message 上报说明，只进日志
+         * @param message 上报说明，最长 255 字节；落库的同时也进日志
          * @return 成功返回新影子；失败区分内容不合法、状态不合法与节点/配置不存在
          */
         AsynGyanis::Core::Task<std::expected<NodeConfigRecord, NodeConfigError>> report(AsynGyanis::Core::EventLoop &loop, System::TenantScope tenant, std::int64_t nodeId,
@@ -111,7 +111,7 @@ namespace EdgePulse::Device
          * @param node 目标节点
          * @param version 新版本号
          * @param operatorId 操作人
-         * @note 没有命令仓储或通道时静默跳过属于设计内的可选装配；命令创建失败不回滚已落库的配置
+         * @note 没有命令仓储或通道时跳过属于设计内的可选装配；配置提交后下发失败只记日志，不向调用方抛出
          */
         AsynGyanis::Core::Task<> dispatchConfigApply(AsynGyanis::Core::EventLoop &loop, const NodeRecord &node, std::int64_t version, std::int64_t operatorId);
 

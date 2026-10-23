@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS biz_node_config (
     reported_version BIGINT NOT NULL DEFAULT 0,
     reported_hash CHAR(64) NOT NULL DEFAULT '',
     reported_status VARCHAR(16) NOT NULL DEFAULT '',
+    reported_message VARCHAR(255) NOT NULL DEFAULT '',
     reported_at DATETIME NULL
 );
 

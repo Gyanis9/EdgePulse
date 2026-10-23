@@ -166,6 +166,12 @@ protected:
         ASSERT_NE(nullptr, connection->execute("UPDATE biz_node SET cert_fingerprint = '" + fingerprint + "' WHERE id = " + std::to_string(nodeId)));
     }
 
+    void executeOnDatabase(const std::string &sql)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(m_context->databasePath().string());
+        ASSERT_NE(nullptr, connection->execute(sql)) << connection->lastError();
+    }
+
     std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>  m_context;
     EdgePulse::TestSupport::EventLoopRunner                   m_runner;
     std::shared_ptr<EdgePulse::Device::NodeRepository>        m_nodes;
@@ -248,6 +254,7 @@ TEST_F(NodeConfigEndpointsTest, ConfigLifecycleAcrossBrowserAndAgent)
     EXPECT_TRUE((*syncedData)["inSync"].get<bool>());
     EXPECT_EQ(1, (*syncedData)["reported"]["version"].get<std::int64_t>());
     EXPECT_EQ("applied", (*syncedData)["reported"]["status"].get<std::string>());
+    EXPECT_EQ("已生效", (*syncedData)["reported"]["message"].get<std::string>());
 
     const auto revisions = m_server->get("/api/nodes/" + std::to_string(nodeId) + "/config/revisions?pageNum=1&pageSize=10", bearer(token));
     ASSERT_EQ(200, revisions.status) << revisions.body;
@@ -409,4 +416,37 @@ TEST_F(NodeConfigEndpointsTest, TenantAdminCannotReachOtherTenantConfig)
     ASSERT_TRUE(platformData.has_value());
     EXPECT_EQ(0, (*platformData)["desired"]["version"].get<std::int64_t>());
     EXPECT_TRUE((*platformData)["inSync"].get<bool>());
+}
+
+// 钉住：尚无期望配置时上报只能拿到 404，不能凭空创建一行影子
+TEST_F(NodeConfigEndpointsTest, ReportBeforeDesiredConfigReturnsNotFound)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "config-no-desired-node");
+    const std::string  fingerprint(64, '9');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    const auto report = m_server->post("/api/agent/nodes/" + std::to_string(nodeId) + "/config/report",
+                                       AsynGyanis::Base::ConfigValue::object({{"version", 1}, {"status", "applied"}}).dump(), "application/json", agentHeaders(fingerprint));
+    EXPECT_EQ(404, report.status) << report.body;
+}
+
+// 钉住：存储的正文被外部改坏时接口报错，不能把损坏数据当成空配置交给界面
+TEST_F(NodeConfigEndpointsTest, CorruptStoredConfigFailsInsteadOfRenderingEmptyObject)
+{
+    const std::string  token   = login();
+    const std::int64_t nodeId  = createNode(token, "config-corrupt-node");
+    const auto         applied = m_runner.run(m_service->applyDesired(m_runner.loop(), {1, false}, nodeId, R"({"interval":30})", 0, "", 1));
+    ASSERT_TRUE(applied.has_value()) << applied.error().message;
+
+    executeOnDatabase("UPDATE biz_node_config SET desired_json = '{bad' WHERE node_id = " + std::to_string(nodeId));
+    const auto corruptConfig = m_server->get("/api/nodes/" + std::to_string(nodeId) + "/config", bearer(token));
+    // 安全头中间件把未捕获异常收成 500，响应里不带存储原文
+    EXPECT_EQ(500, corruptConfig.status) << corruptConfig.body;
+
+    // 修订正文走同一条判据：修回期望正文后单独弄坏修订
+    executeOnDatabase(R"(UPDATE biz_node_config SET desired_json = '{"interval":30}' WHERE node_id = )" + std::to_string(nodeId));
+    executeOnDatabase("UPDATE biz_node_config_revision SET content_json = '{bad' WHERE node_id = " + std::to_string(nodeId));
+    const auto corruptRevision = m_server->get("/api/nodes/" + std::to_string(nodeId) + "/config/revisions", bearer(token));
+    EXPECT_EQ(500, corruptRevision.status) << corruptRevision.body;
 }
