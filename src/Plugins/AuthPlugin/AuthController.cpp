@@ -4,9 +4,9 @@
 #include "Core/Auth/CaptchaService.h"
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
-#include "Net/Http/HttpRequest.h"
-#include "Net/Http/HttpResponse.h"
-#include "Net/Http/Router.h"
+#include "Net/Http/Message/HttpRequest.h"
+#include "Net/Http/Message/HttpResponse.h"
+#include "Net/Http/Routing/Router.h"
 #include "Core/Http/Authorization.h"
 #include "Core/Http/RequestId.h"
 

@@ -2,8 +2,8 @@
 
 #include "Core/Socket/InetAddress.h"
 #include "Net/Http/Client/HttpClient.h"
-#include "Net/Http/HttpServer.h"
-#include "Net/Http/Router.h"
+#include "Net/Http/Server/HttpServer.h"
+#include "Net/Http/Routing/Router.h"
 
 #include <algorithm>
 #include <cctype>

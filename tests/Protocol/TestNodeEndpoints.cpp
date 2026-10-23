@@ -3,7 +3,7 @@
 #include "Base/Config/ConfigValue.h"
 #include "Plugins/DevicePlugin/DeviceController.h"
 #include "Core/Device/NodeService.h"
-#include "Net/Http/HttpRequest.h"
+#include "Net/Http/Message/HttpRequest.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
 #include "Core/Http/MiddlewareSetup.h"

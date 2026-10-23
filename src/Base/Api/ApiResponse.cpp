@@ -1,7 +1,7 @@
 #include "Base/Api/ApiResponse.h"
 
 #include "Base/Api/ErrorCatalog.h"
-#include "Net/Http/HttpResponse.h"
+#include "Net/Http/Message/HttpResponse.h"
 
 #include <string>
 #include <utility>

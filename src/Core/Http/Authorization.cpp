@@ -1,6 +1,6 @@
 #include "Core/Http/Authorization.h"
 
-#include "Net/Http/HttpRequest.h"
+#include "Net/Http/Message/HttpRequest.h"
 
 #include <cctype>
 #include <string_view>

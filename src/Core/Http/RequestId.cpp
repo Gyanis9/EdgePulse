@@ -1,7 +1,7 @@
 #include "Core/Http/RequestId.h"
 
-#include "Net/Http/HttpRequest.h"
-#include "Net/Http/HttpRequestId.h"
+#include "Net/Http/Message/HttpRequest.h"
+#include "Net/Http/Message/HttpRequestId.h"
 
 namespace EdgePulse::Web
 {

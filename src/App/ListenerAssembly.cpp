@@ -5,10 +5,10 @@
 #include "Base/Config/ConfigValue.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Http/RequestId.h"
-#include "Net/Http/FileSender.h"
-#include "Net/Http/HttpRequest.h"
-#include "Net/Http/HttpResponse.h"
-#include "Net/Http/Router.h"
+#include "Net/Http/Server/FileSender.h"
+#include "Net/Http/Message/HttpRequest.h"
+#include "Net/Http/Message/HttpResponse.h"
+#include "Net/Http/Routing/Router.h"
 
 #include <filesystem>
 #include <fstream>

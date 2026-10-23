@@ -17,8 +17,8 @@
 
 #include <Core/Coroutine/Task.h>
 #include <Core/EventLoop/EventLoop.h>
-#include "Net/Http/HttpRequest.h"
-#include "Net/Http/HttpResponse.h"
+#include "Net/Http/Message/HttpRequest.h"
+#include "Net/Http/Message/HttpResponse.h"
 
 #include <algorithm>
 #include <optional>

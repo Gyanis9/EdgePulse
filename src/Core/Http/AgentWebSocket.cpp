@@ -4,9 +4,9 @@
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/NodeRepository.h"
-#include "Net/Http/HttpRequest.h"
-#include "Net/Http/HttpResponse.h"
-#include "Net/Http/Router.h"
+#include "Net/Http/Message/HttpRequest.h"
+#include "Net/Http/Message/HttpResponse.h"
+#include "Net/Http/Routing/Router.h"
 #include "Net/WebSocket/WebSocketPeer.h"
 #include "Net/WebSocket/WebSocketUpgradePolicy.h"
 
