@@ -186,7 +186,7 @@ namespace EdgePulse::App
             m_captchaService   = std::make_shared<Auth::CaptchaService>(m_cache, Auth::CaptchaOptions{m_configuration.captchaTtlSeconds, m_configuration.captchaRequestsPerMinute});
             m_loginAudit       = std::make_shared<Auth::LoginAudit>(m_database);
             m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache, m_tenantRepository);
-            m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>(loop);
+            m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>();
             m_sseBroadcaster   = std::make_shared<Web::SseBroadcaster>();
             Web::RealtimeBusOptions realtimeOptions;
             realtimeOptions.enabled  = m_configuration.redisEnabled;

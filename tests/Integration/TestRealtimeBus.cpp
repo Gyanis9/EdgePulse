@@ -52,8 +52,8 @@ TEST(RealtimeBus, RedisFanoutReachesSecondInstance)
 
     EdgePulse::TestSupport::EventLoopRunner runnerA;
     EdgePulse::TestSupport::EventLoopRunner runnerB;
-    EdgePulse::Web::BrowserWebSocket        webSocketA(runnerA.loop());
-    EdgePulse::Web::BrowserWebSocket        webSocketB(runnerB.loop());
+    EdgePulse::Web::BrowserWebSocket        webSocketA;
+    EdgePulse::Web::BrowserWebSocket        webSocketB;
     EdgePulse::Web::SseBroadcaster          sseA;
     EdgePulse::Web::SseBroadcaster          sseB;
     auto                                    received = std::make_shared<std::promise<std::string>>();

@@ -13,6 +13,7 @@
 #include "Core/Http/AgentWebSocket.h"
 #include "Core/Http/Authorization.h"
 #include "Core/Http/MiddlewareSetup.h"
+#include "Core/Http/WebSocketEndpoints.h"
 #include "Core/System/LogRepository.h"
 #include "Core/System/TenantRepository.h"
 #include "Core/Telemetry/TelemetryRepository.h"
@@ -146,6 +147,51 @@ namespace
         completion->set_value(std::move(result));
         co_return;
     }
+
+    struct AuthTimeoutProbeResult
+    {
+        bool          closed{false}; ///< 收到关闭帧
+        std::uint16_t closeCode{0};  ///< 关闭帧状态码
+        std::string   error;         ///< 失败原因
+    };
+
+    AsynGyanis::Core::Task<> probeUnauthenticatedBrowserSocket(AsynGyanis::Core::EventLoop &loop, std::uint16_t port,
+                                                               std::shared_ptr<std::promise<AuthTimeoutProbeResult>> completion)
+    {
+        AuthTimeoutProbeResult result;
+        try
+        {
+            AsynGyanis::Net::WebSocketClient::Configuration configuration;
+            configuration.hostName      = "127.0.0.1";
+            configuration.port          = port;
+            configuration.requestTarget = "/api/ws";
+            auto connection             = co_await AsynGyanis::Net::WebSocketClient::connect(loop, configuration);
+            if (!connection)
+            {
+                result.error = "升级失败：" + connection.error().message;
+                completion->set_value(std::move(result));
+                co_return;
+            }
+            std::unique_ptr<AsynGyanis::Net::WebSocketClient> client = std::move(*connection);
+            const auto                                        frame  = co_await client->receiveFor(std::chrono::seconds{7});
+            if (!frame.has_value())
+            {
+                result.error = "未在时限内收到关闭帧";
+            } else
+            {
+                result.closed = frame->opCode == AsynGyanis::Net::WebSocketOpCode::Close;
+                if (result.closed && frame->payload.size() >= 2)
+                {
+                    result.closeCode = static_cast<std::uint16_t>((static_cast<std::uint8_t>(frame->payload[0]) << 8) | static_cast<std::uint8_t>(frame->payload[1]));
+                }
+            }
+        } catch (const std::exception &failure)
+        {
+            result.error = failure.what();
+        }
+        completion->set_value(std::move(result));
+        co_return;
+    }
 } // namespace
 
 class FleetEndpointsTest : public ::testing::Test
@@ -153,17 +199,18 @@ class FleetEndpointsTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        m_context      = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
-        m_storage      = std::filesystem::temp_directory_path() / ("edgepulse-firmware-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-        m_nodes        = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
-        m_nodeService  = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
-        m_groups       = std::make_shared<EdgePulse::Device::NodeGroupRepository>(m_context->database);
-        m_telemetry    = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
-        m_alarmRepo    = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
-        m_alarmService = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
-        m_commands     = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
-        m_channels     = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
-        m_firmware     = std::make_shared<EdgePulse::Firmware::FirmwareRepository>(m_context->database);
+        m_context          = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
+        m_storage          = std::filesystem::temp_directory_path() / ("edgepulse-firmware-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        m_nodes            = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
+        m_nodeService      = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
+        m_groups           = std::make_shared<EdgePulse::Device::NodeGroupRepository>(m_context->database);
+        m_telemetry        = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
+        m_alarmRepo        = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
+        m_alarmService     = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
+        m_commands         = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
+        m_channels         = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
+        m_firmware         = std::make_shared<EdgePulse::Firmware::FirmwareRepository>(m_context->database);
+        m_browserWebSocket = std::make_shared<EdgePulse::Web::BrowserWebSocket>();
 
         m_server = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
@@ -212,6 +259,9 @@ protected:
                     EdgePulse::Command::registerCommandRoutes(router, loop, commands);
                     EdgePulse::Command::registerCommandAgentRoutes(router, loop, commands);
                     EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels);
+                    // 浏览器端点只用于首条认证超时的用例：令牌校验器从不被调用，未认证连接必须在 5 秒后收到 1008
+                    m_browserWebSocket->registerRoute(router, [](std::string_view) -> AsynGyanis::Core::Task<std::optional<EdgePulse::Web::BrowserSubscriptionScope>>
+                                                      { co_return std::nullopt; }, {});
 
                     EdgePulse::Firmware::FirmwareDependencies firmware;
                     firmware.auth               = m_context->auth.get();
@@ -291,6 +341,7 @@ protected:
     std::shared_ptr<EdgePulse::Command::CommandRepository>     m_commands;
     std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>  m_channels;
     std::shared_ptr<EdgePulse::Firmware::FirmwareRepository>   m_firmware;
+    std::shared_ptr<EdgePulse::Web::BrowserWebSocket>          m_browserWebSocket;
     std::unique_ptr<EdgePulse::TestSupport::ServerHarness>     m_server;
     std::vector<AsynGyanis::Core::Task<>>                      m_probeTasks; ///< WebSocket 探针帧，活到夹具析构
     std::filesystem::path                                      m_storage;
@@ -383,6 +434,22 @@ TEST_F(FleetEndpointsTest, CommandOverAgentWebSocket)
         status = (*json)["data"]["rows"][0]["status"].get<std::string>();
     }
     EXPECT_EQ("succeeded", status);
+}
+
+// 钉住：浏览器连接 5 秒内不认证即被 1008 收口，且不依赖额外的计时线程
+TEST_F(FleetEndpointsTest, BrowserWebSocketClosesUnauthenticatedSession)
+{
+    auto                                promise = std::make_shared<std::promise<AuthTimeoutProbeResult>>();
+    std::future<AuthTimeoutProbeResult> future  = promise->get_future();
+    AsynGyanis::Core::Task<>            probe   = probeUnauthenticatedBrowserSocket(m_server->loop(), m_server->port(), promise);
+    m_server->loop().scheduler().scheduleRemote(probe.handle());
+    m_probeTasks.push_back(std::move(probe));
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{10})) << "未认证连接未在时限内收口";
+    const AuthTimeoutProbeResult result = future.get();
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.closed);
+    EXPECT_EQ(1008, result.closeCode);
 }
 
 // 钉住：固件流式上传、Range 下载、ETag 304 与下发任务

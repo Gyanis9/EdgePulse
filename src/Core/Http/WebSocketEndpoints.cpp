@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -70,22 +69,6 @@ namespace EdgePulse::Web
         }
 
         /**
-         * @brief 5 秒内未认证时关闭连接
-         * @param peer 目标连接
-         * @param finished 处理器是否已退出
-         */
-        AsynGyanis::Core::Task<> closeAfterTimeout(AsynGyanis::Net::WebSocketPeer *peer, std::shared_ptr<std::atomic<bool>> finished)
-        {
-            // 处理器已经退出的情况下对端对象可能已销毁，不能再碰
-            if (finished->load() || !peer->isOpen())
-            {
-                co_return;
-            }
-            co_await peer->close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unauthorized");
-            co_return;
-        }
-
-        /**
          * @brief 解析首条认证消息
          * @param payload 文本负载
          * @return 令牌；类型或字段不符时为空
@@ -107,60 +90,9 @@ namespace EdgePulse::Web
         }
     } // namespace
 
-    BrowserWebSocket::BrowserWebSocket(AsynGyanis::Core::EventLoop &loop) : m_loop(loop)
-    {
-    }
-
-    BrowserWebSocket::~BrowserWebSocket()
-    {
-        m_isStopping.store(true);
-        // 计时线程最长休眠 5 秒；这里等它们退出，避免线程继续向已停止的循环投递
-        std::lock_guard<std::mutex> lock(m_threadsMutex);
-        for (std::jthread &thread: m_authThreads)
-        {
-            if (thread.joinable())
-            {
-                thread.join();
-            }
-        }
-    }
-
     AsynGyanis::Net::WebSocketHub &BrowserWebSocket::hub() noexcept
     {
         return m_hub;
-    }
-
-    void BrowserWebSocket::startAuthenticationTimer(AsynGyanis::Net::WebSocketPeer &peer, std::shared_ptr<std::atomic<bool>> authenticated,
-                                                    std::shared_ptr<std::atomic<bool>> finished)
-    {
-        // shortcut: 引擎 v4.0.0 的 receive() 没有超时参数，这里用一条休眠线程兜住首条认证的 5 秒；
-        // 每条未认证连接占一条线程，且停机会等待其到期。升级到带超时的 receive 或可取消等待后删除。
-        std::jthread timer(
-                [this, peer = &peer, authenticated = std::move(authenticated), finished = std::move(finished)](std::stop_token) mutable
-                {
-                    std::this_thread::sleep_for(kAuthenticationTimeout);
-                    if (authenticated->load() || m_isStopping.load())
-                    {
-                        return;
-                    }
-                    // 只把动作投回循环；线程本身不碰对端对象
-                    m_loop.scheduler().postRemote(
-                            [this, peer, authenticated, finished]
-                            {
-                                if (m_isStopping.load() || authenticated->load() || finished->load() || !peer->isOpen())
-                                {
-                                    return;
-                                }
-                                AsynGyanis::Core::Task<> task = closeAfterTimeout(peer, finished);
-                                {
-                                    std::lock_guard<std::mutex> taskLock(m_tasksMutex);
-                                    m_timeoutTasks.push_back(std::move(task));
-                                }
-                                m_loop.scheduler().schedule(m_timeoutTasks.back().handle());
-                            });
-                });
-        std::lock_guard<std::mutex> lock(m_threadsMutex);
-        m_authThreads.push_back(std::move(timer));
     }
 
     void BrowserWebSocket::registerRoute(AsynGyanis::Net::Router                                                                         &router,
@@ -184,23 +116,21 @@ namespace EdgePulse::Web
                        response.upgradeToWebSocket(
                                [this, tokenValidator](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
                                {
-                                   auto authenticated = std::make_shared<std::atomic<bool>>(false);
-                                   auto finished      = std::make_shared<std::atomic<bool>>(false);
-                                   // 会话收口会直接销毁处理器帧；靠 RAII 把退出标记送到超时路径
-                                   struct FinishGuard
+                                   // 首条消息与令牌校验共用同一份预算：两者合计超过 5 秒即按 1008 收口
+                                   const auto                                             authenticationDeadline = std::chrono::steady_clock::now() + kAuthenticationTimeout;
+                                   const std::optional<AsynGyanis::Net::WebSocketMessage> first                  = co_await peer.receiveFor(kAuthenticationTimeout);
+                                   if (!first.has_value())
                                    {
-                                       std::shared_ptr<std::atomic<bool>> flag;
-                                       ~FinishGuard()
+                                       // 超时只结束等待，连接仍可用：由这里主动收口；对端已断开则无需再发 Close
+                                       if (peer.isOpen())
                                        {
-                                           flag->store(true);
+                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unauthorized");
                                        }
-                                   } finishGuard{finished};
-                                   startAuthenticationTimer(peer, authenticated, finished);
-
-                                   const std::optional<AsynGyanis::Net::WebSocketMessage> first = co_await peer.receive();
-                                   if (!first.has_value() || first->opCode != AsynGyanis::Net::WebSocketOpCode::Text)
+                                       co_return;
+                                   }
+                                   if (first->opCode != AsynGyanis::Net::WebSocketOpCode::Text || std::chrono::steady_clock::now() > authenticationDeadline)
                                    {
-                                       finished->store(true);
+                                       co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unauthorized");
                                        co_return;
                                    }
                                    const std::optional<std::string>        token = parseAuthToken(first->payload);
@@ -209,18 +139,15 @@ namespace EdgePulse::Web
                                    {
                                        scope = co_await tokenValidator(*token);
                                    }
-                                   if (!scope.has_value())
+                                   if (!scope.has_value() || std::chrono::steady_clock::now() > authenticationDeadline)
                                    {
-                                       // 明确的策略拒绝：先关 1008，再让会话收口
+                                       // 明确的策略拒绝或校验超出预算：先关 1008，再让会话收口
                                        co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unauthorized");
-                                       finished->store(true);
                                        co_return;
                                    }
-                                   authenticated->store(true);
                                    const std::string acknowledgement = R"({"type":"auth","ok":true})";
                                    if (!co_await peer.sendText(acknowledgement))
                                    {
-                                       finished->store(true);
                                        co_return;
                                    }
                                    // 认证回执之后所有出站都走集线器，处理器只读入站帧；三类主题共用同一条连接。
@@ -236,7 +163,6 @@ namespace EdgePulse::Web
                                        // 客户端保活文本只用于续上连接的空闲计时，内容不参与业务
                                        static_cast<void>(message);
                                    }
-                                   finished->store(true);
                                    co_return;
                                },
                                std::move(policy));
