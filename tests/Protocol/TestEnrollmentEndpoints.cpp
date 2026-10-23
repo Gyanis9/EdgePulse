@@ -15,6 +15,7 @@
 #include "TestSupport/EventLoopRunner.h"
 #include "TestSupport/HttpClientHarness.h"
 
+#include <Core/Tls/TlsPeerIdentity.h>
 #include <gtest/gtest.h>
 
 #include <cctype>
@@ -76,6 +77,7 @@ protected:
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
                     EdgePulse::Web::applySecurityHeaders(router);
+                    EdgePulse::TestSupport::installTestAgentIdentity(router);
                     EdgePulse::Auth::registerRoutes(router, loop, *m_context->auth, *m_context->captcha, true);
                     EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, [this](AsynGyanis::Core::EventLoop &accessLoop, AsynGyanis::Net::HttpRequest &request)
                                                       { return resolveAccess(accessLoop, request); });
@@ -251,10 +253,11 @@ TEST_F(EnrollmentEndpointsTest, RegistrationConsumesToken)
     EdgePulse::Device::AgentRegistry registry(m_nodeRepository, options);
 
     EdgePulse::Device::AgentRegistration registration;
-    registration.name            = "edge-agent";
-    registration.agentVersion    = "1.0.0";
-    registration.certFingerprint = std::string(64, 'a');
-    registration.enrollmentToken = plaintext;
+    registration.name               = "edge-agent";
+    registration.agentVersion       = "1.0.0";
+    registration.certFingerprint    = std::string(64, 'a');
+    registration.enrollmentToken    = plaintext;
+    registration.connectionIdentity = std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, std::string(64, 'a'));
     // 注册走独立事件循环：管理端 HTTP 服务器不在这条线程上，两者只共享数据库
     EdgePulse::TestSupport::EventLoopRunner runner;
     const auto                              registered = runner.run(registry.registerAgent(runner.loop(), registration));
@@ -283,7 +286,7 @@ TEST_F(EnrollmentEndpointsTest, AgentRegistrationAcceptsEnrollmentToken)
     EXPECT_EQ(400, m_server->post("/api/agent/register", invalid, "application/json").status);
 
     const std::string missing  = R"({"name":"edge-token","agentVersion":"1.0.0","certFingerprint":")" + fingerprint + R"("})";
-    const auto        rejected = m_server->post("/api/agent/register", missing, "application/json");
+    const auto        rejected = m_server->post("/api/agent/register", missing, "application/json", {{"X-Test-Agent-Fingerprint", fingerprint}});
     EXPECT_EQ(403, rejected.status) << rejected.body;
 
     const std::string token = login();
@@ -295,10 +298,35 @@ TEST_F(EnrollmentEndpointsTest, AgentRegistrationAcceptsEnrollmentToken)
     const std::string plaintext = (*issuedJson)["data"]["token"].get<std::string>();
 
     const std::string accepted   = R"({"name":"edge-token","agentVersion":"1.0.0","certFingerprint":")" + fingerprint + R"(","enrollmentToken":")" + plaintext + R"("})";
-    const auto        registered = m_server->post("/api/agent/register", accepted, "application/json");
+    const auto        registered = m_server->post("/api/agent/register", accepted, "application/json", {{"X-Test-Agent-Fingerprint", fingerprint}});
     ASSERT_EQ(200, registered.status) << registered.body;
     const auto registeredJson = registered.json();
     ASSERT_TRUE(registeredJson.has_value());
     EXPECT_EQ("online", (*registeredJson)["data"]["status"].get<std::string>());
     EXPECT_EQ(fingerprint, (*registeredJson)["data"]["certFingerprint"].get<std::string>());
+}
+
+// 钉住：required 模式下即使令牌有效，没有已验证的叶证书也必须拒绝注册
+TEST_F(EnrollmentEndpointsTest, RequiredModeRejectsMissingIdentity)
+{
+    const std::string token = login();
+    ASSERT_FALSE(token.empty());
+    const auto issued = m_server->post("/api/enrollment-tokens", R"({"nodeName":"edge-no-identity","action":"enroll"})", "application/json", bearer(token));
+    ASSERT_EQ(200, issued.status) << issued.body;
+    const auto issuedJson = issued.json();
+    ASSERT_TRUE(issuedJson.has_value());
+    const std::string plaintext = (*issuedJson)["data"]["token"].get<std::string>();
+
+    const std::string fingerprint = std::string(64, 'e');
+    const std::string body        = R"({"name":"edge-no-identity","agentVersion":"1.0.0","certFingerprint":")" + fingerprint + R"(","enrollmentToken":")" + plaintext + R"("})";
+    const auto        rejected    = m_server->post("/api/agent/register", body, "application/json");
+    ASSERT_EQ(403, rejected.status) << rejected.body;
+    EXPECT_NE(std::string::npos, rejected.body.find("客户端证书"));
+
+    // 注册没有落库，节点名仍可被真正的持证注册使用
+    const auto missing = m_server->get("/api/nodes?keyword=edge-no-identity", bearer(token));
+    ASSERT_EQ(200, missing.status) << missing.body;
+    const auto missingJson = missing.json();
+    ASSERT_TRUE(missingJson.has_value());
+    EXPECT_TRUE((*missingJson)["data"]["rows"].empty());
 }

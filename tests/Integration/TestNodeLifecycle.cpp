@@ -207,6 +207,39 @@ TEST(NodeLifecycle, HeartbeatWithoutOnlineTransitionResolvesOfflineAlarm)
     EXPECT_EQ(0, published);
 }
 
+// 钉住：已吊销证书的节点不会再心跳，补告警扫描不能为它制造无法销案的 critical 告警
+TEST(NodeLifecycle, RevokedNodeGetsNoOfflineAlarm)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    auto                                    nodes  = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    auto                                    alarms = std::make_shared<EdgePulse::Alarm::AlarmRepository>(context.database);
+    EdgePulse::Alarm::AlarmService          alarmService(alarms);
+    int                                     published = 0;
+    EdgePulse::Device::NodeLifecycleService lifecycle(
+            *nodes, alarmService,
+            [&published](const EdgePulse::Device::NodeRecord &) -> AsynGyanis::Core::Task<>
+            {
+                ++published;
+                co_return;
+            },
+            90);
+
+    const auto created = runner.run(nodes->create(runner.loop(), "revoked-node", "{}"));
+    const auto beat    = runner.run(nodes->heartbeat(runner.loop(), created.id, "1.0.0"));
+    ASSERT_TRUE(beat.has_value());
+    ASSERT_TRUE(beat->becameOnline);
+
+    const auto revoked = runner.run(nodes->revokeCertificate(runner.loop(), created.id));
+    ASSERT_TRUE(revoked.has_value());
+    ASSERT_FALSE(revoked->certRevokedAt.empty());
+
+    runner.run(lifecycle.sweep(runner.loop(), "9999-12-31 23:59:59"));
+
+    EXPECT_EQ(0, runner.run(alarms->openCount(runner.loop())));
+    EXPECT_EQ(0, published);
+}
+
 // 钉住：全租户扫描能转换别家租户的节点，告警落在节点自己的租户下
 TEST(NodeLifecycle, SweepTransitionsNodeFromOtherTenant)
 {

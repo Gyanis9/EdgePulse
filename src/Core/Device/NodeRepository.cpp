@@ -3,6 +3,7 @@
 #include "Base/Database/SqlExecution.h"
 #include "Base/Database/SqlHelpers.h"
 #include "Base/Database/SqlRetry.h"
+#include "Base/Log/LogMacros.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Database/Common/DatabaseResult.h"
@@ -132,6 +133,23 @@ namespace EdgePulse::Device
                 return std::nullopt;
             }
             return readNode(*result);
+        }
+
+        /**
+         * @brief 判断是否已有同名软删除节点占着全局唯一索引
+         * @param connection 当前数据库连接
+         * @param name 注册声明的节点名
+         * @return true 表示插入冲突来自软删除记录，重试也不会成功
+         */
+        [[nodiscard]] bool hasDeletedNodeWithName(AsynGyanis::Database::DatabaseConnection &connection, const std::string &name)
+        {
+            const std::vector<AsynGyanis::Database::DatabaseValue>      parameters{name};
+            const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute("SELECT 1 FROM biz_node WHERE name = ? AND deleted = 1 LIMIT 1", parameters);
+            if (!result)
+            {
+                throw Common::DatabaseException("查询已删除同名节点失败：" + connection.lastError());
+            }
+            return result->next();
         }
 
         /**
@@ -362,6 +380,8 @@ namespace EdgePulse::Device
                     // 只有把令牌消费和节点写入放进同一笔事务，才能挡住两次读之间的改绑或吊销
                     for (int attempt = 0; attempt < kRegistrationAttempts; ++attempt)
                     {
+                        bool        insertingNode = false;
+                        std::string consumedAction;
                         try
                         {
                             Sql::executeOrThrowVoid(connection, "BEGIN");
@@ -369,6 +389,11 @@ namespace EdgePulse::Device
                             const std::optional<NodeRecord> current         = findByNameOnConnection(connection, registration.name, tenant);
                             const bool                      revoked         = current.has_value() && !current->certRevokedAt.empty();
                             const bool                      sameCertificate = current.has_value() && !revoked && current->certFingerprint == registration.certFingerprint;
+                            if (current.has_value() && current->certFingerprint != registration.certFingerprint && registration.enrollmentMode != "required")
+                            {
+                                // off 模式没有令牌约束；改绑仍要留下可追溯的告警日志
+                                LOG_WARN_FMT("off 模式允许证书指纹改绑：node={} name={}", current->id, registration.name);
+                            }
                             if (!sameCertificate && registration.enrollmentMode == "required")
                             {
                                 // 动作由事务内读到的节点状态决定：enroll 只给新节点，rebind 只给已有节点
@@ -391,31 +416,40 @@ namespace EdgePulse::Device
                                     rollbackQuietly(connection);
                                     return std::unexpected(AgentUpsertFailure::TokenRejected);
                                 }
+                                // 令牌与节点同成同败，提交后再记日志，避免回滚时留下已消费的假记录
+                                consumedAction = action;
                             }
                             if (!current.has_value())
                             {
+                                insertingNode   = true;
                                 NodeRecord node = insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
                                                              registration.certFingerprint, registration.certNotAfter, now);
                                 Sql::executeOrThrowVoid(connection, "COMMIT");
+                                if (!consumedAction.empty())
+                                {
+                                    LOG_INFO_FMT("消费注册令牌：tenant={} action={} node={}", registration.tenantId, consumedAction, registration.name);
+                                }
                                 return std::expected<AgentUpsertOutcome, AgentUpsertFailure>{AgentUpsertOutcome{std::move(node), true, true}};
                             }
                             const bool                                               becameOnline = current->status != "online";
-                            const std::array<AsynGyanis::Database::DatabaseValue, 7> parameters{registration.agentVersion,
+                            const std::array<AsynGyanis::Database::DatabaseValue, 8> parameters{registration.agentVersion,
                                                                                                 registration.certFingerprint,
                                                                                                 nullableText(registration.certNotAfter),
                                                                                                 nullableText(registration.labelsJson),
                                                                                                 now,
                                                                                                 now,
-                                                                                                current->id};
+                                                                                                current->id,
+                                                                                                current->version};
                             // 走到这里说明本次出示的证书已被事务内确认允许写入（同指纹、已消费令牌或 off 模式），才清掉旧的吊销时间
+                            // 版本条件把读取与写入绑成一次比较交换：期间提交的吊销或改绑会让这次更新落空，而不是被覆盖
                             const auto update = Sql::executeOrThrow(
                                     connection,
                                     "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
-                                    "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND deleted = 0",
+                                    "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0",
                                     parameters);
                             if (update->affectedRowCount() == 0)
                             {
-                                // 节点在读取后被软删除：不能提交并返回一条指向已消失节点的成功记录，重来一次会走新建路径
+                                // 节点在读取后被软删除，或版本被吊销/改绑推进：回滚后整套判定重来，不能把旧快照写回去
                                 rollbackQuietly(connection);
                                 if (attempt + 1 < kRegistrationAttempts)
                                 {
@@ -424,6 +458,10 @@ namespace EdgePulse::Device
                                 return std::unexpected(AgentUpsertFailure::ConcurrentRegistration);
                             }
                             Sql::executeOrThrowVoid(connection, "COMMIT");
+                            if (!consumedAction.empty())
+                            {
+                                LOG_INFO_FMT("消费注册令牌：tenant={} action={} node={}", registration.tenantId, consumedAction, registration.name);
+                            }
                             NodeRecord node      = *current;
                             node.status          = "online";
                             node.agentVersion    = registration.agentVersion;
@@ -440,6 +478,22 @@ namespace EdgePulse::Device
                             if (!Sql::isRetryableSqlFailure(failure.what()))
                             {
                                 throw;
+                            }
+                            // 插入撞唯一索引且同名节点只是被软删除时，重试永远不会成功；返回可操作的名字冲突而不是并发冲突
+                            bool deletedNameConflict = false;
+                            if (insertingNode && Sql::isUniqueViolation(failure.what()))
+                            {
+                                try
+                                {
+                                    deletedNameConflict = hasDeletedNodeWithName(connection, registration.name);
+                                } catch (const Common::DatabaseException &)
+                                {
+                                    // 判断本身失败时仍按可重试的并发冲突处理，不让它盖过原始失败
+                                }
+                            }
+                            if (deletedNameConflict)
+                            {
+                                return std::unexpected(AgentUpsertFailure::NameConflict);
                             }
                             if (attempt + 1 < kRegistrationAttempts)
                             {
@@ -606,7 +660,8 @@ namespace EdgePulse::Device
                 [limit, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::vector<NodeRecord>
                 {
                     std::vector<AsynGyanis::Database::DatabaseValue> parameters;
-                    std::string                                      filter = " WHERE status = 'offline' AND deleted = 0 AND last_seen IS NOT NULL";
+                    // 已吊销证书的节点永远不会再心跳，补告警只会制造一条无法销案的 critical 告警
+                    std::string filter = " WHERE status = 'offline' AND deleted = 0 AND cert_revoked_at IS NULL AND last_seen IS NOT NULL";
                     if (!tenant.allTenants)
                     {
                         filter += " AND tenant_id = ?";

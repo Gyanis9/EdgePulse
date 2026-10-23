@@ -53,6 +53,12 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "certFingerprint 必须是 64 位十六进制"});
         }
+        // required 模式必须拿到已验证的叶证书：certificateBindingFailure 对空身份返回放行，
+        // 只适合 off 模式的测试/开发链路，不能让它绕过 required 的身份约束
+        if (m_options.enrollmentMode == "required" && (!registration.connectionIdentity || !registration.connectionIdentity->isVerified()))
+        {
+            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, "required 模式下注册必须出示通过 TLS 校验的客户端证书"});
+        }
         // 自报值必须与这条 mTLS 连接出示的叶证书一致，否则任何持 CA 签发证书的对端都能冒名注册
         if (const std::optional<std::string> bindingFailure = certificateBindingFailure(registration.connectionIdentity, *fingerprint); bindingFailure.has_value())
         {
@@ -105,7 +111,12 @@ namespace EdgePulse::Device
         const auto outcome         = co_await m_repository->upsertAgent(loop, std::move(upsert));
         if (!outcome.has_value())
         {
-            // 仓储拒绝分两类：令牌/改绑不通过按授权失败返回 403；整段事务仍撞并发返回 409 让 Agent 稍后重试
+            // 仓储拒绝分三类：同名软删除记录按名字冲突返回 409 并给出改名/清理建议；
+            // 令牌/改绑不通过按授权失败返回 403；整段事务仍撞并发返回 409 让 Agent 稍后重试
+            if (outcome.error() == AgentUpsertFailure::NameConflict)
+            {
+                co_return std::unexpected(AgentError{AgentError::Reason::Conflict, "节点名与已删除的节点重复，请改名后重试，或先清理该已删除记录"});
+            }
             if (outcome.error() == AgentUpsertFailure::ConcurrentRegistration)
             {
                 co_return std::unexpected(AgentError{AgentError::Reason::Conflict, "并发注册冲突，请稍后重试"});

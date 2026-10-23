@@ -133,7 +133,7 @@ namespace EdgePulse::Web
                 return body;
             }
             AsynGyanis::Base::ConfigValue sanitized = *parsed;
-            for (const std::string_view key: {"password", "oldPassword", "newPassword", "token", "captcha", "captchaUuid", "secret"})
+            for (const std::string_view key: {"password", "oldPassword", "newPassword", "token", "enrollmentToken", "signature", "captcha", "captchaUuid", "secret"})
             {
                 sanitized.erase(std::string{key});
             }

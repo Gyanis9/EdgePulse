@@ -778,6 +778,41 @@ TEST_F(FleetEndpointsTest, CertificateRevocationClosesAgentWebSocket)
     EXPECT_EQ(1008, result.closeCode);
 }
 
+// 钉住：删除节点和吊销一样要摘除在线通道并以 1008 关闭已建立的 Agent WebSocket
+TEST_F(FleetEndpointsTest, DeletingNodeClosesAgentWebSocket)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "ws-delete-node");
+
+    auto                               promise = std::make_shared<std::promise<AgentCloseProbeResult>>();
+    std::future<AgentCloseProbeResult> future  = promise->get_future();
+    AsynGyanis::Core::Task<>           probe   = probeAgentSocketUntilClosed(m_server->loop(), m_server->port(), nodeId, promise);
+    m_server->loop().scheduler().scheduleRemote(probe.handle());
+    m_probeTasks.push_back(std::move(probe));
+
+    bool connected = false;
+    for (int attempt = 0; attempt < 500 && !connected; ++attempt)
+    {
+        connected = m_channels->isConnected(nodeId);
+        if (!connected)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+    }
+    ASSERT_TRUE(connected) << "Agent WebSocket 未在时限内完成 hello 注册";
+
+    const auto removed = m_server->send("DELETE", "/api/nodes/" + std::to_string(nodeId), "", "", bearer(token));
+    ASSERT_EQ(200, removed.status) << removed.body;
+    EXPECT_FALSE(m_channels->isConnected(nodeId));
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{10})) << "Agent WebSocket 未在删除后收口";
+    const AgentCloseProbeResult result = future.get();
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.connected);
+    EXPECT_TRUE(result.closed);
+    EXPECT_EQ(1008, result.closeCode);
+}
+
 // 钉住：浏览器连接 5 秒内不认证即被 1008 收口，且不依赖额外的计时线程
 TEST_F(FleetEndpointsTest, BrowserWebSocketClosesUnauthenticatedSession)
 {

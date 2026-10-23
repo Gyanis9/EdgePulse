@@ -108,7 +108,22 @@ namespace EdgePulse::Web
                                        }
                                        nodeId          = *id;
                                        const auto beat = co_await allNodes->heartbeat(loop, nodeId, stringOf(*hello, "agentVersion"));
-                                       if (beat.has_value() && lifecycle != nullptr)
+                                       if (!beat.has_value())
+                                       {
+                                           // 心跳返回空表示节点在 hello 校验之后被吊销或删除；不能继续登记通道
+                                           LOG_WARN_FMT("Agent WebSocket 心跳被拒：node={}", nodeId);
+                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
+                                           co_return;
+                                       }
+                                       // 登记通道前重读一次，避免把刚被吊销的节点留在通道表里
+                                       const auto beforeRegister = co_await allNodes->findById(loop, nodeId);
+                                       if (!beforeRegister.has_value() || !beforeRegister->certRevokedAt.empty())
+                                       {
+                                           LOG_WARN_FMT("Agent WebSocket 登记前发现证书已吊销：node={}", nodeId);
+                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
+                                           co_return;
+                                       }
+                                       if (lifecycle != nullptr)
                                        {
                                            try
                                            {
@@ -121,6 +136,15 @@ namespace EdgePulse::Web
                                            }
                                        }
                                        channels.registerNode(nodeId, &peer);
+                                       // 登记后再读一次：吊销可能恰好落在读取与登记之间，必须摘表并关闭
+                                       const auto afterRegister = co_await allNodes->findById(loop, nodeId);
+                                       if (!afterRegister.has_value() || !afterRegister->certRevokedAt.empty())
+                                       {
+                                           channels.unregisterNode(nodeId, &peer);
+                                           LOG_WARN_FMT("Agent WebSocket 登记后发现证书已吊销：node={}", nodeId);
+                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
+                                           co_return;
+                                       }
                                        static_cast<void>(co_await peer.sendText(R"({"type":"hello","ok":true})"));
                                        break;
                                    }

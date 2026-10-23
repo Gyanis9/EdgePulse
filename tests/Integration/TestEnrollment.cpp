@@ -155,12 +155,15 @@ TEST(Enrollment, RejectsTokenActionMismatch)
     const auto issued = runner.run(service->create(runner.loop(), 1, "edge-mismatch", "rebind", 3600, 1));
     ASSERT_TRUE(issued.has_value());
 
-    EdgePulse::Device::AgentRegistration registration;
-    registration.name            = "edge-mismatch";
-    registration.agentVersion    = "1.0.0";
-    registration.certFingerprint = std::string(64, 'c');
-    registration.enrollmentToken = issued->plaintext;
-    const auto rejected          = runner.run(registry.registerAgent(runner.loop(), registration));
+    const std::string                          fingerprint(64, 'c');
+    const AsynGyanis::Core::TlsPeerIdentityPtr identity = std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, fingerprint);
+    EdgePulse::Device::AgentRegistration       registration;
+    registration.name               = "edge-mismatch";
+    registration.agentVersion       = "1.0.0";
+    registration.certFingerprint    = fingerprint;
+    registration.enrollmentToken    = issued->plaintext;
+    registration.connectionIdentity = identity;
+    const auto rejected             = runner.run(registry.registerAgent(runner.loop(), registration));
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(EdgePulse::Device::AgentError::Reason::FingerprintRejected, rejected.error().reason);
 
@@ -168,6 +171,27 @@ TEST(Enrollment, RejectsTokenActionMismatch)
     const auto active = runner.run(service->list(runner.loop(), "active"));
     ASSERT_EQ(1U, active.size());
     EXPECT_EQ(issued->record.id, active[0].id);
+}
+
+// 钉住：节点名被软删除记录占着时，同名注册给出可操作的 409，而不是永远重试的并发冲突
+TEST(Enrollment, ReRegistrationAfterSoftDeleteReportsNameConflict)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    auto                                    nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    EdgePulse::Device::AgentRegistry     registry(nodes, {});
+    EdgePulse::Device::AgentRegistration registration{"edge-deleted", "1.0.0", std::string(64, 'd'), "{}"};
+    const auto                           first = runner.run(registry.registerAgent(runner.loop(), registration));
+    ASSERT_TRUE(first.has_value()) << first.error().message;
+
+    ASSERT_TRUE(runner.run(nodes->remove(runner.loop(), first->id)));
+
+    const auto rejected = runner.run(registry.registerAgent(runner.loop(), registration));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(EdgePulse::Device::AgentError::Reason::Conflict, rejected.error().reason);
+    EXPECT_NE(std::string::npos, rejected.error().message.find("已删除"));
+    EXPECT_EQ(std::string::npos, rejected.error().message.find("并发"));
 }
 
 // 钉住：enroll/rebind 由仓储在事务内判定；调用方给的旧快照不能当放行依据，吊销节点必须重新持令牌

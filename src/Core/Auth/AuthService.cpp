@@ -104,8 +104,8 @@ namespace EdgePulse::Auth
         {
             co_await recordAudit(loop,
                                  LoginAuditEntry{credentials.username, credentials.clientIp, false, "账号已锁定", credentials.traceId, user->id, user->departmentId, tenantId});
-            // 不足一分钟也按一分钟提示，避免展示「请 0 分钟后再试」
-            co_return std::unexpected(AuthError{423, 423, "账号已锁定，请 " + std::to_string((m_options.loginLockSeconds + 59) / 60) + " 分钟后再试"});
+            // 分钟数是配置的锁定时长，不是剩余时间；不足一分钟也按一分钟提示
+            co_return std::unexpected(AuthError{423, 423, "账号已锁定，请稍后再试（锁定时长 " + std::to_string((m_options.loginLockSeconds + 59) / 60) + " 分钟）"});
         }
 
         // PBKDF2 是 CPU 密集操作，放到工作线程，避免 210000 次迭代占住事件循环

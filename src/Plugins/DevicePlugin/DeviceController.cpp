@@ -316,6 +316,7 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                             co_return;
                         }
+                        LOG_INFO_FMT("吊销节点证书：node={} name={}", revoked->id, revoked->name);
                         // 证书已清空；先掐断仍在线的 Agent WebSocket，再收口实时状态与告警
                         if (channels != nullptr)
                         {
@@ -405,8 +406,8 @@ namespace EdgePulse::Device
                    });
 
         router.del("/api/nodes/:id",
-                   [&loop, &nodeService, accessResolver, dataScopes, lifecycle](AsynGyanis::Net::HttpRequest  &request,
-                                                                                AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodeService, accessResolver, dataScopes, lifecycle, channels](AsynGyanis::Net::HttpRequest  &request,
+                                                                                          AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
                        const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
@@ -432,6 +433,11 @@ namespace EdgePulse::Device
                        {
                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                            co_return;
+                       }
+                       // 删除后该节点不会再有心跳；和吊销一样先关闭在线 Agent 通道，再收口告警
+                       if (channels != nullptr)
+                       {
+                           co_await channels->closeNode(*nodeId, AsynGyanis::Net::kWebSocketPolicyViolationCode, "node deleted");
                        }
                        // 删除后的节点不会再有心跳来销案，必须在这里收口它的系统离线告警
                        if (lifecycle != nullptr)

@@ -1,5 +1,6 @@
 #include "Core/Device/EnrollmentService.h"
 
+#include "Base/Log/LogMacros.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/RandomToken.h"
 
@@ -55,6 +56,9 @@ namespace EdgePulse::Device
         record.createdBy                   = operatorId;
         record.createdAt                   = Common::nowDateTimeUtc();
         const EnrollmentTokenRecord stored = co_await m_repository->create(loop, record, hashToken(plaintext));
+        // 只记记录标识与用途，明文与摘要都不进日志
+        LOG_INFO_FMT("签发注册令牌：token={} tenant={} action={} node={} expires={} operator={}", stored.id, stored.tenantId, stored.action, stored.nodeName, stored.expiresAt,
+                     stored.createdBy);
         co_return IssuedEnrollmentToken{stored, plaintext};
     }
 
@@ -65,7 +69,9 @@ namespace EdgePulse::Device
 
     AsynGyanis::Core::Task<bool> EnrollmentService::revoke(AsynGyanis::Core::EventLoop &loop, const std::int64_t tokenId)
     {
-        co_return co_await m_repository->revoke(loop, tokenId);
+        const bool revoked = co_await m_repository->revoke(loop, tokenId);
+        LOG_INFO_FMT("吊销注册令牌：token={} result={}", tokenId, revoked ? "ok" : "not_found");
+        co_return revoked;
     }
 
     std::string EnrollmentService::hashToken(const std::string_view token)
