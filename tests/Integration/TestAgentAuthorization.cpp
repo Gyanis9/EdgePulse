@@ -43,18 +43,21 @@ TEST(AgentAuthorization, RequiresVerifiedMatchingLeafCertificate)
     const auto missing = runner.run(EdgePulse::Device::requireAgentNode(runner.loop(), *nodes, request, node.id));
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(403, missing.error().httpStatus);
+    EXPECT_EQ(EdgePulse::Device::AgentIdentityError::Reason::Unauthenticated, missing.error().reason);
 
     // 身份未验证：同样拒绝
     request.setTlsPeerIdentity(std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(false, std::vector<std::uint8_t>{}, std::string(64, 'a')));
     const auto unverified = runner.run(EdgePulse::Device::requireAgentNode(runner.loop(), *nodes, request, node.id));
     ASSERT_FALSE(unverified.has_value());
     EXPECT_EQ(403, unverified.error().httpStatus);
+    EXPECT_EQ(EdgePulse::Device::AgentIdentityError::Reason::Unauthenticated, unverified.error().reason);
 
     // 指纹不符：拒绝
     request.setTlsPeerIdentity(std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, std::string(64, 'b')));
     const auto mismatch = runner.run(EdgePulse::Device::requireAgentNode(runner.loop(), *nodes, request, node.id));
     ASSERT_FALSE(mismatch.has_value());
     EXPECT_EQ(403, mismatch.error().httpStatus);
+    EXPECT_EQ(EdgePulse::Device::AgentIdentityError::Reason::Forbidden, mismatch.error().reason);
 
     // 匹配：返回节点
     request.setTlsPeerIdentity(std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, fingerprint));
@@ -75,4 +78,24 @@ TEST(AgentAuthorization, UnknownNodeIsNotFound)
     const auto missing = runner.run(EdgePulse::Device::requireAgentNode(runner.loop(), *nodes, request, 999999));
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(404, missing.error().httpStatus);
+    EXPECT_EQ(EdgePulse::Device::AgentIdentityError::Reason::NotFound, missing.error().reason);
+}
+
+// 钉住：非正整数标识按客户端错误拒绝，不进入节点查询
+TEST(AgentAuthorization, NonPositiveNodeIdIsInvalidRequest)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    auto                                    nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    AsynGyanis::Net::HttpRequest request;
+    request.setTlsPeerIdentity(std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, std::string(64, 'a')));
+    for (const std::int64_t nodeId: {std::int64_t{0}, std::int64_t{-7}})
+    {
+        const auto invalid = runner.run(EdgePulse::Device::requireAgentNode(runner.loop(), *nodes, request, nodeId));
+        ASSERT_FALSE(invalid.has_value()) << nodeId;
+        EXPECT_EQ(400, invalid.error().httpStatus) << nodeId;
+        EXPECT_EQ(EdgePulse::Device::AgentIdentityError::Reason::InvalidRequest, invalid.error().reason) << nodeId;
+        EXPECT_FALSE(invalid.error().message.empty()) << nodeId;
+    }
 }

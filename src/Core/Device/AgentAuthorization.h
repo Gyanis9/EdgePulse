@@ -35,6 +35,7 @@ namespace EdgePulse::Device
     {
         enum class Reason
         {
+            InvalidRequest,  ///< 节点标识不合法
             Unauthenticated, ///< 没有出示客户端证书或证书未验证
             Forbidden,       ///< 证书与登记指纹不一致
             NotFound,        ///< 节点不存在或已删除

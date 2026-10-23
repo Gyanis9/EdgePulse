@@ -157,14 +157,14 @@ namespace EdgePulse::Firmware
             return ByteRange{start, end - start + 1};
         }
 
-        [[nodiscard]] std::string downloadPayload(const FirmwareRecord &record)
+        [[nodiscard]] std::string downloadPayload(const FirmwareRecord &record, const std::int64_t nodeId)
         {
             return ConfigValue::object({{"firmwareId", record.id},
                                         {"name", record.name},
                                         {"version", record.version},
                                         {"sha256", record.sha256},
                                         {"sizeBytes", record.sizeBytes},
-                                        {"downloadPath", "/api/agent/firmware/" + std::to_string(record.id) + "/download"}})
+                                        {"downloadPath", "/api/agent/firmware/" + std::to_string(record.id) + "/download?nodeId=" + std::to_string(nodeId)}})
                     .dump();
         }
     } // namespace
@@ -389,7 +389,7 @@ namespace EdgePulse::Firmware
                             {
                                 continue;
                             }
-                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(*firmware), session->userId, 600);
+                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(*firmware, nodeId), session->userId, 600);
                             if (!command.has_value())
                             {
                                 continue;
@@ -464,7 +464,7 @@ namespace EdgePulse::Firmware
                             {
                                 continue;
                             }
-                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(*target), session->userId, 600);
+                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(*target, nodeId), session->userId, 600);
                             if (!command.has_value())
                             {
                                 continue;

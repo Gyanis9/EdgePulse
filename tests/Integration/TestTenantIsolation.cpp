@@ -271,6 +271,7 @@ TEST(TenantIsolation, PermissionsGraphIsTenantScoped)
     ASSERT_EQ(1U, tenantUsers.size()) << tenantGraph.body;
     EXPECT_EQ("acme-admin", tenantUsers[0]["username"].get<std::string>());
     // 用户角色关系与用户列表同一范围，不能带出默认租户的 user_id
+    ASSERT_FALSE((*tenantJson)["data"]["userRoles"].empty()) << tenantGraph.body;
     for (const auto &pair: (*tenantJson)["data"]["userRoles"])
     {
         EXPECT_NE(1, pair[0].get<std::int64_t>()) << tenantGraph.body;

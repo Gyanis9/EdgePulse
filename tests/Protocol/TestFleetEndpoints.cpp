@@ -438,6 +438,11 @@ TEST_F(FleetEndpointsTest, AgentRequestsRequireCertificateBinding)
     EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", heartbeatBody).status);
     EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(std::string(64, 'b'))).status);
     EXPECT_EQ(200, m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(fingerprint)).status);
+
+    // 未登记指纹的节点不接受任何证书，即使证书格式合法
+    const auto        unbound     = runner.run(m_nodes->create(runner.loop(), "agent-unbound", "{}"));
+    const std::string unboundBody = R"({"nodeId":)" + std::to_string(unbound.id) + R"(,"agentVersion":"1.0.0"})";
+    EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", unboundBody, "application/json", agentHeaders(std::string(64, 'f'))).status);
 }
 
 // 钉住：Agent 走 WebSocket 时 hello 注册成功，命令由长连接推送、结果回写为 succeeded
@@ -523,7 +528,19 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
                            AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeId})}}).dump(), "application/json", bearer(token));
     ASSERT_EQ(200, deployed.status) << deployed.body;
     ASSERT_EQ(1, (*deployed.json())["data"].size());
-    const std::int64_t taskId = (*deployed.json())["data"][0]["taskId"].get<std::int64_t>();
+    const std::int64_t taskId    = (*deployed.json())["data"][0]["taskId"].get<std::int64_t>();
+    const std::int64_t commandId = (*deployed.json())["data"][0]["commandId"].get<std::int64_t>();
+    const auto         commands  = m_server->get("/api/commands?pageNum=1&pageSize=10&nodeId=" + std::to_string(nodeId), bearer(token));
+    ASSERT_EQ(200, commands.status) << commands.body;
+    const auto commandsJson = commands.json();
+    ASSERT_TRUE(commandsJson.has_value());
+    const auto &rows    = (*commandsJson)["data"]["rows"];
+    const auto  created = std::find_if(rows.begin(), rows.end(), [commandId](const AsynGyanis::Base::ConfigValue &row) { return row["id"].get<std::int64_t>() == commandId; });
+    ASSERT_NE(rows.end(), created) << commands.body;
+    // 下发的下载地址必须带上目标节点，否则真实 Agent 按它请求会得到 400
+    const auto downloadPayload = AsynGyanis::Base::parseConfigValue((*created)["payload"].get<std::string>());
+    ASSERT_TRUE(downloadPayload.has_value());
+    EXPECT_EQ("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(nodeId), (*downloadPayload)["downloadPath"].get<std::string>());
     const auto         status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
                                                AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "ok"}}).dump(),
                                                "application/json", agentHeaders(fingerprint));
