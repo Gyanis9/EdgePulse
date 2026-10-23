@@ -35,6 +35,7 @@ set_target_properties(edgepulse-unit-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 gtest_discover_tests(edgepulse-unit-tests DISCOVERY_MODE PRE_TEST)
 
 add_executable(edgepulse-integration-tests
+        Integration/TestAgentAuthorization.cpp
         Integration/TestAuthService.cpp
         Integration/TestDeviceService.cpp
         Integration/TestExternalStores.cpp
@@ -47,7 +48,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestUdpTelemetry.cpp)
 target_include_directories(edgepulse-integration-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(edgepulse-integration-tests PRIVATE EDGEPULSE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-target_link_libraries(edgepulse-integration-tests PRIVATE EdgePulse::Core edgepulse-test-support GTest::gtest_main)
+target_link_libraries(edgepulse-integration-tests PRIVATE EdgePulse::Core EdgePulse::Plugins edgepulse-test-support GTest::gtest_main)
 edgepulse_enable_warnings(edgepulse-integration-tests)
 set_target_properties(edgepulse-integration-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 gtest_discover_tests(edgepulse-integration-tests DISCOVERY_MODE PRE_TEST)

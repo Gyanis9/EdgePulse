@@ -2,6 +2,7 @@
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
+#include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/System/TenantRepository.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
@@ -75,7 +76,7 @@ namespace EdgePulse::Device
         }
     } // namespace
 
-    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, System::TenantRepository &tenants)
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants)
     {
         router.post("/api/agent/register",
                     [&loop, &registry, &tenants](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -123,7 +124,7 @@ namespace EdgePulse::Device
                     });
 
         router.post("/api/agent/heartbeat",
-                    [&loop, &registry](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, &registry, &nodes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string                                  traceId = Web::resolveRequestId(request);
                         const std::optional<AsynGyanis::Base::ConfigValue> body    = request.jsonBody();
@@ -139,7 +140,13 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少整数 nodeId 或字符串 agentVersion", traceId);
                             co_return;
                         }
-                        const auto result = co_await registry.heartbeat(loop, nodeIdIterator->get<std::int64_t>(), *agentVersion);
+                        const auto identity = co_await requireAgentNode(loop, nodes, request, nodeIdIterator->get<std::int64_t>());
+                        if (!identity.has_value())
+                        {
+                            Common::writeFailure(response, identity.error().httpStatus, identity.error().httpStatus, identity.error().message, traceId);
+                            co_return;
+                        }
+                        const auto result = co_await registry.heartbeat(loop, identity->id, *agentVersion);
                         if (!result.has_value())
                         {
                             writeAgentError(response, result.error(), traceId);

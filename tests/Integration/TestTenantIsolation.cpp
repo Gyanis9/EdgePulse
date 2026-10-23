@@ -2,17 +2,25 @@
 #include "Base/Security/PasswordHash.h"
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Auth/AuthService.h"
+#include "Core/Auth/DataScopeService.h"
 #include "Core/Auth/SessionStore.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/NodeGroupRepository.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Http/MiddlewareSetup.h"
+#include "Core/System/DictionaryRepository.h"
 #include "Core/System/LogRepository.h"
+#include "Core/System/MenuRepository.h"
+#include "Core/System/OrgRepository.h"
+#include "Core/System/RoleRepository.h"
 #include "Core/System/TenantRepository.h"
 #include "Core/System/UserRepository.h"
 #include "Core/Telemetry/TelemetryRepository.h"
+#include "Plugins/SystemPlugin/SystemController.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
+#include "TestSupport/HttpClientHarness.h"
 
 #include <gtest/gtest.h>
 
@@ -215,6 +223,70 @@ TEST(TenantIsolation, AlarmsAreIsolatedByTenant)
     EXPECT_EQ(0, runner.run(defaultAlarms->openCount(runner.loop())));
     EXPECT_EQ(1, runner.run(defaultAlarms->scoped(TenantScope{0, true})->openCount(runner.loop())));
     EXPECT_FALSE(runner.run(defaultAlarms->findAlarm(runner.loop(), alarm->id)).has_value());
+}
+
+// 钉住：权限图按会话租户返回用户与用户角色关系，平台管理员仍能跨租户读取
+TEST(TenantIsolation, PermissionsGraphIsTenantScoped)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const std::int64_t                      tenantId = provisionTenantB(context, runner);
+    ASSERT_GT(tenantId, 0);
+
+    auto users        = std::make_shared<EdgePulse::System::UserRepository>(context.database);
+    auto roles        = std::make_shared<EdgePulse::System::RoleRepository>(context.database);
+    auto menus        = std::make_shared<EdgePulse::System::MenuRepository>(context.database);
+    auto org          = std::make_shared<EdgePulse::System::OrgRepository>(context.database);
+    auto dictionaries = std::make_shared<EdgePulse::System::DictionaryRepository>(context.database);
+    auto dataScopes   = std::make_shared<EdgePulse::Auth::DataScopeService>(context.database);
+
+    EdgePulse::TestSupport::ServerHarness server(
+            [&context, &users, &roles, &menus, &org, &dictionaries, &dataScopes](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+            {
+                EdgePulse::Web::applySecurityHeaders(router);
+                EdgePulse::System::SystemDependencies dependencies;
+                dependencies.auth         = context.auth.get();
+                dependencies.dataScopes   = dataScopes.get();
+                dependencies.users        = users.get();
+                dependencies.roles        = roles.get();
+                dependencies.menus        = menus.get();
+                dependencies.org          = org.get();
+                dependencies.dictionaries = dictionaries.get();
+                dependencies.tenants      = context.tenants.get();
+                EdgePulse::System::registerSystemRoutes(router, loop, dependencies);
+            });
+
+    const auto tenantChallenge = runner.run(context.captcha->issue(runner.loop(), "127.0.0.1"));
+    ASSERT_TRUE(tenantChallenge.has_value());
+    EdgePulse::Auth::LoginCredentials tenantAdmin{"acme-admin", "acme-pass-1", tenantChallenge->code, tenantChallenge->uuid, "127.0.0.1", "tenant-graph"};
+    tenantAdmin.tenantCode = "acme";
+    const auto tenantLogin = runner.run(context.auth->login(runner.loop(), tenantAdmin));
+    ASSERT_TRUE(tenantLogin.has_value()) << tenantLogin.error().message;
+
+    const auto tenantGraph = server.get("/api/system/permissions/graph", {{"Authorization", "Bearer " + tenantLogin->token}});
+    ASSERT_EQ(200, tenantGraph.status) << tenantGraph.body;
+    const auto tenantJson = tenantGraph.json();
+    ASSERT_TRUE(tenantJson.has_value());
+    const auto &tenantUsers = (*tenantJson)["data"]["users"];
+    ASSERT_EQ(1U, tenantUsers.size()) << tenantGraph.body;
+    EXPECT_EQ("acme-admin", tenantUsers[0]["username"].get<std::string>());
+    // 用户角色关系与用户列表同一范围，不能带出默认租户的 user_id
+    for (const auto &pair: (*tenantJson)["data"]["userRoles"])
+    {
+        EXPECT_NE(1, pair[0].get<std::int64_t>()) << tenantGraph.body;
+    }
+
+    // 平台管理员按全租户视图读取
+    const auto platformChallenge = runner.run(context.captcha->issue(runner.loop(), "127.0.0.1"));
+    ASSERT_TRUE(platformChallenge.has_value());
+    EdgePulse::Auth::LoginCredentials platformAdmin{"admin", "admin123", platformChallenge->code, platformChallenge->uuid, "127.0.0.1", "tenant-graph"};
+    const auto platformLogin = runner.run(context.auth->login(runner.loop(), platformAdmin));
+    ASSERT_TRUE(platformLogin.has_value()) << platformLogin.error().message;
+    const auto platformGraph = server.get("/api/system/permissions/graph", {{"Authorization", "Bearer " + platformLogin->token}});
+    ASSERT_EQ(200, platformGraph.status) << platformGraph.body;
+    const auto platformJson = platformGraph.json();
+    ASSERT_TRUE(platformJson.has_value());
+    EXPECT_GE((*platformJson)["data"]["users"].size(), 2U) << platformGraph.body;
 }
 
 // 钉住：日志删除与清空也受租户边界约束，租户管理员不能借删除接口抹掉别家日志

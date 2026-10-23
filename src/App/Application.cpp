@@ -441,7 +441,7 @@ namespace EdgePulse::App
                 }
                 m_agentServer->setClientCertificateRequired(true);
                 Web::applySecurityHeaders(m_agentServer->router());
-                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_tenantRepository);
+                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_nodeRepository, *m_tenantRepository);
                 Telemetry::TelemetryDependencies telemetryAgentDependencies;
                 telemetryAgentDependencies.auth      = m_authService.get();
                 telemetryAgentDependencies.nodes     = m_nodeRepository.get();
@@ -452,6 +452,7 @@ namespace EdgePulse::App
                 commandAgentDependencies.auth     = m_authService.get();
                 commandAgentDependencies.commands = m_commandRepository.get();
                 commandAgentDependencies.channels = m_agentChannels.get();
+                commandAgentDependencies.nodes    = m_nodeRepository.get();
                 Command::registerCommandAgentRoutes(m_agentServer->router(), loop, commandAgentDependencies);
                 Firmware::FirmwareDependencies firmwareAgentDependencies;
                 firmwareAgentDependencies.auth               = m_authService.get();

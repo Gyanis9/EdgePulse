@@ -1080,7 +1080,7 @@ namespace EdgePulse::System
                            co_return;
                        }
                        const Common::PageParameters page{1, 100};
-                       const auto                   usersPage = co_await deps->users->list(loop, UserQuery{}, page);
+                       const auto                   usersPage = co_await deps->users->scoped(session->tenantScope())->list(loop, UserQuery{}, page);
                        const auto                   rolesPage = co_await deps->roles->scoped(session->tenantScope())->list(loop, "", "", page);
                        const auto                   menuTree  = co_await deps->menus->tree(loop, "", "");
                        ConfigValue                  users     = ConfigValue::array();
@@ -1129,7 +1129,7 @@ namespace EdgePulse::System
                                                                 {"visible", node.visible},
                                                                 {"status", node.status}}));
                        }
-                       const auto  pairs     = co_await deps->users->userRolePairs(loop, 10000);
+                       const auto  pairs     = co_await deps->users->scoped(session->tenantScope())->userRolePairs(loop, 10000);
                        ConfigValue userRoles = ConfigValue::array();
                        for (const auto &[userId, roleId]: pairs)
                        {

@@ -11,6 +11,7 @@
 #include "Core/Auth/AuthService.h"
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
+#include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareFileWriter.h"
 #include "Core/Firmware/FirmwareRepository.h"
@@ -536,15 +537,28 @@ namespace EdgePulse::Firmware
                    {
                        const std::string traceId = Web::resolveRequestId(request);
                        const auto        id      = Common::parsePositiveIdentifier(request.param("id"));
-                       if (!id.has_value())
+                       const auto        nodeId  = Common::queryInteger(request.queryParams(), "nodeId");
+                       if (!id.has_value() || !nodeId.has_value() || *nodeId <= 0)
                        {
-                           fail(response, Common::kCodeBadRequest, "固件标识不合法", traceId);
+                           fail(response, Common::kCodeBadRequest, "固件标识或 nodeId 不合法", traceId);
+                           co_return;
+                       }
+                       const auto identity = co_await Device::requireAgentNode(loop, *deps->nodes, request, *nodeId);
+                       if (!identity.has_value())
+                       {
+                           fail(response, identity.error().httpStatus, identity.error().message, traceId);
                            co_return;
                        }
                        const auto firmware = co_await allFirmware->find(loop, *id);
                        if (!firmware.has_value())
                        {
                            fail(response, Common::kCodeNotFound, "固件不存在", traceId);
+                           co_return;
+                       }
+                       // 固件归属必须与节点一致，否则任一租户的 Agent 都能取走别家的镜像
+                       if (firmware->tenantId != identity->tenantId)
+                       {
+                           fail(response, Common::kCodeForbidden, "固件不属于该节点所在租户", traceId);
                            co_return;
                        }
                        AsynGyanis::Platform::MemoryMappedFile mapped = AsynGyanis::Platform::MemoryMappedFile::open(firmware->storagePath);
@@ -605,6 +619,12 @@ namespace EdgePulse::Firmware
                         if (!nodeId.has_value() || (status != "pending" && status != "downloading" && status != "installing" && status != "installed" && status != "failed"))
                         {
                             fail(response, Common::kCodeBadRequest, "nodeId 或状态不合法", traceId);
+                            co_return;
+                        }
+                        const auto identity = co_await Device::requireAgentNode(loop, *deps->nodes, request, *nodeId);
+                        if (!identity.has_value())
+                        {
+                            fail(response, identity.error().httpStatus, identity.error().message, traceId);
                             co_return;
                         }
                         const auto task = co_await allFirmware->updateTask(loop, *id, *nodeId, status, progress, message);

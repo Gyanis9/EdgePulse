@@ -1,9 +1,12 @@
 #include "TestSupport/HttpClientHarness.h"
 
 #include "Core/Socket/InetAddress.h"
+#include "Core/Tls/TlsPeerIdentity.h"
 #include "Net/Http/Client/HttpClient.h"
-#include "Net/Http/Server/HttpServer.h"
+#include "Net/Http/Message/HttpRequest.h"
+#include "Net/Http/Routing/Middleware.h"
 #include "Net/Http/Routing/Router.h"
+#include "Net/Http/Server/HttpServer.h"
 
 #include <algorithm>
 #include <cctype>
@@ -11,6 +14,7 @@
 #include <future>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace EdgePulse::TestSupport
 {
@@ -87,6 +91,20 @@ namespace EdgePulse::TestSupport
     {
         // 解析失败返回空而不是抛异常：用例判空后打印原始正文
         return AsynGyanis::Base::parseConfigValue(body);
+    }
+
+    void installTestAgentIdentity(AsynGyanis::Net::Router &router)
+    {
+        router.addMiddleware(
+                [](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &, std::function<AsynGyanis::Core::Task<>()> next) -> AsynGyanis::Core::Task<>
+                {
+                    const std::optional<std::string> fingerprint = request.getHeader("x-test-agent-fingerprint");
+                    if (fingerprint.has_value() && fingerprint->size() == 64)
+                    {
+                        request.setTlsPeerIdentity(std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, *fingerprint));
+                    }
+                    co_await next();
+                });
     }
 
     ServerHarness::ServerHarness(const std::function<void(AsynGyanis::Net::Router &, AsynGyanis::Core::EventLoop &)> &configure)

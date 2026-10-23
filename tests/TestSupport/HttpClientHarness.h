@@ -54,6 +54,13 @@ namespace EdgePulse::TestSupport
     };
 
     /**
+     * @brief 测试专用：按请求头注入已验证的叶证书身份
+     * @param router 测试服务器路由器
+     * @note 只有测试夹具调用；生产代码没有任何头部旁路
+     */
+    void installTestAgentIdentity(AsynGyanis::Net::Router &router);
+
+    /**
      * @brief 自持事件循环与真实 HttpServer 的回环夹具
      *
      * @details 服务端与客户端跑在同一条事件循环上：服务端在构造时绑定端口 0，

@@ -8,6 +8,7 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Auth/AuthService.h"
+#include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
@@ -145,6 +146,12 @@ namespace EdgePulse::Telemetry
                         if (!nodeId.has_value() || *nodeId <= 0 || samples == body->end() || !samples->is_array() || samples->empty() || samples->size() > 500)
                         {
                             fail(response, Common::kCodeBadRequest, "nodeId 或 samples 不合法（1 到 500 条）", traceId);
+                            co_return;
+                        }
+                        const auto identity = co_await Device::requireAgentNode(loop, *deps->nodes, request, *nodeId);
+                        if (!identity.has_value())
+                        {
+                            fail(response, identity.error().httpStatus, identity.error().message, traceId);
                             co_return;
                         }
                         std::vector<TelemetrySample> parsed;

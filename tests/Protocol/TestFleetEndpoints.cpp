@@ -1,4 +1,5 @@
 #include "Base/Config/ConfigValue.h"
+#include "Base/Database/Database.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/PasswordHash.h"
 #include "Core/Alarm/AlarmRepository.h"
@@ -6,6 +7,7 @@
 #include "Core/Auth/AuthService.h"
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
+#include "Core/Device/AgentRegistry.h"
 #include "Core/Device/NodeGroupRepository.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/Device/NodeService.h"
@@ -20,6 +22,7 @@
 #include "Plugins/AlarmPlugin/AlarmController.h"
 #include "Plugins/AuthPlugin/AuthController.h"
 #include "Plugins/CommandPlugin/CommandController.h"
+#include "Plugins/DevicePlugin/AgentController.h"
 #include "Plugins/DevicePlugin/DeviceController.h"
 #include "Plugins/DevicePlugin/NodeGroupController.h"
 #include "Plugins/FirmwarePlugin/FirmwareController.h"
@@ -203,6 +206,7 @@ protected:
         m_storage          = std::filesystem::temp_directory_path() / ("edgepulse-firmware-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         m_nodes            = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
         m_nodeService      = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
+        m_agentRegistry    = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, EdgePulse::Device::AgentRegistry::Options{});
         m_groups           = std::make_shared<EdgePulse::Device::NodeGroupRepository>(m_context->database);
         m_telemetry        = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
         m_alarmRepo        = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
@@ -216,6 +220,7 @@ protected:
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
                     EdgePulse::Web::applySecurityHeaders(router);
+                    EdgePulse::TestSupport::installTestAgentIdentity(router);
                     EdgePulse::Auth::registerRoutes(router, loop, *m_context->auth, *m_context->captcha, true);
                     const auto access = [this](AsynGyanis::Core::EventLoop  &accessLoop,
                                                AsynGyanis::Net::HttpRequest &request) -> AsynGyanis::Core::Task<std::optional<EdgePulse::Device::AccessContext>>
@@ -234,6 +239,7 @@ protected:
                                                                    session->departmentId, session->roles,    session->permissions};
                     };
                     EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get());
+                    EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants);
                     EdgePulse::Device::NodeGroupDependencies groups;
                     groups.auth   = m_context->auth.get();
                     groups.groups = m_groups.get();
@@ -256,6 +262,7 @@ protected:
                     commands.auth     = m_context->auth.get();
                     commands.commands = m_commands.get();
                     commands.channels = m_channels.get();
+                    commands.nodes    = m_nodes.get();
                     EdgePulse::Command::registerCommandRoutes(router, loop, commands);
                     EdgePulse::Command::registerCommandAgentRoutes(router, loop, commands);
                     EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels);
@@ -287,6 +294,7 @@ protected:
         m_telemetry.reset();
         m_groups.reset();
         m_nodeService.reset();
+        m_agentRegistry.reset();
         m_nodes.reset();
         m_context.reset();
         std::error_code error;
@@ -330,10 +338,22 @@ protected:
         return (*response.json())["data"]["id"].get<std::int64_t>();
     }
 
+    static std::vector<std::pair<std::string, std::string>> agentHeaders(const std::string &fingerprint)
+    {
+        return {{"X-Test-Agent-Fingerprint", fingerprint}};
+    }
+
+    void setNodeFingerprint(const std::int64_t nodeId, const std::string &fingerprint)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(m_context->databasePath().string());
+        ASSERT_NE(nullptr, connection->execute("UPDATE biz_node SET cert_fingerprint = '" + fingerprint + "' WHERE id = " + std::to_string(nodeId)));
+    }
+
     std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>   m_context;
     EdgePulse::TestSupport::EventLoopRunner                    m_runner;
     std::shared_ptr<EdgePulse::Device::NodeRepository>         m_nodes;
     std::shared_ptr<EdgePulse::Device::NodeService>            m_nodeService;
+    std::shared_ptr<EdgePulse::Device::AgentRegistry>          m_agentRegistry;
     std::shared_ptr<EdgePulse::Device::NodeGroupRepository>    m_groups;
     std::shared_ptr<EdgePulse::Telemetry::TelemetryRepository> m_telemetry;
     std::shared_ptr<EdgePulse::Alarm::AlarmRepository>         m_alarmRepo;
@@ -352,12 +372,14 @@ TEST_F(FleetEndpointsTest, TelemetryTriggersAndAlarmLifecycle)
 {
     const std::string  token  = login();
     const std::int64_t nodeId = createNode(token, "telemetry-node");
+    const std::string  fingerprint(64, 'a');
+    setNodeFingerprint(nodeId, fingerprint);
     const std::string  body =
             AsynGyanis::Base::ConfigValue::object(
                     {{"nodeId", nodeId},
                      {"samples", AsynGyanis::Base::ConfigValue::array({AsynGyanis::Base::ConfigValue::object({{"metric", "cpu.usage"}, {"value", 96}, {"unit", "%"}})})}})
                     .dump();
-    const auto ingest = m_server->post("/api/agent/telemetry", body);
+    const auto ingest = m_server->post("/api/agent/telemetry", body, "application/json", agentHeaders(fingerprint));
     ASSERT_EQ(200, ingest.status) << ingest.body;
     EXPECT_EQ(1, (*ingest.json())["data"]["alarms"].size());
 
@@ -381,13 +403,15 @@ TEST_F(FleetEndpointsTest, CommandRoundTrip)
 {
     const std::string  token  = login();
     const std::int64_t nodeId = createNode(token, "command-node");
+    const std::string  fingerprint(64, 'b');
+    setNodeFingerprint(nodeId, fingerprint);
     const auto         created =
             m_server->post("/api/commands", AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"type", "reboot"}, {"payload", "{}"}, {"timeoutSeconds", 30}}).dump(),
                            "application/json", bearer(token));
     ASSERT_EQ(200, created.status) << created.body;
     const std::int64_t commandId = (*created.json())["data"]["id"].get<std::int64_t>();
 
-    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeId));
+    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeId), agentHeaders(fingerprint));
     ASSERT_EQ(200, next.status) << next.body;
     const auto nextJson = next.json();
     ASSERT_TRUE(nextJson.has_value());
@@ -396,9 +420,24 @@ TEST_F(FleetEndpointsTest, CommandRoundTrip)
 
     const auto result =
             m_server->post("/api/agent/commands/" + std::to_string(commandId) + "/result",
-                           AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "succeeded"}, {"result", R"({"ok":true})"}, {"message", "done"}}).dump());
+                           AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "succeeded"}, {"result", R"({"ok":true})"}, {"message", "done"}}).dump(),
+                           "application/json", agentHeaders(fingerprint));
     ASSERT_EQ(200, result.status) << result.body;
     EXPECT_EQ("succeeded", (*result.json())["data"]["status"].get<std::string>());
+}
+
+// 钉住：同一个合法 CA 下，没有登记指纹或指纹不符的证书不能冒充节点
+TEST_F(FleetEndpointsTest, AgentRequestsRequireCertificateBinding)
+{
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                                node = runner.run(m_nodes->create(runner.loop(), "agent-identity", "{}"));
+    const std::string                         fingerprint(64, 'a');
+    setNodeFingerprint(node.id, fingerprint);
+
+    const std::string heartbeatBody = R"({"nodeId":)" + std::to_string(node.id) + R"(,"agentVersion":"1.0.0"})";
+    EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", heartbeatBody).status);
+    EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(std::string(64, 'b'))).status);
+    EXPECT_EQ(200, m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(fingerprint)).status);
 }
 
 // 钉住：Agent 走 WebSocket 时 hello 注册成功，命令由长连接推送、结果回写为 succeeded
@@ -457,6 +496,8 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
 {
     const std::string  token  = login();
     const std::int64_t nodeId = createNode(token, "firmware-node");
+    const std::string  fingerprint(64, 'c');
+    setNodeFingerprint(nodeId, fingerprint);
     std::string        payload(1024 * 1024, 'E');
     const auto         upload = m_server->send("POST", "/api/firmware?name=EdgePulse+OS&version=1.0.0&fileName=os.bin", payload, "application/octet-stream", bearer(token));
     ASSERT_EQ(200, upload.status) << upload.body;
@@ -466,11 +507,15 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
     const std::string  sha256     = (*uploadJson)["data"]["sha256"].get<std::string>();
     EXPECT_EQ(1024 * 1024, (*uploadJson)["data"]["sizeBytes"].get<std::int64_t>());
 
-    const auto range = m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download", {{"Range", "bytes=10-19"}});
+    std::vector<std::pair<std::string, std::string>> rangeHeaders = agentHeaders(fingerprint);
+    rangeHeaders.emplace_back("Range", "bytes=10-19");
+    const auto range = m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(nodeId), rangeHeaders);
     ASSERT_EQ(206, range.status) << range.body;
     EXPECT_EQ(std::string(10, 'E'), range.body);
     EXPECT_EQ("bytes 10-19/1048576", range.header("content-range"));
-    const auto cached = m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download", {{"If-None-Match", "\"" + sha256 + "\""}});
+    std::vector<std::pair<std::string, std::string>> cachedHeaders = agentHeaders(fingerprint);
+    cachedHeaders.emplace_back("If-None-Match", "\"" + sha256 + "\"");
+    const auto cached = m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(nodeId), cachedHeaders);
     EXPECT_EQ(304, cached.status);
 
     const auto deployed =
@@ -480,7 +525,8 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
     ASSERT_EQ(1, (*deployed.json())["data"].size());
     const std::int64_t taskId = (*deployed.json())["data"][0]["taskId"].get<std::int64_t>();
     const auto         status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
-                                               AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "ok"}}).dump());
+                                               AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "ok"}}).dump(),
+                                               "application/json", agentHeaders(fingerprint));
     ASSERT_EQ(200, status.status) << status.body;
     EXPECT_EQ(taskId, (*status.json())["data"]["id"].get<std::int64_t>());
 
@@ -517,17 +563,20 @@ TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
 
     const auto tenantNodes    = m_nodes->scoped({tenantId, false});
     const auto node           = m_runner.run(tenantNodes->create(m_runner.loop(), "tenant-b-node", "{}"));
+    const std::string fingerprint(64, 'd');
+    setNodeFingerprint(node.id, fingerprint);
     const auto tenantCommands = m_commands->scoped({tenantId, false});
     const auto command        = m_runner.run(tenantCommands->create(m_runner.loop(), node.id, "reboot", "{}", 1, 60));
     ASSERT_TRUE(command.has_value());
 
-    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(node.id));
+    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(node.id), agentHeaders(fingerprint));
     ASSERT_EQ(200, next.status) << next.body;
     ASSERT_TRUE((*next.json())["data"].is_object()) << next.body;
     EXPECT_EQ(command->id, (*next.json())["data"]["id"].get<std::int64_t>());
 
     const auto result = m_server->post("/api/agent/commands/" + std::to_string(command->id) + "/result",
-                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "succeeded"}, {"result", "{}"}}).dump());
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "succeeded"}, {"result", "{}"}}).dump(),
+                                       "application/json", agentHeaders(fingerprint));
     ASSERT_EQ(200, result.status) << result.body;
     EXPECT_EQ("succeeded", (*result.json())["data"]["status"].get<std::string>());
 
@@ -544,9 +593,18 @@ TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
     const std::int64_t taskId = m_runner.run(tenantFirmware->createTask(m_runner.loop(), firmwareId, node.id));
     ASSERT_GT(taskId, 0);
     const auto status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
-                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "installed"}, {"progress", 100}}).dump());
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "installed"}, {"progress", 100}}).dump(),
+                                       "application/json", agentHeaders(fingerprint));
     ASSERT_EQ(200, status.status) << status.body;
     EXPECT_EQ(taskId, (*status.json())["data"]["id"].get<std::int64_t>());
+
+    // 默认租户的节点不能借自己的合法证书取走别家租户的固件
+    const auto        defaultNode = m_runner.run(m_nodes->create(m_runner.loop(), "tenant-a-node", "{}"));
+    const std::string defaultFingerprint(64, '5');
+    setNodeFingerprint(defaultNode.id, defaultFingerprint);
+    const auto crossTenant = m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(defaultNode.id),
+                                           agentHeaders(defaultFingerprint));
+    EXPECT_EQ(403, crossTenant.status) << crossTenant.body;
 }
 
 // 钉住：批量命令共享批次号；计划时间未到时 Agent 取不到，到点后可取
@@ -555,6 +613,10 @@ TEST_F(FleetEndpointsTest, BatchAndScheduledCommands)
     const std::string  token  = login();
     const std::int64_t nodeA  = createNode(token, "batch-node-a");
     const std::int64_t nodeB  = createNode(token, "batch-node-b");
+    const std::string  fingerprintA(64, 'e');
+    const std::string  fingerprintB(64, '1');
+    setNodeFingerprint(nodeA, fingerprintA);
+    setNodeFingerprint(nodeB, fingerprintB);
     const auto         now    = std::chrono::system_clock::now();
     const std::string  future = EdgePulse::Common::formatDateTimeUtc(now + std::chrono::hours{1});
     const std::string  past   = EdgePulse::Common::formatDateTimeUtc(now - std::chrono::minutes{1});
@@ -572,14 +634,14 @@ TEST_F(FleetEndpointsTest, BatchAndScheduledCommands)
     const std::int64_t batchId = (*scheduledJson)["data"]["batchId"].get<std::int64_t>();
     EXPECT_EQ(batchId, (*scheduledJson)["data"]["commands"][0]["batchId"].get<std::int64_t>());
     EXPECT_EQ(future, (*scheduledJson)["data"]["commands"][0]["scheduledAt"].get<std::string>());
-    const auto early = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA));
+    const auto early = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA), agentHeaders(fingerprintA));
     ASSERT_EQ(200, early.status) << early.body;
     EXPECT_TRUE((*early.json())["data"].is_null());
     const auto canceled = m_server->send("PUT", "/api/commands/batch/" + std::to_string(batchId) + "/cancel", "{}", "application/json", bearer(token));
     ASSERT_EQ(200, canceled.status) << canceled.body;
     ASSERT_EQ(2, (*canceled.json())["data"].size());
     EXPECT_EQ("canceled", (*canceled.json())["data"][0]["status"].get<std::string>());
-    const auto afterCancel = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA));
+    const auto afterCancel = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA), agentHeaders(fingerprintA));
     ASSERT_EQ(200, afterCancel.status) << afterCancel.body;
     EXPECT_TRUE((*afterCancel.json())["data"].is_null());
 
@@ -589,7 +651,7 @@ TEST_F(FleetEndpointsTest, BatchAndScheduledCommands)
                     .dump(),
             "application/json", bearer(token));
     ASSERT_EQ(200, due.status) << due.body;
-    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA));
+    const auto next = m_server->get("/api/agent/commands/next?nodeId=" + std::to_string(nodeA), agentHeaders(fingerprintA));
     ASSERT_EQ(200, next.status) << next.body;
     ASSERT_TRUE((*next.json())["data"].is_object()) << next.body;
     EXPECT_EQ("reboot", (*next.json())["data"]["type"].get<std::string>());
@@ -601,7 +663,11 @@ TEST_F(FleetEndpointsTest, FirmwareCanaryAndRollback)
     const std::string  token = login();
     const std::int64_t nodeA = createNode(token, "canary-node-a");
     const std::int64_t nodeB = createNode(token, "canary-node-b");
-    const std::string  bytes(1024, 'F');
+    const std::string  fingerprintA(64, '2');
+    const std::string  fingerprintB(64, '3');
+    setNodeFingerprint(nodeA, fingerprintA);
+    setNodeFingerprint(nodeB, fingerprintB);
+    const std::string bytes(1024, 'F');
 
     const auto uploadFirst = m_server->send("POST", "/api/firmware?name=Canary+OS&version=1.0.0&fileName=a.bin", bytes, "application/octet-stream", bearer(token));
     ASSERT_EQ(200, uploadFirst.status) << uploadFirst.body;
@@ -610,10 +676,11 @@ TEST_F(FleetEndpointsTest, FirmwareCanaryAndRollback)
             m_server->post("/api/firmware/" + std::to_string(firstId) + "/deploy",
                            AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeA, nodeB})}}).dump(), "application/json", bearer(token));
     ASSERT_EQ(200, deployFirst.status) << deployFirst.body;
-    for (const std::int64_t nodeId: {nodeA, nodeB})
+    for (const auto &[nodeId, fingerprint]: {std::pair{nodeA, fingerprintA}, std::pair{nodeB, fingerprintB}})
     {
         ASSERT_EQ(200, m_server->post("/api/agent/firmware/" + std::to_string(firstId) + "/status",
-                                      AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}}).dump())
+                                      AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}}).dump(),
+                                      "application/json", agentHeaders(fingerprint))
                                .status);
     }
 
@@ -630,7 +697,8 @@ TEST_F(FleetEndpointsTest, FirmwareCanaryAndRollback)
     ASSERT_EQ(1, (*canaryJson)["data"]["deferredNodeIds"].size());
     EXPECT_EQ(nodeB, (*canaryJson)["data"]["deferredNodeIds"][0].get<std::int64_t>());
     ASSERT_EQ(200, m_server->post("/api/agent/firmware/" + std::to_string(secondId) + "/status",
-                                  AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeA}, {"status", "installed"}, {"progress", 100}}).dump())
+                                  AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeA}, {"status", "installed"}, {"progress", 100}}).dump(),
+                                  "application/json", agentHeaders(fingerprintA))
                            .status);
 
     const auto rollback =

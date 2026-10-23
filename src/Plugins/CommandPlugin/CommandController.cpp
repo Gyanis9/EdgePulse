@@ -10,6 +10,8 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Device/AgentAuthorization.h"
+#include "Core/Device/NodeRepository.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 #include "Net/Http/Message/HttpRequest.h"
@@ -322,6 +324,12 @@ namespace EdgePulse::Command
                            fail(response, Common::kCodeBadRequest, "缺少 nodeId", traceId);
                            co_return;
                        }
+                       const auto identity = co_await Device::requireAgentNode(loop, *deps->nodes, request, *nodeId);
+                       if (!identity.has_value())
+                       {
+                           fail(response, identity.error().httpStatus, identity.error().message, traceId);
+                           co_return;
+                       }
                        const auto command = co_await allCommands->takeNext(loop, *nodeId);
                        if (!command.has_value())
                        {
@@ -354,6 +362,12 @@ namespace EdgePulse::Command
                         if (!nodeId.has_value())
                         {
                             fail(response, Common::kCodeBadRequest, "缺少 nodeId", traceId);
+                            co_return;
+                        }
+                        const auto identity = co_await Device::requireAgentNode(loop, *deps->nodes, request, *nodeId);
+                        if (!identity.has_value())
+                        {
+                            fail(response, identity.error().httpStatus, identity.error().message, traceId);
                             co_return;
                         }
                         const auto existing = co_await allCommands->find(loop, *id);
