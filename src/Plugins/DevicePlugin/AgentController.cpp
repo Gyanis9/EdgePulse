@@ -76,7 +76,8 @@ namespace EdgePulse::Device
         }
     } // namespace
 
-    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants)
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants,
+                        const int heartbeatIntervalSeconds)
     {
         router.post("/api/agent/register",
                     [&loop, &registry, &tenants](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -124,7 +125,7 @@ namespace EdgePulse::Device
                     });
 
         router.post("/api/agent/heartbeat",
-                    [&loop, &registry, &nodes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, &registry, &nodes, heartbeatIntervalSeconds](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string                                  traceId = Web::resolveRequestId(request);
                         const std::optional<AsynGyanis::Base::ConfigValue> body    = request.jsonBody();
@@ -152,7 +153,10 @@ namespace EdgePulse::Device
                             writeAgentError(response, result.error(), traceId);
                             co_return;
                         }
-                        Common::writeSuccess(response, nodeToJson(*result), traceId);
+                        // 心跳响应同时充当 Agent 的节奏协商：interval 由服务端配置下发，节点无需自定
+                        AsynGyanis::Base::ConfigValue payload = nodeToJson(result->node);
+                        payload["heartbeatIntervalSeconds"]   = heartbeatIntervalSeconds;
+                        Common::writeSuccess(response, std::move(payload), traceId);
                         co_return;
                     });
     }

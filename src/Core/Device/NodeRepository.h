@@ -16,6 +16,7 @@
 #include <Core/Coroutine/Task.h>
 #include <Core/EventLoop/EventLoop.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -52,6 +53,43 @@ namespace EdgePulse::Device
     {
         std::vector<NodeRecord> rows;     ///< 当前页
         std::int64_t            total{0}; ///< 总行数
+    };
+
+    /**
+     * @brief 一次心跳的结果
+     */
+    struct HeartbeatOutcome
+    {
+        NodeRecord node;                ///< 更新后的节点
+        bool       becameOnline{false}; ///< 心跳前是否不在线
+    };
+
+    /**
+     * @brief Agent 注册的结果
+     */
+    struct AgentUpsertOutcome
+    {
+        NodeRecord node;                ///< 注册后的节点
+        bool       becameOnline{false}; ///< 注册前是否不在线
+        bool       created{false};      ///< 是否新建了节点
+    };
+
+    /**
+     * @brief Agent 注册被拒的原因
+     */
+    enum class AgentUpsertFailure
+    {
+        TokenRejected,    ///< 注册/改绑令牌无效、过期、已用或与节点名不符
+        RebindNotAllowed, ///< 已有节点换了证书但没有改绑令牌
+    };
+
+    /**
+     * @brief 按状态统计的节点数
+     */
+    struct NodeStatusCounts
+    {
+        std::int64_t online{0};  ///< 在线节点数
+        std::int64_t offline{0}; ///< 离线节点数
     };
 
     /**
@@ -153,14 +191,36 @@ namespace EdgePulse::Device
 
         /**
          * @brief Agent 注册：按名称更新或新建，并置为在线
+         * @param loop 恢复协程用的事件循环
+         * @param registration 注册输入
+         * @return 成功返回节点与在线转换标记；令牌校验由注册令牌接入时在同一事务内完成
          */
-        AsynGyanis::Core::Task<NodeRecord> upsertAgent(AsynGyanis::Core::EventLoop &loop, AgentUpsert registration);
+        AsynGyanis::Core::Task<std::expected<AgentUpsertOutcome, AgentUpsertFailure>> upsertAgent(AsynGyanis::Core::EventLoop &loop, AgentUpsert registration);
 
         /**
          * @brief 心跳：更新在线状态与最近时间
-         * @return 节点不存在时为空
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点标识
+         * @param agentVersion Agent 版本；空表示不改
+         * @return 节点不存在时为空；becameOnline 表示更新前是否不在线
          */
-        AsynGyanis::Core::Task<std::optional<NodeRecord>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion);
+        AsynGyanis::Core::Task<std::optional<HeartbeatOutcome>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion);
+
+        /**
+         * @brief 把超时未心跳的在线节点批量置为离线
+         * @param loop 恢复协程用的事件循环
+         * @param cutoff 最近心跳早于该时刻即视为超时
+         * @param limit 本次最多转换多少个节点
+         * @return 本次真正转换的节点
+         */
+        AsynGyanis::Core::Task<std::vector<NodeRecord>> markStaleOffline(AsynGyanis::Core::EventLoop &loop, std::string cutoff, std::size_t limit);
+
+        /**
+         * @brief 按状态统计未删除节点
+         * @param loop 恢复协程用的事件循环
+         * @return 在线与离线节点数
+         */
+        AsynGyanis::Core::Task<NodeStatusCounts> countByStatus(AsynGyanis::Core::EventLoop &loop);
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装

@@ -378,4 +378,23 @@ namespace EdgePulse::Command
                     return findOnConnection(connection, commandId, tenant);
                 });
     }
+
+    AsynGyanis::Core::Task<std::int64_t> CommandRepository::pendingCount(AsynGyanis::Core::EventLoop &loop)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                {
+                    std::vector<DatabaseValue> parameters;
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    // 执行中的命令同样没有结果，积压读数把两种未结束状态一起算进去
+                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_command WHERE status IN ('pending', 'running')" + clause, parameters);
+                    return rows->next() ? Sql::integer(*rows, "total") : 0;
+                });
+    }
 } // namespace EdgePulse::Command

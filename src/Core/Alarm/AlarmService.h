@@ -25,6 +25,11 @@ namespace AsynGyanis::Core
     class EventLoop;
 }
 
+namespace EdgePulse::Device
+{
+    struct NodeRecord;
+}
+
 namespace EdgePulse::Alarm
 {
     /**
@@ -57,6 +62,24 @@ namespace EdgePulse::Alarm
          * @return std::vector<AlarmRecord> 本次新增或恢复的告警
          */
         AsynGyanis::Core::Task<std::vector<AlarmRecord>> evaluate(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, const std::vector<Telemetry::TelemetrySample> &samples);
+
+        /**
+         * @brief 为超时离线的节点生成一条系统告警
+         * @param loop 恢复协程用的事件循环
+         * @param node 已转为离线的节点
+         * @param timeoutSeconds 判定超时的秒数，写入告警说明
+         * @return std::optional<AlarmRecord> 新建的告警；同一节点已有未恢复的系统告警时返回那一条
+         * @note 系统告警固定 rule_id=0、metric=node.online，不依赖用户配置的告警规则
+         */
+        AsynGyanis::Core::Task<std::optional<AlarmRecord>> reportNodeOffline(AsynGyanis::Core::EventLoop &loop, const Device::NodeRecord &node, int timeoutSeconds);
+
+        /**
+         * @brief 节点恢复在线时销案它的系统离线告警
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点标识
+         * @return std::optional<AlarmRecord> 被销案的告警；没有未恢复告警时为空
+         */
+        AsynGyanis::Core::Task<std::optional<AlarmRecord>> resolveNodeOffline(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
 
         /**
          * @brief 广播一条告警变更

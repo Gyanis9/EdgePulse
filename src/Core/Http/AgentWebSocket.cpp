@@ -5,6 +5,7 @@
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/CertificateBinding.h"
+#include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeRepository.h"
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
@@ -51,10 +52,10 @@ namespace EdgePulse::Web
     } // namespace
 
     void registerAgentWebSocket(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, Device::NodeRepository &nodes, Command::CommandRepository &commands,
-                                Command::AgentChannelRegistry &channels)
+                                Command::AgentChannelRegistry &channels, Device::NodeLifecycleService *lifecycle)
     {
         router.get("/api/agent/ws",
-                   [&loop, &nodes, &commands, &channels](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodes, &commands, &channels, lifecycle](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        // Agent 请求没有会话：节点与命令都按全租户视图处理，归属由节点自身决定
                        const auto                              allNodes    = nodes.scoped(System::TenantScope{0, true});
@@ -63,7 +64,7 @@ namespace EdgePulse::Web
                        // Agent 已在 mTLS 监听器上完成证书校验；此处不再要求浏览器 Origin
                        policy.originMode = AsynGyanis::Net::WebSocketOriginMode::AllowAny;
                        response.upgradeToWebSocket(
-                               [&loop, allNodes, allCommands, &channels](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
+                               [&loop, allNodes, allCommands, &channels, lifecycle](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
                                {
                                    std::int64_t nodeId = 0;
                                    // 首条消息必须是 hello；mTLS 已经挡住匿名对端，这里只校验节点确实存在
@@ -98,8 +99,12 @@ namespace EdgePulse::Web
                                            co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate mismatch");
                                            co_return;
                                        }
-                                       nodeId = *id;
-                                       static_cast<void>(co_await allNodes->heartbeat(loop, nodeId, stringOf(*hello, "agentVersion")));
+                                       nodeId          = *id;
+                                       const auto beat = co_await allNodes->heartbeat(loop, nodeId, stringOf(*hello, "agentVersion"));
+                                       if (beat.has_value() && beat->becameOnline && lifecycle != nullptr)
+                                       {
+                                           co_await lifecycle->onHeartbeat(loop, beat->node, true);
+                                       }
                                        channels.registerNode(nodeId, &peer);
                                        static_cast<void>(co_await peer.sendText(R"({"type":"hello","ok":true})"));
                                        break;

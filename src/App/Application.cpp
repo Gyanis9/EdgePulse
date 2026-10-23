@@ -22,11 +22,14 @@
 #include "Net/Http/Server/ReadinessCheck.h"
 #include "Base/Database/Database.h"
 #include "Base/Runtime/Environment.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Plugins/DevicePlugin/AgentController.h"
 #include "Core/Device/AgentRegistry.h"
+#include "Core/Device/NodeLifecycleService.h"
 #include "Plugins/DevicePlugin/DeviceController.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
+#include "Core/Metrics/BusinessMetrics.h"
 #include "Core/System/MigrationRunner.h"
 #include "Core/System/DictionaryRepository.h"
 #include "Core/System/LogRepository.h"
@@ -197,45 +200,9 @@ namespace EdgePulse::App
             m_realtimeBus            = std::make_unique<Web::RealtimeBus>(loop, *m_browserWebSocket, *m_sseBroadcaster, std::move(realtimeOptions));
             m_realtimeBus->start();
             m_nodeRepository = std::make_shared<Device::NodeRepository>(m_database);
-            m_nodeService    = std::make_shared<Device::NodeService>(m_nodeRepository);
-            Device::AgentRegistry::Options agentOptions;
-            if (!m_configuration.agentFingerprint.empty())
-            {
-                agentOptions.allowedFingerprints.push_back(m_configuration.agentFingerprint);
-            }
-            agentOptions.publisher = [bus = m_realtimeBus.get()](const Device::NodeRecord &node) -> AsynGyanis::Core::Task<>
-            {
-                const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "node.status"}, {"data", Device::nodeToJson(node)}}).dump();
-                co_await bus->publish("nodes", node.tenantId, payload);
-                co_return;
-            };
-            m_agentRegistry  = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
-            m_userRepository = std::make_shared<System::UserRepository>(m_database);
-            if (m_configuration.oidcEnabled)
-            {
-                Auth::OidcConfiguration oidcConfiguration;
-                oidcConfiguration.enabled             = true;
-                oidcConfiguration.issuer              = m_configuration.oidcIssuer;
-                oidcConfiguration.clientId            = m_configuration.oidcClientId;
-                oidcConfiguration.clientSecret        = m_configuration.oidcClientSecret;
-                oidcConfiguration.redirectUri         = m_configuration.oidcRedirectUri;
-                oidcConfiguration.frontendRedirect    = m_configuration.oidcFrontendRedirect;
-                oidcConfiguration.scopes              = m_configuration.oidcScopes;
-                oidcConfiguration.autoProvision       = m_configuration.oidcAutoProvision;
-                oidcConfiguration.defaultRoleId       = m_configuration.oidcDefaultRoleId;
-                oidcConfiguration.defaultDepartmentId = m_configuration.oidcDefaultDepartmentId;
-                oidcConfiguration.allowedEmailDomains = m_configuration.oidcAllowedEmailDomains;
-                oidcConfiguration.tenantCode          = m_configuration.oidcTenantCode;
-                m_oidcService                         = std::make_unique<Auth::OidcService>(oidcConfiguration, *m_userRepository, *m_tenantRepository, *m_cache, *m_authService);
-            }
-            m_roleRepository         = std::make_shared<System::RoleRepository>(m_database);
-            m_menuRepository         = std::make_shared<System::MenuRepository>(m_database);
-            m_orgRepository          = std::make_shared<System::OrgRepository>(m_database);
-            m_dictionaryRepository   = std::make_shared<System::DictionaryRepository>(m_database);
-            m_logRepository          = std::make_shared<System::LogRepository>(m_database);
-            m_dataScopeService       = std::make_shared<Auth::DataScopeService>(m_database);
-            m_nodeGroupRepository    = std::make_shared<Device::NodeGroupRepository>(m_database);
-            m_telemetryRepository    = std::make_shared<Telemetry::TelemetryRepository>(m_database);
+            // 离线判定按进程汇总；仓储默认只看默认租户，周期扫描必须显式取全租户视图
+            m_fleetNodes             = m_nodeRepository->scoped({0, true});
+            m_nodeService            = std::make_shared<Device::NodeService>(m_nodeRepository);
             m_alarmRepository        = std::make_shared<Alarm::AlarmRepository>(m_database);
             m_notificationRepository = std::make_shared<Notification::NotificationRepository>(m_database);
             m_notificationService    = std::make_shared<Notification::NotificationService>(m_notificationRepository);
@@ -262,10 +229,47 @@ namespace EdgePulse::App
                         dispatcher->enqueue(alarm);
                         co_return;
                     });
-            m_firmwareRepository = std::make_shared<Firmware::FirmwareRepository>(m_database);
-            m_commandRepository  = std::make_shared<Command::CommandRepository>(m_database);
-            m_agentChannels      = std::make_shared<Command::AgentChannelRegistry>();
-            m_opsRepository      = std::make_shared<Ops::OpsRepository>(m_database);
+            m_lifecycle = std::make_shared<Device::NodeLifecycleService>(
+                    *m_fleetNodes, *m_alarmService, [this](const Device::NodeRecord &node) -> AsynGyanis::Core::Task<> { co_await publishNodeStatus(node); },
+                    m_configuration.heartbeatTimeoutSeconds);
+            Device::AgentRegistry::Options agentOptions;
+            if (!m_configuration.agentFingerprint.empty())
+            {
+                agentOptions.allowedFingerprints.push_back(m_configuration.agentFingerprint);
+            }
+            agentOptions.publisher = [lifecycle = m_lifecycle, &loop](const Device::NodeRecord &node, const bool becameOnline) -> AsynGyanis::Core::Task<>
+            { co_await lifecycle->onHeartbeat(loop, node, becameOnline); };
+            m_agentRegistry  = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
+            m_userRepository = std::make_shared<System::UserRepository>(m_database);
+            if (m_configuration.oidcEnabled)
+            {
+                Auth::OidcConfiguration oidcConfiguration;
+                oidcConfiguration.enabled             = true;
+                oidcConfiguration.issuer              = m_configuration.oidcIssuer;
+                oidcConfiguration.clientId            = m_configuration.oidcClientId;
+                oidcConfiguration.clientSecret        = m_configuration.oidcClientSecret;
+                oidcConfiguration.redirectUri         = m_configuration.oidcRedirectUri;
+                oidcConfiguration.frontendRedirect    = m_configuration.oidcFrontendRedirect;
+                oidcConfiguration.scopes              = m_configuration.oidcScopes;
+                oidcConfiguration.autoProvision       = m_configuration.oidcAutoProvision;
+                oidcConfiguration.defaultRoleId       = m_configuration.oidcDefaultRoleId;
+                oidcConfiguration.defaultDepartmentId = m_configuration.oidcDefaultDepartmentId;
+                oidcConfiguration.allowedEmailDomains = m_configuration.oidcAllowedEmailDomains;
+                oidcConfiguration.tenantCode          = m_configuration.oidcTenantCode;
+                m_oidcService                         = std::make_unique<Auth::OidcService>(oidcConfiguration, *m_userRepository, *m_tenantRepository, *m_cache, *m_authService);
+            }
+            m_roleRepository       = std::make_shared<System::RoleRepository>(m_database);
+            m_menuRepository       = std::make_shared<System::MenuRepository>(m_database);
+            m_orgRepository        = std::make_shared<System::OrgRepository>(m_database);
+            m_dictionaryRepository = std::make_shared<System::DictionaryRepository>(m_database);
+            m_logRepository        = std::make_shared<System::LogRepository>(m_database);
+            m_dataScopeService     = std::make_shared<Auth::DataScopeService>(m_database);
+            m_nodeGroupRepository  = std::make_shared<Device::NodeGroupRepository>(m_database);
+            m_telemetryRepository  = std::make_shared<Telemetry::TelemetryRepository>(m_database);
+            m_firmwareRepository   = std::make_shared<Firmware::FirmwareRepository>(m_database);
+            m_commandRepository    = std::make_shared<Command::CommandRepository>(m_database);
+            m_agentChannels        = std::make_shared<Command::AgentChannelRegistry>();
+            m_opsRepository        = std::make_shared<Ops::OpsRepository>(m_database);
 
             if (m_configuration.udpTelemetryEnabled)
             {
@@ -315,6 +319,7 @@ namespace EdgePulse::App
             m_buildInfoMetric =
                     AsynGyanis::Core::ProcessMetricsRegistry::registerMetric("edgepulse_build_info", "EdgePulse 构建信息（恒为 1）", AsynGyanis::Core::ProcessMetricKind::Gauge,
                                                                              AsynGyanis::Core::ProcessMetricMerge::Sum, [] { return std::uint64_t{1}; });
+            Metrics::BusinessMetrics::instance().registerMetrics();
 
             if (configurationManager.getBool("metrics.enabled", false))
             {
@@ -441,7 +446,7 @@ namespace EdgePulse::App
                 }
                 m_agentServer->setClientCertificateRequired(true);
                 Web::applySecurityHeaders(m_agentServer->router());
-                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_nodeRepository, *m_tenantRepository);
+                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_nodeRepository, *m_tenantRepository, m_configuration.heartbeatIntervalSeconds);
                 Telemetry::TelemetryDependencies telemetryAgentDependencies;
                 telemetryAgentDependencies.auth      = m_authService.get();
                 telemetryAgentDependencies.nodes     = m_nodeRepository.get();
@@ -463,7 +468,7 @@ namespace EdgePulse::App
                 firmwareAgentDependencies.storageDirectory   = m_configuration.firmwareDirectory;
                 firmwareAgentDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
                 Firmware::registerFirmwareAgentRoutes(m_agentServer->router(), loop, firmwareAgentDependencies);
-                Web::registerAgentWebSocket(m_agentServer->router(), loop, *m_nodeRepository, *m_commandRepository, *m_agentChannels);
+                Web::registerAgentWebSocket(m_agentServer->router(), loop, *m_nodeRepository, *m_commandRepository, *m_agentChannels, m_lifecycle.get());
                 m_agentAccept.emplace(m_agentServer->start());
                 loop.scheduler().schedule(m_agentAccept->handle());
             }
@@ -508,6 +513,8 @@ namespace EdgePulse::App
         }
         m_commandScheduler = runCommandScheduler(loop);
         loop.scheduler().schedule(m_commandScheduler->handle());
+        m_fleetLifecycle = runFleetLifecycle(loop);
+        loop.scheduler().schedule(m_fleetLifecycle->handle());
         if (m_configuration.telemetryRetentionDays > 0 || m_configuration.logRetentionDays > 0 || m_configuration.deliveryRetentionDays > 0)
         {
             m_dataRetention = runDataRetention(loop);
@@ -612,6 +619,40 @@ namespace EdgePulse::App
             LOG_INFO_FMT("数据清理完成（保留天数，0 表示关闭）：遥测 {}、日志 {}、投递记录 {}", m_configuration.telemetryRetentionDays, m_configuration.logRetentionDays,
                          m_configuration.deliveryRetentionDays);
         }
+    }
+
+    AsynGyanis::Core::Task<> Application::runFleetLifecycle(AsynGyanis::Core::EventLoop &loop)
+    {
+        AsynGyanis::Core::Timer ticker(loop);
+        const auto              allAlarms   = m_alarmRepository->scoped({0, true});
+        const auto              allCommands = m_commandRepository->scoped({0, true});
+        bool                    firstRun    = true;
+        while (true)
+        {
+            // 首次延后十秒：给启动中的 Agent 留出重连窗口，避免把正在恢复的节点误判离线
+            co_await ticker.waitFor(firstRun ? std::chrono::seconds{10} : std::chrono::seconds{m_configuration.offlineSweepSeconds});
+            firstRun = false;
+            try
+            {
+                const std::string cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{m_configuration.heartbeatTimeoutSeconds});
+                co_await m_lifecycle->sweep(loop, cutoff);
+                const Device::NodeStatusCounts counts = co_await m_fleetNodes->countByStatus(loop);
+                Metrics::BusinessMetrics::instance().setNodeCounts(counts.online, counts.offline);
+                Metrics::BusinessMetrics::instance().setAlarmsOpen(co_await allAlarms->openCount(loop));
+                Metrics::BusinessMetrics::instance().setCommandsPending(co_await allCommands->pendingCount(loop));
+            } catch (const std::exception &failure)
+            {
+                // 单轮失败（数据库抖动、临时锁冲突）不能终止周期任务，否则服务会永久停止判离线
+                LOG_WARN_FMT("离线扫描或指标刷新失败：{}", failure.what());
+            }
+        }
+    }
+
+    AsynGyanis::Core::Task<> Application::publishNodeStatus(const Device::NodeRecord &node)
+    {
+        const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "node.status"}, {"data", Device::nodeToJson(node)}}).dump();
+        co_await m_realtimeBus->publish("nodes", node.tenantId, payload);
+        co_return;
     }
 
     void Application::registerPublicRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)

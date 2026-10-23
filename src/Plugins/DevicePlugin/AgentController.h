@@ -22,7 +22,7 @@ namespace EdgePulse::Device
 {
     class AgentRegistry;
     class NodeRepository;
-}
+} // namespace EdgePulse::Device
 
 namespace EdgePulse::System
 {
@@ -38,6 +38,8 @@ namespace EdgePulse::Device
      * @param registry Agent 注册表
      * @param nodes 节点仓储，用于校验心跳请求的证书身份
      * @param tenants 租户仓储，用于解析注册请求的租户编码
+     * @param heartbeatIntervalSeconds 期望的心跳间隔，随心跳响应下发
      */
-    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants);
+    void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants,
+                        int heartbeatIntervalSeconds);
 } // namespace EdgePulse::Device

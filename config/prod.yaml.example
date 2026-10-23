@@ -44,6 +44,9 @@ edgepulse:
     allowed_origins: https://console.example.com
   agent:
     fingerprint: ""
+    heartbeat_interval_seconds: 30
+    heartbeat_timeout_seconds: 90
+    offline_sweep_seconds: 30
   udp_telemetry:
     enabled: false
     address: 0.0.0.0

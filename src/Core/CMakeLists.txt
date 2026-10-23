@@ -16,6 +16,7 @@ add_library(edgepulse-core STATIC
         Device/AgentRegistry.cpp
         Device/CertificateBinding.cpp
         Device/NodeGroupRepository.cpp
+        Device/NodeLifecycleService.cpp
         Device/NodeRepository.cpp
         Device/NodeService.cpp
         Firmware/FirmwareFileWriter.cpp
@@ -30,6 +31,7 @@ add_library(edgepulse-core STATIC
         Http/RequestId.cpp
         Http/SseBroadcaster.cpp
         Http/WebSocketEndpoints.cpp
+        Metrics/BusinessMetrics.cpp
         Notification/NotificationDispatcher.cpp
         Notification/NotificationRepository.cpp
         Notification/NotificationService.cpp

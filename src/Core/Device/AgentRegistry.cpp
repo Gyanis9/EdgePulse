@@ -75,36 +75,44 @@ namespace EdgePulse::Device
         upsert.agentVersion    = registration.agentVersion;
         upsert.certFingerprint = *fingerprint;
         upsert.labelsJson      = *labels;
-        const NodeRecord node  = co_await m_repository->upsertAgent(loop, std::move(upsert));
-        co_await publish(node);
-        co_return node;
+        const auto outcome     = co_await m_repository->upsertAgent(loop, std::move(upsert));
+        if (!outcome.has_value())
+        {
+            // 仓储只会在注册令牌核验失败时拒绝；按授权失败返回 403，而不是伪装成服务端错误
+            const std::string message = outcome.error() == AgentUpsertFailure::TokenRejected ? "注册令牌无效、过期、已用或与节点名不符" : "已有节点更换证书必须提供改绑令牌";
+            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, message});
+        }
+        co_await publish(outcome->node, outcome->becameOnline);
+        co_return outcome->node;
     }
 
-    AsynGyanis::Core::Task<std::expected<NodeRecord, AgentError>> AgentRegistry::heartbeat(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string agentVersion)
+    AsynGyanis::Core::Task<std::expected<HeartbeatOutcome, AgentError>> AgentRegistry::heartbeat(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
+                                                                                                 std::string agentVersion)
     {
         if (nodeId <= 0)
         {
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "nodeId 必须是正整数"});
         }
         // Agent 侧没有会话，节点标识全局唯一；按全租户视图查节点，避免只认默认租户
-        const std::optional<NodeRecord> node = co_await m_repository->scoped(System::TenantScope{0, true})->heartbeat(loop, nodeId, std::move(agentVersion));
-        if (!node.has_value())
+        const auto outcome = co_await m_repository->scoped(System::TenantScope{0, true})->heartbeat(loop, nodeId, std::move(agentVersion));
+        if (!outcome.has_value())
         {
             co_return std::unexpected(AgentError{AgentError::Reason::NotFound, "节点不存在或已删除"});
         }
-        co_await publish(*node);
-        co_return *node;
+        co_await publish(outcome->node, outcome->becameOnline);
+        co_return *outcome;
     }
 
-    AsynGyanis::Core::Task<> AgentRegistry::publish(const NodeRecord &node)
+    AsynGyanis::Core::Task<> AgentRegistry::publish(const NodeRecord &node, const bool becameOnline)
     {
-        if (!m_options.publisher)
+        // 只在离线转在线时广播：每次心跳都推一遍会让前端连接被无意义的状态帧刷满
+        if (!becameOnline || !m_options.publisher)
         {
             co_return;
         }
         try
         {
-            co_await m_options.publisher(node);
+            co_await m_options.publisher(node, becameOnline);
         } catch (const std::exception &failure)
         {
             // 状态已经落库；推送失败只影响实时界面，不能在注册/心跳路径上放大成 500

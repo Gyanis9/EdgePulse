@@ -1,5 +1,7 @@
 #include "Core/Device/NodeRepository.h"
 
+#include "Base/Database/SqlExecution.h"
+#include "Base/Database/SqlHelpers.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Database/Common/DatabaseResult.h"
@@ -324,20 +326,22 @@ namespace EdgePulse::Device
                                                             });
     }
 
-    AsynGyanis::Core::Task<NodeRecord> NodeRepository::upsertAgent(AsynGyanis::Core::EventLoop &loop, AgentUpsert registration)
+    AsynGyanis::Core::Task<std::expected<AgentUpsertOutcome, AgentUpsertFailure>> NodeRepository::upsertAgent(AsynGyanis::Core::EventLoop &loop, AgentUpsert registration)
     {
-        co_return co_await m_database->withConnection<NodeRecord>(
+        co_return co_await m_database->withConnection<std::expected<AgentUpsertOutcome, AgentUpsertFailure>>(
                 loop,
-                [registration = std::move(registration)](AsynGyanis::Database::DatabaseConnection &connection) -> NodeRecord
+                [registration = std::move(registration)](AsynGyanis::Database::DatabaseConnection &connection) -> std::expected<AgentUpsertOutcome, AgentUpsertFailure>
                 {
                     const std::string               now = Common::nowDateTimeUtc();
                     const System::TenantScope       tenant{registration.tenantId, false};
                     const std::optional<NodeRecord> current = findByNameOnConnection(connection, registration.name, tenant);
                     if (!current.has_value())
                     {
-                        return insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
-                                          registration.certFingerprint, now);
+                        NodeRecord node = insertNode(connection, registration.tenantId, registration.name, registration.labelsJson, "online", registration.agentVersion,
+                                                     registration.certFingerprint, now);
+                        return AgentUpsertOutcome{std::move(node), true, true};
                     }
+                    const bool                                               becameOnline = current->status != "online";
                     const std::array<AsynGyanis::Database::DatabaseValue, 6> parameters{
                             registration.agentVersion, registration.certFingerprint, nullableText(registration.labelsJson), now, now, current->id};
                     const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
@@ -355,16 +359,22 @@ namespace EdgePulse::Device
                     node.labelsJson      = registration.labelsJson;
                     node.lastSeen        = now;
                     node.version         = current->version + 1;
-                    return node;
+                    return AgentUpsertOutcome{std::move(node), becameOnline, false};
                 });
     }
 
-    AsynGyanis::Core::Task<std::optional<NodeRecord>> NodeRepository::heartbeat(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string agentVersion)
+    AsynGyanis::Core::Task<std::optional<HeartbeatOutcome>> NodeRepository::heartbeat(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string agentVersion)
     {
-        co_return co_await m_database->withConnection<std::optional<NodeRecord>>(
+        co_return co_await m_database->withConnection<std::optional<HeartbeatOutcome>>(
                 loop,
-                [nodeId, agentVersion = std::move(agentVersion), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<NodeRecord>
+                [nodeId, agentVersion = std::move(agentVersion), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<HeartbeatOutcome>
                 {
+                    // 先读旧状态再更新：更新后的 status 恒为 online，转换与否只能从更新前的值判断
+                    const std::optional<NodeRecord> current = findByIdOnConnection(connection, nodeId, tenant);
+                    if (!current.has_value())
+                    {
+                        return std::nullopt;
+                    }
                     const std::string                                now = Common::nowDateTimeUtc();
                     std::vector<AsynGyanis::Database::DatabaseValue> parameters{now, agentVersion, agentVersion, now, nodeId};
                     std::string                                      clause;
@@ -382,7 +392,86 @@ namespace EdgePulse::Device
                     {
                         throw Common::DatabaseException("更新节点心跳失败：" + connection.lastError());
                     }
-                    return findByIdOnConnection(connection, nodeId, tenant);
+                    const std::optional<NodeRecord> updated = findByIdOnConnection(connection, nodeId, tenant);
+                    if (!updated.has_value())
+                    {
+                        return std::nullopt;
+                    }
+                    return HeartbeatOutcome{*updated, current->status != "online"};
+                });
+    }
+
+    AsynGyanis::Core::Task<std::vector<NodeRecord>> NodeRepository::markStaleOffline(AsynGyanis::Core::EventLoop &loop, std::string cutoff, const std::size_t limit)
+    {
+        co_return co_await m_database->withConnection<std::vector<NodeRecord>>(
+                loop,
+                [cutoff = std::move(cutoff), limit, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::vector<NodeRecord>
+                {
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{cutoff};
+                    std::string                                      filter = " WHERE status = 'online' AND last_seen IS NOT NULL AND last_seen < ?";
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    // LIMIT 占位符在筛选条件之后，参数必须按语句里的出现顺序追加
+                    parameters.emplace_back(static_cast<std::int64_t>(limit));
+                    const auto                rows = Sql::executeOrThrow(connection, "SELECT id FROM biz_node" + filter + " ORDER BY last_seen LIMIT ?", parameters);
+                    std::vector<std::int64_t> ids;
+                    while (rows->next())
+                    {
+                        ids.push_back(Sql::integer(*rows, "id"));
+                    }
+
+                    std::vector<NodeRecord> changed;
+                    for (const std::int64_t id: ids)
+                    {
+                        // 选中与更新之间可能有心跳把节点拉回在线；条件更新保证每个离线过程只转换一次
+                        const std::array<AsynGyanis::Database::DatabaseValue, 2> updateParameters{Common::nowDateTimeUtc(), id};
+                        const auto update = Sql::executeOrThrow(connection,
+                                                                "UPDATE biz_node SET status = 'offline', version = version + 1, updated_at = ? "
+                                                                "WHERE id = ? AND status = 'online'",
+                                                                updateParameters);
+                        if (update->affectedRowCount() == 0)
+                        {
+                            continue;
+                        }
+                        if (const auto node = findByIdOnConnection(connection, id, tenant); node.has_value())
+                        {
+                            changed.push_back(*node);
+                        }
+                    }
+                    return changed;
+                });
+    }
+
+    AsynGyanis::Core::Task<NodeStatusCounts> NodeRepository::countByStatus(AsynGyanis::Core::EventLoop &loop)
+    {
+        co_return co_await m_database->withConnection<NodeStatusCounts>(
+                loop,
+                [tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> NodeStatusCounts
+                {
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters;
+                    std::string                                      clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, "SELECT status, COUNT(*) AS total FROM biz_node WHERE deleted = 0" + clause + " GROUP BY status", parameters);
+                    NodeStatusCounts counts;
+                    while (rows->next())
+                    {
+                        const std::string status = Sql::text(*rows, "status");
+                        if (status == "online")
+                        {
+                            counts.online = Sql::integer(*rows, "total");
+                        } else if (status == "offline")
+                        {
+                            counts.offline = Sql::integer(*rows, "total");
+                        }
+                    }
+                    return counts;
                 });
     }
 } // namespace EdgePulse::Device

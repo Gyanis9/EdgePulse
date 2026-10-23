@@ -65,8 +65,10 @@ namespace EdgePulse::Device
 {
     class AgentRegistry;
     class NodeGroupRepository;
+    class NodeLifecycleService;
     class NodeRepository;
     class NodeService;
+    struct NodeRecord;
 } // namespace EdgePulse::Device
 
 namespace EdgePulse::System
@@ -184,6 +186,20 @@ namespace EdgePulse::App
          */
         AsynGyanis::Core::Task<> runDataRetention(AsynGyanis::Core::EventLoop &loop);
 
+        /**
+         * @brief 周期扫描心跳超时的节点并刷新业务指标
+         * @param loop 服务器所属事件循环
+         * @return AsynGyanis::Core::Task<> 周期协程，活到应用析构
+         */
+        AsynGyanis::Core::Task<> runFleetLifecycle(AsynGyanis::Core::EventLoop &loop);
+
+        /**
+         * @brief 把节点状态推给实时总线
+         * @param node 待推送的节点
+         * @return AsynGyanis::Core::Task<> 推送完成即返回
+         */
+        AsynGyanis::Core::Task<> publishNodeStatus(const Device::NodeRecord &node);
+
     private:
         ApplicationConfiguration                                  m_configuration;
         std::filesystem::path                                     m_webRoot; ///< 前端构建产物目录
@@ -197,8 +213,10 @@ namespace EdgePulse::App
         std::unique_ptr<Auth::OidcService>                        m_oidcService;            ///< OIDC 登录
         std::shared_ptr<Web::BrowserWebSocket>                    m_browserWebSocket;       ///< 浏览器 WebSocket 与节点扇出
         std::shared_ptr<Device::NodeRepository>                   m_nodeRepository;         ///< 节点仓储
+        std::shared_ptr<Device::NodeRepository>                   m_fleetNodes;             ///< 离线扫描用的全租户节点视图
         std::shared_ptr<Device::NodeService>                      m_nodeService;            ///< 节点服务
         std::shared_ptr<Device::AgentRegistry>                    m_agentRegistry;          ///< Agent 注册表
+        std::shared_ptr<Device::NodeLifecycleService>             m_lifecycle;              ///< 节点在线转换与离线扫描
         std::shared_ptr<System::UserRepository>                   m_userRepository;         ///< 用户仓储
         std::shared_ptr<System::RoleRepository>                   m_roleRepository;         ///< 角色仓储
         std::shared_ptr<System::MenuRepository>                   m_menuRepository;         ///< 菜单仓储
@@ -219,6 +237,7 @@ namespace EdgePulse::App
         std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;     ///< 固件
         std::shared_ptr<Command::CommandRepository>               m_commandRepository;      ///< 命令
         std::optional<AsynGyanis::Core::Task<>>                   m_commandScheduler;       ///< 计划命令推进协程
+        std::optional<AsynGyanis::Core::Task<>>                   m_fleetLifecycle;         ///< 离线扫描与指标刷新协程
         std::optional<AsynGyanis::Core::Task<>>                   m_dataRetention;          ///< 数据保留期清理协程
         std::shared_ptr<Command::AgentChannelRegistry>            m_agentChannels;          ///< Agent 长连接
         std::shared_ptr<Ops::OpsRepository>                       m_opsRepository;          ///< 运维总览

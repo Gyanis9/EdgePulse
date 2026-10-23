@@ -54,8 +54,8 @@ namespace EdgePulse::Device
         AsynGyanis::Core::TlsPeerIdentityPtr connectionIdentity{}; ///< 注册请求的 TLS 对端身份；非 TLS 链路为空
     };
 
-    /// 节点状态变化后的发布回调；在服务器循环线程上 co_await
-    using NodeStatusPublisher = std::function<AsynGyanis::Core::Task<>(const NodeRecord &)>;
+    /// 节点状态变化后的发布回调；becameOnline 表示本次注册或心跳是否把节点拉回在线
+    using NodeStatusPublisher = std::function<AsynGyanis::Core::Task<>(const NodeRecord &, bool becameOnline)>;
 
     /**
      * @brief Agent 注册表
@@ -92,15 +92,15 @@ namespace EdgePulse::Device
          * @param loop 恢复协程用的事件循环
          * @param nodeId 节点标识
          * @param agentVersion Agent 版本
-         * @return 成功返回更新后的节点；失败返回可恢复错误
+         * @return 成功返回更新后的节点与在线转换标记；失败返回可恢复错误
          */
-        AsynGyanis::Core::Task<std::expected<NodeRecord, AgentError>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion);
+        AsynGyanis::Core::Task<std::expected<HeartbeatOutcome, AgentError>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion);
 
     private:
         /**
          * @brief 通知发布回调；回调异常只记日志，不推翻已经落库的状态
          */
-        AsynGyanis::Core::Task<> publish(const NodeRecord &node);
+        AsynGyanis::Core::Task<> publish(const NodeRecord &node, bool becameOnline);
 
         std::shared_ptr<NodeRepository> m_repository; ///< 节点仓储
         Options                         m_options;    ///< 选项

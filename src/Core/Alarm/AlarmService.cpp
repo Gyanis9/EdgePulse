@@ -1,6 +1,7 @@
 #include "Core/Alarm/AlarmService.h"
 
 #include "Base/Log/LogMacros.h"
+#include "Core/Device/NodeRepository.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -120,6 +121,51 @@ namespace EdgePulse::Alarm
             }
         }
         co_return changed;
+    }
+
+    AsynGyanis::Core::Task<std::optional<AlarmRecord>> AlarmService::reportNodeOffline(AsynGyanis::Core::EventLoop &loop, const Device::NodeRecord &node, const int timeoutSeconds)
+    {
+        // 先抓住 scoped 视图：协程恢复期间它必须一直活着
+        const std::shared_ptr<AlarmRepository> scopedRepository = m_repository->scoped({node.tenantId, false});
+        const auto                             current          = co_await scopedRepository->findOpen(loop, 0, node.id);
+        if (current.has_value())
+        {
+            // 同一个离线过程只保留一条：扫描重入或并发心跳都不能把告警刷成多条
+            co_return *current;
+        }
+
+        AlarmRuleRecord systemRule;
+        systemRule.id        = 0;
+        systemRule.level     = "critical";
+        systemRule.metric    = "node.online";
+        systemRule.threshold = 1;
+
+        const std::string message  = "节点离线：超过 " + std::to_string(timeoutSeconds) + " 秒未收到心跳";
+        auto              inserted = co_await scopedRepository->insertAlarm(loop, systemRule, node.id, 0, message);
+        if (inserted.has_value())
+        {
+            LOG_INFO_FMT("系统离线告警已生成：alarm={} node={} name={}", inserted->id, node.id, node.name);
+            co_await notify(*inserted);
+        }
+        co_return inserted;
+    }
+
+    AsynGyanis::Core::Task<std::optional<AlarmRecord>> AlarmService::resolveNodeOffline(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
+    {
+        // 节点标识全局唯一，而恢复路径拿不到节点租户；按全租户视图找那条系统告警
+        const std::shared_ptr<AlarmRepository> scopedRepository = m_repository->scoped({0, true});
+        const auto                             open             = co_await scopedRepository->findOpen(loop, 0, nodeId);
+        if (!open.has_value())
+        {
+            co_return std::nullopt;
+        }
+        const auto resolved = co_await scopedRepository->resolve(loop, open->id, 0);
+        if (resolved.has_value())
+        {
+            LOG_INFO_FMT("系统离线告警已销案：alarm={} node={}", resolved->id, nodeId);
+            co_await notify(*resolved);
+        }
+        co_return resolved;
     }
 
     AsynGyanis::Core::Task<> AlarmService::notify(const AlarmRecord &alarm)

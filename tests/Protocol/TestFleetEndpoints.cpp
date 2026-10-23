@@ -239,7 +239,7 @@ protected:
                                                                    session->departmentId, session->roles,    session->permissions};
                     };
                     EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get());
-                    EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants);
+                    EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants, 30);
                     EdgePulse::Device::NodeGroupDependencies groups;
                     groups.auth   = m_context->auth.get();
                     groups.groups = m_groups.get();

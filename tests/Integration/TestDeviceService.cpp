@@ -47,7 +47,7 @@ TEST(DeviceService, CreatesListsUpdatesAndRemovesNode)
     EXPECT_EQ(0, afterRemoval.total);
 }
 
-// 钉住：白名单外指纹被拒；注册与心跳都发布节点状态
+// 钉住：白名单外指纹被拒；注册与心跳只在离线转在线时发布节点状态
 TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
 {
     EdgePulse::TestSupport::AuthTestContext context;
@@ -58,7 +58,7 @@ TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
     int                                       publishCount = 0;
     EdgePulse::Device::AgentRegistry::Options options;
     options.allowedFingerprints = {fingerprint};
-    options.publisher           = [&publishCount](const EdgePulse::Device::NodeRecord &) -> AsynGyanis::Core::Task<>
+    options.publisher           = [&publishCount](const EdgePulse::Device::NodeRecord &, bool) -> AsynGyanis::Core::Task<>
     {
         ++publishCount;
         co_return;
@@ -76,9 +76,18 @@ TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
 
     const auto heartbeated = runner.run(registry.heartbeat(runner.loop(), registered->id, "1.0.1"));
     ASSERT_TRUE(heartbeated.has_value()) << heartbeated.error().message;
-    EXPECT_EQ("online", heartbeated->status);
-    EXPECT_EQ("1.0.1", heartbeated->agentVersion);
-    EXPECT_FALSE(heartbeated->lastSeen.empty());
+    EXPECT_EQ("online", heartbeated->node.status);
+    EXPECT_EQ("1.0.1", heartbeated->node.agentVersion);
+    EXPECT_FALSE(heartbeated->node.lastSeen.empty());
+    EXPECT_FALSE(heartbeated->becameOnline);
+    EXPECT_EQ(1, publishCount);
+
+    // 扫描转离线后再心跳才是新的在线转换，状态发布随之增加
+    EXPECT_EQ(1U, runner.run(repository->markStaleOffline(runner.loop(), "9999-12-31 23:59:59", 10)).size());
+    const auto recovered = runner.run(registry.heartbeat(runner.loop(), registered->id, "1.0.1"));
+    ASSERT_TRUE(recovered.has_value()) << recovered.error().message;
+    EXPECT_EQ("online", recovered->node.status);
+    EXPECT_TRUE(recovered->becameOnline);
     EXPECT_EQ(2, publishCount);
 }
 

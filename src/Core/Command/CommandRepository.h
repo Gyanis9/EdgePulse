@@ -153,6 +153,13 @@ namespace EdgePulse::Command
          */
         AsynGyanis::Core::Task<std::vector<CommandRecord>> cancelBatch(AsynGyanis::Core::EventLoop &loop, std::int64_t batchId);
 
+        /**
+         * @brief 统计还没结束的命令数
+         * @param loop 恢复协程用的事件循环
+         * @return std::int64_t 待执行与执行中的命令数
+         */
+        AsynGyanis::Core::Task<std::int64_t> pendingCount(AsynGyanis::Core::EventLoop &loop);
+
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
         System::TenantScope               m_tenant;   ///< 租户边界

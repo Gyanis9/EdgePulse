@@ -40,6 +40,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestDeviceService.cpp
         Integration/TestExternalStores.cpp
         Integration/TestMigrations.cpp
+        Integration/TestNodeLifecycle.cpp
         Integration/TestNotificationChannels.cpp
         Integration/TestRealtimeBus.cpp
         Integration/TestFleetServices.cpp

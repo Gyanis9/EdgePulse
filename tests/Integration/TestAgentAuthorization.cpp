@@ -35,7 +35,9 @@ TEST(AgentAuthorization, RequiresVerifiedMatchingLeafCertificate)
     auto                                    nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
 
     const std::string fingerprint(64, 'a');
-    const auto        node = runner.run(nodes->upsertAgent(runner.loop(), agentUpsert("edge-auth", fingerprint)));
+    const auto        outcome = runner.run(nodes->upsertAgent(runner.loop(), agentUpsert("edge-auth", fingerprint)));
+    ASSERT_TRUE(outcome.has_value());
+    const EdgePulse::Device::NodeRecord node = outcome->node;
 
     AsynGyanis::Net::HttpRequest request;
 
