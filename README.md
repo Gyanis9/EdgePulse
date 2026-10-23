@@ -36,7 +36,7 @@ docs/          架构、API、部署、验收、覆盖率与设计/计划
 
 ## 引擎版本
 
-引擎使用重构后的 AsynGyanis 1.0.0 线。该线源码已重组为 Platform/Base/Core/Net/Database 五库，仓库尚未在该线上打新 tag，因此子模块钉在提交 `5a4e9769`；本地 Conan 包版本为 `asyngyanis/1.0.0`，构建时打开 MySQL 驱动。
+引擎使用重构后的 AsynGyanis 1.0.0 线。该线源码已重组为 Platform/Base/Core/Net/Database 五库，子模块钉在提交 `1830e6eb`（上游 `v1.0.0` 标签指向该提交）；本地 Conan 包版本为 `asyngyanis/1.0.0`，构建时打开 MySQL 驱动。
 
 引擎只作为 Conan 包消费：不修改、不复制进 `src/`、不 `add_subdirectory`。
 
@@ -94,7 +94,7 @@ npm run dev      # http://127.0.0.1:5173，/api 与 /api/ws 代理到 8080
 ## 验收
 
 ```bash
-# 后端：96 条用例（真机存储与 Redis 扇出用例按环境变量门控）
+# 后端：104 条用例（真机存储与 Redis 扇出用例按环境变量门控）
 ctest --preset debug --output-on-failure
 
 # 前端：23 条单测 + 类型检查/构建 + 6 条 Playwright
@@ -139,8 +139,8 @@ python scripts/check-docker-stack.py --build
 - 命令批次可在列表里整批取消；已取消命令不会再被 Agent 取走。
 - Redis 跨实例扇出只在启用 Redis 时生效；单实例未启用 Redis 时仍走进程内扇出。
 - 监听器目前统一绑定事件循环 0；`edgepulse.threads` 只创建额外循环，不会分担监听。多 worker 监听分发与多进程编排未作为本次交付形态。
-- mTLS 指纹白名单在 Agent 注册时按自报值校验；逐请求身份绑定需要引擎开放对端证书接口或每节点独立 CA。
-- WebSocket 首条认证的 5 秒兜底仍用计时线程（实现标注了 `shortcut`），等引擎提供带超时接收后替换。
+- mTLS 注册时自报的指纹必须与连接出示的叶证书一致；Agent WebSocket 升级后也用同一份对端身份复核节点登记值，明文链路（开发与测试）不做绑定。
+- 浏览器 WebSocket 首条认证的 5 秒预算由引擎的 `receiveFor()` 实现，不再为每条未认证连接占用计时线程。
 - OTLP 出口已用 mock collector 与真实 OTel collector 容器验证；外部生产采集端的网络与鉴权仍需部署环境复核。
 - Docker 镜像、Compose 全栈与 systemd 服务已在本机 Docker 中真机启动验证；systemd 验证使用特权容器，未覆盖真实主机的内核与 cgroup 差异。
 
