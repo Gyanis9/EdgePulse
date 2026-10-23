@@ -96,7 +96,7 @@ server:
   parser_limits:
     maximum_body_size: 268435456
   rate_limit:
-    requests_per_second: 0.0  # 按浮点读取，整数会被当成未配置；0 关闭
+    requests_per_second: 0.0  # 整数与小数均可（如 10 或 0.5）；0 关闭
     burst_capacity: 1.0
 
 metrics:

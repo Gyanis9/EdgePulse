@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <expected>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -84,6 +86,36 @@ namespace EdgePulse::App
                 return std::unexpected(ConfigurationError{"端口配置越界（要求 0..65535）：" + std::string{key}});
             }
             return static_cast<std::uint16_t>(value);
+        }
+
+        /**
+         * @brief 读取整数或小数形式的数值配置
+         * @param configurationManager 已装载配置的读取入口
+         * @param key 配置键
+         * @param fallback 键缺失时的默认值
+         * @return 成功返回解析后的有限数值；失败返回中文原因，含键名与原始文本
+         * @note 键存在但内容不是数字时报错而不回落默认值，避免写错之后静默关闭限流
+         */
+        [[nodiscard]] std::expected<double, ConfigurationError> readDouble(AsynGyanis::Base::ConfigManager &configurationManager, const std::string_view key,
+                                                                           const double fallback)
+        {
+            if (!configurationManager.has(key))
+            {
+                return fallback;
+            }
+            const std::string text  = trimCopy(configurationManager.getText(key));
+            double            value = 0.0;
+            const char       *begin = text.data();
+            const char       *end   = begin + text.size();
+            // from_chars 不接受空串与首尾空白；指针没走完全部文本说明数字后面还跟着别的字符
+            const auto [parsedEnd, parseError] = std::from_chars(begin, end, value);
+            // inf 与 nan 能被 from_chars 接受，但拿去建令牌桶只会得到永远取不到或无限补发的桶
+            if (text.empty() || parseError != std::errc{} || parsedEnd != end || !std::isfinite(value))
+            {
+                const std::string display = text.empty() ? "空值" : "“" + text + "”";
+                return std::unexpected(ConfigurationError{"配置项 " + std::string{key} + " 必须是数字，整数或小数均可，当前值无法解析：" + display});
+            }
+            return value;
         }
     } // namespace
 
@@ -175,8 +207,18 @@ namespace EdgePulse::App
         configuration.allowedOrigins           = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
         configuration.allowPrivateWebhooks     = configurationManager.getBool("edgepulse.security.allow_private_webhooks", configuration.allowPrivateWebhooks);
 
-        configuration.requestsPerSecond         = configurationManager.getDouble("server.rate_limit.requests_per_second", configuration.requestsPerSecond);
-        configuration.rateLimitBurstCapacity    = configurationManager.getDouble("server.rate_limit.burst_capacity", configuration.rateLimitBurstCapacity);
+        const auto requestsPerSecond = readDouble(configurationManager, "server.rate_limit.requests_per_second", configuration.requestsPerSecond);
+        if (!requestsPerSecond)
+        {
+            return std::unexpected(requestsPerSecond.error());
+        }
+        configuration.requestsPerSecond         = *requestsPerSecond;
+        const auto burstCapacity = readDouble(configurationManager, "server.rate_limit.burst_capacity", configuration.rateLimitBurstCapacity);
+        if (!burstCapacity)
+        {
+            return std::unexpected(burstCapacity.error());
+        }
+        configuration.rateLimitBurstCapacity    = *burstCapacity;
         configuration.idleTimeoutMs             = configurationManager.getInt("server.limits.idle_timeout_ms", configuration.idleTimeoutMs);
         configuration.readTimeoutMs             = configurationManager.getInt("server.limits.read_timeout_ms", configuration.readTimeoutMs);
         configuration.writeTimeoutMs            = configurationManager.getInt("server.limits.write_timeout_ms", configuration.writeTimeoutMs);
