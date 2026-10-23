@@ -1,7 +1,9 @@
 #include "Base/Config/ConfigValue.h"
+#include "Base/Coding/Base64.h"
 #include "Base/Database/Database.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/PasswordHash.h"
+#include "Core/Crypto/Digest.h"
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Auth/AuthService.h"
@@ -15,6 +17,8 @@
 #include "Core/Device/NodeRepository.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Firmware/FirmwareSignatureVerifier.h"
+#include "Core/Firmware/FirmwareSigningPolicy.h"
 #include "Core/Http/AgentWebSocket.h"
 #include "Core/Http/Authorization.h"
 #include "Core/Http/MiddlewareSetup.h"
@@ -40,9 +44,14 @@
 
 #include <gtest/gtest.h>
 
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <optional>
@@ -56,6 +65,78 @@ namespace
     std::vector<std::pair<std::string, std::string>> bearer(const std::string &token)
     {
         return {{"Authorization", "Bearer " + token}};
+    }
+
+    using PkeyPointer = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+
+    struct SigningKeyPair
+    {
+        PkeyPointer privateKey{nullptr, &EVP_PKEY_free}; ///< 签名私钥
+        PkeyPointer publicKey{nullptr, &EVP_PKEY_free};  ///< 写入信任键目录的公钥
+    };
+
+    [[nodiscard]] SigningKeyPair generateSigningKey()
+    {
+        SigningKeyPair pair;
+        EVP_PKEY_CTX  *context = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+        if (context == nullptr)
+        {
+            return pair;
+        }
+        EVP_PKEY_keygen_init(context);
+        EVP_PKEY *key = nullptr;
+        EVP_PKEY_keygen(context, &key);
+        EVP_PKEY_CTX_free(context);
+        pair.privateKey.reset(key);
+        pair.publicKey.reset(key != nullptr ? EVP_PKEY_dup(key) : nullptr);
+        return pair;
+    }
+
+    void writePublicKey(const std::filesystem::path &path, EVP_PKEY *key)
+    {
+        BIO *bio = BIO_new_file(path.string().c_str(), "w");
+        if (bio == nullptr)
+        {
+            return;
+        }
+        PEM_write_bio_PUBKEY(bio, key);
+        BIO_free(bio);
+    }
+
+    [[nodiscard]] std::string signFirmwareDigest(EVP_PKEY *privateKey, const std::string &digestHex)
+    {
+        if (privateKey == nullptr || digestHex.size() != 64)
+        {
+            return {};
+        }
+        std::array<unsigned char, 32> digest{};
+        for (std::size_t index = 0; index < digest.size(); ++index)
+        {
+            digest[index] = static_cast<unsigned char>(std::stoul(digestHex.substr(index * 2, 2), nullptr, 16));
+        }
+        EVP_MD_CTX *context = EVP_MD_CTX_new();
+        if (context == nullptr)
+        {
+            return {};
+        }
+        std::string signature;
+        if (EVP_DigestSignInit(context, nullptr, nullptr, nullptr, privateKey) == 1)
+        {
+            std::size_t signatureLength = 0;
+            if (EVP_DigestSign(context, nullptr, &signatureLength, digest.data(), digest.size()) == 1)
+            {
+                signature.assign(signatureLength, '\0');
+                if (EVP_DigestSign(context, reinterpret_cast<unsigned char *>(signature.data()), &signatureLength, digest.data(), digest.size()) != 1)
+                {
+                    signature.clear();
+                } else
+                {
+                    signature.resize(signatureLength);
+                }
+            }
+        }
+        EVP_MD_CTX_free(context);
+        return AsynGyanis::Base::base64Encode(signature);
     }
 
     struct WebSocketProbeResult
@@ -272,6 +353,15 @@ protected:
     {
         m_context          = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
         m_storage          = std::filesystem::temp_directory_path() / ("edgepulse-firmware-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        m_keyDirectory     = std::filesystem::path(m_storage.string() + "-keys");
+        std::filesystem::create_directories(m_keyDirectory);
+        m_signingKey = generateSigningKey();
+        ASSERT_NE(nullptr, m_signingKey.privateKey.get());
+        writePublicKey(m_keyDirectory / "protocol-key.pem", m_signingKey.publicKey.get());
+        auto signingVerifier = EdgePulse::Firmware::FirmwareSignatureVerifier::loadFromDirectory(m_keyDirectory);
+        ASSERT_TRUE(signingVerifier.has_value()) << signingVerifier.error();
+        m_signingPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(
+                EdgePulse::Firmware::FirmwareSigningPolicy{false, std::make_shared<EdgePulse::Firmware::FirmwareSignatureVerifier>(std::move(*signingVerifier))});
         m_nodes            = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
         m_nodeService      = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
         m_groups           = std::make_shared<EdgePulse::Device::NodeGroupRepository>(m_context->database);
@@ -364,6 +454,7 @@ protected:
                     firmware.tenants            = m_context->tenants.get();
                     firmware.storageDirectory   = m_storage.string();
                     firmware.maximumUploadBytes = 8U * 1024U * 1024U;
+                    firmware.signingPolicy      = m_signingPolicy;
                     EdgePulse::Firmware::registerFirmwareRoutes(router, loop, firmware);
                     EdgePulse::Firmware::registerFirmwareAgentRoutes(router, loop, firmware);
                 });
@@ -385,8 +476,11 @@ protected:
         m_agentRegistry.reset();
         m_nodes.reset();
         m_context.reset();
+        m_signingPolicy.reset();
+        m_signingKey = SigningKeyPair{};
         std::error_code error;
         std::filesystem::remove_all(m_storage, error);
+        std::filesystem::remove_all(m_keyDirectory, error);
     }
 
     std::string loginInTenant(const std::string &username, const std::string &password, const std::string &tenantCode)
@@ -456,6 +550,9 @@ protected:
     std::unique_ptr<EdgePulse::TestSupport::ServerHarness>     m_server;
     std::vector<AsynGyanis::Core::Task<>>                      m_probeTasks; ///< WebSocket 探针帧，活到夹具析构
     std::filesystem::path                                      m_storage;
+    std::filesystem::path                                      m_keyDirectory;
+    SigningKeyPair                                             m_signingKey;
+    std::shared_ptr<EdgePulse::Firmware::FirmwareSigningPolicy> m_signingPolicy;
 };
 
 // 钉住：遥测上报触发告警，告警列表、确认与规则接口都能读回
@@ -751,6 +848,153 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
     const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
     ASSERT_EQ(200, tasks.status);
     EXPECT_EQ("installed", (*tasks.json())["data"][0]["status"].get<std::string>());
+}
+
+// 钉住：签名上传落库、下载下发签名头，策略端点读回信任键，篡改或缺 key id 都拒绝
+TEST_F(FleetEndpointsTest, FirmwareSignedUploadDownloadAndPolicy)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "signed-firmware-node");
+    const std::string  fingerprint(64, '7');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    const std::string bytes(4096, 'S');
+    const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(bytes);
+    const std::string signature = signFirmwareDigest(m_signingKey.privateKey.get(), digest);
+    ASSERT_FALSE(signature.empty());
+
+    std::vector<std::pair<std::string, std::string>> uploadHeaders = bearer(token);
+    uploadHeaders.emplace_back("X-Firmware-Signature", signature);
+    uploadHeaders.emplace_back("X-Firmware-Key-Id", "protocol-key");
+    const auto upload = m_server->send("POST", "/api/firmware?name=Signed+OS&version=2.0.0&fileName=s.bin", bytes, "application/octet-stream", uploadHeaders);
+    ASSERT_EQ(200, upload.status) << upload.body;
+    const auto uploadJson = upload.json();
+    ASSERT_TRUE(uploadJson.has_value());
+    const std::int64_t firmwareId = (*uploadJson)["data"]["id"].get<std::int64_t>();
+    EXPECT_TRUE((*uploadJson)["data"]["signed"].get<bool>());
+    EXPECT_EQ("protocol-key", (*uploadJson)["data"]["signatureKeyId"].get<std::string>());
+    EXPECT_EQ("ed25519-sha256", (*uploadJson)["data"]["signatureAlgorithm"].get<std::string>());
+
+    const auto download = m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(nodeId), agentHeaders(fingerprint));
+    ASSERT_EQ(200, download.status) << download.body;
+    ASSERT_TRUE(download.header("x-firmware-signature").has_value());
+    EXPECT_EQ(signature, *download.header("x-firmware-signature"));
+    ASSERT_TRUE(download.header("x-firmware-key-id").has_value());
+    EXPECT_EQ("protocol-key", *download.header("x-firmware-key-id"));
+    ASSERT_TRUE(download.header("x-firmware-signature-algorithm").has_value());
+    EXPECT_EQ("ed25519-sha256", *download.header("x-firmware-signature-algorithm"));
+
+    const auto policy = m_server->get("/api/firmware/policy", bearer(token));
+    ASSERT_EQ(200, policy.status) << policy.body;
+    const auto policyJson = policy.json();
+    ASSERT_TRUE(policyJson.has_value());
+    EXPECT_FALSE((*policyJson)["data"]["requireSignature"].get<bool>());
+    ASSERT_EQ(1, (*policyJson)["data"]["trustedKeyIds"].size());
+    EXPECT_EQ("protocol-key", (*policyJson)["data"]["trustedKeyIds"][0].get<std::string>());
+
+    // 缺少 key id：在收正文前拒绝
+    std::vector<std::pair<std::string, std::string>> missingKeyId = bearer(token);
+    missingKeyId.emplace_back("X-Firmware-Signature", signature);
+    EXPECT_EQ(400, m_server->send("POST", "/api/firmware?name=NoKey&version=2.0.1", bytes, "application/octet-stream", missingKeyId).status);
+
+    // 未知 key id 与摘要不符都不能落库
+    std::vector<std::pair<std::string, std::string>> unknownKey = bearer(token);
+    unknownKey.emplace_back("X-Firmware-Signature", signature);
+    unknownKey.emplace_back("X-Firmware-Key-Id", "missing-key");
+    EXPECT_EQ(400, m_server->send("POST", "/api/firmware?name=UnknownKey&version=2.0.2", bytes, "application/octet-stream", unknownKey).status);
+
+    std::vector<std::pair<std::string, std::string>> tampered = bearer(token);
+    tampered.emplace_back("X-Firmware-Signature", signFirmwareDigest(m_signingKey.privateKey.get(), AsynGyanis::Core::Digest::sha256Hex("other-bytes")));
+    tampered.emplace_back("X-Firmware-Key-Id", "protocol-key");
+    EXPECT_EQ(400, m_server->send("POST", "/api/firmware?name=Tampered&version=2.0.3", bytes, "application/octet-stream", tampered).status);
+
+    // 失败上传要把已重命名的成品删掉，只留下那一份成功固件
+    std::size_t storedFiles = 0;
+    for (const auto &entry: std::filesystem::directory_iterator(m_storage))
+    {
+        if (entry.is_regular_file())
+        {
+            ++storedFiles;
+        }
+    }
+    EXPECT_EQ(1U, storedFiles);
+}
+
+// 钉住：强制签名时未签名固件不能上传或下发，但历史未签名固件仍可下载
+TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedButAllowsLegacyDownload)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "required-firmware-node");
+    const std::string  fingerprint(64, '8');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    auto requiredPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(
+            EdgePulse::Firmware::FirmwareSigningPolicy{true, m_signingPolicy->verifier});
+    EdgePulse::TestSupport::ServerHarness requiredServer(
+            [this, requiredPolicy](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+            {
+                EdgePulse::Web::applySecurityHeaders(router);
+                EdgePulse::TestSupport::installTestAgentIdentity(router);
+                EdgePulse::Auth::registerRoutes(router, loop, *m_context->auth, *m_context->captcha, true);
+                EdgePulse::Firmware::FirmwareDependencies firmware;
+                firmware.auth               = m_context->auth.get();
+                firmware.firmware           = m_firmware.get();
+                firmware.nodes              = m_nodes.get();
+                firmware.commands           = m_commands.get();
+                firmware.channels           = m_channels.get();
+                firmware.tenants            = m_context->tenants.get();
+                firmware.storageDirectory   = m_storage.string();
+                firmware.maximumUploadBytes = 8U * 1024U * 1024U;
+                firmware.signingPolicy      = requiredPolicy;
+                EdgePulse::Firmware::registerFirmwareRoutes(router, loop, firmware);
+                EdgePulse::Firmware::registerFirmwareAgentRoutes(router, loop, firmware);
+            });
+
+    const std::string bytes(256, 'R');
+    const auto        unsignedUpload =
+            requiredServer.send("POST", "/api/firmware?name=Unsigned+OS&version=3.0.0&fileName=u.bin", bytes, "application/octet-stream", bearer(token));
+    EXPECT_EQ(400, unsignedUpload.status) << unsignedUpload.body;
+
+    const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(bytes);
+    const std::string signature = signFirmwareDigest(m_signingKey.privateKey.get(), digest);
+    std::vector<std::pair<std::string, std::string>> signedHeaders = bearer(token);
+    signedHeaders.emplace_back("X-Firmware-Signature", signature);
+    signedHeaders.emplace_back("X-Firmware-Key-Id", "protocol-key");
+    const auto signedUpload =
+            requiredServer.send("POST", "/api/firmware?name=Signed+OS&version=3.0.1&fileName=s.bin", bytes, "application/octet-stream", signedHeaders);
+    ASSERT_EQ(200, signedUpload.status) << signedUpload.body;
+    const std::int64_t signedId = (*signedUpload.json())["data"]["id"].get<std::int64_t>();
+    const auto         deploySigned =
+            requiredServer.post("/api/firmware/" + std::to_string(signedId) + "/deploy",
+                                AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeId})}}).dump(), "application/json", bearer(token));
+    ASSERT_EQ(200, deploySigned.status) << deploySigned.body;
+
+    EdgePulse::Firmware::FirmwareRecord legacy;
+    legacy.name        = "Legacy OS";
+    legacy.version     = "0.9.0";
+    legacy.fileName    = "legacy.bin";
+    legacy.contentType = "application/octet-stream";
+    legacy.sha256      = AsynGyanis::Core::Digest::sha256Hex("legacy-bytes");
+    legacy.storagePath = (m_storage / "legacy-unsigned.bin").string();
+    {
+        std::ofstream stream(legacy.storagePath, std::ios::binary);
+        ASSERT_TRUE(stream.is_open());
+        stream << "legacy-bytes";
+    }
+    const std::int64_t legacyId = m_runner.run(m_firmware->create(m_runner.loop(), legacy));
+    ASSERT_GT(legacyId, 0);
+
+    const auto deployLegacy =
+            requiredServer.post("/api/firmware/" + std::to_string(legacyId) + "/deploy",
+                                AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeId})}}).dump(), "application/json", bearer(token));
+    EXPECT_EQ(400, deployLegacy.status) << deployLegacy.body;
+
+    // 历史未签名固件照常可下载，只是响应不宣称签名
+    const auto legacyDownload =
+            requiredServer.get("/api/agent/firmware/" + std::to_string(legacyId) + "/download?nodeId=" + std::to_string(nodeId), agentHeaders(fingerprint));
+    ASSERT_EQ(200, legacyDownload.status) << legacyDownload.body;
+    EXPECT_FALSE(legacyDownload.header("x-firmware-signature").has_value());
+    EXPECT_EQ("legacy-bytes", legacyDownload.body);
 }
 
 // 钉住：节点分组 CRUD 与占用保护

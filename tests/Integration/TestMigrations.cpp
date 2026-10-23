@@ -85,6 +85,9 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_user"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 15"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 16"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 17"));
+        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_firmware') "
+                                                     "WHERE name IN ('signature', 'signing_key_id', 'signature_algorithm')"));
         // 只断存在与空表：表缺失时 COUNT(*) 会因查询失败返回 -1，两种情况都不会被放过
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'biz_agent_enrollment'"));
         EXPECT_EQ(0, querySingleInteger(*connection, "SELECT COUNT(*) FROM biz_agent_enrollment"));
@@ -96,7 +99,7 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_node_config_revision') WHERE name = 'idx_node_config_revision_tenant'"));
         EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_node_config_revision') AS il, pragma_index_info(il.name) AS ii "
                                                      "WHERE il.\"unique\" = 1 AND ii.name IN ('node_id', 'version')"));
-        EXPECT_EQ(16, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(17, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }

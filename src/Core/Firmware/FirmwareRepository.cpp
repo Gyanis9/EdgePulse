@@ -22,7 +22,8 @@ namespace EdgePulse::Firmware
         using AsynGyanis::Database::DatabaseValue;
 
         constexpr std::string_view kSelectFirmware =
-                "SELECT id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, storage_path, created_by, created_at FROM biz_firmware ";
+                "SELECT id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, signature, signing_key_id, signature_algorithm, storage_path, created_by, "
+                "created_at FROM biz_firmware ";
         constexpr std::string_view kSelectTask =
                 "SELECT t.id, t.firmware_id, t.node_id, t.status, t.progress, t.message, t.created_at, t.updated_at, t.previous_firmware_id, COALESCE(n.name, '') AS node_name "
                 "FROM biz_firmware_task t LEFT JOIN biz_node n ON n.id = t.node_id ";
@@ -30,17 +31,20 @@ namespace EdgePulse::Firmware
         [[nodiscard]] FirmwareRecord readFirmware(const DatabaseResult &result)
         {
             FirmwareRecord record;
-            record.id          = Sql::integer(result, "id");
-            record.tenantId    = Sql::integer(result, "tenant_id");
-            record.name        = Sql::text(result, "name");
-            record.version     = Sql::text(result, "version");
-            record.fileName    = Sql::text(result, "file_name");
-            record.contentType = Sql::text(result, "content_type");
-            record.sizeBytes   = Sql::integer(result, "size_bytes");
-            record.sha256      = Sql::text(result, "sha256");
-            record.storagePath = Sql::text(result, "storage_path");
-            record.createdBy   = Sql::integer(result, "created_by");
-            record.createdAt   = Sql::dateTimeText(result, "created_at");
+            record.id                 = Sql::integer(result, "id");
+            record.tenantId           = Sql::integer(result, "tenant_id");
+            record.name               = Sql::text(result, "name");
+            record.version            = Sql::text(result, "version");
+            record.fileName           = Sql::text(result, "file_name");
+            record.contentType        = Sql::text(result, "content_type");
+            record.sizeBytes          = Sql::integer(result, "size_bytes");
+            record.sha256             = Sql::text(result, "sha256");
+            record.signature          = Sql::text(result, "signature");
+            record.signingKeyId       = Sql::text(result, "signing_key_id");
+            record.signatureAlgorithm = Sql::text(result, "signature_algorithm");
+            record.storagePath        = Sql::text(result, "storage_path");
+            record.createdBy          = Sql::integer(result, "created_by");
+            record.createdAt          = Sql::dateTimeText(result, "created_at");
             return record;
         }
 
@@ -84,12 +88,13 @@ namespace EdgePulse::Firmware
                     {
                         record.createdAt = Common::nowDateTimeUtc();
                     }
-                    const std::array<DatabaseValue, 12> parameters{record.id,        tenant.tenantId, record.name,        record.version,   record.fileName,  record.contentType,
-                                                                   record.sizeBytes, record.sha256,   record.storagePath, record.createdBy, record.createdAt, std::int64_t{0}};
+                    const std::array<DatabaseValue, 15> parameters{record.id,       tenant.tenantId, record.name,       record.version,   record.fileName, record.contentType,
+                                                                   record.sizeBytes, record.sha256,   record.signature,  record.signingKeyId, record.signatureAlgorithm,
+                                                                   record.storagePath, record.createdBy, record.createdAt, std::int64_t{0}};
                     Sql::executeOrThrowVoid(
                             connection,
-                            "INSERT INTO biz_firmware (id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, storage_path, created_by, created_at, "
-                            "deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO biz_firmware (id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, signature, signing_key_id, signature_algorithm, "
+                            "storage_path, created_by, created_at, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             parameters);
                     return record.id;
                 });
@@ -186,6 +191,24 @@ namespace EdgePulse::Firmware
                     }
                     Sql::executeOrThrowVoid(connection, "UPDATE biz_firmware SET deleted = 1 WHERE id = ?" + deleteClause, deleteParameters);
                     return record;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::unsignedCount(AsynGyanis::Core::EventLoop &loop)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                {
+                    std::string                filter = "WHERE deleted = 0 AND signature = ''";
+                    std::vector<DatabaseValue> parameters;
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_firmware " + filter, parameters);
+                    return rows->next() ? Sql::integer(*rows, "total") : 0;
                 });
     }
 

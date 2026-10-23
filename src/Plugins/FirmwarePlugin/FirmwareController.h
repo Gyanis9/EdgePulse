@@ -12,6 +12,7 @@
 #include "Plugins/CommandPlugin/CommandController.h"
 
 #include <cstddef>
+#include <memory>
 #include <string>
 
 namespace AsynGyanis::Core
@@ -42,6 +43,7 @@ namespace EdgePulse::System
 namespace EdgePulse::Firmware
 {
     class FirmwareRepository;
+    struct FirmwareSigningPolicy;
 }
 
 namespace EdgePulse::Firmware
@@ -60,6 +62,7 @@ namespace EdgePulse::Firmware
         System::TenantRepository      *tenants{nullptr};                         ///< 租户，用于校验平台管理员指定的归属
         std::string                    storageDirectory{"var/firmware"};         ///< 落盘目录
         std::size_t                    maximumUploadBytes{256U * 1024U * 1024U}; ///< 上传上限
+        std::shared_ptr<FirmwareSigningPolicy> signingPolicy;                     ///< 签名门禁；为空时按不强制签名处理
     };
 
     /**

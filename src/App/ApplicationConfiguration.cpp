@@ -130,9 +130,11 @@ namespace EdgePulse::App
         configuration.threads                = static_cast<int>(configurationManager.getInt("edgepulse.threads", configuration.threads));
         configuration.migrationsDirectory    = configurationManager.getString("edgepulse.migrations_dir", configuration.migrationsDirectory);
         configuration.webRoot                = configurationManager.getString("edgepulse.web_root", configuration.webRoot);
-        configuration.firmwareDirectory      = configurationManager.getString("edgepulse.firmware_dir", configuration.firmwareDirectory);
-        configuration.maximumFirmwareBytes   = configurationManager.getInt("edgepulse.maximum_firmware_bytes", configuration.maximumFirmwareBytes);
-        configuration.telemetryRetentionDays = static_cast<int>(configurationManager.getInt("edgepulse.telemetry_retention_days", configuration.telemetryRetentionDays));
+        configuration.firmwareDirectory            = configurationManager.getString("edgepulse.firmware_dir", configuration.firmwareDirectory);
+        configuration.maximumFirmwareBytes         = configurationManager.getInt("edgepulse.maximum_firmware_bytes", configuration.maximumFirmwareBytes);
+        configuration.firmwareRequireSignature     = configurationManager.getBool("edgepulse.firmware.require_signature", configuration.firmwareRequireSignature);
+        configuration.firmwareTrustedKeysDirectory = configurationManager.getString("edgepulse.firmware.trusted_keys_dir", configuration.firmwareTrustedKeysDirectory);
+        configuration.telemetryRetentionDays       = static_cast<int>(configurationManager.getInt("edgepulse.telemetry_retention_days", configuration.telemetryRetentionDays));
         configuration.logRetentionDays       = static_cast<int>(configurationManager.getInt("edgepulse.log_retention_days", configuration.logRetentionDays));
         configuration.deliveryRetentionDays  = static_cast<int>(configurationManager.getInt("edgepulse.delivery_retention_days", configuration.deliveryRetentionDays));
         configuration.certificateDirectory   = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
@@ -203,6 +205,10 @@ namespace EdgePulse::App
         if (configuration.enrollmentMode != "off" && configuration.enrollmentMode != "required")
         {
             return std::unexpected(ConfigurationError{"edgepulse.agent.enrollment_mode 只能是 off 或 required，当前值：" + configuration.enrollmentMode});
+        }
+        if (configuration.firmwareRequireSignature && configuration.firmwareTrustedKeysDirectory.empty())
+        {
+            return std::unexpected(ConfigurationError{"启用固件签名校验时 edgepulse.firmware.trusted_keys_dir 不能为空"});
         }
         if (configuration.heartbeatIntervalSeconds < 1 || configuration.heartbeatIntervalSeconds > 600)
         {

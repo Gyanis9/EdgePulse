@@ -15,6 +15,8 @@
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareFileWriter.h"
 #include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Firmware/FirmwareSignatureVerifier.h"
+#include "Core/Firmware/FirmwareSigningPolicy.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 #include "Core/System/TenantRepository.h"
@@ -57,6 +59,9 @@ namespace EdgePulse::Firmware
                                         {"contentType", record.contentType},
                                         {"sizeBytes", record.sizeBytes},
                                         {"sha256", record.sha256},
+                                        {"signed", !record.signature.empty()},
+                                        {"signatureKeyId", record.signingKeyId},
+                                        {"signatureAlgorithm", record.signatureAlgorithm},
                                         {"createdAt", record.createdAt},
                                         {"createdBy", record.createdBy}});
         }
@@ -77,6 +82,11 @@ namespace EdgePulse::Firmware
         void fail(AsynGyanis::Net::HttpResponse &response, const int status, const std::string &message, const std::string_view traceId)
         {
             Common::writeFailure(response, status, status, message, traceId);
+        }
+
+        [[nodiscard]] bool signatureRequired(const FirmwareDependencies &dependencies) noexcept
+        {
+            return dependencies.signingPolicy != nullptr && dependencies.signingPolicy->signatureRequired();
         }
 
         [[nodiscard]] std::string safeFileName(const std::string &fileName)
@@ -164,6 +174,9 @@ namespace EdgePulse::Firmware
                                         {"version", record.version},
                                         {"sha256", record.sha256},
                                         {"sizeBytes", record.sizeBytes},
+                                        {"signature", record.signature},
+                                        {"signingKeyId", record.signingKeyId},
+                                        {"signatureAlgorithm", record.signatureAlgorithm},
                                         {"downloadPath", "/api/agent/firmware/" + std::to_string(record.id) + "/download?nodeId=" + std::to_string(nodeId)}})
                     .dump();
         }
@@ -191,6 +204,28 @@ namespace EdgePulse::Firmware
                            rows.push_back(firmwareJson(record));
                        }
                        Common::writeSuccess(response, Common::makePageResult(page, result.total, std::move(rows)), traceId);
+                       co_return;
+                   });
+
+        router.get("/api/firmware/policy",
+                   [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string traceId = Web::resolveRequestId(request);
+                       const auto        session = co_await Web::requireSession(*deps->auth, loop, request, response, "device:firmware:list", traceId);
+                       if (!session.has_value())
+                       {
+                           co_return;
+                       }
+                       ConfigValue trustedKeyIds = ConfigValue::array();
+                       if (deps->signingPolicy != nullptr && deps->signingPolicy->verifier != nullptr)
+                       {
+                           for (const std::string &keyId: deps->signingPolicy->verifier->keyIds())
+                           {
+                               trustedKeyIds.push_back(keyId);
+                           }
+                       }
+                       Common::writeSuccess(response,
+                                            ConfigValue::object({{"requireSignature", signatureRequired(*deps)}, {"trustedKeyIds", std::move(trustedKeyIds)}}), traceId);
                        co_return;
                    });
 
@@ -239,6 +274,28 @@ namespace EdgePulse::Firmware
                                  if (name.empty() || version.empty())
                                  {
                                      fail(response, Common::kCodeBadRequest, "缺少 name 或 version", traceId);
+                                     co_return;
+                                 }
+                                 // 签名头在收正文前读出并保留：缺 key id 或策略不允许时不必把固件写盘
+                                 const std::optional<std::string> signatureHeader = request.getHeader("x-firmware-signature");
+                                 const std::optional<std::string> keyIdHeader     = request.getHeader("x-firmware-key-id");
+                                 // 强制签名时在收正文前就拒绝，避免把注定丢弃的固件写满磁盘
+                                 if (signatureRequired(*deps) && (!signatureHeader.has_value() || !keyIdHeader.has_value()))
+                                 {
+                                     fail(response, Common::kCodeBadRequest, "当前部署要求固件签名：请提供 X-Firmware-Signature 与 X-Firmware-Key-Id", traceId);
+                                     co_return;
+                                 }
+                                 if (signatureHeader.has_value() != keyIdHeader.has_value())
+                                 {
+                                     fail(response,
+                                          Common::kCodeBadRequest,
+                                          signatureHeader.has_value() ? "提供了固件签名但缺少 X-Firmware-Key-Id" : "提供了 X-Firmware-Key-Id 但缺少 X-Firmware-Signature",
+                                          traceId);
+                                     co_return;
+                                 }
+                                 if (signatureHeader.has_value() && (deps->signingPolicy == nullptr || deps->signingPolicy->verifier == nullptr))
+                                 {
+                                     fail(response, Common::kCodeBadRequest, "当前部署未配置固件信任键，无法校验固件签名", traceId);
                                      co_return;
                                  }
                                  std::int64_t targetTenantId = session->tenantId;
@@ -310,18 +367,32 @@ namespace EdgePulse::Firmware
                                      fail(response, Common::kCodeInternalServerError, "固件摘要或落盘失败", traceId);
                                      co_return;
                                  }
+                                 if (signatureHeader.has_value())
+                                 {
+                                     const auto verified = deps->signingPolicy->verifier->verify(*keyIdHeader, *digest, *signatureHeader);
+                                     if (!verified.has_value())
+                                     {
+                                         std::error_code error;
+                                         std::filesystem::remove(finalPath, error);
+                                         fail(response, Common::kCodeBadRequest, verified.error(), traceId);
+                                         co_return;
+                                     }
+                                 }
                                  FirmwareRecord record;
-                                 record.id          = id;
-                                 record.name        = name;
-                                 record.version     = version;
-                                 record.fileName    = safeName;
-                                 record.contentType = request.getHeader("content-type").value_or("application/octet-stream");
-                                 record.sizeBytes   = static_cast<std::int64_t>(totalBytes);
-                                 record.sha256      = *digest;
-                                 record.storagePath = finalPath;
-                                 record.createdBy   = session->userId;
-                                 record.createdAt   = Common::nowDateTimeUtc();
-                                 record.tenantId    = targetTenantId;
+                                 record.id                 = id;
+                                 record.name               = name;
+                                 record.version            = version;
+                                 record.fileName           = safeName;
+                                 record.contentType        = request.getHeader("content-type").value_or("application/octet-stream");
+                                 record.sizeBytes          = static_cast<std::int64_t>(totalBytes);
+                                 record.sha256             = *digest;
+                                 record.signature          = signatureHeader.value_or("");
+                                 record.signingKeyId       = keyIdHeader.value_or("");
+                                 record.signatureAlgorithm = signatureHeader.has_value() ? "ed25519-sha256" : "";
+                                 record.storagePath        = finalPath;
+                                 record.createdBy          = session->userId;
+                                 record.createdAt          = Common::nowDateTimeUtc();
+                                 record.tenantId           = targetTenantId;
                                  try
                                  {
                                      static_cast<void>(co_await firmware->create(loop, record));
@@ -356,6 +427,11 @@ namespace EdgePulse::Firmware
                         if (!firmware.has_value())
                         {
                             fail(response, Common::kCodeNotFound, "固件不存在", traceId);
+                            co_return;
+                        }
+                        if (signatureRequired(*deps) && firmware->signature.empty())
+                        {
+                            fail(response, Common::kCodeBadRequest, "该固件未签名，当前部署要求签名固件", traceId);
                             co_return;
                         }
                         const auto nodeIds = Json::integerArrayField(*body, "nodeIds");
@@ -444,9 +520,16 @@ namespace EdgePulse::Firmware
                             fail(response, Common::kCodeBadRequest, "nodeIds 必须是 1 到 100 个节点", traceId);
                             co_return;
                         }
-                        const auto  firmwareRepo = deps->firmware->scoped(session->tenantScope());
-                        const auto  commandRepo  = deps->commands->scoped(session->tenantScope());
-                        ConfigValue results      = ConfigValue::array();
+                        const auto firmwareRepo = deps->firmware->scoped(session->tenantScope());
+                        const auto commandRepo  = deps->commands->scoped(session->tenantScope());
+                        // 先解析全部回滚目标并在下发前统一校验签名，避免部分节点已建任务后才发现目标未签名
+                        struct RollbackTarget
+                        {
+                            std::int64_t   nodeId{0};     ///< 目标节点
+                            std::int64_t   firmwareId{0}; ///< 回滚到的固件
+                            FirmwareRecord firmware;      ///< 回滚目标元数据
+                        };
+                        std::vector<RollbackTarget> targets;
                         for (const std::int64_t nodeId: nodeIds)
                         {
                             const std::int64_t targetId = co_await firmwareRepo->rollbackSource(loop, *id, nodeId);
@@ -454,17 +537,34 @@ namespace EdgePulse::Firmware
                             {
                                 continue;
                             }
-                            const auto target = co_await firmwareRepo->find(loop, targetId);
+                            auto target = co_await firmwareRepo->find(loop, targetId);
                             if (!target.has_value())
                             {
                                 continue;
                             }
-                            const std::int64_t taskId = co_await firmwareRepo->createTask(loop, targetId, nodeId, *id);
+                            if (signatureRequired(*deps) && target->signature.empty())
+                            {
+                                fail(response, Common::kCodeBadRequest, "回滚目标未签名，当前部署要求签名固件", traceId);
+                                co_return;
+                            }
+                            targets.push_back(RollbackTarget{nodeId, targetId, std::move(*target)});
+                        }
+                        if (targets.empty())
+                        {
+                            fail(response, Common::kCodeNotFound, "没有可回滚的历史版本", traceId);
+                            co_return;
+                        }
+                        ConfigValue results = ConfigValue::array();
+                        for (const RollbackTarget &rollbackTarget: targets)
+                        {
+                            const std::int64_t nodeId   = rollbackTarget.nodeId;
+                            const std::int64_t targetId = rollbackTarget.firmwareId;
+                            const std::int64_t taskId   = co_await firmwareRepo->createTask(loop, targetId, nodeId, *id);
                             if (taskId == 0)
                             {
                                 continue;
                             }
-                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(*target, nodeId), session->userId, 600);
+                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(rollbackTarget.firmware, nodeId), session->userId, 600);
                             if (!command.has_value())
                             {
                                 continue;
@@ -573,6 +673,13 @@ namespace EdgePulse::Firmware
                        response.setHeader("Accept-Ranges", "bytes");
                        response.setHeader("Content-Type", firmware->contentType);
                        response.setHeader("Content-Disposition", "attachment; filename=\"" + firmware->fileName + "\"");
+                       // 未签名固件照常下载，但不宣称签名；签名相关头部只在记录确实带签名时出现
+                       if (!firmware->signature.empty())
+                       {
+                           response.setHeader("X-Firmware-Signature", firmware->signature);
+                           response.setHeader("X-Firmware-Key-Id", firmware->signingKeyId);
+                           response.setHeader("X-Firmware-Signature-Algorithm", firmware->signatureAlgorithm);
+                       }
                        if (const auto ifNoneMatch = request.getHeader("if-none-match"); ifNoneMatch.has_value() && ifNoneMatch->find(firmware->sha256) != std::string::npos)
                        {
                            response.setStatus(304);

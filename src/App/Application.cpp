@@ -50,6 +50,8 @@
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Firmware/FirmwareSignatureVerifier.h"
+#include "Core/Firmware/FirmwareSigningPolicy.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Ops/OpsRepository.h"
@@ -278,6 +280,21 @@ namespace EdgePulse::App
             m_nodeGroupRepository  = std::make_shared<Device::NodeGroupRepository>(m_database);
             m_telemetryRepository  = std::make_shared<Telemetry::TelemetryRepository>(m_database);
             m_firmwareRepository   = std::make_shared<Firmware::FirmwareRepository>(m_database);
+            // 信任键在装配阶段一次读入；强制签名但目录无键时直接拒绝启动，避免上线后才发现门禁形同虚设
+            auto verifier = Firmware::FirmwareSignatureVerifier::loadFromDirectory(m_configuration.firmwareTrustedKeysDirectory);
+            if (!verifier.has_value())
+            {
+                error = "固件信任键加载失败：" + verifier.error();
+                return false;
+            }
+            if (m_configuration.firmwareRequireSignature && verifier->empty())
+            {
+                error = "require_signature=true 但信任键目录为空：" + m_configuration.firmwareTrustedKeysDirectory;
+                return false;
+            }
+            auto verifierPointer = std::make_shared<Firmware::FirmwareSignatureVerifier>(std::move(*verifier));
+            m_signingPolicy =
+                    std::make_shared<Firmware::FirmwareSigningPolicy>(Firmware::FirmwareSigningPolicy{m_configuration.firmwareRequireSignature, std::move(verifierPointer)});
             m_commandRepository    = std::make_shared<Command::CommandRepository>(m_database);
             m_agentChannels        = std::make_shared<Command::AgentChannelRegistry>();
             m_nodeConfigService    = std::make_shared<Device::NodeConfigService>(m_nodeConfigRepository, m_nodeRepository, m_commandRepository, m_agentChannels.get(),
@@ -487,6 +504,7 @@ namespace EdgePulse::App
                 firmwareAgentDependencies.channels           = m_agentChannels.get();
                 firmwareAgentDependencies.storageDirectory   = m_configuration.firmwareDirectory;
                 firmwareAgentDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
+                firmwareAgentDependencies.signingPolicy      = m_signingPolicy;
                 Firmware::registerFirmwareAgentRoutes(m_agentServer->router(), loop, firmwareAgentDependencies);
                 Web::registerAgentWebSocket(m_agentServer->router(), loop, *m_nodeRepository, *m_commandRepository, *m_agentChannels, m_lifecycle.get());
                 m_agentAccept.emplace(m_agentServer->start());
@@ -646,6 +664,7 @@ namespace EdgePulse::App
         AsynGyanis::Core::Timer ticker(loop);
         const auto              allAlarms   = m_alarmRepository->scoped({0, true});
         const auto              allCommands = m_commandRepository->scoped({0, true});
+        const auto              allFirmware = m_firmwareRepository->scoped({0, true});
         bool                    firstRun    = true;
         while (true)
         {
@@ -661,6 +680,7 @@ namespace EdgePulse::App
                 Metrics::BusinessMetrics::instance().setAgentCertificatesExpiring(co_await m_fleetNodes->countExpiringCertificates(loop, 7));
                 Metrics::BusinessMetrics::instance().setAlarmsOpen(co_await allAlarms->openCount(loop));
                 Metrics::BusinessMetrics::instance().setCommandsPending(co_await allCommands->pendingCount(loop));
+                Metrics::BusinessMetrics::instance().setUnsignedFirmware(co_await allFirmware->unsignedCount(loop));
             } catch (const std::exception &failure)
             {
                 // 单轮失败（数据库抖动、临时锁冲突）不能终止周期任务，否则服务会永久停止判离线
@@ -766,6 +786,7 @@ namespace EdgePulse::App
         firmwareDependencies.tenants            = m_tenantRepository.get();
         firmwareDependencies.storageDirectory   = m_configuration.firmwareDirectory;
         firmwareDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
+        firmwareDependencies.signingPolicy      = m_signingPolicy;
         Firmware::registerFirmwareRoutes(router, loop, firmwareDependencies);
 
         Ops::OpsDependencies opsDependencies;

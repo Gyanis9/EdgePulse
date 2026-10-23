@@ -19,6 +19,10 @@ edgepulse:
   cert_dir: /etc/edgepulse/tls
   firmware_dir: /var/lib/edgepulse/firmware
   maximum_firmware_bytes: 268435456
+  firmware:
+    # 生产必须签名；trusted_keys_dir 指向只含公钥的绝对路径，目录为空时启动失败
+    require_signature: true
+    trusted_keys_dir: /etc/edgepulse/firmware-keys
   telemetry_retention_days: 30
   log_retention_days: 90
   delivery_retention_days: 30

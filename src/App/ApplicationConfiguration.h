@@ -54,6 +54,8 @@ namespace EdgePulse::App
         std::string              webRoot{"web"};                                      ///< 静态站点根目录
         std::string              firmwareDirectory{"var/firmware"};                   ///< 固件落盘目录
         std::int64_t             maximumFirmwareBytes{256LL * 1024 * 1024};           ///< 单份固件上限
+        bool                     firmwareRequireSignature{false};                     ///< 是否拒绝未签名固件的上传与下发
+        std::string              firmwareTrustedKeysDirectory{"config/firmware-keys"}; ///< 固件公钥目录，文件名即 key id
         int                      telemetryRetentionDays{30};                          ///< 遥测保留天数
         int                      logRetentionDays{90};                                ///< 操作与登录日志保留天数
         int                      deliveryRetentionDays{30};                           ///< 通知投递记录保留天数

@@ -1,2 +1,3 @@
 add_subdirectory(H3Probe)
 add_subdirectory(DeviceAgent)
+add_subdirectory(FirmwareVerifier)

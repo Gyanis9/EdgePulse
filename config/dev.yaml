@@ -11,6 +11,10 @@ edgepulse:
   cert_dir: var/certs
   firmware_dir: var/firmware
   maximum_firmware_bytes: 268435456
+  firmware:
+    # 开发档允许未签名固件；trusted_keys_dir 不存在时按空信任键处理
+    require_signature: false
+    trusted_keys_dir: config/firmware-keys
   telemetry_retention_days: 30
   log_retention_days: 90
   delivery_retention_days: 30

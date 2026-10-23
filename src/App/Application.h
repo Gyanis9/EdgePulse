@@ -106,7 +106,9 @@ namespace EdgePulse::Alarm
 namespace EdgePulse::Firmware
 {
     class FirmwareRepository;
-}
+    class FirmwareSignatureVerifier;
+    struct FirmwareSigningPolicy;
+} // namespace EdgePulse::Firmware
 namespace EdgePulse::Command
 {
     class AgentChannelRegistry;
@@ -251,6 +253,7 @@ namespace EdgePulse::App
         std::shared_ptr<Notification::NotificationService>        m_notificationService;    ///< 通知投递
         std::shared_ptr<Notification::NotificationDispatcher>     m_notificationDispatcher; ///< 通知队列
         std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;     ///< 固件
+        std::shared_ptr<Firmware::FirmwareSigningPolicy>          m_signingPolicy;          ///< 固件签名门禁
         std::shared_ptr<Command::CommandRepository>               m_commandRepository;      ///< 命令
         std::optional<AsynGyanis::Core::Task<>>                   m_commandScheduler;       ///< 计划命令推进协程
         std::optional<AsynGyanis::Core::Task<>>                   m_fleetLifecycle;         ///< 离线扫描与指标刷新协程

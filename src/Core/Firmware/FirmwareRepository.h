@@ -33,17 +33,20 @@ namespace EdgePulse::Firmware
      */
     struct FirmwareRecord
     {
-        std::int64_t id{0};        ///< 主键
-        std::int64_t tenantId{1};  ///< 归属租户
-        std::string  name;         ///< 名称
-        std::string  version;      ///< 版本
-        std::string  fileName;     ///< 原始文件名
-        std::string  contentType;  ///< 媒体类型
-        std::int64_t sizeBytes{0}; ///< 字节数
-        std::string  sha256;       ///< 十六进制摘要
-        std::string  storagePath;  ///< 落盘路径
-        std::int64_t createdBy{0}; ///< 上传人
-        std::string  createdAt;    ///< 上传时间
+        std::int64_t id{0};                  ///< 主键
+        std::int64_t tenantId{1};            ///< 归属租户
+        std::string  name;                   ///< 名称
+        std::string  version;                ///< 版本
+        std::string  fileName;               ///< 原始文件名
+        std::string  contentType;            ///< 媒体类型
+        std::int64_t sizeBytes{0};           ///< 字节数
+        std::string  sha256;                 ///< 十六进制摘要
+        std::string  signature;              ///< 摘要签名的 Base64；空表示未签名
+        std::string  signingKeyId;           ///< 签名所用信任键的 key id
+        std::string  signatureAlgorithm;     ///< 签名算法标识
+        std::string  storagePath;            ///< 落盘路径
+        std::int64_t createdBy{0};           ///< 上传人
+        std::string  createdAt;              ///< 上传时间
     };
 
     /**
@@ -110,6 +113,13 @@ namespace EdgePulse::Firmware
          * @return std::optional<FirmwareRecord> 被删除的元数据；不存在时为空
          */
         AsynGyanis::Core::Task<std::optional<FirmwareRecord>> remove(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId);
+
+        /**
+         * @brief 统计未签名固件数
+         * @param loop 恢复协程用的事件循环
+         * @return std::int64_t 未软删除且 signature 为空的固件数，受租户边界约束
+         */
+        AsynGyanis::Core::Task<std::int64_t> unsignedCount(AsynGyanis::Core::EventLoop &loop);
 
         /**
          * @brief 创建下发任务
