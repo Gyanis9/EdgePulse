@@ -148,7 +148,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?,tenantCode?}`；tenantCode 缺省 `default` |
+| POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?,tenantCode?}`；tenantCode 缺省 `default`；`certFingerprint` 必须与这条 mTLS 连接出示的叶证书一致 |
 | POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}` |
 | POST | `/api/agent/telemetry` | `{nodeId,samples:[{metric,value,unit?,collectedAt?,labels?}]}`，1–500 条 |
 | GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
@@ -181,6 +181,8 @@ Agent 请求没有会话：命令、固件任务、遥测都按目标节点/固�
 - 成功回 `{"type":"auth","ok":true}`，并订阅 `nodes`、`alarms`、`commands`。
 - 推送：`{"type":"node.status","data":...}`、`{"type":"alarm","data":...}`、`{"type":"command.status","data":...}`。
 - 客户端每 25 秒发 `{"type":"ping"}`；服务端不要求 pong。
+
+Agent `/api/agent/ws`：首条消息 `{"type":"hello","nodeId":N,"agentVersion":"..."}`；连接证书的叶证书指纹必须与节点登记的 `certFingerprint` 一致，否则按 1008 关闭。
 
 SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `event: alarm` 发送，每 15 秒注释保活。浏览器用 fetch 流式读取并在请求头带 Bearer。
 
