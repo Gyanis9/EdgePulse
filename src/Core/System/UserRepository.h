@@ -178,8 +178,10 @@ namespace EdgePulse::System
          * @param windowSeconds 失败计数的滑动窗口，单位秒
          * @param maximumFailures 触发锁定的失败次数
          * @param lockSeconds 锁定时长，单位秒
-         * @return 本次达到阈值时返回锁定截止时刻；未触发锁定返回空
-         * @note 读计数、判窗口与写回在同一条连接的事务里完成；写入失败时整体回滚
+         * @return 锁定截止时刻在将来时返回该时刻；未触发锁定或锁定已过期返回空
+         * @note 计数递增由单条条件 UPDATE 完成，并发失败不会各自读到旧值再覆盖
+         * @note 用户不存在、已删除或不在当前租户范围内时返回空，调用方仍按统一 401 处理
+         * @note 达到阈值时只在锁定为空或已过期时补写截止时刻，不覆盖其它请求刚写入的新锁定
          */
         AsynGyanis::Core::Task<std::optional<std::string>> recordLoginFailure(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, int windowSeconds, int maximumFailures,
                                                                               int lockSeconds);

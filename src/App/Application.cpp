@@ -380,30 +380,32 @@ namespace EdgePulse::App
             return false;
         }
 
-        // 固件上传走流式正文，解析器仍按正文总量累计；配置的正文上限必须给固件留出余量
+        // 公开 HTTP/HTTPS 与 h3 接受固件上传，解析器上限给固件留出余量；Agent 与运维口只收小正文
         AsynGyanis::Net::HttpServerLimits limits;
         limits.idleTimeout  = std::chrono::milliseconds{m_configuration.idleTimeoutMs};
         limits.readTimeout  = std::chrono::milliseconds{m_configuration.readTimeoutMs};
         limits.writeTimeout = std::chrono::milliseconds{m_configuration.writeTimeoutMs};
-        const std::size_t effectiveMaximumBodySize =
-                std::max(static_cast<std::size_t>(m_configuration.maximumRequestBodyBytes), static_cast<std::size_t>(m_configuration.maximumFirmwareBytes));
-        LOG_INFO_FMT("连接限额已生效：空闲 {} ms、读取 {} ms、写入 {} ms；解析器正文上限 {} 字节", m_configuration.idleTimeoutMs, m_configuration.readTimeoutMs,
-                     m_configuration.writeTimeoutMs, effectiveMaximumBodySize);
+        const std::size_t configuredMaximumBodySize = static_cast<std::size_t>(m_configuration.maximumRequestBodyBytes);
+        const std::size_t uploadMaximumBodySize =
+                std::max(configuredMaximumBodySize, static_cast<std::size_t>(m_configuration.maximumFirmwareBytes));
+        LOG_INFO_FMT("连接限额已生效：空闲 {} ms、读取 {} ms、写入 {} ms；Agent 与运维口正文上限 {} 字节，公开口与 h3 正文上限 {} 字节",
+                     m_configuration.idleTimeoutMs, m_configuration.readTimeoutMs, m_configuration.writeTimeoutMs, configuredMaximumBodySize,
+                     uploadMaximumBodySize);
 
-        if (m_configuration.requestsPerSecond > 0)
+        if (m_configuration.requestsPerSecond > 0.0)
         {
             // 全进程只建一个桶：每个监听器各持一份会让实际速率乘以监听器数量
-            m_rateLimitBucket = std::make_shared<AsynGyanis::Net::TokenBucket>(static_cast<double>(m_configuration.requestsPerSecond), m_configuration.rateLimitBurstCapacity);
+            m_rateLimitBucket = std::make_shared<AsynGyanis::Net::TokenBucket>(m_configuration.requestsPerSecond, m_configuration.rateLimitBurstCapacity);
             LOG_INFO_FMT("全局限流已启用：每秒 {} 个请求，桶容量 {}", m_configuration.requestsPerSecond, m_configuration.rateLimitBurstCapacity);
         } else
         {
             LOG_INFO("全局限流已关闭：server.rate_limit.requests_per_second 为 0");
         }
 
-        const auto applyParserLimits = [effectiveMaximumBodySize](auto &server)
+        const auto applyParserLimits = [](auto &server, const std::size_t maximumBodySize)
         {
             AsynGyanis::Net::HttpParserLimits parserLimits = server.parserLimits();
-            parserLimits.maximumBodySize                   = effectiveMaximumBodySize;
+            parserLimits.maximumBodySize                   = maximumBodySize;
             server.setParserLimits(parserLimits);
         };
 
@@ -430,7 +432,7 @@ namespace EdgePulse::App
             m_webRoot    = std::filesystem::path(m_configuration.webRoot);
             m_httpServer = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *httpAddress);
             m_httpServer->setLimits(limits);
-            applyParserLimits(*m_httpServer);
+            applyParserLimits(*m_httpServer, uploadMaximumBodySize);
             registerPublicRoutes(m_httpServer->router(), loop);
             m_acceptTask.emplace(m_httpServer->start());
             loop.scheduler().schedule(m_acceptTask->handle());
@@ -464,7 +466,7 @@ namespace EdgePulse::App
                 // 8443/TCP：HTTP/2 控制台，Alt-Svc 通告同端口 UDP 上的 h3
                 m_httpsServer = std::make_unique<AsynGyanis::Net::HttpsServer>(loop, *httpsAddress, serverCertificate.string(), serverKey.string());
                 m_httpsServer->setLimits(limits);
-                applyParserLimits(*m_httpsServer);
+                applyParserLimits(*m_httpsServer, uploadMaximumBodySize);
                 m_httpsServer->router().addMiddleware(AsynGyanis::Net::altSvcMiddleware(m_configuration.httpsPort));
                 registerPublicRoutes(m_httpsServer->router(), loop);
                 m_httpsAccept.emplace(m_httpsServer->start());
@@ -484,7 +486,7 @@ namespace EdgePulse::App
                 registerPublicRoutes(*m_h3Router, loop);
                 m_quicServer = std::make_unique<AsynGyanis::Net::QuicServer>(loop, quicConfiguration);
                 m_quicServer->setLimits(limits);
-                applyParserLimits(*m_quicServer);
+                applyParserLimits(*m_quicServer, uploadMaximumBodySize);
                 m_quicServer->setRouter(*m_h3Router);
                 m_quicListen.emplace(m_quicServer->listen(*httpsAddress));
                 loop.scheduler().schedule(m_quicListen->handle());
@@ -504,7 +506,7 @@ namespace EdgePulse::App
                 // 9443：只挂 Agent 路由；要求客户端证书，公共浏览器路由不得出现在这里
                 m_agentServer = std::make_unique<AsynGyanis::Net::HttpsServer>(loop, *agentAddress, serverCertificate.string(), serverKey.string());
                 m_agentServer->setLimits(limits);
-                applyParserLimits(*m_agentServer);
+                applyParserLimits(*m_agentServer, configuredMaximumBodySize);
                 if (!m_agentServer->loadClientCertificateAuthority(caCertificate.string()))
                 {
                     error = "加载客户端 CA 失败：" + caCertificate.string();
@@ -576,7 +578,7 @@ namespace EdgePulse::App
                 };
                 m_opsServer = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *opsAddress);
                 m_opsServer->setLimits(limits);
-                applyParserLimits(*m_opsServer);
+                applyParserLimits(*m_opsServer, configuredMaximumBodySize);
                 AsynGyanis::Net::registerOperationEndpoints(*m_opsServer, opsConfiguration, readiness);
                 m_opsAccept.emplace(m_opsServer->start());
                 loop.scheduler().schedule(m_opsAccept->handle());

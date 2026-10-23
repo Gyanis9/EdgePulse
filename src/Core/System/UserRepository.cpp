@@ -1,6 +1,7 @@
 #include "Core/System/UserRepository.h"
 
 #include "Base/Database/SqlHelpers.h"
+#include "Base/Database/SqlRetry.h"
 #include "Base/Exception/EdgePulseException.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
@@ -16,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,9 @@ namespace EdgePulse::System
         using AsynGyanis::Database::DatabaseConnection;
         using AsynGyanis::Database::DatabaseResult;
         using AsynGyanis::Database::DatabaseValue;
+
+        constexpr int                       kLoginFailureAttempts = 4; ///< 并发失败计数最多尝试几次
+        constexpr std::chrono::milliseconds kLoginFailureBackoff{5};   ///< 两次尝试之间的退避，只在工作线程上等
 
         constexpr std::string_view kSelectUser = "SELECT u.id, u.tenant_id, u.platform_admin, u.username, u.password, u.nickname, u.phone, u.email, u.dept_id, u.status, "
                                                  "u.failed_login_count, u.locked_until, "
@@ -50,6 +55,31 @@ namespace EdgePulse::System
         void executeStatement(DatabaseConnection &connection, const std::string &sql, std::span<const DatabaseValue> parameters)
         {
             static_cast<void>(execute(connection, sql, parameters));
+        }
+
+        [[nodiscard]] std::unique_ptr<DatabaseResult> executeWithRetry(DatabaseConnection &connection, const std::string &sql, std::span<const DatabaseValue> parameters)
+        {
+            for (int attempt = 0; attempt < kLoginFailureAttempts; ++attempt)
+            {
+                try
+                {
+                    return execute(connection, sql, parameters);
+                } catch (const Common::DatabaseException &failure)
+                {
+                    if (!Sql::isRetryableSqlFailure(failure.what()) || attempt + 1 >= kLoginFailureAttempts)
+                    {
+                        throw;
+                    }
+                    // 工作线程上的短暂退避，避开并发写持有的锁；事件循环线程不经过这里
+                    std::this_thread::sleep_for(kLoginFailureBackoff);
+                }
+            }
+            throw Common::DatabaseException("登录失败计数重试次数已用尽");
+        }
+
+        void executeStatementWithRetry(DatabaseConnection &connection, const std::string &sql, std::span<const DatabaseValue> parameters)
+        {
+            static_cast<void>(executeWithRetry(connection, sql, parameters));
         }
 
         [[nodiscard]] UserRecord readUser(const DatabaseResult &result)
@@ -514,60 +544,65 @@ namespace EdgePulse::System
                 loop,
                 [userId, windowSeconds, maximumFailures, lockSeconds, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<std::string>
                 {
-                    const auto rollbackQuietly = [&connection] { static_cast<void>(connection.execute("ROLLBACK")); };
-                    if (!connection.execute("BEGIN"))
+                    const auto        now          = std::chrono::system_clock::now();
+                    const std::string nowText      = Common::formatDateTimeUtc(now);
+                    const std::string windowStart  = Common::formatDateTimeUtc(now - std::chrono::seconds{windowSeconds});
+                    const std::string tenantClause = tenant.allTenants ? std::string{} : std::string{" AND tenant_id = ?"};
+
+                    std::vector<DatabaseValue> incrementParameters{windowStart, nowText, userId};
+                    if (!tenant.allTenants)
                     {
-                        throw Common::DatabaseException("开启登录失败计数事务失败：" + connection.lastError());
+                        incrementParameters.emplace_back(tenant.tenantId);
                     }
-                    try
+                    // 窗口判定与自增在同一条 UPDATE 里完成：并发失败不会各自读到旧计数再加一
+                    executeStatementWithRetry(connection,
+                                              "UPDATE sys_user SET failed_login_count = CASE WHEN last_failed_login_at IS NULL OR last_failed_login_at < ? "
+                                              "THEN 1 ELSE failed_login_count + 1 END, last_failed_login_at = ? WHERE id = ? AND deleted = 0" +
+                                                      tenantClause,
+                                              incrementParameters);
+
+                    std::vector<DatabaseValue> selectParameters{userId};
+                    if (!tenant.allTenants)
                     {
-                        std::vector<DatabaseValue> parameters{userId};
-                        std::string                clause;
+                        selectParameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto row =
+                            executeWithRetry(connection, "SELECT failed_login_count, locked_until FROM sys_user WHERE id = ? AND deleted = 0" + tenantClause, selectParameters);
+                    if (!row->next())
+                    {
+                        return std::nullopt;
+                    }
+                    const int         failureCount = static_cast<int>(Sql::integer(*row, "failed_login_count"));
+                    const std::string currentLock  = Sql::dateTimeText(*row, "locked_until");
+
+                    if (failureCount >= maximumFailures && (currentLock.empty() || currentLock <= nowText))
+                    {
+                        const std::string          proposedLock = Common::formatDateTimeUtc(now + std::chrono::seconds{lockSeconds});
+                        std::vector<DatabaseValue> lockParameters{proposedLock, userId, nowText};
                         if (!tenant.allTenants)
                         {
-                            clause = " AND tenant_id = ?";
-                            parameters.emplace_back(tenant.tenantId);
+                            lockParameters.emplace_back(tenant.tenantId);
                         }
-                        const auto row = execute(connection, "SELECT failed_login_count, last_failed_login_at FROM sys_user WHERE id = ? AND deleted = 0" + clause, parameters);
-                        if (!row->next())
-                        {
-                            rollbackQuietly();
-                            return std::nullopt;
-                        }
-                        const int         previousCount = static_cast<int>(Sql::integer(*row, "failed_login_count"));
-                        const std::string lastFailedAt  = Sql::dateTimeText(*row, "last_failed_login_at");
-                        const auto        now           = std::chrono::system_clock::now();
-                        const std::string nowText       = Common::formatDateTimeUtc(now);
-                        const std::string windowStart   = Common::formatDateTimeUtc(now - std::chrono::seconds{windowSeconds});
-
-                        // 窗口外的旧失败不再累计；窗口内接着上次的次数加一
-                        const int                        currentCount = (!lastFailedAt.empty() && lastFailedAt >= windowStart) ? previousCount + 1 : 1;
-                        const std::optional<std::string> lockedUntil =
-                                currentCount >= maximumFailures ? std::optional<std::string>{Common::formatDateTimeUtc(now + std::chrono::seconds{lockSeconds})} : std::nullopt;
-
-                        std::vector<DatabaseValue> updateParameters{static_cast<std::int64_t>(currentCount), nowText};
-                        std::string                updateSql = "UPDATE sys_user SET failed_login_count = ?, last_failed_login_at = ?";
-                        // 未触发锁定时不碰 locked_until：并发失败的另一个请求可能刚写入锁定，这里不能把它清掉
-                        if (lockedUntil.has_value())
-                        {
-                            updateSql += ", locked_until = ?";
-                            updateParameters.emplace_back(*lockedUntil);
-                        }
-                        updateSql += " WHERE id = ? AND deleted = 0";
-                        updateParameters.emplace_back(userId);
-                        if (!tenant.allTenants)
-                        {
-                            updateSql += " AND tenant_id = ?";
-                            updateParameters.emplace_back(tenant.tenantId);
-                        }
-                        executeStatement(connection, updateSql, updateParameters);
-                        executeStatement(connection, "COMMIT", {});
-                        return lockedUntil;
-                    } catch (...)
-                    {
-                        rollbackQuietly();
-                        throw;
+                        // 只补写仍然空着或已过期的锁定，不能覆盖并发请求刚写入的新截止时刻
+                        executeStatementWithRetry(connection,
+                                                  "UPDATE sys_user SET locked_until = ? WHERE id = ? AND deleted = 0 AND (locked_until IS NULL OR locked_until <= ?)" +
+                                                          tenantClause,
+                                                  lockParameters);
                     }
+
+                    std::vector<DatabaseValue> finalParameters{userId};
+                    if (!tenant.allTenants)
+                    {
+                        finalParameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto finalRow = executeWithRetry(connection, "SELECT locked_until FROM sys_user WHERE id = ? AND deleted = 0" + tenantClause, finalParameters);
+                    if (!finalRow->next())
+                    {
+                        return std::nullopt;
+                    }
+                    const std::string finalLock = Sql::dateTimeText(*finalRow, "locked_until");
+                    // 只有仍在将来的锁定才回报给调用方；已过期的不算本次触发
+                    return !finalLock.empty() && finalLock > nowText ? std::optional<std::string>{finalLock} : std::nullopt;
                 });
     }
 

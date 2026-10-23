@@ -111,12 +111,18 @@ protected:
         return loginInTenant(username, password, "");
     }
 
-    std::string loginInTenant(const std::string &username, const std::string &password, const std::string &tenantCode)
+    EdgePulse::TestSupport::HttpResult attemptLogin(const std::string &username, const std::string &password, const std::string &tenantCode = "")
     {
         const auto captcha = m_server->get("/api/auth/captcha");
-        EXPECT_EQ(200, captcha.status) << captcha.body;
+        if (captcha.status != 200)
+        {
+            return captcha;
+        }
         const auto json = captcha.json();
-        EXPECT_TRUE(json.has_value());
+        if (!json.has_value())
+        {
+            return captcha;
+        }
         const std::string             uuid      = (*json)["data"]["uuid"].get<std::string>();
         const std::string             code      = (*json)["data"]["code"].get<std::string>();
         AsynGyanis::Base::ConfigValue bodyValue = AsynGyanis::Base::ConfigValue::object({{"username", username}, {"password", password}, {"captcha", code}, {"captchaUuid", uuid}});
@@ -124,10 +130,19 @@ protected:
         {
             bodyValue["tenantCode"] = tenantCode;
         }
-        const auto response = m_server->post("/api/auth/login", bodyValue.dump());
+        return m_server->post("/api/auth/login", bodyValue.dump());
+    }
+
+    std::string loginInTenant(const std::string &username, const std::string &password, const std::string &tenantCode)
+    {
+        const auto response = attemptLogin(username, password, tenantCode);
         EXPECT_EQ(200, response.status) << response.body;
         const auto loginJson = response.json();
         EXPECT_TRUE(loginJson.has_value());
+        if (!loginJson.has_value())
+        {
+            return {};
+        }
         return (*loginJson)["data"]["token"].get<std::string>();
     }
 
@@ -179,6 +194,19 @@ protected:
     void SetUp() override
     {
         m_authOptions = EdgePulse::Auth::AuthOptions{10, true, 900, 5, 900};
+        SystemEndpointsTest::SetUp();
+    }
+};
+
+/**
+ * @brief 两次失败即锁定的同一套管理端夹具
+ */
+class LockingSystemEndpointsTest : public SystemEndpointsTest
+{
+protected:
+    void SetUp() override
+    {
+        m_authOptions = EdgePulse::Auth::AuthOptions{6, false, 900, 2, 60};
         SystemEndpointsTest::SetUp();
     }
 };
@@ -258,6 +286,52 @@ TEST_F(StrictSystemEndpointsTest, RejectsWeakPasswordOnCreateAndReset)
     const std::string resetPath = "/api/system/users/" + std::to_string(userId) + "/password";
     EXPECT_EQ(400, m_server->send("PUT", resetPath, R"({"password":"short"})", "application/json", bearer(token)).status);
     EXPECT_EQ(200, m_server->send("PUT", resetPath, R"({"password":"Another-pass1"})", "application/json", bearer(token)).status);
+}
+
+// 钉住：严格口令档下租户管理员口令同样先过策略，弱口令在建租户时即被拒
+TEST_F(StrictSystemEndpointsTest, TenantProvisioningAppliesPasswordPolicy)
+{
+    const std::string token          = login("admin", "admin123");
+    const auto        weakTenantBody = AsynGyanis::Base::ConfigValue::object({{"code", "strict_tenant"},
+                                                                              {"name", "严格租户"},
+                                                                              {"adminUsername", "strict-tenant-admin"},
+                                                                              {"adminPassword", "short"}})
+                                               .dump();
+    const auto weakTenant = m_server->post("/api/system/tenants", weakTenantBody, "application/json", bearer(token));
+    ASSERT_EQ(400, weakTenant.status) << weakTenant.body;
+    EXPECT_NE(std::string::npos, weakTenant.body.find("口令长度"));
+
+    const auto strongTenantBody = AsynGyanis::Base::ConfigValue::object({{"code", "strict_tenant"},
+                                                                         {"name", "严格租户"},
+                                                                         {"adminUsername", "strict-tenant-admin"},
+                                                                         {"adminPassword", "Strong-pass1"}})
+                                          .dump();
+    const auto strongTenant = m_server->post("/api/system/tenants", strongTenantBody, "application/json", bearer(token));
+    ASSERT_EQ(200, strongTenant.status) << strongTenant.body;
+    EXPECT_GT((*strongTenant.json())["data"]["tenantId"].get<std::int64_t>(), 1);
+    EXPECT_FALSE(loginInTenant("strict-tenant-admin", "Strong-pass1", "strict_tenant").empty());
+}
+
+// 钉住：锁定的账号出现在用户 JSON 的 lockedUntil 里，下一次登录由认证路由返回 423
+TEST_F(LockingSystemEndpointsTest, LockedAccountIsVisibleAndLoginReturns423)
+{
+    const std::string  token  = login("admin", "admin123");
+    const std::int64_t roleId = createRole(token, "锁定用户角色", "lockout_role", {1300});
+    createUser(token, "lockme", "锁定用户", roleId);
+
+    EXPECT_EQ(401, attemptLogin("lockme", "wrong-1").status);
+    EXPECT_EQ(401, attemptLogin("lockme", "wrong-2").status);
+
+    const auto list = m_server->get("/api/system/users?pageNum=1&pageSize=10&keyword=lockme", bearer(token));
+    ASSERT_EQ(200, list.status) << list.body;
+    const auto listJson = list.json();
+    ASSERT_TRUE(listJson.has_value());
+    ASSERT_EQ(1, (*listJson)["data"]["total"].get<std::int64_t>());
+    const auto &row = (*listJson)["data"]["rows"][0];
+    ASSERT_TRUE(row.contains("lockedUntil"));
+    EXPECT_FALSE(row["lockedUntil"].get<std::string>().empty());
+
+    EXPECT_EQ(423, attemptLogin("lockme", "userpass1").status);
 }
 
 // 钉住：匿名 401、无权限 403；低权限账号无法读取用户列表，但可访问工作台

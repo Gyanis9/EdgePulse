@@ -15,6 +15,7 @@
 #include "Net/Http/Message/HttpResponse.h"
 #include "Net/Http/Routing/Router.h"
 
+#include <Core/Coroutine/AsyncExecutor.h>
 #include <Core/EventLoop/EventLoop.h>
 
 #include <cstdint>
@@ -109,12 +110,20 @@ namespace EdgePulse::System
                         provision.adminUsername    = Json::stringField(*body, "adminUsername");
                         provision.adminNickname    = Json::stringField(*body, "adminNickname", provision.adminUsername);
                         const std::string password = Json::stringField(*body, "adminPassword");
-                        if (provision.code.empty() || provision.name.empty() || provision.adminUsername.empty() || password.size() < 6 || password.size() > 64)
+                        if (provision.code.empty() || provision.name.empty() || provision.adminUsername.empty() || password.empty())
                         {
-                            fail(response, Common::kCodeBadRequest, "code、name、adminUsername 不能为空，adminPassword 长度必须在 6 到 64 之间", traceId);
+                            fail(response, Common::kCodeBadRequest, "code、name、adminUsername 与 adminPassword 不能为空", traceId);
                             co_return;
                         }
-                        provision.adminPasswordHash = Common::hashPassword(password);
+                        // 口令规则只认认证服务持有的策略，租户初始化不另写一套长度判断
+                        if (const auto validation = dependencies->auth->validatePassword(password); !validation)
+                        {
+                            fail(response, Common::kCodeBadRequest, validation.error(), traceId);
+                            co_return;
+                        }
+                        // PBKDF2 放在工作线程，避免建租户时占住事件循环
+                        provision.adminPasswordHash =
+                                co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::string>(loop, [password] { return Common::hashPassword(password); });
                         const auto created          = co_await dependencies->tenants->provision(loop, std::move(provision), session->userId);
                         if (!created.has_value())
                         {

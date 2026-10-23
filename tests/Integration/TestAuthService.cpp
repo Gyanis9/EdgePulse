@@ -1,5 +1,7 @@
 #include "Core/Auth/AuthService.h"
 #include "Base/Database/Database.h"
+#include "Base/Database/SqlHelpers.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/PasswordHash.h"
 #include "Core/System/UserRepository.h"
 #include "TestSupport/AuthTestContext.h"
@@ -8,10 +10,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <barrier>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -118,17 +123,23 @@ TEST(AuthService, ChangesPasswordAndInvalidatesOldCredential)
     ASSERT_TRUE(newCredential.has_value()) << newCredential.error().message;
 }
 
-// 钉住：连续失败达到阈值后账号锁定，正确口令在锁定期内也回 423
+// 钉住：连续失败达到阈值后账号锁定，触发锁定的那次仍是 401，正确口令在锁定期内也回 423
 TEST(AuthService, LocksAccountAfterRepeatedFailures)
 {
-    EdgePulse::TestSupport::AuthTestContext context({10, true, 900, 2, 60});
+    // 锁定 90 秒用于核对提示按分钟向上取整：旧算法会显示「1 分钟」，实际还差半分钟才解锁
+    EdgePulse::TestSupport::AuthTestContext context({10, true, 900, 2, 90});
     EdgePulse::TestSupport::EventLoopRunner runner;
 
-    EXPECT_FALSE(loginWithCaptcha(context, runner, "wrong-1").has_value());
-    EXPECT_FALSE(loginWithCaptcha(context, runner, "wrong-2").has_value());
+    const auto first = loginWithCaptcha(context, runner, "wrong-1");
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(401, first.error().httpStatus);
+    const auto second = loginWithCaptcha(context, runner, "wrong-2");
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(401, second.error().httpStatus);
     const auto locked = loginWithCaptcha(context, runner, "admin123");
     ASSERT_FALSE(locked.has_value());
     EXPECT_EQ(423, locked.error().httpStatus);
+    EXPECT_NE(std::string::npos, locked.error().message.find("2 分钟"));
 
     // 管理员重置口令会清空锁定，新口令立即可用
     EdgePulse::System::UserRepository users(context.database);
@@ -138,6 +149,73 @@ TEST(AuthService, LocksAccountAfterRepeatedFailures)
     ASSERT_TRUE(runner.run(users.scoped({1, false})->resetPassword(runner.loop(), admin->id, hash, 1)));
     const auto recovered = loginWithCaptcha(context, runner, "admin123");
     ASSERT_TRUE(recovered.has_value()) << recovered.error().message;
+}
+
+// 钉住：两条连接并发记录失败时计数不会互相覆盖，最终至少达到阈值且写入锁定
+TEST(AuthService, ConcurrentFailuresReachThresholdWithoutOverwrite)
+{
+    EdgePulse::TestSupport::AuthTestContext context({6, false, 900, 4, 60});
+    EdgePulse::TestSupport::EventLoopRunner runnerA;
+    EdgePulse::TestSupport::EventLoopRunner runnerB;
+    auto                                    usersA = std::make_shared<EdgePulse::System::UserRepository>(context.database, EdgePulse::System::TenantScope{1, false});
+    auto                                    usersB = std::make_shared<EdgePulse::System::UserRepository>(context.database, EdgePulse::System::TenantScope{1, false});
+
+    const auto admin = runnerA.run(usersA->findByUsername(runnerA.loop(), "admin"));
+    ASSERT_TRUE(admin.has_value());
+
+    constexpr int perWorker       = 3;
+    constexpr int maximumFailures = 4;
+    std::barrier  barrier{2};
+    std::exception_ptr failureA;
+    std::exception_ptr failureB;
+    // 两条线程都到齐后才开始写，避免退化成先后执行
+    const auto worker = [&barrier, userId = admin->id, perWorker, maximumFailures](EdgePulse::TestSupport::EventLoopRunner &runner, EdgePulse::System::UserRepository &users,
+                                                                                    std::exception_ptr &failure)
+    {
+        barrier.arrive_and_wait();
+        try
+        {
+            for (int attempt = 0; attempt < perWorker; ++attempt)
+            {
+                // 返回值只表示是否触发锁定；本用例关心落库后的最终不变量
+                static_cast<void>(runner.run(users.recordLoginFailure(runner.loop(), userId, 900, maximumFailures, 60)));
+            }
+        } catch (...)
+        {
+            failure = std::current_exception();
+        }
+    };
+    std::thread threadA(worker, std::ref(runnerA), std::ref(*usersA), std::ref(failureA));
+    std::thread threadB(worker, std::ref(runnerB), std::ref(*usersB), std::ref(failureB));
+    threadA.join();
+    threadB.join();
+
+    for (const std::exception_ptr &failure: {failureA, failureB})
+    {
+        if (failure != nullptr)
+        {
+            try
+            {
+                std::rethrow_exception(failure);
+            } catch (const std::exception &error)
+            {
+                FAIL() << "并发记录登录失败抛出异常：" << error.what();
+            } catch (...)
+            {
+                FAIL() << "并发记录登录失败抛出未知异常";
+            }
+        }
+    }
+
+    const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+    const auto                                                      result =
+            connection->execute("SELECT failed_login_count, locked_until FROM sys_user WHERE id = " + std::to_string(admin->id));
+    ASSERT_NE(nullptr, result) << connection->lastError();
+    ASSERT_TRUE(result->next());
+    EXPECT_GE(EdgePulse::Sql::integer(*result, "failed_login_count"), maximumFailures);
+    const std::string lockedUntil = EdgePulse::Sql::dateTimeText(*result, "locked_until");
+    EXPECT_FALSE(lockedUntil.empty());
+    EXPECT_GT(lockedUntil, EdgePulse::Common::nowDateTimeUtc());
 }
 
 // 钉住：成功登录会清空账号失败计数，此前的输错不参与后续累计

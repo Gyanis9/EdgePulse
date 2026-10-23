@@ -175,7 +175,7 @@ namespace EdgePulse::App
         configuration.allowedOrigins           = splitByComma(configurationManager.getString("edgepulse.security.allowed_origins", ""));
         configuration.allowPrivateWebhooks     = configurationManager.getBool("edgepulse.security.allow_private_webhooks", configuration.allowPrivateWebhooks);
 
-        configuration.requestsPerSecond         = configurationManager.getInt("server.rate_limit.requests_per_second", configuration.requestsPerSecond);
+        configuration.requestsPerSecond         = configurationManager.getDouble("server.rate_limit.requests_per_second", configuration.requestsPerSecond);
         configuration.rateLimitBurstCapacity    = configurationManager.getDouble("server.rate_limit.burst_capacity", configuration.rateLimitBurstCapacity);
         configuration.idleTimeoutMs             = configurationManager.getInt("server.limits.idle_timeout_ms", configuration.idleTimeoutMs);
         configuration.readTimeoutMs             = configurationManager.getInt("server.limits.read_timeout_ms", configuration.readTimeoutMs);
@@ -293,9 +293,9 @@ namespace EdgePulse::App
         {
             return std::unexpected(ConfigurationError{"captcha/session 的 TTL 必须是正数"});
         }
-        if (configuration.requestsPerSecond < 0)
+        if (!std::isfinite(configuration.requestsPerSecond) || configuration.requestsPerSecond < 0.0)
         {
-            return std::unexpected(ConfigurationError{"server.rate_limit.requests_per_second 不能为负数；关闭限流请写 0"});
+            return std::unexpected(ConfigurationError{"server.rate_limit.requests_per_second 必须是不小于 0 的有限数；关闭限流请写 0"});
         }
         // 令牌桶容量小于 1 时任何请求都取不到令牌，那是配置错误而不是更严格的限流
         if (!std::isfinite(configuration.rateLimitBurstCapacity) || configuration.rateLimitBurstCapacity < 1.0)
@@ -310,9 +310,9 @@ namespace EdgePulse::App
         {
             return std::unexpected(ConfigurationError{"server.parser_limits.maximum_body_size 必须是正数"});
         }
-        if (configuration.passwordMinimumLength < 6 || configuration.passwordMinimumLength > 64)
+        if (configuration.passwordMinimumLength < 8 || configuration.passwordMinimumLength > 64)
         {
-            return std::unexpected(ConfigurationError{"edgepulse.security.password_min_length 必须在 6 到 64 之间"});
+            return std::unexpected(ConfigurationError{"edgepulse.security.password_min_length 必须在 8 到 64 之间"});
         }
         if (configuration.loginFailureWindowSeconds < 60 || configuration.loginFailureWindowSeconds > 86400)
         {
