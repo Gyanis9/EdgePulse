@@ -36,7 +36,7 @@ npm run test:e2e
 
 ## 引擎边界
 
-`third_party/AsynGyanis` 是只读 submodule。不得修改、复制源码进 `src/`、或以 `add_subdirectory` 消费。发现引擎缺陷时：
+`3rd/AsynGyanis` 是只读 submodule。不得修改、复制源码进 `src/`、或以 `add_subdirectory` 消费。发现引擎缺陷时：
 
 1. 记录最小复现步骤、期望行为与实际行为；
 2. 在应用层绕过，并把绕过点与撤销条件写进代码注释与部署文档；

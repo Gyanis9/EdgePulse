@@ -20,7 +20,7 @@ RUN conan profile detect --force
 WORKDIR /src
 COPY . /src
 
-RUN conan create third_party/AsynGyanis/packaging/conan --build=missing \
+RUN conan create 3rd/AsynGyanis/packaging/conan --build=missing \
         -s compiler.cppstd=23 -s build_type=Release -o "&:with_mysql=True"
 
 RUN conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release

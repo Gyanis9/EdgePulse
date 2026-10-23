@@ -24,7 +24,7 @@ src/
 ├─ App/        配置、生命周期、监听器与工作线程装配
 └─ Main/       进程入口
 frontend/      Vue 3 + Vite 管理后台
-third_party/AsynGyanis/  引擎 git submodule，只读
+3rd/AsynGyanis/  引擎 git submodule，只读
 migrations/    SQL 迁移 V1–V14
 config/        非敏感配置样例
 deploy/        Docker、systemd、Prometheus
@@ -51,7 +51,7 @@ docs/          架构、API、部署、验收、覆盖率与设计/计划
 ```bash
 git submodule update --init --recursive
 
-conan create third_party/AsynGyanis/packaging/conan --build=missing \
+conan create 3rd/AsynGyanis/packaging/conan --build=missing \
   -s compiler.cppstd=23 -s build_type=Release -o "&:with_mysql=True"
 
 conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
