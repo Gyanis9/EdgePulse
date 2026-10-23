@@ -42,6 +42,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestEnrollment.cpp
         Integration/TestExternalStores.cpp
         Integration/TestMigrations.cpp
+        Integration/TestNodeConfig.cpp
         Integration/TestNodeLifecycle.cpp
         Integration/TestNotificationChannels.cpp
         Integration/TestRealtimeBus.cpp
@@ -62,6 +63,7 @@ add_executable(edgepulse-protocol-tests
         Protocol/TestEnrollmentEndpoints.cpp
         Protocol/TestHealthServer.cpp
         Protocol/TestFleetEndpoints.cpp
+        Protocol/TestNodeConfigEndpoints.cpp
         Protocol/TestNodeEndpoints.cpp
         Protocol/TestReverseProxy.cpp
         Protocol/TestSystemEndpoints.cpp)

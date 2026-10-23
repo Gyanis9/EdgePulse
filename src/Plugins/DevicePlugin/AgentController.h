@@ -21,6 +21,7 @@ namespace AsynGyanis::Net
 namespace EdgePulse::Device
 {
     class AgentRegistry;
+    class NodeConfigRepository;
     class NodeRepository;
 } // namespace EdgePulse::Device
 
@@ -39,7 +40,8 @@ namespace EdgePulse::Device
      * @param nodes 节点仓储，用于校验心跳请求的证书身份
      * @param tenants 租户仓储，用于解析注册请求的租户编码
      * @param heartbeatIntervalSeconds 期望的心跳间隔，随心跳响应下发
+     * @param nodeConfig 配置影子仓储，心跳响应据此带回期望配置版本；可空
      */
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants,
-                        int heartbeatIntervalSeconds);
+                        int heartbeatIntervalSeconds, NodeConfigRepository *nodeConfig = nullptr);
 } // namespace EdgePulse::Device

@@ -27,9 +27,12 @@
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/EnrollmentRepository.h"
 #include "Core/Device/EnrollmentService.h"
+#include "Core/Device/NodeConfigRepository.h"
+#include "Core/Device/NodeConfigService.h"
 #include "Core/Device/NodeLifecycleService.h"
 #include "Plugins/DevicePlugin/DeviceController.h"
 #include "Plugins/DevicePlugin/EnrollmentController.h"
+#include "Plugins/DevicePlugin/NodeConfigController.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Metrics/BusinessMetrics.h"
@@ -205,6 +208,7 @@ namespace EdgePulse::App
             m_nodeRepository = std::make_shared<Device::NodeRepository>(m_database);
             // 离线判定按进程汇总；仓储默认只看默认租户，周期扫描必须显式取全租户视图
             m_fleetNodes             = m_nodeRepository->scoped({0, true});
+            m_nodeConfigRepository   = std::make_shared<Device::NodeConfigRepository>(m_database);
             m_enrollmentRepository   = std::make_shared<Device::EnrollmentRepository>(m_database);
             m_enrollmentService      = std::make_shared<Device::EnrollmentService>(m_enrollmentRepository);
             m_nodeService            = std::make_shared<Device::NodeService>(m_nodeRepository);
@@ -276,6 +280,9 @@ namespace EdgePulse::App
             m_firmwareRepository   = std::make_shared<Firmware::FirmwareRepository>(m_database);
             m_commandRepository    = std::make_shared<Command::CommandRepository>(m_database);
             m_agentChannels        = std::make_shared<Command::AgentChannelRegistry>();
+            m_nodeConfigService    = std::make_shared<Device::NodeConfigService>(m_nodeConfigRepository, m_nodeRepository, m_commandRepository, m_agentChannels.get(),
+                                                                                 [this](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
+                                                                                 { co_await publishCommandStatus(command); });
             m_opsRepository        = std::make_shared<Ops::OpsRepository>(m_database);
 
             if (m_configuration.udpTelemetryEnabled)
@@ -453,7 +460,13 @@ namespace EdgePulse::App
                 }
                 m_agentServer->setClientCertificateRequired(true);
                 Web::applySecurityHeaders(m_agentServer->router());
-                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_nodeRepository, *m_tenantRepository, m_configuration.heartbeatIntervalSeconds);
+                Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_nodeRepository, *m_tenantRepository, m_configuration.heartbeatIntervalSeconds,
+                                       m_nodeConfigRepository.get());
+                Device::NodeConfigDependencies nodeConfigAgentDependencies;
+                nodeConfigAgentDependencies.nodes   = m_nodeRepository.get();
+                nodeConfigAgentDependencies.configs = m_nodeConfigRepository.get();
+                nodeConfigAgentDependencies.service = m_nodeConfigService.get();
+                Device::registerNodeConfigAgentRoutes(m_agentServer->router(), loop, nodeConfigAgentDependencies);
                 Telemetry::TelemetryDependencies telemetryAgentDependencies;
                 telemetryAgentDependencies.auth      = m_authService.get();
                 telemetryAgentDependencies.nodes     = m_nodeRepository.get();
@@ -663,6 +676,18 @@ namespace EdgePulse::App
         co_return;
     }
 
+    AsynGyanis::Core::Task<> Application::publishCommandStatus(const Command::CommandRecord &command)
+    {
+        const std::string payload =
+                AsynGyanis::Base::ConfigValue::object(
+                        {{"type", "command.status"},
+                         {"data", AsynGyanis::Base::ConfigValue::object(
+                                          {{"id", command.id}, {"nodeId", command.nodeId}, {"type", command.type}, {"status", command.status}, {"message", command.message}})}})
+                        .dump();
+        co_await m_realtimeBus->publish("commands", command.tenantId, payload);
+        co_return;
+    }
+
     void Application::registerPublicRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
     {
         // 中间件必须先于业务路由注册，异常兜底才能包住所有处理器
@@ -723,17 +748,7 @@ namespace EdgePulse::App
         Alarm::registerAlarmRoutes(router, loop, alarmDependencies);
         Web::registerAlarmEventStream(router, loop, *m_authService, *m_sseBroadcaster);
 
-        const auto commandNotifier = [bus = m_realtimeBus.get()](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
-        {
-            const std::string payload =
-                    AsynGyanis::Base::ConfigValue::object(
-                            {{"type", "command.status"},
-                             {"data", AsynGyanis::Base::ConfigValue::object(
-                                              {{"id", command.id}, {"nodeId", command.nodeId}, {"type", command.type}, {"status", command.status}, {"message", command.message}})}})
-                            .dump();
-            co_await bus->publish("commands", command.tenantId, payload);
-            co_return;
-        };
+        const auto                   commandNotifier = [this](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<> { co_await publishCommandStatus(command); };
         Command::CommandDependencies commandDependencies;
         commandDependencies.auth     = m_authService.get();
         commandDependencies.commands = m_commandRepository.get();
@@ -761,6 +776,13 @@ namespace EdgePulse::App
         opsDependencies.agentPort  = m_configuration.agentPort;
         opsDependencies.opsPort    = m_configuration.opsPort;
         Ops::registerOpsRoutes(router, loop, opsDependencies);
+        Device::NodeConfigDependencies nodeConfigDependencies;
+        nodeConfigDependencies.auth       = m_authService.get();
+        nodeConfigDependencies.configs    = m_nodeConfigRepository.get();
+        nodeConfigDependencies.service    = m_nodeConfigService.get();
+        nodeConfigDependencies.nodes      = m_nodeRepository.get();
+        nodeConfigDependencies.dataScopes = m_dataScopeService.get();
+        Device::registerNodeConfigRoutes(router, loop, nodeConfigDependencies);
         const auto accessResolver = [auth = m_authService, &loop](AsynGyanis::Core::EventLoop  &resolverLoop,
                                                                   AsynGyanis::Net::HttpRequest &request) -> AsynGyanis::Core::Task<std::optional<Device::AccessContext>>
         {
@@ -777,7 +799,8 @@ namespace EdgePulse::App
             co_return Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                             session->departmentId, session->roles,    session->permissions};
         };
-        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get(), m_agentChannels.get());
+        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get(), m_agentChannels.get(),
+                               m_nodeConfigRepository.get());
         Device::EnrollmentDependencies enrollmentDependencies;
         enrollmentDependencies.auth        = m_authService.get();
         enrollmentDependencies.enrollments = m_enrollmentService.get();

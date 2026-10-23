@@ -7,6 +7,7 @@
 #include "Base/Log/LogMacros.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Device/NodeConfigRepository.h"
 #include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Auth/DataScopeService.h"
@@ -159,7 +160,8 @@ namespace EdgePulse::Device
     } // namespace
 
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants, NodeLifecycleService *lifecycle, Command::AgentChannelRegistry *channels)
+                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants, NodeLifecycleService *lifecycle, Command::AgentChannelRegistry *channels,
+                        NodeConfigRepository *configs)
     {
         router.get("/api/nodes",
                    [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -240,7 +242,8 @@ namespace EdgePulse::Device
                     });
 
         router.get("/api/nodes/:id",
-                   [&loop, &nodeService, accessResolver, dataScopes](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodeService, accessResolver, dataScopes, configs](AsynGyanis::Net::HttpRequest  &request,
+                                                                              AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
                        const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kListPermission, traceId);
@@ -262,7 +265,24 @@ namespace EdgePulse::Device
                            Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除", traceId);
                            co_return;
                        }
-                       Common::writeSuccess(response, nodeToJson(*existing), traceId);
+                       AsynGyanis::Base::ConfigValue payload               = nodeToJson(*existing);
+                       std::int64_t                  desiredConfigVersion  = 0;
+                       std::int64_t                  reportedConfigVersion = 0;
+                       bool                          configInSync          = true;
+                       if (configs != nullptr)
+                       {
+                           const std::optional<NodeConfigRecord> config = co_await configs->scoped({existing->tenantId, false})->find(loop, *nodeId);
+                           if (config.has_value())
+                           {
+                               desiredConfigVersion  = config->desiredVersion;
+                               reportedConfigVersion = config->reportedVersion;
+                               configInSync          = config->inSync;
+                           }
+                       }
+                       payload["desiredConfigVersion"]  = desiredConfigVersion;
+                       payload["reportedConfigVersion"] = reportedConfigVersion;
+                       payload["configInSync"]          = configInSync;
+                       Common::writeSuccess(response, std::move(payload), traceId);
                        co_return;
                    });
 

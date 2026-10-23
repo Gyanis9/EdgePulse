@@ -8,6 +8,8 @@
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/AgentRegistry.h"
+#include "Core/Device/NodeConfigRepository.h"
+#include "Core/Device/NodeConfigService.h"
 #include "Core/Device/NodeGroupRepository.h"
 #include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeRepository.h"
@@ -25,6 +27,7 @@
 #include "Plugins/CommandPlugin/CommandController.h"
 #include "Plugins/DevicePlugin/AgentController.h"
 #include "Plugins/DevicePlugin/DeviceController.h"
+#include "Plugins/DevicePlugin/NodeConfigController.h"
 #include "Plugins/DevicePlugin/NodeGroupController.h"
 #include "Plugins/FirmwarePlugin/FirmwareController.h"
 #include "Plugins/TelemetryPlugin/TelemetryController.h"
@@ -287,6 +290,9 @@ protected:
         m_firmware         = std::make_shared<EdgePulse::Firmware::FirmwareRepository>(m_context->database);
         m_browserWebSocket = std::make_shared<EdgePulse::Web::BrowserWebSocket>();
 
+        m_nodeConfigs       = std::make_shared<EdgePulse::Device::NodeConfigRepository>(m_context->database);
+        m_nodeConfigService = std::make_shared<EdgePulse::Device::NodeConfigService>(m_nodeConfigs, m_nodes, m_commands, m_channels.get(), nullptr);
+
         m_server = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
@@ -309,8 +315,16 @@ protected:
                         co_return EdgePulse::Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                                                    session->departmentId, session->roles,    session->permissions};
                     };
-                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), m_lifecycle.get(), m_channels.get());
-                    EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants, 30);
+                    EdgePulse::Device::NodeConfigDependencies configDependencies;
+                    configDependencies.auth    = m_context->auth.get();
+                    configDependencies.configs = m_nodeConfigs.get();
+                    configDependencies.service = m_nodeConfigService.get();
+                    configDependencies.nodes   = m_nodes.get();
+                    EdgePulse::Device::registerNodeConfigRoutes(router, loop, configDependencies);
+                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), m_lifecycle.get(), m_channels.get(),
+                                                      m_nodeConfigs.get());
+                    EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants, 30, m_nodeConfigs.get());
+                    EdgePulse::Device::registerNodeConfigAgentRoutes(router, loop, configDependencies);
                     EdgePulse::Device::NodeGroupDependencies groups;
                     groups.auth   = m_context->auth.get();
                     groups.groups = m_groups.get();
@@ -359,6 +373,8 @@ protected:
     {
         m_server.reset();
         m_firmware.reset();
+        m_nodeConfigService.reset();
+        m_nodeConfigs.reset();
         m_commands.reset();
         m_lifecycle.reset();
         m_alarmService.reset();
@@ -433,6 +449,8 @@ protected:
     std::unique_ptr<EdgePulse::Device::NodeLifecycleService>   m_lifecycle;
     std::shared_ptr<EdgePulse::Command::CommandRepository>     m_commands;
     std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>  m_channels;
+    std::shared_ptr<EdgePulse::Device::NodeConfigRepository>   m_nodeConfigs;
+    std::shared_ptr<EdgePulse::Device::NodeConfigService>      m_nodeConfigService;
     std::shared_ptr<EdgePulse::Firmware::FirmwareRepository>   m_firmware;
     std::shared_ptr<EdgePulse::Web::BrowserWebSocket>          m_browserWebSocket;
     std::unique_ptr<EdgePulse::TestSupport::ServerHarness>     m_server;
@@ -516,11 +534,34 @@ TEST_F(FleetEndpointsTest, AgentRequestsRequireCertificateBinding)
     ASSERT_TRUE(heartbeatJson.has_value());
     // 心跳响应要带回服务端下发的节奏，Agent 不需要自己猜间隔
     EXPECT_EQ(30, (*heartbeatJson)["data"]["heartbeatIntervalSeconds"].get<std::int64_t>());
+    EXPECT_EQ(0, (*heartbeatJson)["data"]["desiredConfigVersion"].get<std::int64_t>());
 
     // 未登记指纹的节点不接受任何证书，即使证书格式合法
     const auto        unbound     = runner.run(m_nodes->create(runner.loop(), "agent-unbound", "{}"));
     const std::string unboundBody = R"({"nodeId":)" + std::to_string(unbound.id) + R"(,"agentVersion":"1.0.0"})";
     EXPECT_EQ(403, m_server->post("/api/agent/heartbeat", unboundBody, "application/json", agentHeaders(std::string(64, 'f'))).status);
+}
+
+// 钉住：心跳把最新期望配置版本带回 Agent，配置下发后无需等待下一次命令轮询
+TEST_F(FleetEndpointsTest, HeartbeatCarriesDesiredConfigVersion)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "heartbeat-config-node");
+    const std::string  fingerprint(64, '9');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    const auto applied = m_runner.run(m_nodeConfigService->applyDesired(m_runner.loop(), {1, false}, nodeId, R"({"interval":30})", 0, "初始配置", 1));
+    ASSERT_TRUE(applied.has_value()) << applied.error().message;
+
+    const std::string heartbeatBody = R"({"nodeId":)" + std::to_string(nodeId) + R"(,"agentVersion":"1.0.0"})";
+    const auto        heartbeat     = m_server->post("/api/agent/heartbeat", heartbeatBody, "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, heartbeat.status) << heartbeat.body;
+    EXPECT_EQ(1, (*heartbeat.json())["data"]["desiredConfigVersion"].get<std::int64_t>());
+
+    const auto detail = m_server->get("/api/nodes/" + std::to_string(nodeId), bearer(token));
+    ASSERT_EQ(200, detail.status) << detail.body;
+    EXPECT_EQ(1, (*detail.json())["data"]["desiredConfigVersion"].get<std::int64_t>());
+    EXPECT_FALSE((*detail.json())["data"]["configInSync"].get<bool>());
 }
 
 // 钉住：节点已在线时的心跳不再触发在线转换，但仍要销案扫描在心跳落库后插入的离线告警

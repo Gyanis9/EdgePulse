@@ -66,6 +66,8 @@ namespace EdgePulse::Device
     class AgentRegistry;
     class EnrollmentRepository;
     class EnrollmentService;
+    class NodeConfigRepository;
+    class NodeConfigService;
     class NodeGroupRepository;
     class NodeLifecycleService;
     class NodeRepository;
@@ -109,6 +111,7 @@ namespace EdgePulse::Command
 {
     class AgentChannelRegistry;
     class CommandRepository;
+    struct CommandRecord;
 } // namespace EdgePulse::Command
 namespace EdgePulse::Ops
 {
@@ -202,6 +205,13 @@ namespace EdgePulse::App
          */
         AsynGyanis::Core::Task<> publishNodeStatus(const Device::NodeRecord &node);
 
+        /**
+         * @brief 把命令状态推给实时总线
+         * @param command 待推送的命令
+         * @return AsynGyanis::Core::Task<> 推送完成即返回
+         */
+        AsynGyanis::Core::Task<> publishCommandStatus(const Command::CommandRecord &command);
+
     private:
         ApplicationConfiguration                                  m_configuration;
         std::filesystem::path                                     m_webRoot; ///< 前端构建产物目录
@@ -219,6 +229,8 @@ namespace EdgePulse::App
         std::shared_ptr<Device::EnrollmentRepository>             m_enrollmentRepository;   ///< 一次性注册令牌仓储
         std::shared_ptr<Device::EnrollmentService>                m_enrollmentService;      ///< 一次性注册令牌服务
         std::shared_ptr<Device::NodeService>                      m_nodeService;            ///< 节点服务
+        std::shared_ptr<Device::NodeConfigRepository>             m_nodeConfigRepository;   ///< 配置影子仓储
+        std::shared_ptr<Device::NodeConfigService>                m_nodeConfigService;      ///< 配置影子服务
         std::shared_ptr<Device::AgentRegistry>                    m_agentRegistry;          ///< Agent 注册表
         std::shared_ptr<Device::NodeLifecycleService>             m_lifecycle;              ///< 节点在线转换与离线扫描
         std::shared_ptr<System::UserRepository>                   m_userRepository;         ///< 用户仓储

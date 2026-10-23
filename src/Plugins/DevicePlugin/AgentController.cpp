@@ -4,6 +4,7 @@
 #include "Base/Api/ErrorCatalog.h"
 #include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/AgentRegistry.h"
+#include "Core/Device/NodeConfigRepository.h"
 #include "Core/System/TenantRepository.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Net/Http/Message/HttpRequest.h"
@@ -80,7 +81,7 @@ namespace EdgePulse::Device
     } // namespace
 
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants,
-                        const int heartbeatIntervalSeconds)
+                        const int heartbeatIntervalSeconds, NodeConfigRepository *nodeConfig)
     {
         router.post("/api/agent/register",
                     [&loop, &registry, &tenants](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -141,7 +142,8 @@ namespace EdgePulse::Device
                     });
 
         router.post("/api/agent/heartbeat",
-                    [&loop, &registry, &nodes, heartbeatIntervalSeconds](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, &registry, &nodes, heartbeatIntervalSeconds, nodeConfig](AsynGyanis::Net::HttpRequest  &request,
+                                                                                     AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string                                  traceId = Web::resolveRequestId(request);
                         const std::optional<AsynGyanis::Base::ConfigValue> body    = request.jsonBody();
@@ -171,7 +173,14 @@ namespace EdgePulse::Device
                         }
                         // 心跳响应同时充当 Agent 的节奏协商：interval 由服务端配置下发，节点无需自定
                         AsynGyanis::Base::ConfigValue payload = nodeToJson(result->node);
-                        payload["heartbeatIntervalSeconds"]   = heartbeatIntervalSeconds;
+                        // Agent 没有会话，配置版本按全租户视图查询；节点归属已由证书绑定确定
+                        std::int64_t desiredConfigVersion = 0;
+                        if (nodeConfig != nullptr)
+                        {
+                            desiredConfigVersion = co_await nodeConfig->scoped(System::TenantScope{0, true})->desiredVersion(loop, identity->id);
+                        }
+                        payload["desiredConfigVersion"]     = desiredConfigVersion;
+                        payload["heartbeatIntervalSeconds"] = heartbeatIntervalSeconds;
                         Common::writeSuccess(response, std::move(payload), traceId);
                         co_return;
                     });

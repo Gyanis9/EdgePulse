@@ -17,6 +17,8 @@ add_library(edgepulse-core STATIC
         Device/CertificateBinding.cpp
         Device/EnrollmentRepository.cpp
         Device/EnrollmentService.cpp
+        Device/NodeConfigRepository.cpp
+        Device/NodeConfigService.cpp
         Device/NodeGroupRepository.cpp
         Device/NodeLifecycleService.cpp
         Device/NodeRepository.cpp
