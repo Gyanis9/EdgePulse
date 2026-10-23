@@ -20,3 +20,6 @@ Thumbs.db
 # Python 临时字节码
 __pycache__/
 *.pyc
+
+# 设计规范与实施计划只留在本机，不进版本库
+/docs/superpowers/

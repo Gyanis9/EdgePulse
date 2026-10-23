@@ -29,7 +29,7 @@ migrations/    SQL 迁移 V1–V14
 config/        非敏感配置样例
 deploy/        Docker、systemd、Prometheus
 scripts/       证书、开发运行、验收
-docs/          架构、API、部署、验收、覆盖率与设计/计划
+docs/          架构、API、部署、验收与覆盖率
 ```
 
 依赖方向固定为 `Base ← Core ← Plugins ← App ← Main`：基础件不碰业务，Core 承载领域服务与 HTTP 交付原语，Plugins 只放控制器与路由，App 负责装配，Main 只剩入口。
@@ -158,5 +158,3 @@ python scripts/check-docker-stack.py --build
 - [部署](docs/部署.md)
 - [验收](docs/验收.md)
 - [覆盖率](docs/覆盖率.md)
-- [全量设计规范](docs/superpowers/specs/2026-10-20-edgepulse-full-design.md)
-- [全量实施计划](docs/superpowers/plans/2026-10-20-edgepulse-full.md)
