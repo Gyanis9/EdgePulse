@@ -110,7 +110,9 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "租户已停用", traceId);
                             co_return;
                         }
-                        const auto result = co_await registry.registerAgent(loop, AgentRegistration{*name, *version, *fingerprint, *labels, tenant->id});
+                        AgentRegistration registration{*name, *version, *fingerprint, *labels, tenant->id};
+                        registration.connectionIdentity = request.tlsPeerIdentity();
+                        const auto result               = co_await registry.registerAgent(loop, std::move(registration));
                         if (!result.has_value())
                         {
                             writeAgentError(response, result.error(), traceId);

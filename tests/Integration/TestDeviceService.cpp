@@ -3,8 +3,11 @@
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 
+#include <Core/Tls/TlsPeerIdentity.h>
+
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -77,6 +80,32 @@ TEST(DeviceService, AgentRegistrationChecksFingerprintAndPublishesStatus)
     EXPECT_EQ("1.0.1", heartbeated->agentVersion);
     EXPECT_FALSE(heartbeated->lastSeen.empty());
     EXPECT_EQ(2, publishCount);
+}
+
+// 钉住：自报指纹必须与这条 mTLS 连接出示的叶证书一致
+TEST(DeviceService, AgentRegistrationBindsConnectionCertificate)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+
+    const auto                                 repository = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    EdgePulse::Device::AgentRegistry           registry(repository, {});
+    const std::string                          fingerprint(64, 'a');
+    const AsynGyanis::Core::TlsPeerIdentityPtr identity = std::make_shared<const AsynGyanis::Core::TlsPeerIdentity>(true, std::vector<std::uint8_t>{}, fingerprint);
+
+    EdgePulse::Device::AgentRegistration mismatched{"edge-cert", "1.0.0", std::string(64, 'b'), ""};
+    mismatched.connectionIdentity = identity;
+    const auto rejected           = runner.run(registry.registerAgent(runner.loop(), std::move(mismatched)));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(EdgePulse::Device::AgentError::Reason::FingerprintRejected, rejected.error().reason);
+    EXPECT_NE(std::string::npos, rejected.error().message.find("不一致"));
+
+    // 自报值大小写不影响比较，落库仍是小写归一值
+    EdgePulse::Device::AgentRegistration matched{"edge-cert", "1.0.0", std::string(64, 'A'), ""};
+    matched.connectionIdentity = identity;
+    const auto registered      = runner.run(registry.registerAgent(runner.loop(), std::move(matched)));
+    ASSERT_TRUE(registered.has_value()) << registered.error().message;
+    EXPECT_EQ(fingerprint, registered->certFingerprint);
 }
 
 // 钉住：节点列表按归属部门与创建人过滤，ALL 不受限

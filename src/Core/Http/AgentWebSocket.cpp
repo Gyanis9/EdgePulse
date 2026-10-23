@@ -1,8 +1,10 @@
 #include "Core/Http/AgentWebSocket.h"
 
 #include "Base/Config/ConfigValue.h"
+#include "Base/Log/LogMacros.h"
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
+#include "Core/Device/CertificateBinding.h"
 #include "Core/Device/NodeRepository.h"
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
@@ -77,9 +79,23 @@ namespace EdgePulse::Web
                                            continue;
                                        }
                                        const auto id = integerOf(*hello, "nodeId");
-                                       if (!id.has_value() || !(co_await allNodes->findById(loop, *id)).has_value())
+                                       if (!id.has_value())
                                        {
                                            co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unknown node");
+                                           co_return;
+                                       }
+                                       const auto node = co_await allNodes->findById(loop, *id);
+                                       if (!node.has_value())
+                                       {
+                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "unknown node");
+                                           co_return;
+                                       }
+                                       // mTLS 只证明对端持有 CA 签发的证书；节点身份还必须与登记的叶证书指纹一致
+                                       if (const std::optional<std::string> bindingFailure = Device::certificateBindingFailure(peer.peerIdentity(), node->certFingerprint);
+                                           bindingFailure.has_value())
+                                       {
+                                           LOG_WARN_FMT("Agent WebSocket 证书绑定失败：node={} reason={}", *id, *bindingFailure);
+                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate mismatch");
                                            co_return;
                                        }
                                        nodeId = *id;

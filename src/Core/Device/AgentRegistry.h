@@ -13,6 +13,7 @@
 
 #include <Core/Coroutine/Task.h>
 #include <Core/EventLoop/EventLoop.h>
+#include <Core/Tls/TlsPeerIdentity.h>
 
 #include <cstdint>
 #include <expected>
@@ -49,6 +50,8 @@ namespace EdgePulse::Device
         std::string  certFingerprint; ///< 自报证书 SHA-256
         std::string  labelsJson;      ///< 标签 JSON，可空
         std::int64_t tenantId{1};     ///< 节点归属租户，由注册请求的租户编码解析
+
+        AsynGyanis::Core::TlsPeerIdentityPtr connectionIdentity{}; ///< 注册请求的 TLS 对端身份；非 TLS 链路为空
     };
 
     /// 节点状态变化后的发布回调；在服务器循环线程上 co_await

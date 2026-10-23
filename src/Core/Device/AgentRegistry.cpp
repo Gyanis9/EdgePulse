@@ -2,9 +2,9 @@
 
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogMacros.h"
+#include "Core/Device/CertificateBinding.h"
 
 #include <algorithm>
-#include <cctype>
 #include <exception>
 #include <optional>
 #include <string>
@@ -15,33 +15,6 @@ namespace EdgePulse::Device
 {
     namespace
     {
-        constexpr std::size_t kFingerprintLength = 64;
-
-        /**
-         * @brief 校验并归一化证书指纹
-         * @param fingerprint 原始输入
-         * @return 64 位小写十六进制；非法时为空
-         */
-        [[nodiscard]] std::optional<std::string> normalizeFingerprint(const std::string_view fingerprint)
-        {
-            if (fingerprint.size() != kFingerprintLength)
-            {
-                return std::nullopt;
-            }
-            std::string normalized;
-            normalized.reserve(kFingerprintLength);
-            for (const char character: fingerprint)
-            {
-                const auto value = static_cast<unsigned char>(character);
-                if (!std::isxdigit(value))
-                {
-                    return std::nullopt;
-                }
-                normalized.push_back(static_cast<char>(std::tolower(value)));
-            }
-            return normalized;
-        }
-
         /**
          * @brief 校验并归一化标签
          */
@@ -74,10 +47,15 @@ namespace EdgePulse::Device
         {
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "Agent 版本不能超过 64 个字符"});
         }
-        const std::optional<std::string> fingerprint = normalizeFingerprint(registration.certFingerprint);
+        const std::optional<std::string> fingerprint = normalizeCertificateFingerprint(registration.certFingerprint);
         if (!fingerprint.has_value())
         {
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "certFingerprint 必须是 64 位十六进制"});
+        }
+        // 自报值必须与这条 mTLS 连接出示的叶证书一致，否则任何持 CA 签发证书的对端都能冒名注册
+        if (const std::optional<std::string> bindingFailure = certificateBindingFailure(registration.connectionIdentity, *fingerprint); bindingFailure.has_value())
+        {
+            co_return std::unexpected(AgentError{AgentError::Reason::FingerprintRejected, *bindingFailure});
         }
         // 白名单为空时只依赖 mTLS 的 CA 链校验；非空时在链校验之上再点名
         if (!m_options.allowedFingerprints.empty() &&
