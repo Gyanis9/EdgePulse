@@ -26,6 +26,8 @@ const props = withDefaults(defineProps<{
   minWidth?: number
   /** 为 true 时用 #alt 插槽（画布、看板、矩阵等版式）替换查询区与表格 */
   altView?: boolean
+  /** 空表文案，默认「暂无数据」 */
+  emptyText?: string
 }>(), {
   tableTitle: '数据列表',
   rowKey: 'id',
@@ -81,6 +83,7 @@ function clearSelection() {
             :row-key="rowKey"
             :min-width="minWidth"
             :tree="isTree"
+            :empty-text="emptyText"
           >
             <template v-for="name in cellSlots" :key="name" #[name]="scope">
               <slot :name="name" v-bind="scope" />

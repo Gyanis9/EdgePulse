@@ -8,6 +8,7 @@ const seedFiles = [
   new URL('../../../../migrations/V4__management_domain.sql', import.meta.url),
   new URL('../../../../migrations/V8__multi_tenancy.sql', import.meta.url),
   new URL('../../../../migrations/V9__notification_channels.sql', import.meta.url),
+  new URL('../../../../migrations/V19__enterprise_identity.sql', import.meta.url),
 ]
 
 function seedMenuIcons(): string[] {

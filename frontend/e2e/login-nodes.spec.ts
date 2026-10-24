@@ -35,11 +35,18 @@ test('system user page loads from the management API', async ({ page }) => {
   await page.goto('/system/notification')
   await expect(page.getByRole('heading', { name: '通知渠道', exact: true })).toBeVisible()
   const tokenList = page.waitForResponse(
-    response => response.url().includes('/api/system/api-tokens') && response.request().method() === 'GET',
+    response => new URL(response.url()).pathname === '/api/system/api-tokens' && response.request().method() === 'GET',
   )
   await page.goto('/system/apitoken')
   await expect(page.getByRole('heading', { name: 'API 令牌', exact: true })).toBeVisible()
-  expect((await tokenList).status()).toBe(200)
+  const listed = await tokenList
+  expect(listed.status()).toBe(200)
+  const payload = await listed.json()
+  expect(payload.code).toBe(200)
+  expect(Array.isArray(payload.data)).toBe(true)
+  // 有令牌时渲染数据行，没有时渲染页面自带的空态文案
+  await expect(page.locator('tr.data-row').first().or(page.getByText('还没有 API 令牌'))).toBeVisible()
+  await expect(page.getByText('数据加载失败')).toHaveCount(0)
 })
 
 test('device domain pages render with live data endpoints', async ({ page }) => {

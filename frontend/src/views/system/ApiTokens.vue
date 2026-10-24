@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { Button, Field, Modal, Tag, TextInput, type Column } from '@/components/ui'
 import { FormDialog, ListPage, PermissionButton } from '@/components/business'
 import { systemApi, type ApiTokenCreated, type ApiTokenRow } from '@/api'
@@ -43,21 +43,49 @@ const columns: Column[] = [
   { key: 'actions', title: '操作', width: 110, className: 'col-actions' },
 ]
 
-/** 后端时间不带时区，按 UTC 比较过期 */
-function isExpired(value: string) {
+/** 后端时间不带时区，按 UTC 解析；无法解析时返回 null */
+function expiryMillis(value: string): number | null {
+  if (!value) return null
   const normalized = value.includes('T') ? value : value.replace(' ', 'T')
   const millis = Date.parse(/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(normalized) ? normalized : `${normalized}Z`)
-  return Number.isFinite(millis) && millis <= Date.now()
+  return Number.isFinite(millis) ? millis : null
 }
+
+/** 状态判定用的当前时刻：页面停留时每 30 秒推进一次，回到前台也会刷新 */
+const now = ref(Date.now())
+let statusTimer: number | undefined
+
+function refreshStatus() {
+  now.value = Date.now()
+}
+
+function onVisibilityChange() {
+  if (!document.hidden) refreshStatus()
+}
+
+onMounted(() => {
+  statusTimer = window.setInterval(refreshStatus, 30_000)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+})
+
+onBeforeUnmount(() => {
+  if (statusTimer !== undefined) window.clearInterval(statusTimer)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
 
 function statusOf(row: ApiTokenRow) {
   if (row.revokedAt) return { label: '已吊销', tone: 'danger' }
-  if (isExpired(row.expiresAt)) return { label: '已过期', tone: 'neutral' }
+  const expires = expiryMillis(row.expiresAt)
+  if (expires === null) return { label: '到期未知', tone: 'neutral' }
+  if (expires <= now.value) return { label: '已过期', tone: 'neutral' }
   return { label: '有效', tone: 'ok' }
 }
 
+/** 到期时间无法解析时按不可用处理，轮换入口一并隐藏 */
 function isActive(row: ApiTokenRow) {
-  return !row.revokedAt && !isExpired(row.expiresAt)
+  if (row.revokedAt) return false
+  const expires = expiryMillis(row.expiresAt)
+  return expires !== null && expires > now.value
 }
 
 interface TokenForm {
@@ -121,6 +149,8 @@ async function copySecret() {
 }
 
 async function submit() {
+  // 隐藏提交按钮与输入框回车都会再进这里；保存中或对话框已关闭时都不得再次创建
+  if (saving.value || !dialog.value) return
   errors.value = validate(form, {
     name: [required('请输入令牌名称'), maxLength(64, '令牌名称不能超过 64 个字符')],
     scopesText: [scopeRule],
@@ -136,6 +166,8 @@ async function submit() {
     })
     dialog.value = false
     showSecret(created, '令牌已创建')
+    // 新令牌在列表首行，回到第一页再拉取
+    list.page.value = 1
     await list.load()
   } catch (error) {
     toastError(error, '令牌创建失败')
@@ -144,43 +176,66 @@ async function submit() {
   }
 }
 
+/** 单行轮换 / 吊销的进行中标记：确认框与按钮都不可重复触发 */
+const rowBusy = ref(new Set<number>())
+
+function beginRow(row: ApiTokenRow) {
+  if (rowBusy.value.has(row.id)) return false
+  const next = new Set(rowBusy.value)
+  next.add(row.id)
+  rowBusy.value = next
+  return true
+}
+
+function endRow(row: ApiTokenRow) {
+  const next = new Set(rowBusy.value)
+  next.delete(row.id)
+  rowBusy.value = next
+}
+
 async function rotate(row: ApiTokenRow) {
-  const ok = await confirm({
-    title: '轮换令牌',
-    message: `确认轮换「${row.name}」吗？新明文只显示一次，旧令牌在 1 小时内仍可用，之后立即失效。`,
-    confirmText: '轮换',
-    danger: true,
-  })
-  if (!ok) return
+  if (!beginRow(row)) return
   try {
+    const ok = await confirm({
+      title: '轮换令牌',
+      message: `确认轮换「${row.name}」吗？新明文只显示一次，旧令牌在 1 小时内仍可用，之后立即失效。`,
+      confirmText: '轮换',
+      danger: true,
+    })
+    if (!ok) return
     const created = await systemApi.apiTokens.rotate(row.id)
     showSecret(created, '令牌已轮换')
     await list.load()
   } catch (error) {
     toastError(error, '令牌轮换失败')
+  } finally {
+    endRow(row)
   }
 }
 
 async function revoke(row: ApiTokenRow) {
-  const ok = await confirm({
-    title: '吊销令牌',
-    message: `确认吊销「${row.name}」吗？使用该令牌的脚本会立即失效，且无法恢复。`,
-    confirmText: '吊销',
-    danger: true,
-  })
-  if (!ok) return
+  if (!beginRow(row)) return
   try {
+    const ok = await confirm({
+      title: '吊销令牌',
+      message: `确认吊销「${row.name}」吗？使用该令牌的脚本会立即失效，且无法恢复。`,
+      confirmText: '吊销',
+      danger: true,
+    })
+    if (!ok) return
     await systemApi.apiTokens.remove(row.id)
     pushToast('令牌已吊销')
     await list.load()
   } catch (error) {
     toastError(error, '令牌吊销失败')
+  } finally {
+    endRow(row)
   }
 }
 </script>
 
 <template>
-  <ListPage title="API 令牌" desc="供脚本与外部系统调用开放接口；明文只在创建或轮换时显示一次，平台不保存明文。" table-title="令牌列表" :list="list" :columns="columns" :min-width="1180">
+  <ListPage title="API 令牌" desc="供脚本与外部系统调用开放接口；明文只在创建或轮换时显示一次，平台不保存明文。" table-title="令牌列表" :list="list" :columns="columns" :min-width="1180" empty-text="还没有 API 令牌">
     <template #actions>
       <PermissionButton perm="system:token:add" variant="primary" icon="plus" @click="openCreate">新增令牌</PermissionButton>
     </template>
@@ -214,8 +269,8 @@ async function revoke(row: ApiTokenRow) {
     <template #cell-createdAt="{ row }"><span class="tnum soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
     <template #cell-actions="{ row }">
       <div class="row-actions">
-        <PermissionButton v-if="isActive(row)" perm="system:token:edit" icon-only icon="refresh" label="轮换" @click="rotate(row)" />
-        <PermissionButton v-if="!row.revokedAt" perm="system:token:remove" icon-only icon="ban" label="吊销" danger @click="revoke(row)" />
+        <PermissionButton v-if="isActive(row)" perm="system:token:edit" icon-only icon="refresh" label="轮换" :disabled="rowBusy.has(row.id)" @click="rotate(row)" />
+        <PermissionButton v-if="!row.revokedAt" perm="system:token:remove" icon-only icon="ban" label="吊销" danger :disabled="rowBusy.has(row.id)" @click="revoke(row)" />
       </div>
     </template>
 
