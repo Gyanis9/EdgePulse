@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <expected>
 #include <string>
@@ -200,6 +201,71 @@ namespace EdgePulse::Agent
             }
             return true;
         }
+
+        /**
+         * @brief 判断子进程是否是 Windows PowerShell
+         * @param program 可执行文件名或路径
+         * @return true 表示需要为它重建模块搜索路径
+         */
+        [[nodiscard]] bool launchesWindowsPowerShell(const std::wstring &program)
+        {
+            std::wstring name = std::filesystem::path{program}.filename().wstring();
+            std::transform(name.begin(), name.end(), name.begin(), [](const wchar_t character) { return static_cast<wchar_t>(std::towlower(character)); });
+            return name == L"powershell.exe";
+        }
+
+        /**
+         * @brief 复制当前环境块并去掉 PSModulePath
+         * @return 双 null 结尾的环境块；读取失败时为空
+         */
+        [[nodiscard]] std::vector<wchar_t> environmentWithoutModulePath()
+        {
+            std::vector<wchar_t> block;
+            LPWCH                environment = ::GetEnvironmentStringsW();
+            if (environment == nullptr)
+            {
+                return block;
+            }
+            constexpr wchar_t     kModulePathPrefix[] = L"PSModulePath=";
+            constexpr std::size_t kPrefixLength       = sizeof(kModulePathPrefix) / sizeof(wchar_t) - 1;
+            for (const wchar_t *entry = environment; *entry != L'\0'; entry += std::wcslen(entry) + 1)
+            {
+                if (std::wcslen(entry) >= kPrefixLength &&
+                    ::CompareStringOrdinal(entry, static_cast<int>(kPrefixLength), kModulePathPrefix, static_cast<int>(kPrefixLength), TRUE) == CSTR_EQUAL)
+                {
+                    continue;
+                }
+                block.insert(block.end(), entry, entry + std::wcslen(entry) + 1);
+            }
+            ::FreeEnvironmentStringsW(environment);
+            block.push_back(L'\0');
+            return block;
+        }
+
+        /**
+         * @brief 为子进程准备环境块
+         * @param program 可执行文件名或路径
+         * @param storage 保存自建环境块，调用期间必须存活
+         * @param creationFlags 需要时追加 CREATE_UNICODE_ENVIRONMENT
+         * @return 环境块指针；nullptr 表示继承当前进程环境
+         * @note 从 PowerShell 7 启动 powershell.exe 时，子进程会继承 pwsh 的 PSModulePath。
+         *       Windows PowerShell 5.1 会优先找到面向 .NET Core 的 Microsoft.PowerShell.Utility
+         *       并加载失败，Get-FileHash 等命令随之消失；去掉该变量后 5.1 按自己的默认路径重建。
+         */
+        [[nodiscard]] LPVOID environmentForChild(const std::wstring &program, std::vector<wchar_t> &storage, DWORD &creationFlags)
+        {
+            if (!launchesWindowsPowerShell(program))
+            {
+                return nullptr;
+            }
+            storage = environmentWithoutModulePath();
+            if (storage.empty())
+            {
+                return nullptr;
+            }
+            creationFlags |= CREATE_UNICODE_ENVIRONMENT;
+            return storage.data();
+        }
 #endif
     } // namespace
 
@@ -253,6 +319,10 @@ namespace EdgePulse::Agent
             program     = executableWide;
             commandLine = buildCommandLine(program, wideArguments);
         }
+
+        std::vector<wchar_t> childEnvironment;
+        DWORD                creationFlags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
+        const LPVOID         environment   = environmentForChild(program, childEnvironment, creationFlags);
 
         SECURITY_ATTRIBUTES security{};
         security.nLength        = sizeof(security);
@@ -319,7 +389,7 @@ namespace EdgePulse::Agent
         }
 
         PROCESS_INFORMATION processInformation{};
-        const BOOL          created = ::CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, TRUE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, nullptr,
+        const BOOL          created = ::CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, TRUE, creationFlags, environment, nullptr,
                                                        &startupInfo.StartupInfo, &processInformation);
         const int           createError = created != 0 ? 0 : static_cast<int>(::GetLastError());
         ::DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
@@ -580,11 +650,14 @@ namespace EdgePulse::Agent
             wideArguments.push_back(AsynGyanis::Platform::TextEncoding::toWideString(argument));
         }
 
-        std::wstring commandLine = buildCommandLine(executableWide, wideArguments);
+        std::wstring         commandLine = buildCommandLine(executableWide, wideArguments);
+        std::vector<wchar_t> childEnvironment;
+        DWORD                creationFlags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        const LPVOID         environment   = environmentForChild(executableWide, childEnvironment, creationFlags);
         STARTUPINFOW        startupInfo{};
         startupInfo.cb        = sizeof(startupInfo);
         PROCESS_INFORMATION processInformation{};
-        const BOOL          created = ::CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr,
+        const BOOL          created = ::CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, creationFlags, environment, nullptr,
                                                        &startupInfo, &processInformation);
         if (created == 0)
         {
