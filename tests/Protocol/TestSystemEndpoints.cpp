@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <utility>
@@ -253,6 +254,46 @@ TEST_F(SystemEndpointsTest, ManagementEndpointsAndAudit)
 
     EXPECT_EQ(200, m_server->send("DELETE", "/api/system/users/" + std::to_string(userId), "", "", bearer(token)).status);
     EXPECT_EQ(200, m_server->send("DELETE", "/api/system/roles/" + std::to_string(roleId), "", "", bearer(token)).status);
+}
+
+// 钉住：审计落库前剔除写请求里的注册令牌与签名，正常字段照原样保留
+TEST_F(SystemEndpointsTest, AuditLogRedactsEnrollmentTokenAndSignature)
+{
+    const std::string token           = login("admin", "admin123");
+    const std::string enrollmentToken = "enroll-audit-secret-4b1c";
+    const std::string signature       = "sig-audit-secret-8d2f";
+    const std::string dictType        = "audit_redaction_probe";
+    const std::string dictName        = "审计脱敏探针";
+    const auto        created         = m_server->post(
+            "/api/system/dict/types",
+            AsynGyanis::Base::ConfigValue::object(
+                    {{"dictName", dictName}, {"dictType", dictType}, {"remark", "审计脱敏"}, {"status", 1}, {"enrollmentToken", enrollmentToken}, {"signature", signature}})
+                    .dump(),
+            "application/json", bearer(token));
+    ASSERT_EQ(200, created.status) << created.body;
+
+    const auto logs = m_server->get("/api/monitor/oper-logs?pageNum=1&pageSize=10", bearer(token));
+    ASSERT_EQ(200, logs.status) << logs.body;
+    const auto logsJson = logs.json();
+    ASSERT_TRUE(logsJson.has_value());
+    const auto &rows = (*logsJson)["data"]["rows"];
+    const auto  row  = std::find_if(rows.begin(), rows.end(),
+                                    [](const AsynGyanis::Base::ConfigValue &entry)
+                                    {
+                                      const auto url = entry.find("url");
+                                      return url != entry.end() && url->is_string() && url->get<std::string>() == "/api/system/dict/types";
+                                    });
+    ASSERT_NE(rows.end(), row) << logs.body;
+
+    const std::string params = (*row)["params"].get<std::string>();
+    EXPECT_EQ(std::string::npos, params.find(enrollmentToken));
+    EXPECT_EQ(std::string::npos, params.find(signature));
+    const auto sanitized = AsynGyanis::Base::parseConfigValue(params);
+    ASSERT_TRUE(sanitized.has_value()) << params;
+    EXPECT_FALSE(sanitized->contains("enrollmentToken"));
+    EXPECT_FALSE(sanitized->contains("signature"));
+    EXPECT_EQ(dictType, (*sanitized)["dictType"].get<std::string>());
+    EXPECT_EQ(dictName, (*sanitized)["dictName"].get<std::string>());
 }
 
 // 钉住：严格口令档下短口令在建号与重置两处都被拒，符合策略的口令正常落库

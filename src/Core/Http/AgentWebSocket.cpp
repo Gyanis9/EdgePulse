@@ -53,10 +53,12 @@ namespace EdgePulse::Web
     } // namespace
 
     void registerAgentWebSocket(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, Device::NodeRepository &nodes, Command::CommandRepository &commands,
-                                Command::AgentChannelRegistry &channels, Device::NodeLifecycleService *lifecycle)
+                                Command::AgentChannelRegistry &channels, Device::NodeLifecycleService *lifecycle,
+                                std::function<AsynGyanis::Core::Task<>(std::int64_t)> beforeHeartbeat)
     {
         router.get("/api/agent/ws",
-                   [&loop, &nodes, &commands, &channels, lifecycle](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodes, &commands, &channels, lifecycle,
+                    beforeHeartbeat = std::move(beforeHeartbeat)](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        // Agent 请求没有会话：节点与命令都按全租户视图处理，归属由节点自身决定
                        const auto                              allNodes    = nodes.scoped(System::TenantScope{0, true});
@@ -65,7 +67,7 @@ namespace EdgePulse::Web
                        // Agent 已在 mTLS 监听器上完成证书校验；此处不再要求浏览器 Origin
                        policy.originMode = AsynGyanis::Net::WebSocketOriginMode::AllowAny;
                        response.upgradeToWebSocket(
-                               [&loop, allNodes, allCommands, &channels, lifecycle](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
+                               [&loop, allNodes, allCommands, &channels, lifecycle, beforeHeartbeat](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
                                {
                                    std::int64_t nodeId = 0;
                                    // 首条消息必须是 hello；mTLS 已经挡住匿名对端，这里只校验节点确实存在
@@ -106,7 +108,12 @@ namespace EdgePulse::Web
                                            co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate mismatch");
                                            co_return;
                                        }
-                                       nodeId          = *id;
+                                       nodeId = *id;
+                                       if (beforeHeartbeat)
+                                       {
+                                           // 钩子落在心跳落库之前：测试可在此窗口内吊销节点，稳定命中心跳返回空的分支
+                                           co_await beforeHeartbeat(nodeId);
+                                       }
                                        const auto beat = co_await allNodes->heartbeat(loop, nodeId, stringOf(*hello, "agentVersion"));
                                        if (!beat.has_value())
                                        {
