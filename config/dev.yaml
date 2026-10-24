@@ -55,7 +55,8 @@ edgepulse:
     heartbeat_timeout_seconds: 30
     offline_sweep_seconds: 5
   agent_ca:
-    # 开发档复用 scripts/dev-certs.sh 生成的 CA；私钥在 var/certs 下，已被 .gitignore 排除
+    # 开发档复用 scripts/dev-certs.sh 生成的 CA，证书与 cert_dir/ca.pem 是同一文件；
+    # 私钥在 var/certs 下，已被 .gitignore 排除
     enabled: true
     certificate_file: var/certs/ca.pem
     key_file: var/certs/ca-key.pem

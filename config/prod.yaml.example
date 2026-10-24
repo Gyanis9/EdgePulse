@@ -63,11 +63,13 @@ edgepulse:
     heartbeat_timeout_seconds: 90
     offline_sweep_seconds: 30
   agent_ca:
-    # 默认关闭。启用后控制面用这里的 CA 为 Agent 自动签发证书；打开前先准备运维自备的
-    # CA 证书与私钥，私钥放在仅服务账号可读的独立路径并保持 0600，不要随配置文件进镜像或版本库。
+    # 默认关闭。启用后控制面用这里的 CA 为 Agent 自动签发证书。
+    # certificate_file 必须就是 9443 监听器信任的锚（cert_dir/ca.pem）；ca.pem 是拼接信任包时，
+    # 该 CA 证书必须包含在其中，启动时按 SHA-256 指纹比对，对不上直接拒绝启动。
+    # 私钥单独存放且仅服务账号可读、权限 0600，不要随配置、镜像或公开证书卷分发。
     enabled: false
-    certificate_file: /etc/edgepulse/agent-ca/ca.pem
-    key_file: /etc/edgepulse/agent-ca/ca-key.pem
+    certificate_file: /etc/edgepulse/tls/ca.pem
+    key_file: /etc/edgepulse/agent-ca-key.pem
     validity_days: 30
     overlap_hours: 24
   udp_telemetry:

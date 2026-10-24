@@ -240,6 +240,11 @@ namespace EdgePulse::App
             agentCaOptions.keyFile         = m_configuration.agentCaKeyFile;
             agentCaOptions.validityDays    = m_configuration.agentCaValidityDays;
             agentCaOptions.overlapHours    = m_configuration.agentCaOverlapHours;
+            // 9443 的客户端信任锚必须包含签发 CA，否则新证书在 TLS 握手阶段会被判成陌生 CA；监听器关闭时不做这项比对
+            if (m_configuration.agentPort != 0)
+            {
+                agentCaOptions.trustedCertificateFile = std::filesystem::path{m_configuration.certificateDirectory} / "ca.pem";
+            }
             auto agentCertificateAuthority = Device::AgentCertificateAuthority::load(agentCaOptions);
             if (!agentCertificateAuthority)
             {

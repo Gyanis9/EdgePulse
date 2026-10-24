@@ -25,6 +25,7 @@ namespace EdgePulse::Device
         bool                  enabled{false};                      ///< 是否启用自动签发
         std::filesystem::path certificateFile{"var/certs/ca.pem"}; ///< CA 证书链 PEM
         std::filesystem::path keyFile{"var/certs/ca-key.pem"};     ///< CA 私钥 PEM，POSIX 上要求 0600 或更严
+        std::filesystem::path trustedCertificateFile;              ///< 9443 监听器使用的客户端信任库；非空时签发 CA 必须出现在其中，可拼接多张证书
         int                   validityDays{30};                    ///< 签发证书的有效期，按天计
         int                   overlapHours{24};                    ///< 新旧证书重叠窗口，按小时计
     };
@@ -37,7 +38,7 @@ namespace EdgePulse::Device
         std::string certificatePem; ///< 新证书的 PEM 文本
         std::string fingerprint;    ///< 证书 SHA-256 指纹，64 位小写十六进制
         std::string serial;         ///< 序列号，小写十六进制
-        std::string subject;        ///< 证书主题，RFC 2253 文本
+        std::string subject;        ///< 审计用主题，CN=<节点名> 的 UTF-8 原文
         std::string notBefore;      ///< 生效时间，UTC，形如 2026-10-25 12:00:00
         std::string notAfter;       ///< 到期时间，UTC，形如 2026-10-25 12:00:00
     };
@@ -62,7 +63,8 @@ namespace EdgePulse::Device
         /**
          * @brief 加载 CA 证书与私钥并校验配对
          * @param options 启动参数；未启用时只返回禁用状态，不读取任何文件
-         * @return 成功返回签发器；文件缺失、无法解析、私钥权限过宽或证书与私钥不配对时返回中文原因
+         * @return 成功返回签发器；文件缺失、无法解析、私钥权限过宽、证书不是可用 CA、证书与私钥不配对或
+         *         签发 CA 不在监听器信任库内时返回中文原因
          */
         [[nodiscard]] static std::expected<AgentCertificateAuthority, std::string> load(const AgentCaOptions &options);
 

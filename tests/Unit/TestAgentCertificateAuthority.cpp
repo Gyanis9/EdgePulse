@@ -14,9 +14,11 @@
 #include <openssl/x509v3.h>
 
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -84,6 +86,22 @@ namespace
         {
             throw std::runtime_error("写入测试文件失败：" + path.string());
         }
+    }
+
+    /**
+     * @brief 读取整个文本文件
+     * @param path 文件路径
+     * @return std::string 文件内容
+     * @throws std::runtime_error 无法打开或读取
+     */
+    [[nodiscard]] std::string readTextFile(const std::filesystem::path &path)
+    {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream)
+        {
+            throw std::runtime_error("读取测试文件失败：" + path.string());
+        }
+        return std::string{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
     }
 
     /**
@@ -206,6 +224,19 @@ namespace
     }
 
     /**
+     * @brief 测试用 CA 的可变参数
+     */
+    struct TestAuthorityOptions
+    {
+        bool        isCa{true};                                     ///< basicConstraints 是否为 CA:TRUE
+        bool        includeKeyUsage{true};                          ///< 是否写入带 keyCertSign 的 keyUsage
+        int         rsaBits{0};                                     ///< 0 表示 EC P-256，正数表示对应位数的 RSA
+        long        notBeforeOffsetSeconds{-60};                    ///< 生效时间相对当前时刻的偏移
+        long        notAfterOffsetSeconds{3650L * 24L * 60L * 60L}; ///< 到期时间相对当前时刻的偏移
+        const char *passphrase{nullptr};                            ///< 非空时私钥按该口令加密写出
+    };
+
+    /**
      * @brief 测试用 CA 的文件路径
      */
     struct TestAuthority
@@ -213,56 +244,6 @@ namespace
         std::filesystem::path certificateFile; ///< CA 证书
         std::filesystem::path keyFile;         ///< CA 私钥
     };
-
-    /**
-     * @brief 在临时目录里生成一把 EC P-256 自签 CA
-     * @param directory 临时目录
-     * @param prefix 文件名前缀
-     * @return TestAuthority 文件路径
-     */
-    [[nodiscard]] TestAuthority writeTestAuthority(const EdgePulse::TestSupport::TemporaryDirectory &directory, const std::string &prefix)
-    {
-        KeyHandle key(EVP_EC_gen("prime256v1"), &EVP_PKEY_free);
-        requireStep(key != nullptr, "生成 CA 私钥");
-
-        CertHandle certificate(X509_new(), &X509_free);
-        requireStep(certificate != nullptr, "创建 CA 证书");
-        requireStep(X509_set_version(certificate.get(), 2) == 1, "设置 CA 证书版本");
-        requireStep(ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1) == 1, "设置 CA 序列号");
-        requireStep(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60L) != nullptr, "设置 CA 起始时间");
-        requireStep(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3650L * 24L * 60L * 60L) != nullptr, "设置 CA 到期时间");
-        requireStep(X509_set_pubkey(certificate.get(), key.get()) == 1, "写入 CA 公钥");
-
-        X509_NAME        *subject    = X509_get_subject_name(certificate.get());
-        const std::string commonName = prefix + " EdgePulse Test CA";
-        requireStep(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char *>(commonName.c_str()), -1, -1, 0) == 1, "写入 CA 主题");
-        requireStep(X509_set_issuer_name(certificate.get(), subject) == 1, "写入 CA 签发者");
-
-        ExtHandle constraints(X509V3_EXT_nconf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE"), &X509_EXTENSION_free);
-        requireStep(constraints != nullptr, "创建 CA 基本约束");
-        requireStep(X509_add_ext(certificate.get(), constraints.get(), -1) == 1, "写入 CA 基本约束");
-        ExtHandle usage(X509V3_EXT_nconf_nid(nullptr, nullptr, NID_key_usage, "critical,keyCertSign,cRLSign"), &X509_EXTENSION_free);
-        requireStep(usage != nullptr, "创建 CA 密钥用途");
-        requireStep(X509_add_ext(certificate.get(), usage.get(), -1) == 1, "写入 CA 密钥用途");
-        requireStep(X509_sign(certificate.get(), key.get(), EVP_sha256()) != 0, "签名 CA 证书");
-
-        BioHandle certificateBio(BIO_new(BIO_s_mem()), &BIO_free);
-        requireStep(certificateBio != nullptr, "创建 CA 证书缓冲");
-        requireStep(PEM_write_bio_X509(certificateBio.get(), certificate.get()) == 1, "输出 CA 证书");
-        BioHandle keyBio(BIO_new(BIO_s_mem()), &BIO_free);
-        requireStep(keyBio != nullptr, "创建 CA 私钥缓冲");
-        requireStep(PEM_write_bio_PrivateKey(keyBio.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1, "输出 CA 私钥");
-
-        TestAuthority authority;
-        authority.certificateFile = directory.path() / (prefix + ".pem");
-        authority.keyFile         = directory.path() / (prefix + "-key.pem");
-        writeTextFile(authority.certificateFile, bioText(*certificateBio));
-        writeTextFile(authority.keyFile, bioText(*keyBio));
-#ifndef _WIN32
-        requireStep(::chmod(authority.keyFile.c_str(), S_IRUSR | S_IWUSR) == 0, "设置 CA 私钥权限");
-#endif
-        return authority;
-    }
 
     /**
      * @brief 生成一把椭圆曲线私钥
@@ -289,14 +270,82 @@ namespace
     }
 
     /**
+     * @brief 在临时目录里生成一把自签 CA 及其私钥
+     * @param directory 临时目录
+     * @param prefix 文件名前缀
+     * @param options 证书与密钥的可变参数
+     * @return TestAuthority 文件路径
+     */
+    [[nodiscard]] TestAuthority writeTestAuthority(const EdgePulse::TestSupport::TemporaryDirectory &directory, const std::string &prefix, const TestAuthorityOptions &options = {})
+    {
+        KeyHandle key = options.rsaBits > 0 ? generateRsaKey(static_cast<unsigned int>(options.rsaBits)) : generateEcKey("prime256v1");
+
+        CertHandle certificate(X509_new(), &X509_free);
+        requireStep(certificate != nullptr, "创建 CA 证书");
+        requireStep(X509_set_version(certificate.get(), 2) == 1, "设置 CA 证书版本");
+        requireStep(ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1) == 1, "设置 CA 序列号");
+        requireStep(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), options.notBeforeOffsetSeconds) != nullptr, "设置 CA 起始时间");
+        requireStep(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), options.notAfterOffsetSeconds) != nullptr, "设置 CA 到期时间");
+        requireStep(X509_set_pubkey(certificate.get(), key.get()) == 1, "写入 CA 公钥");
+
+        X509_NAME        *subject    = X509_get_subject_name(certificate.get());
+        const std::string commonName = prefix + " EdgePulse Test CA";
+        requireStep(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char *>(commonName.c_str()), -1, -1, 0) == 1, "写入 CA 主题");
+        requireStep(X509_set_issuer_name(certificate.get(), subject) == 1, "写入 CA 签发者");
+
+        const char *constraintsText = options.isCa ? "critical,CA:TRUE" : "critical,CA:FALSE";
+        ExtHandle   constraints(X509V3_EXT_nconf_nid(nullptr, nullptr, NID_basic_constraints, constraintsText), &X509_EXTENSION_free);
+        requireStep(constraints != nullptr, "创建 CA 基本约束");
+        requireStep(X509_add_ext(certificate.get(), constraints.get(), -1) == 1, "写入 CA 基本约束");
+        if (options.includeKeyUsage)
+        {
+            ExtHandle usage(X509V3_EXT_nconf_nid(nullptr, nullptr, NID_key_usage, "critical,keyCertSign,cRLSign"), &X509_EXTENSION_free);
+            requireStep(usage != nullptr, "创建 CA 密钥用途");
+            requireStep(X509_add_ext(certificate.get(), usage.get(), -1) == 1, "写入 CA 密钥用途");
+        }
+        requireStep(X509_sign(certificate.get(), key.get(), EVP_sha256()) != 0, "签名 CA 证书");
+
+        BioHandle certificateBio(BIO_new(BIO_s_mem()), &BIO_free);
+        requireStep(certificateBio != nullptr, "创建 CA 证书缓冲");
+        requireStep(PEM_write_bio_X509(certificateBio.get(), certificate.get()) == 1, "输出 CA 证书");
+        BioHandle keyBio(BIO_new(BIO_s_mem()), &BIO_free);
+        requireStep(keyBio != nullptr, "创建 CA 私钥缓冲");
+        unsigned char *passphrase       = options.passphrase == nullptr ? nullptr : reinterpret_cast<unsigned char *>(const_cast<char *>(options.passphrase));
+        const int      passphraseLength = options.passphrase == nullptr ? 0 : static_cast<int>(std::strlen(options.passphrase));
+        requireStep(
+                PEM_write_bio_PrivateKey(keyBio.get(), key.get(), options.passphrase == nullptr ? nullptr : EVP_aes_256_cbc(), passphrase, passphraseLength, nullptr, nullptr) == 1,
+                "输出 CA 私钥");
+
+        TestAuthority authority;
+        authority.certificateFile = directory.path() / (prefix + ".pem");
+        authority.keyFile         = directory.path() / (prefix + "-key.pem");
+        writeTextFile(authority.certificateFile, bioText(*certificateBio));
+        writeTextFile(authority.keyFile, bioText(*keyBio));
+#ifndef _WIN32
+        requireStep(::chmod(authority.keyFile.c_str(), S_IRUSR | S_IWUSR) == 0, "设置 CA 私钥权限");
+#endif
+        return authority;
+    }
+
+    /**
+     * @brief CSR 要携带的基本约束
+     */
+    enum class CsrConstraints
+    {
+        Absent, ///< 不写 basicConstraints 扩展
+        CaTrue, ///< 声明 CA:TRUE
+        CaFalse ///< 声明 CA:FALSE
+    };
+
+    /**
      * @brief 生成 PKCS#10 CSR
      * @param publicKey CSR 声明的公钥
      * @param commonName CSR 主题里的 CN，服务端应忽略它
-     * @param ca 是否写入 CA:TRUE 基本约束
+     * @param constraints CSR 携带的基本约束
      * @param signingKey 实际签名私钥；空表示用 publicKey 自签
      * @return std::string CSR 的 PEM 文本
      */
-    [[nodiscard]] std::string makeCertificateRequest(EVP_PKEY &publicKey, const std::string &commonName, const bool ca, EVP_PKEY *signingKey = nullptr)
+    [[nodiscard]] std::string makeCertificateRequest(EVP_PKEY &publicKey, const std::string &commonName, const CsrConstraints constraints, EVP_PKEY *signingKey = nullptr)
     {
         ReqHandle request(X509_REQ_new(), &X509_REQ_free);
         requireStep(request != nullptr, "创建 CSR");
@@ -305,9 +354,10 @@ namespace
         X509_NAME *subject = X509_REQ_get_subject_name(request.get());
         requireStep(subject != nullptr, "创建 CSR 主题");
         requireStep(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char *>(commonName.c_str()), -1, -1, 0) == 1, "写入 CSR 主题");
-        if (ca)
+        if (constraints != CsrConstraints::Absent)
         {
-            ExtHandle extension(X509V3_EXT_nconf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE"), &X509_EXTENSION_free);
+            const char *text = constraints == CsrConstraints::CaTrue ? "critical,CA:TRUE" : "critical,CA:FALSE";
+            ExtHandle   extension(X509V3_EXT_nconf_nid(nullptr, nullptr, NID_basic_constraints, text), &X509_EXTENSION_free);
             requireStep(extension != nullptr, "创建 CSR 基本约束");
             STACK_OF(X509_EXTENSION) *extensions = sk_X509_EXTENSION_new_null();
             requireStep(extensions != nullptr, "创建 CSR 扩展列表");
@@ -322,6 +372,20 @@ namespace
         requireStep(bio != nullptr, "创建 CSR 缓冲");
         requireStep(PEM_write_bio_X509_REQ(bio.get(), request.get()) == 1, "输出 CSR");
         return bioText(*bio);
+    }
+
+    /**
+     * @brief 从 PEM 文本读 CSR
+     * @param pem PEM 文本
+     * @return ReqHandle CSR 句柄
+     */
+    [[nodiscard]] ReqHandle parseRequest(const std::string &pem)
+    {
+        BioHandle bio(BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), &BIO_free);
+        requireStep(bio != nullptr, "创建 CSR 内存缓冲");
+        ReqHandle request(PEM_read_bio_X509_REQ(bio.get(), nullptr, nullptr, nullptr), &X509_REQ_free);
+        requireStep(request != nullptr, "解析 CSR PEM");
+        return request;
     }
 
     /**
@@ -363,7 +427,7 @@ TEST(AgentCertificateAuthority, IssuesServerOwnedIdentityFromCsr)
     EXPECT_TRUE(authority->enabled());
 
     const KeyHandle   key = generateEcKey("prime256v1");
-    const std::string csr = makeCertificateRequest(*key, "csr-supplied-name", false);
+    const std::string csr = makeCertificateRequest(*key, "csr-supplied-name", CsrConstraints::Absent);
 
     const std::time_t issuedAt = std::time(nullptr);
     const auto        issued   = authority->issue(csr, 42, "edge-42");
@@ -447,7 +511,7 @@ TEST(AgentCertificateAuthority, AcceptsRsa3072Csr)
     ASSERT_TRUE(authority.has_value()) << authority.error();
 
     const KeyHandle   key    = generateRsaKey(3072U);
-    const std::string csr    = makeCertificateRequest(*key, "rsa-agent", false);
+    const std::string csr    = makeCertificateRequest(*key, "rsa-agent", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 7, "edge-rsa");
     ASSERT_TRUE(issued.has_value()) << issued.error();
     EXPECT_EQ("edge-rsa", commonNameOf(*parseCertificate(issued->certificatePem)));
@@ -462,7 +526,7 @@ TEST(AgentCertificateAuthority, RejectsCsrWithBrokenSignature)
 
     const KeyHandle   publicKey  = generateEcKey("prime256v1");
     const KeyHandle   signingKey = generateEcKey("prime256v1");
-    const std::string csr        = makeCertificateRequest(*publicKey, "tampered", false, signingKey.get());
+    const std::string csr        = makeCertificateRequest(*publicKey, "tampered", CsrConstraints::Absent, signingKey.get());
 
     const auto issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
@@ -478,7 +542,7 @@ TEST(AgentCertificateAuthority, RejectsCaTrueCsr)
     ASSERT_TRUE(authority.has_value()) << authority.error();
 
     const KeyHandle   key    = generateEcKey("prime256v1");
-    const std::string csr    = makeCertificateRequest(*key, "ca-request", true);
+    const std::string csr    = makeCertificateRequest(*key, "ca-request", CsrConstraints::CaTrue);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
     EXPECT_NE(std::string::npos, issued.error().find("CA"));
@@ -493,7 +557,7 @@ TEST(AgentCertificateAuthority, RejectsNonP256EcCsr)
     ASSERT_TRUE(authority.has_value()) << authority.error();
 
     const KeyHandle   key    = generateEcKey("secp384r1");
-    const std::string csr    = makeCertificateRequest(*key, "p384-agent", false);
+    const std::string csr    = makeCertificateRequest(*key, "p384-agent", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
     EXPECT_NE(std::string::npos, issued.error().find("P-256"));
@@ -508,7 +572,7 @@ TEST(AgentCertificateAuthority, RejectsWeakRsaCsr)
     ASSERT_TRUE(authority.has_value()) << authority.error();
 
     const KeyHandle   key    = generateRsaKey(2048U);
-    const std::string csr    = makeCertificateRequest(*key, "weak-rsa", false);
+    const std::string csr    = makeCertificateRequest(*key, "weak-rsa", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
     EXPECT_NE(std::string::npos, issued.error().find("3072"));
@@ -545,7 +609,7 @@ TEST(AgentCertificateAuthority, RejectsDisabledAuthority)
     EXPECT_FALSE(authority->enabled());
 
     const KeyHandle   key    = generateEcKey("prime256v1");
-    const std::string csr    = makeCertificateRequest(*key, "disabled", false);
+    const std::string csr    = makeCertificateRequest(*key, "disabled", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
     EXPECT_NE(std::string::npos, issued.error().find("未启用"));
@@ -607,13 +671,229 @@ TEST(AgentCertificateAuthority, RejectsInvalidNodeIdentity)
     ASSERT_TRUE(authority.has_value()) << authority.error();
 
     const KeyHandle   key = generateEcKey("prime256v1");
-    const std::string csr = makeCertificateRequest(*key, "edge", false);
+    const std::string csr = makeCertificateRequest(*key, "edge", CsrConstraints::Absent);
 
     const auto invalidId = authority->issue(csr, 0, "edge-1");
     ASSERT_FALSE(invalidId.has_value());
     EXPECT_NE(std::string::npos, invalidId.error().find("节点标识"));
 
+    const auto negativeId = authority->issue(csr, -1, "edge-1");
+    ASSERT_FALSE(negativeId.has_value());
+    EXPECT_NE(std::string::npos, negativeId.error().find("节点标识"));
+
     const auto emptyName = authority->issue(csr, 1, "");
     ASSERT_FALSE(emptyName.has_value());
     EXPECT_NE(std::string::npos, emptyName.error().find("节点名称"));
+
+    const auto tooLongName = authority->issue(csr, 1, std::string(129, 'a'));
+    ASSERT_FALSE(tooLongName.has_value());
+    EXPECT_NE(std::string::npos, tooLongName.error().find("128"));
+}
+
+TEST(AgentCertificateAuthority, KeepsIssuedCertificatePublicKeyAndConfiguredValidity)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    const TestAuthority                              authorityMaterial = writeTestAuthority(directory, "ca");
+
+    EdgePulse::Device::AgentCaOptions options = optionsFor(authorityMaterial, true);
+    options.validityDays                      = 7;
+    auto authority                            = EdgePulse::Device::AgentCertificateAuthority::load(options);
+    ASSERT_TRUE(authority.has_value()) << authority.error();
+
+    const KeyHandle   key = generateEcKey("prime256v1");
+    const std::string csr = makeCertificateRequest(*key, "public-key-check", CsrConstraints::Absent);
+
+    const std::time_t issuedAt = std::time(nullptr);
+    const auto        issued   = authority->issue(csr, 11, "edge-11");
+    ASSERT_TRUE(issued.has_value()) << issued.error();
+
+    const CertHandle certificate = parseCertificate(issued->certificatePem);
+    const ReqHandle  request     = parseRequest(csr);
+    EXPECT_EQ(1, EVP_PKEY_eq(X509_get0_pubkey(certificate.get()), X509_REQ_get0_pubkey(request.get())));
+
+    const int serialLength = ASN1_STRING_length(X509_get0_serialNumber(certificate.get()));
+    EXPECT_GT(serialLength, 0);
+    EXPECT_LE(serialLength, 16);
+    EXPECT_GE(issued->serial.size(), 2U);
+    EXPECT_LE(issued->serial.size(), 32U);
+
+    EXPECT_NEAR(static_cast<double>(epochOf(X509_get0_notAfter(certificate.get()))), static_cast<double>(issuedAt + 7 * 24 * 60 * 60), 120.0);
+}
+
+TEST(AgentCertificateAuthority, AcceptsCaFalseCsr)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    const TestAuthority                              authorityMaterial = writeTestAuthority(directory, "ca");
+    auto                                             authority         = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(authorityMaterial, true));
+    ASSERT_TRUE(authority.has_value()) << authority.error();
+
+    const KeyHandle   key    = generateEcKey("prime256v1");
+    const std::string csr    = makeCertificateRequest(*key, "explicit-leaf", CsrConstraints::CaFalse);
+    const auto        issued = authority->issue(csr, 12, "edge-12");
+    ASSERT_TRUE(issued.has_value()) << issued.error();
+    const CertHandle certificate = parseCertificate(issued->certificatePem);
+
+    const std::unique_ptr<BASIC_CONSTRAINTS, decltype(&BASIC_CONSTRAINTS_free)> constraints(
+            static_cast<BASIC_CONSTRAINTS *>(X509_get_ext_d2i(certificate.get(), NID_basic_constraints, nullptr, nullptr)), &BASIC_CONSTRAINTS_free);
+    ASSERT_NE(nullptr, constraints);
+    EXPECT_EQ(0, constraints->ca);
+}
+
+TEST(AgentCertificateAuthority, UsesCompactAuditSubjectForLongNonAsciiNodeName)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    const TestAuthority                              authorityMaterial = writeTestAuthority(directory, "ca");
+    auto                                             authority         = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(authorityMaterial, true));
+    ASSERT_TRUE(authority.has_value()) << authority.error();
+
+    std::string nodeName;
+    for (int index = 0; index < 21; ++index)
+    {
+        nodeName += "边缘";
+    }
+    nodeName += "01";
+    ASSERT_EQ(128U, nodeName.size());
+
+    const KeyHandle   key    = generateEcKey("prime256v1");
+    const std::string csr    = makeCertificateRequest(*key, "ignored-csr-name", CsrConstraints::Absent);
+    const auto        issued = authority->issue(csr, 13, nodeName);
+    ASSERT_TRUE(issued.has_value()) << issued.error();
+
+    EXPECT_EQ("CN=" + nodeName, issued->subject);
+    EXPECT_LE(issued->subject.size(), 255U);
+    EXPECT_EQ(std::string::npos, issued->subject.find('\\'));
+    EXPECT_EQ(nodeName, commonNameOf(*parseCertificate(issued->certificatePem)));
+}
+
+TEST(AgentCertificateAuthority, RejectsNonCaAuthorityCertificate)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    TestAuthorityOptions                             options;
+    options.isCa                          = false;
+    const TestAuthority authorityMaterial = writeTestAuthority(directory, "leaf", options);
+
+    auto authority = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(authorityMaterial, true));
+    ASSERT_FALSE(authority.has_value());
+    EXPECT_NE(std::string::npos, authority.error().find("CA:TRUE"));
+    expectNoSensitiveMaterial(authority.error());
+}
+
+TEST(AgentCertificateAuthority, RejectsAuthorityWithoutKeyCertSign)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    TestAuthorityOptions                             options;
+    options.includeKeyUsage               = false;
+    const TestAuthority authorityMaterial = writeTestAuthority(directory, "no-usage", options);
+
+    auto authority = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(authorityMaterial, true));
+    ASSERT_FALSE(authority.has_value());
+    EXPECT_NE(std::string::npos, authority.error().find("keyCertSign"));
+    expectNoSensitiveMaterial(authority.error());
+}
+
+TEST(AgentCertificateAuthority, RejectsAuthorityOutsideValidityPeriod)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+
+    TestAuthorityOptions expired;
+    expired.notBeforeOffsetSeconds       = -7200L;
+    expired.notAfterOffsetSeconds        = -3600L;
+    const TestAuthority expiredMaterial  = writeTestAuthority(directory, "expired", expired);
+    auto                expiredAuthority = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(expiredMaterial, true));
+    ASSERT_FALSE(expiredAuthority.has_value());
+    EXPECT_NE(std::string::npos, expiredAuthority.error().find("过期"));
+    expectNoSensitiveMaterial(expiredAuthority.error());
+
+    TestAuthorityOptions future;
+    future.notBeforeOffsetSeconds       = 3600L;
+    future.notAfterOffsetSeconds        = 7200L;
+    const TestAuthority futureMaterial  = writeTestAuthority(directory, "future", future);
+    auto                futureAuthority = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(futureMaterial, true));
+    ASSERT_FALSE(futureAuthority.has_value());
+    EXPECT_NE(std::string::npos, futureAuthority.error().find("尚未生效"));
+    expectNoSensitiveMaterial(futureAuthority.error());
+}
+
+TEST(AgentCertificateAuthority, RejectsWeakAuthorityKey)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    TestAuthorityOptions                             options;
+    options.rsaBits                       = 2048;
+    const TestAuthority authorityMaterial = writeTestAuthority(directory, "weak-ca", options);
+
+    auto authority = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(authorityMaterial, true));
+    ASSERT_FALSE(authority.has_value());
+    EXPECT_NE(std::string::npos, authority.error().find("3072"));
+    expectNoSensitiveMaterial(authority.error());
+}
+
+TEST(AgentCertificateAuthority, RejectsSameCertificateAndKeyPath)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    const TestAuthority                              authorityMaterial = writeTestAuthority(directory, "ca");
+
+    EdgePulse::Device::AgentCaOptions options = optionsFor(authorityMaterial, true);
+    options.keyFile                           = options.certificateFile;
+
+    auto authority = EdgePulse::Device::AgentCertificateAuthority::load(options);
+    ASSERT_FALSE(authority.has_value());
+    EXPECT_NE(std::string::npos, authority.error().find("同一个文件"));
+    expectNoSensitiveMaterial(authority.error());
+}
+
+TEST(AgentCertificateAuthority, AcceptsAuthorityTrustedByListenerBundle)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    const TestAuthority                              authorityMaterial = writeTestAuthority(directory, "ca");
+    const TestAuthority                              otherMaterial     = writeTestAuthority(directory, "other");
+
+    const std::filesystem::path bundle = directory.path() / "trust-bundle.pem";
+    // 签发 CA 放在第二张，确认信任库是按整包匹配而不是只看首张证书
+    writeTextFile(bundle, readTextFile(otherMaterial.certificateFile) + readTextFile(authorityMaterial.certificateFile));
+
+    EdgePulse::Device::AgentCaOptions options = optionsFor(authorityMaterial, true);
+    options.trustedCertificateFile            = bundle;
+    auto authority                            = EdgePulse::Device::AgentCertificateAuthority::load(options);
+    ASSERT_TRUE(authority.has_value()) << authority.error();
+    EXPECT_TRUE(authority->enabled());
+}
+
+TEST(AgentCertificateAuthority, RejectsAuthorityMissingFromListenerTrust)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    const TestAuthority                              authorityMaterial = writeTestAuthority(directory, "ca");
+    const TestAuthority                              otherMaterial     = writeTestAuthority(directory, "other");
+
+    EdgePulse::Device::AgentCaOptions options = optionsFor(authorityMaterial, true);
+    options.trustedCertificateFile            = otherMaterial.certificateFile;
+    auto authority                            = EdgePulse::Device::AgentCertificateAuthority::load(options);
+    ASSERT_FALSE(authority.has_value());
+    EXPECT_NE(std::string::npos, authority.error().find("信任"));
+    expectNoSensitiveMaterial(authority.error());
+}
+
+TEST(AgentCertificateAuthority, RejectsMissingListenerTrustFile)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    const TestAuthority                              authorityMaterial = writeTestAuthority(directory, "ca");
+
+    EdgePulse::Device::AgentCaOptions options = optionsFor(authorityMaterial, true);
+    options.trustedCertificateFile            = directory.path() / "absent-trust.pem";
+    auto authority                            = EdgePulse::Device::AgentCertificateAuthority::load(options);
+    ASSERT_FALSE(authority.has_value());
+    EXPECT_NE(std::string::npos, authority.error().find("信任库"));
+    expectNoSensitiveMaterial(authority.error());
+}
+
+TEST(AgentCertificateAuthority, RejectsEncryptedPrivateKey)
+{
+    const EdgePulse::TestSupport::TemporaryDirectory directory;
+    TestAuthorityOptions                             options;
+    options.passphrase                    = "test-passphrase";
+    const TestAuthority authorityMaterial = writeTestAuthority(directory, "encrypted", options);
+
+    auto authority = EdgePulse::Device::AgentCertificateAuthority::load(optionsFor(authorityMaterial, true));
+    ASSERT_FALSE(authority.has_value());
+    EXPECT_NE(std::string::npos, authority.error().find("未加密"));
+    expectNoSensitiveMaterial(authority.error());
 }

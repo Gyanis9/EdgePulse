@@ -5,6 +5,7 @@
 #include <openssl/asn1.h>
 #include <openssl/bio.h>
 #include <openssl/bn.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -41,6 +43,7 @@ namespace EdgePulse::Device
 
         constexpr char        kHexDigits[]              = "0123456789abcdef";
         constexpr std::size_t kMaximumNodeNameLength    = 128;
+        constexpr std::size_t kMaximumSubjectLength     = 255;
         constexpr long        kNotBeforeBackdateSeconds = 300L;
         constexpr std::size_t kSerialBytes              = 16;
 
@@ -56,6 +59,26 @@ namespace EdgePulse::Device
         };
 
         using ExtensionStack = std::unique_ptr<STACK_OF(X509_EXTENSION), ExtensionStackDeleter>;
+
+        /**
+         * @brief 返回失败原因前清空 OpenSSL 错误队列
+         * @param message 中文原因
+         * @return std::unexpected<std::string> 可直接作为 load 的失败结果
+         */
+        [[nodiscard]] std::unexpected<std::string> failAndClear(std::string message)
+        {
+            ERR_clear_error();
+            return std::unexpected(std::move(message));
+        }
+
+        /**
+         * @brief 拒绝为加密私钥索取口令
+         * @return int 恒为 -1；PEM_read_bio_PrivateKey 收到负值即停止，不读终端也不挂起
+         */
+        int denyPassphrase(char * /*buffer*/, const int /*size*/, const int /*writing*/, void * /*userdata*/) noexcept
+        {
+            return -1;
+        }
 
         /**
          * @brief 检查文件存在、是普通文件且可打开
@@ -137,6 +160,147 @@ namespace EdgePulse::Device
         }
 
         /**
+         * @brief 校验 CA 证书自身的约束与有效期
+         * @param certificate 待检查的 CA 证书
+         * @param path 证书路径，写进错误文本
+         * @return 可用于签发时为空；否则返回中文原因
+         */
+        [[nodiscard]] std::optional<std::string> caConstraintError(X509 &certificate, const std::filesystem::path &path)
+        {
+            const std::unique_ptr<BASIC_CONSTRAINTS, decltype(&BASIC_CONSTRAINTS_free)> constraints(
+                    static_cast<BASIC_CONSTRAINTS *>(X509_get_ext_d2i(&certificate, NID_basic_constraints, nullptr, nullptr)), &BASIC_CONSTRAINTS_free);
+            if (!constraints)
+            {
+                return "CA 证书缺少 basicConstraints 扩展，不能用于签发 Agent 证书：" + path.string();
+            }
+            if (constraints->ca == 0)
+            {
+                return "CA 证书的 basicConstraints 不是 CA:TRUE，不能用于签发 Agent 证书：" + path.string();
+            }
+            const std::uint32_t keyUsage = X509_get_key_usage(&certificate);
+            if (keyUsage == UINT32_MAX)
+            {
+                return "CA 证书缺少 keyUsage 扩展，必须包含 keyCertSign：" + path.string();
+            }
+            if ((keyUsage & KU_KEY_CERT_SIGN) == 0)
+            {
+                return "CA 证书的 keyUsage 不含 keyCertSign，不能用于签发 Agent 证书：" + path.string();
+            }
+            const ASN1_TIME *notBefore = X509_get0_notBefore(&certificate);
+            const ASN1_TIME *notAfter  = X509_get0_notAfter(&certificate);
+            tm               parsed{};
+            if (notBefore == nullptr || notAfter == nullptr || ASN1_TIME_to_tm(notBefore, &parsed) != 1 || ASN1_TIME_to_tm(notAfter, &parsed) != 1)
+            {
+                return "CA 证书的时间无法解析，不能用于签发 Agent 证书：" + path.string();
+            }
+            if (X509_cmp_current_time(notBefore) > 0)
+            {
+                return "CA 证书尚未生效：" + path.string();
+            }
+            if (X509_cmp_current_time(notAfter) <= 0)
+            {
+                return "CA 证书已过期：" + path.string();
+            }
+            return std::nullopt;
+        }
+
+        /**
+         * @brief 校验 CA 私钥的算法与强度
+         * @param privateKey CA 私钥
+         * @return 强度可接受时为空；否则返回中文原因
+         */
+        [[nodiscard]] std::optional<std::string> caKeyStrengthError(EVP_PKEY &privateKey)
+        {
+            const int keyType = EVP_PKEY_base_id(&privateKey);
+            if (keyType == EVP_PKEY_EC)
+            {
+                std::array<char, 64> groupName{};
+                std::size_t          groupLength = 0;
+                if (EVP_PKEY_get_group_name(&privateKey, groupName.data(), groupName.size(), &groupLength) != 1)
+                {
+                    return "CA 私钥缺少曲线信息，无法确认强度";
+                }
+                const std::string_view group{groupName.data(), groupLength};
+                // 三种曲线各有 OpenSSL 常见的别名写法，按曲线判定而不是按密钥位数
+                const bool allowed =
+                        group == "prime256v1" || group == "P-256" || group == "secp256r1" || group == "secp384r1" || group == "P-384" || group == "secp521r1" || group == "P-521";
+                if (!allowed)
+                {
+                    return "CA 私钥的椭圆曲线不受支持：只接受 P-256、P-384 或 P-521";
+                }
+                return std::nullopt;
+            }
+            if (keyType == EVP_PKEY_RSA || keyType == EVP_PKEY_RSA_PSS)
+            {
+                const int bits = EVP_PKEY_get_bits(&privateKey);
+                if (bits < 3072)
+                {
+                    return "CA 私钥的 RSA 密钥只有 " + std::to_string(bits) + " 位，要求至少 3072 位";
+                }
+                return std::nullopt;
+            }
+            return "CA 私钥类型不受支持：只接受 P-256、P-384、P-521 椭圆曲线或至少 3072 位的 RSA";
+        }
+
+        /**
+         * @brief 确认签发 CA 会被 9443 监听器信任
+         * @param certificate 签发 CA 证书
+         * @param trustFile 9443 监听器加载的客户端信任库，可包含多张证书
+         * @return 签发 CA 的指纹出现在信任库中时为空；否则返回中文原因
+         */
+        [[nodiscard]] std::optional<std::string> listenerTrustError(X509 &certificate, const std::filesystem::path &trustFile)
+        {
+            std::error_code error;
+            if (!std::filesystem::exists(trustFile, error) || error)
+            {
+                return "9443 监听器的客户端信任库不存在：" + trustFile.string() + "；启用 Agent CA 时必须让 cert_dir/ca.pem 信任签发 CA";
+            }
+            if (!std::filesystem::is_regular_file(trustFile, error) || error)
+            {
+                return "9443 监听器的客户端信任库不是普通文件：" + trustFile.string();
+            }
+            const auto issuerFingerprint = fingerprintOf(certificate);
+            if (!issuerFingerprint)
+            {
+                return issuerFingerprint.error();
+            }
+            BioHandle bio(BIO_new_file(trustFile.string().c_str(), "rb"), &BIO_free);
+            if (!bio)
+            {
+                return "读取 9443 监听器客户端信任库失败：" + trustFile.string() + "（无法打开文件）";
+            }
+            ERR_clear_error();
+            std::size_t parsedCertificates = 0;
+            while (true)
+            {
+                CertHandle candidate(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), &X509_free);
+                if (!candidate)
+                {
+                    break;
+                }
+                ++parsedCertificates;
+                const auto candidateFingerprint = fingerprintOf(*candidate);
+                if (!candidateFingerprint)
+                {
+                    return candidateFingerprint.error();
+                }
+                if (*candidateFingerprint == *issuerFingerprint)
+                {
+                    ERR_clear_error();
+                    return std::nullopt;
+                }
+            }
+            ERR_clear_error();
+            if (parsedCertificates == 0)
+            {
+                return "9443 监听器的客户端信任库没有可解析的 PEM 证书：" + trustFile.string();
+            }
+            return "Agent CA 证书不在 9443 监听器的客户端信任库中：签发 CA 指纹 " + *issuerFingerprint + "，信任库 " + trustFile.string() +
+                   "；请让 edgepulse.agent_ca.certificate_file 与 cert_dir/ca.pem 使用同一 CA，或把该 CA 证书加入信任包"
+                   "（ca.pem 可以拼接多张证书）";
+        }
+
+        /**
          * @brief 把 BIGNUM 写成小写十六进制
          * @param number 待转换数值
          * @return 成功返回十六进制文本；失败返回中文原因
@@ -176,31 +340,6 @@ namespace EdgePulse::Device
             std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", value.tm_year + 1900, value.tm_mon + 1, value.tm_mday, value.tm_hour, value.tm_min,
                           value.tm_sec);
             return std::string{buffer};
-        }
-
-        /**
-         * @brief 把证书主题写成 RFC 2253 文本
-         * @param certificate 证书
-         * @return 成功返回形如 CN=edge-01 的文本；失败返回中文原因
-         */
-        [[nodiscard]] std::expected<std::string, std::string> subjectOf(X509 &certificate)
-        {
-            BioHandle bio(BIO_new(BIO_s_mem()), &BIO_free);
-            if (!bio)
-            {
-                return std::unexpected("输出证书主题失败：无法创建内存缓冲");
-            }
-            if (X509_NAME_print_ex(bio.get(), X509_get_subject_name(&certificate), 0, XN_FLAG_RFC2253) < 0)
-            {
-                return std::unexpected("输出证书主题失败：OpenSSL 无法格式化主题");
-            }
-            char      *buffer = nullptr;
-            const long length = BIO_get_mem_data(bio.get(), &buffer);
-            if (buffer == nullptr || length <= 0)
-            {
-                return std::unexpected("输出证书主题失败：主题文本为空");
-            }
-            return std::string{buffer, static_cast<std::size_t>(length)};
         }
 
         /**
@@ -316,6 +455,7 @@ namespace EdgePulse::Device
 
     std::expected<AgentCertificateAuthority, std::string> AgentCertificateAuthority::load(const AgentCaOptions &options)
     {
+        ERR_clear_error();
         if (options.validityDays < 1 || options.validityDays > 3650)
         {
             return std::unexpected("Agent CA 的证书有效期必须在 1 到 3650 天之间");
@@ -343,6 +483,12 @@ namespace EdgePulse::Device
         {
             return std::unexpected(*error);
         }
+        // 路径不同但指向同一文件同样会先读证书再读私钥，这里按文件身份而不是字面路径拒绝
+        std::error_code samePathError;
+        if (std::filesystem::equivalent(options.certificateFile, options.keyFile, samePathError) && !samePathError)
+        {
+            return failAndClear("CA 证书与私钥不能使用同一个文件：" + options.certificateFile.string() + "；请把私钥放到仅服务账号可读的单独路径");
+        }
         if (const auto error = privateKeyPermissionError(options.keyFile))
         {
             return std::unexpected(*error);
@@ -351,30 +497,47 @@ namespace EdgePulse::Device
         BioHandle certificateBio(BIO_new_file(options.certificateFile.string().c_str(), "rb"), &BIO_free);
         if (!certificateBio)
         {
-            return std::unexpected("读取 CA 证书失败：" + options.certificateFile.string() + "（无法打开文件）");
+            return failAndClear("读取 CA 证书失败：" + options.certificateFile.string() + "（无法打开文件）");
         }
         CertHandle certificate(PEM_read_bio_X509(certificateBio.get(), nullptr, nullptr, nullptr), &X509_free);
         if (!certificate)
         {
-            return std::unexpected("CA 证书解析失败：" + options.certificateFile.string() + "（请确认文件是 PEM 编码的 X.509 证书）");
+            return failAndClear("CA 证书解析失败：" + options.certificateFile.string() + "（请确认文件是 PEM 编码的 X.509 证书）");
         }
 
         BioHandle privateKeyBio(BIO_new_file(options.keyFile.string().c_str(), "rb"), &BIO_free);
         if (!privateKeyBio)
         {
-            return std::unexpected("读取 CA 私钥失败：" + options.keyFile.string() + "（无法打开文件）");
+            return failAndClear("读取 CA 私钥失败：" + options.keyFile.string() + "（无法打开文件）");
         }
-        KeyHandle privateKey(PEM_read_bio_PrivateKey(privateKeyBio.get(), nullptr, nullptr, nullptr), &EVP_PKEY_free);
+        // 口令回调一律拒绝：加密私钥在启动期直接失败，不能读终端或挂起在等待输入
+        KeyHandle privateKey(PEM_read_bio_PrivateKey(privateKeyBio.get(), nullptr, denyPassphrase, nullptr), &EVP_PKEY_free);
         if (!privateKey)
         {
-            return std::unexpected("CA 私钥解析失败：" + options.keyFile.string() + "（请确认文件是未加密的 PEM 私钥）");
+            return failAndClear("CA 私钥解析失败：" + options.keyFile.string() + "（请确认文件是未加密的 PEM 私钥；不接受交互式口令输入）");
         }
         // 配对失败时 OpenSSL 会把原因堆在错误队列里，这里只给固定中文说明，避免把密钥细节带进日志或响应
         if (X509_check_private_key(certificate.get(), privateKey.get()) != 1)
         {
-            return std::unexpected("CA 证书与私钥不匹配：" + options.certificateFile.string() + " 与 " + options.keyFile.string());
+            return failAndClear("CA 证书与私钥不匹配：" + options.certificateFile.string() + " 与 " + options.keyFile.string());
+        }
+        if (const auto error = caConstraintError(*certificate, options.certificateFile))
+        {
+            return failAndClear(*error);
+        }
+        if (const auto error = caKeyStrengthError(*privateKey))
+        {
+            return failAndClear(*error);
+        }
+        if (!options.trustedCertificateFile.empty())
+        {
+            if (const auto error = listenerTrustError(*certificate, options.trustedCertificateFile))
+            {
+                return failAndClear(*error);
+            }
         }
 
+        ERR_clear_error();
         implementation->certificate = std::move(certificate);
         implementation->privateKey  = std::move(privateKey);
         return AgentCertificateAuthority{std::move(implementation)};
@@ -397,6 +560,12 @@ namespace EdgePulse::Device
         if (nodeName.size() > kMaximumNodeNameLength || nodeName.find('\0') != std::string::npos)
         {
             return std::unexpected("节点名称不能超过 128 字节，且不能包含空字符");
+        }
+        // 落库的是审计用紧凑主题而不是 RFC 2253：后者会把每个非 ASCII 字节转义成四个字符，128 字节节点名可超过 255
+        const std::string auditSubject = "CN=" + nodeName;
+        if (auditSubject.size() > kMaximumSubjectLength)
+        {
+            return std::unexpected("节点名称拼成审计主题后超过 255 字节，无法写入证书历史：" + std::to_string(auditSubject.size()) + " 字节");
         }
         if (csrPem.empty())
         {
@@ -538,11 +707,6 @@ namespace EdgePulse::Device
         {
             return std::unexpected(fingerprint.error());
         }
-        const auto subjectText = subjectOf(*certificate);
-        if (!subjectText)
-        {
-            return std::unexpected(subjectText.error());
-        }
         const auto serial = hexOf(*serialNumber);
         if (!serial)
         {
@@ -563,7 +727,7 @@ namespace EdgePulse::Device
         issued.certificatePem = std::string{pemBuffer, static_cast<std::size_t>(pemLength)};
         issued.fingerprint    = *fingerprint;
         issued.serial         = *serial;
-        issued.subject        = *subjectText;
+        issued.subject        = auditSubject;
         issued.notBefore      = *notBefore;
         issued.notAfter       = *notAfter;
         return issued;
