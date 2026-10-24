@@ -74,6 +74,28 @@ namespace EdgePulse::Cache
                               }));
     }
 
+    AsynGyanis::Core::Task<std::optional<std::string>> RedisKeyValueStore::take(AsynGyanis::Core::EventLoop &loop, std::string key)
+    {
+        co_return co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::optional<std::string>>(
+                loop, std::function<std::optional<std::string>()>(
+                              [this, key = std::move(key)]() -> std::optional<std::string>
+                              {
+                                  std::lock_guard<std::mutex> lock(m_mutex);
+                                  // GETDEL 把读取与删除压在服务端一步完成；键不存在时回 nil，没有可消费的值
+                                  const auto result = executeLocked("GETDEL", {key});
+                                  if (!result->next())
+                                  {
+                                      return std::nullopt;
+                                  }
+                                  const AsynGyanis::Database::DatabaseValue value = result->getValue(0);
+                                  if (const auto *text = std::get_if<std::string>(&value); text != nullptr)
+                                  {
+                                      return *text;
+                                  }
+                                  return std::nullopt;
+                              }));
+    }
+
     AsynGyanis::Core::Task<bool> RedisKeyValueStore::set(AsynGyanis::Core::EventLoop &loop, std::string key, std::string value, const std::chrono::seconds ttl)
     {
         co_return co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop, std::function<bool()>(

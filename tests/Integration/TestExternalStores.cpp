@@ -178,7 +178,7 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
     }
 }
 
-// 钉住：Redis 键值存储的读、写、删除、自增与过期语义走真实服务端
+// 钉住：Redis 键值存储的读、写、删除、原子消费、自增与过期语义走真实服务端
 TEST(ExternalStores, RedisKeyValueStoreRoundTrip)
 {
     const std::optional<std::string> host = environmentText("EDGEPULSE_TEST_REDIS_HOST");
@@ -197,6 +197,15 @@ TEST(ExternalStores, RedisKeyValueStoreRoundTrip)
     const auto stored = runner.run(store.get(runner.loop(), base));
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ("值一", *stored);
+
+    // 一次性消费走服务端 GETDEL：第二次取值必须为空，读接口也不能再看到该键
+    const std::string oneTime = base + ":take";
+    ASSERT_TRUE(runner.run(store.set(runner.loop(), oneTime, "一次性", std::chrono::seconds{30})));
+    const auto consumed = runner.run(store.take(runner.loop(), oneTime));
+    ASSERT_TRUE(consumed.has_value());
+    EXPECT_EQ("一次性", *consumed);
+    EXPECT_FALSE(runner.run(store.take(runner.loop(), oneTime)).has_value());
+    EXPECT_FALSE(runner.run(store.get(runner.loop(), oneTime)).has_value());
 
     const std::string counter = base + ":count";
     EXPECT_EQ(1, runner.run(store.increment(runner.loop(), counter, std::chrono::seconds{30})));

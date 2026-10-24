@@ -46,6 +46,15 @@ namespace EdgePulse::Cache
         [[nodiscard]] virtual AsynGyanis::Core::Task<std::optional<std::string>> get(AsynGyanis::Core::EventLoop &loop, std::string key) = 0;
 
         /**
+         * @brief 读取并删除键，取值与删除原子完成
+         * @param loop 恢复协程用的事件循环
+         * @param key 键
+         * @return std::optional<std::string> 删除前的值；不存在或已过期时为空
+         * @note 供一次性凭据消费使用：值只会交给一个调用方，调用方不必再补一次 erase
+         */
+        [[nodiscard]] virtual AsynGyanis::Core::Task<std::optional<std::string>> take(AsynGyanis::Core::EventLoop &loop, std::string key) = 0;
+
+        /**
          * @brief 写入并设置过期时间
          * @param loop 恢复协程用的事件循环
          * @param key 键

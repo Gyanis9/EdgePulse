@@ -30,6 +30,26 @@ namespace EdgePulse::Cache
         co_return iterator->second.value;
     }
 
+    AsynGyanis::Core::Task<std::optional<std::string>> MemoryKeyValueStore::take(AsynGyanis::Core::EventLoop &, std::string key)
+    {
+        // 查找、判过期与 erase 必须在同一把锁内完成，否则两个并发消费方可能取到同一个值
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto                  iterator = m_entries.find(key);
+        if (iterator == m_entries.end())
+        {
+            co_return std::nullopt;
+        }
+        if (isExpired(iterator->second, now()))
+        {
+            m_entries.erase(iterator);
+            co_return std::nullopt;
+        }
+        // 先移出值再抹掉表项：erase 之后迭代器失效，旧值必须先由本地串接管
+        std::string value = std::move(iterator->second.value);
+        m_entries.erase(iterator);
+        co_return value;
+    }
+
     AsynGyanis::Core::Task<bool> MemoryKeyValueStore::set(AsynGyanis::Core::EventLoop &, std::string key, std::string value, const std::chrono::seconds ttl)
     {
         std::lock_guard<std::mutex> lock(m_mutex);

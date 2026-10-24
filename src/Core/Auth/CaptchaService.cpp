@@ -132,14 +132,13 @@ namespace EdgePulse::Auth
 
     AsynGyanis::Core::Task<bool> CaptchaService::consume(AsynGyanis::Core::EventLoop &loop, const std::string_view uuid, const std::string_view code)
     {
-        const std::string                key    = std::string{kChallengePrefix} + std::string{uuid};
-        const std::optional<std::string> stored = co_await m_store->get(loop, key);
+        const std::string key = std::string{kChallengePrefix} + std::string{uuid};
+        // 取值即删除：答案对错都在这一步消耗掉，同一个 uuid 无法被反复试答案
+        const std::optional<std::string> stored = co_await m_store->take(loop, key);
         if (!stored.has_value())
         {
             co_return false;
         }
-        // 一次性：无论对错都删掉，避免同一个 uuid 被反复试答案
-        static_cast<void>(co_await m_store->erase(loop, key));
         co_return AsynGyanis::Base::constantTimeEquals(upperCopy(*stored), upperCopy(code));
     }
 } // namespace EdgePulse::Auth

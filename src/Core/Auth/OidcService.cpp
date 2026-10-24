@@ -178,10 +178,10 @@ namespace EdgePulse::Auth
             result.redirectUrl = redirectWithError(m_configuration.frontendRedirect, result.error);
             co_return result;
         }
+        // state 是一次性的：取值即删除，回调重放时拿不到同一份状态
         const std::string                stateKey    = "oidc:state:" + state;
-        const std::optional<std::string> storedState = co_await m_cache.get(loop, stateKey);
-        static_cast<void>(co_await m_cache.erase(loop, stateKey));
-        std::optional<ConfigValue> stateValue;
+        const std::optional<std::string> storedState = co_await m_cache.take(loop, stateKey);
+        std::optional<ConfigValue>       stateValue;
         if (storedState.has_value())
         {
             stateValue = AsynGyanis::Base::parseConfigValue(*storedState);
@@ -262,10 +262,10 @@ namespace EdgePulse::Auth
             result.error = "缺少一次性登录凭据";
             co_return result;
         }
+        // 一次性凭据只能兑换一次：取值与删除原子完成，并发兑换只会有一方拿到记录
         const std::string                key    = "oidc:code:" + code;
-        const std::optional<std::string> stored = co_await m_cache.get(loop, key);
-        static_cast<void>(co_await m_cache.erase(loop, key));
-        std::optional<ConfigValue> value;
+        const std::optional<std::string> stored = co_await m_cache.take(loop, key);
+        std::optional<ConfigValue>       value;
         if (stored.has_value())
         {
             value = AsynGyanis::Base::parseConfigValue(*stored);

@@ -57,6 +57,16 @@ namespace EdgePulse::Cache
         [[nodiscard]] AsynGyanis::Core::Task<std::optional<std::string>> get(AsynGyanis::Core::EventLoop &loop, std::string key) override;
 
         /**
+         * @brief 读取并删除键
+         * @details 重写 KeyValueStore::take()：单条 GETDEL 由服务端原子完成读取与删除，
+         *          不存在或已过期的键回 nil。GETDEL 要求 Redis 6.2 以上，部署档为 7。
+         * @param loop 恢复协程用的事件循环
+         * @param key 键
+         * @return std::optional<std::string> 删除前的值；不存在或已过期时为空
+         */
+        [[nodiscard]] AsynGyanis::Core::Task<std::optional<std::string>> take(AsynGyanis::Core::EventLoop &loop, std::string key) override;
+
+        /**
          * @brief 写入并设置过期时间
          * @param loop 恢复协程用的事件循环
          * @param key 键
