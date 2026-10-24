@@ -9,7 +9,6 @@
 
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogMacros.h"
-#include "Core/Crypto/Digest.h"
 #include "Core/Firmware/FirmwareSignatureVerifier.h"
 #include "Platform/FileSystem/FileSystem.h"
 #include "Platform/Platform.h"
@@ -216,16 +215,6 @@ namespace EdgePulse::Agent
             return command;
 #endif
         }
-
-        /**
-         * @brief 判断 manifest 里的某个路径是否是 Agent 二进制
-         * @param path 清单里的文件路径
-         * @return true 表示 Linux 的 edgepulse-agent 或 Windows 的 edgepulse-agent.exe
-         */
-        [[nodiscard]] bool isAgentBinaryPath(const std::string_view path)
-        {
-            return path == "edgepulse-agent" || path == "edgepulse-agent.exe";
-        }
     } // namespace
 
     UpdateExecutor::UpdateExecutor(AgentClient &client, AgentState &state, AgentConfiguration configuration, Launcher launcher, StopCallback requestStop) :
@@ -299,92 +288,7 @@ namespace EdgePulse::Agent
         {
             return std::unexpected("agent.update 的 algorithm 只支持 ed25519-sha256，收到 " + *algorithm);
         }
-        update.algorithm = std::move(*algorithm);
-
-        auto manifest = requiredString(*parsed, "manifest", "manifest");
-        if (!manifest.has_value())
-        {
-            return std::unexpected(manifest.error());
-        }
-        update.manifest = std::move(*manifest);
         return update;
-    }
-
-    std::expected<void, std::string> UpdateExecutor::validateManifest(const UpdatePayload &payload) const
-    {
-        const auto parsed = AsynGyanis::Base::parseConfigValue(payload.manifest);
-        if (!parsed.has_value() || !parsed->is_object())
-        {
-            return std::unexpected("agent.update 的 manifest 不是 JSON 对象");
-        }
-
-        auto version = requiredString(*parsed, "version", "manifest 的 version");
-        if (!version.has_value())
-        {
-            return std::unexpected(version.error());
-        }
-        if (*version != payload.version)
-        {
-            return std::unexpected("agent.update 的 manifest 版本 " + *version + " 与命令版本 " + payload.version + " 不一致");
-        }
-
-        auto platform = requiredString(*parsed, "platform", "manifest 的 platform");
-        if (!platform.has_value())
-        {
-            return std::unexpected(platform.error());
-        }
-        if (*platform != kAgentPlatform)
-        {
-            return std::unexpected("agent.update 的 manifest 平台 " + *platform + " 与当前平台 " + std::string{kAgentPlatform} + " 不一致");
-        }
-
-        auto signingKeyId = requiredString(*parsed, "signingKeyId", "manifest 的 signingKeyId");
-        if (!signingKeyId.has_value())
-        {
-            return std::unexpected(signingKeyId.error());
-        }
-        if (*signingKeyId != payload.signingKeyId)
-        {
-            return std::unexpected("agent.update 的 manifest signingKeyId " + *signingKeyId + " 与命令给出的 " + payload.signingKeyId + " 不一致");
-        }
-
-        auto algorithm = requiredString(*parsed, "signatureAlgorithm", "manifest 的 signatureAlgorithm");
-        if (!algorithm.has_value())
-        {
-            return std::unexpected(algorithm.error());
-        }
-        if (*algorithm != "ed25519-sha256")
-        {
-            return std::unexpected("agent.update 的 manifest signatureAlgorithm 只支持 ed25519-sha256，收到 " + *algorithm);
-        }
-
-        const auto files = parsed->find("files");
-        if (files == parsed->end() || !files->is_array())
-        {
-            return std::unexpected("agent.update 的 manifest 缺少 files 数组");
-        }
-        bool agentListed = false;
-        for (const auto &file: *files)
-        {
-            if (!file.is_object())
-            {
-                return std::unexpected("agent.update 的 manifest files 含非对象条目");
-            }
-            const auto path = file.find("path");
-            if (path == file.end() || !path->is_string())
-            {
-                return std::unexpected("agent.update 的 manifest files 条目缺少字符串 path");
-            }
-            if (isAgentBinaryPath(path->get<std::string>()))
-            {
-                agentListed = true;
-            }
-        }
-        if (!agentListed)
-        {
-            return std::unexpected("agent.update 的 manifest 文件清单没有 edgepulse-agent");
-        }
-        return {};
     }
 
     std::filesystem::path UpdateExecutor::stagingPath(const UpdatePayload &payload) const
@@ -536,12 +440,6 @@ namespace EdgePulse::Agent
             co_return CommandResult{false, "{}", "未配置 agent.update.staging_directory，无法下载升级包"};
         }
 
-        const auto manifestValid = validateManifest(payload);
-        if (!manifestValid.has_value())
-        {
-            co_return CommandResult{false, "{}", manifestValid.error()};
-        }
-
         using Verifier = EdgePulse::Firmware::FirmwareSignatureVerifier;
         std::expected<std::shared_ptr<const Verifier>, std::string> loadedVerifier;
         try
@@ -571,7 +469,8 @@ namespace EdgePulse::Agent
         }
         const std::shared_ptr<const Verifier> verifier = *loadedVerifier;
 
-        const auto verified = verifier->verify(payload.signingKeyId, AsynGyanis::Core::Digest::sha256Hex(payload.manifest), payload.signature);
+        // 签名对象是命令给出的归档摘要：验签在下载前完成，控制面无法把合法签名与另一份归档配对
+        const auto verified = verifier->verify(payload.signingKeyId, payload.sha256, payload.signature);
         if (!verified.has_value())
         {
             co_return co_await fail(loop, {}, "升级包签名校验失败：" + verified.error());

@@ -1,5 +1,6 @@
 ﻿# 打包 Windows Agent：收集二进制、安装/卸载脚本与配置模板，生成带 SHA-256 清单的 zip。
-# 提供签名私钥时同时生成 manifest.sig；checksums.sha256 只列 manifest.files 里的数据文件。
+# 提供签名私钥时先签 manifest，再签归档本身；归档签名供 Agent 验签，manifest.sig 是包内纵深防御。
+# checksums.sha256 只列 manifest.files 里的数据文件。
 [CmdletBinding()]
 param(
     [string]$Binary,
@@ -96,6 +97,36 @@ function New-ManifestText {
     return $builder.ToString()
 }
 
+function Invoke-Ed25519Sign {
+    param(
+        [Parameter(Mandatory = $true)][string]$KeyPath,
+        [Parameter(Mandatory = $true)][string]$InputPath,
+        [Parameter(Mandatory = $true)][string]$SignaturePath
+    )
+    $digestFile = [System.IO.Path]::GetTempFileName()
+    $rawSignatureFile = [System.IO.Path]::GetTempFileName()
+    try {
+        & openssl dgst -sha256 -binary -out $digestFile $InputPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "openssl 计算摘要失败（退出码 $LASTEXITCODE）：$InputPath"
+        }
+        & openssl pkeyutl -sign -inkey $KeyPath -rawin -in $digestFile -out $rawSignatureFile
+        if ($LASTEXITCODE -ne 0) {
+            throw "openssl 签名失败（退出码 $LASTEXITCODE）：$InputPath"
+        }
+        if ((Get-Item -LiteralPath $rawSignatureFile).Length -ne 64) {
+            throw "Ed25519 签名长度不是 64 字节：$InputPath"
+        }
+        & openssl base64 -A -in $rawSignatureFile -out $SignaturePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "openssl Base64 编码失败（退出码 $LASTEXITCODE）"
+        }
+    } finally {
+        Remove-Item -LiteralPath $digestFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $rawSignatureFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Build-Package {
     if ([string]::IsNullOrWhiteSpace($Version)) {
         $Version = Get-ProjectVersion
@@ -121,6 +152,10 @@ function Build-Package {
             throw '缺少 openssl：签名需要 OpenSSL 3 的 pkeyutl'
         }
         $SigningKey = (Resolve-Path -LiteralPath $SigningKey).ProviderPath
+        $keyText = & openssl pkey -in $SigningKey -noout -text 2>$null | Select-Object -First 1
+        if ($LASTEXITCODE -ne 0 -or [string]$keyText -notmatch '^ED25519') {
+            throw "签名私钥不是 Ed25519：$SigningKey"
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($Binary)) {
@@ -173,43 +208,43 @@ function Build-Package {
 
         $signaturePath = Join-Path $stageDirectory 'manifest.sig'
         if ($hasSigningKey) {
-            $digestFile = [System.IO.Path]::GetTempFileName()
-            $rawSignatureFile = [System.IO.Path]::GetTempFileName()
-            try {
-                & openssl dgst -sha256 -binary -out $digestFile $manifestPath
-                if ($LASTEXITCODE -ne 0) {
-                    throw "openssl 计算 manifest 摘要失败（退出码 $LASTEXITCODE）"
-                }
-                & openssl pkeyutl -sign -inkey $SigningKey -rawin -in $digestFile -out $rawSignatureFile
-                if ($LASTEXITCODE -ne 0) {
-                    throw "openssl 签名失败（退出码 $LASTEXITCODE）"
-                }
-                & openssl base64 -A -in $rawSignatureFile -out $signaturePath
-                if ($LASTEXITCODE -ne 0) {
-                    throw "openssl Base64 编码失败（退出码 $LASTEXITCODE）"
-                }
-            } finally {
-                Remove-Item -LiteralPath $digestFile -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $rawSignatureFile -Force -ErrorAction SilentlyContinue
-            }
+            Invoke-Ed25519Sign -KeyPath $SigningKey -InputPath $manifestPath -SignaturePath $signaturePath
         }
 
         $archiveName = 'edgepulse-agent-' + $Version + '-' + $platform + '.zip'
         $archivePath = Join-Path $Output $archiveName
+        $archiveSignaturePath = $archivePath + '.sig'
+        $metadataPath = $archivePath + '.json'
+        # 同一版本重打包会覆盖归档；旧的签名旁路必须一起清掉，否则会留下与新手包不匹配的签名
+        foreach ($stale in @($archiveSignaturePath, $metadataPath, ($metadataPath + '.tmp'))) {
+            Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+        }
         Compress-Archive -Path (Join-Path $stageDirectory '*') -DestinationPath $archivePath -Force
 
         $baseName = 'edgepulse-agent-' + $Version + '-' + $platform
         Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $Output ($baseName + '.manifest.json')) -Force
         Copy-Item -LiteralPath $checksumsPath -Destination (Join-Path $Output ($baseName + '.checksums.sha256')) -Force
+        # 旧版本曾把 manifest.sig 复制到输出目录；归档内仍保留它，输出目录不再提供这份旁路
+        $legacyManifestSignature = Join-Path $Output ($baseName + '.manifest.sig')
+        Remove-Item -LiteralPath $legacyManifestSignature -Force -ErrorAction SilentlyContinue
 
+        $archiveDigest = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
         Write-Host "安装包：$archivePath"
         Write-Host "清单：$($manifestFiles.Count) 个文件，逐项记录 size 与 sha256"
         Write-Host "校验：$baseName.checksums.sha256"
+        Write-Host "sha256=$archiveDigest"
         if ($hasSigningKey) {
-            Copy-Item -LiteralPath $signaturePath -Destination (Join-Path $Output ($baseName + '.manifest.sig')) -Force
-            Write-Host "签名：$baseName.manifest.sig（key id $SigningKeyId）"
+            # 签名对象是归档文件本身；先完成归档再签，避免签名覆盖的字节与落盘内容不一致
+            Invoke-Ed25519Sign -KeyPath $SigningKey -InputPath $archivePath -SignaturePath $archiveSignaturePath
+            $archiveSignature = [System.IO.File]::ReadAllText($archiveSignaturePath).Trim()
+            $metadata = '{"version":"' + $Version + '","platform":"' + $platform + '","sha256":"' + $archiveDigest +
+                        '","signature":"' + $archiveSignature + '","signingKeyId":"' + $SigningKeyId + '","algorithm":"ed25519-sha256"}' + "`n"
+            [System.IO.File]::WriteAllText($metadataPath, $metadata, $encoding)
+            Write-Host "signature=$archiveSignature"
+            Write-Host "签名：$baseName.zip.sig（key id $SigningKeyId）"
+            Write-Host "元数据：$baseName.zip.json"
         } else {
-            Write-Host '未提供签名私钥：本次生成的是未签名安装包，不能用于需要验签的升级'
+            Write-Host '未提供签名私钥：本次生成的是未签名安装包，只用于本地或手工安装，不能用于需要验签的升级'
         }
     } finally {
         if (Test-Path -LiteralPath $stageDirectory) {

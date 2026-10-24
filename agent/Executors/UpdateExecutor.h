@@ -28,12 +28,15 @@ namespace EdgePulse::Agent
 
     /**
      * @brief 处理 agent.update 命令
-     * @details 命令给出升级包的下载地址、归档摘要、manifest 原文与 Ed25519 签名。执行器先校验
-     *          manifest 的版本、平台与文件清单，再用升级包信任键目录验签，然后下载归档并核对
-     *          SHA-256。全部通过后确认安装器存在且可执行、清掉旧健康标记（先留快照）、写入升级
+     * @details 命令给出升级包的下载地址与 SHA-256，签名是该 32 字节摘要的 Ed25519 签名。执行器
+     *          先用升级包信任键目录对命令摘要验签，再通过流式下载把归档落到暂存目录并计算
+     *          SHA-256，只有与已验签的摘要完全一致才承认这份归档。归档内的 manifest.json、
+     *          manifest.sig 与 checksums.sha256 因此一并获得认证，安装器据以校验版本、平台与
+     *          文件哈希。全部通过后确认安装器存在且可执行、清掉旧健康标记（先留快照）、写入升级
      *          状态与待上报结果，最后在阻塞执行器上把安装器作为脱离进程启动并请求当前进程停止。
      *          任何启动前失败都不改升级状态、不启动安装器，并删除暂存包；启动失败时回滚升级状态
      *          并恢复旧健康标记。安装器需要消费暂存包，成功路径不删除。
+     *          命令里的 manifest 字段不再参与信任判断，版本只用于本地升级状态与上报。
      *          文件读写与摘要计算在阻塞执行器上完成，事件循环线程只做网络与协程调度。
      */
     class UpdateExecutor final : public CommandExecutor
@@ -88,28 +91,20 @@ namespace EdgePulse::Agent
          */
         struct UpdatePayload
         {
-            std::string version;      ///< 目标版本，非空
+            std::string version;      ///< 目标版本，非空；只用于升级状态与上报
             std::string url;          ///< 下载地址，相对 base_url 或绝对 http(s) 地址
-            std::string sha256;       ///< 归档 SHA-256，小写十六进制
-            std::string signature;    ///< Base64 编码的 Ed25519 签名
+            std::string sha256;       ///< 归档 SHA-256，小写十六进制，也是签名覆盖的对象
+            std::string signature;    ///< Base64 编码的 Ed25519 签名，覆盖 sha256 的 32 字节摘要
             std::string signingKeyId; ///< 信任键目录里的公钥文件名（不含 .pem）
-            std::string algorithm;    ///< 签名算法，只允许 ed25519-sha256
-            std::string manifest;     ///< 被签名的 manifest 原文
         };
 
         /**
          * @brief 解析并校验命令正文
          * @param payload 服务端给出的 JSON 文本
          * @return 成功返回校验后的正文；失败返回中文原因
+         * @note manifest 字段即使存在也原样忽略，不参与验签、版本或平台判断
          */
         [[nodiscard]] std::expected<UpdatePayload, std::string> parsePayload(std::string_view payload) const;
-
-        /**
-         * @brief 校验 manifest 的版本、平台、文件清单与签名声明
-         * @param payload 已校验的正文
-         * @return 成功为空；失败返回中文原因
-         */
-        [[nodiscard]] std::expected<void, std::string> validateManifest(const UpdatePayload &payload) const;
 
         /**
          * @brief 取暂存包路径

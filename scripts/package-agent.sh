@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 打包 Linux Agent：收集二进制、systemd 单元、安装/卸载脚本与配置模板，生成带 SHA-256 清单的 tar.gz。
-# 提供签名私钥时同时生成 manifest.sig；checksums.sha256 只列 manifest.files 里的数据文件。
+# 提供签名私钥时先签 manifest，再签归档本身；归档签名供 Agent 验签，manifest.sig 是包内纵深防御。
+# checksums.sha256 只列 manifest.files 里的数据文件。
 set -euo pipefail
 
 usage() {
@@ -11,19 +12,23 @@ usage() {
   --version VER         包版本，默认取 CMakeLists.txt 中的项目版本
   --output DIR          输出目录，默认 build/agent-package
   --binary PATH         已有的 Linux Agent 二进制；省略时在 Linux 上执行 Release 构建
-  --signing-key PATH    Ed25519 私钥（PEM）；给出时对 manifest 签名
-  --signing-key-id ID   manifest 里记录的 key id，必须与 --signing-key 同时给出
+  --signing-key PATH    Ed25519 私钥（PEM）；给出时对 manifest 与归档签名
+  --signing-key-id ID   manifest 与归档旁路文件里记录的 key id，必须与 --signing-key 同时给出
   -h, --help            显示本帮助
 
 生成的 tar.gz 顶层包含 edgepulse-agent、edgepulse-agent.service、
 install-agent.sh、uninstall-agent.sh、agent.yaml.example、manifest.json 与
-checksums.sha256；提供签名私钥时另有 manifest.sig。
+checksums.sha256；提供签名私钥时包内另有 manifest.sig。
 
-签名前 manifest 会写入 signingKeyId 与 signatureAlgorithm（ed25519-sha256）。
+签名分两层：manifest.sig 覆盖 manifest.json 的 SHA-256 摘要，在归档前生成；
+Agent 实际信任的是归档签名，覆盖归档文件本身的 SHA-256 摘要。提供私钥时输出目录
+另有 <包名>.sig 与确定性的 <包名>.json（version、platform、sha256、signature、
+signingKeyId、algorithm），两者都描述归档，不进入归档。
+
 manifest.files 与 checksums.sha256 只覆盖上面的数据文件：manifest.json、
 manifest.sig 与 checksums.sha256 自身不在清单内，避免清单与校验文件互相引用。
-输出目录同时保留 <包名>.manifest.json、<包名>.checksums.sha256 与
-<包名>.manifest.sig 三份旁路文件，供服务端上传与安装器核验。
+输出目录同时保留 <包名>.manifest.json 与 <包名>.checksums.sha256，供人工核对。
+没有私钥时不产出任何签名旁路文件；未签名包只用于本地或手工安装。
 EOF
 }
 
@@ -182,6 +187,12 @@ archive_name="edgepulse-agent-${version}-${platform}.tar.gz"
 archive_path="${output_dir}/${archive_name}"
 manifest_path="${output_dir}/edgepulse-agent-${version}-${platform}.manifest.json"
 checksums_path="${output_dir}/edgepulse-agent-${version}-${platform}.checksums.sha256"
+metadata_path="${archive_path}.json"
+signature_path="${archive_path}.sig"
+# 同一版本重打包会覆盖归档；旧的签名旁路必须一起清掉，否则会留下与新手包不匹配的签名
+rm -f -- "${signature_path}" "${metadata_path}" "${metadata_path}.tmp"
+# 旧版本曾把 manifest.sig 复制到输出目录；归档内仍保留它，输出目录不再提供这份旁路
+rm -f -- "${output_dir}/edgepulse-agent-${version}-${platform}.manifest.sig"
 
 archive_entries=("${package_files[@]}" manifest.json checksums.sha256)
 if [[ "${signed}" -eq 1 ]]; then
@@ -191,15 +202,33 @@ tar -czf "${archive_path}" -C "${stage_dir}" "${archive_entries[@]}"
 cp "${stage_dir}/manifest.json" "${manifest_path}"
 cp "${stage_dir}/checksums.sha256" "${checksums_path}"
 
+archive_digest="$(sha256sum "${archive_path}" | cut -d' ' -f1)"
 if [[ "${signed}" -eq 1 ]]; then
-    cp "${stage_dir}/manifest.sig" "${output_dir}/edgepulse-agent-${version}-${platform}.manifest.sig"
+    # 签名对象是归档文件本身；先完成归档再签，避免签名覆盖的字节与落盘内容不一致
+    bash "${repo_root}/scripts/sign-agent-package.sh" "${signing_key}" "${archive_path}" "${signing_key_id}"
+    archive_signature="$(cat "${signature_path}")"
+    {
+        printf '{\n'
+        printf '  "version": "%s",\n' "${version}"
+        printf '  "platform": "%s",\n' "${platform}"
+        printf '  "sha256": "%s",\n' "${archive_digest}"
+        printf '  "signature": "%s",\n' "${archive_signature}"
+        printf '  "signingKeyId": "%s",\n' "${signing_key_id}"
+        printf '  "algorithm": "ed25519-sha256"\n'
+        printf '}\n'
+    } > "${metadata_path}.tmp"
+    mv -f "${metadata_path}.tmp" "${metadata_path}"
 fi
 
 echo "安装包：${archive_path}"
 echo "清单：${manifest_path}"
 echo "校验：${checksums_path}"
 if [[ "${signed}" -eq 1 ]]; then
-    echo "签名：${output_dir}/edgepulse-agent-${version}-${platform}.manifest.sig（key id ${signing_key_id}）"
+    echo "sha256=${archive_digest}"
+    echo "signature=${archive_signature}"
+    echo "签名：${signature_path}（key id ${signing_key_id}）"
+    echo "元数据：${metadata_path}"
 else
-    echo "未提供签名私钥：本次生成的是未签名安装包，不能用于需要验签的升级"
+    echo "sha256=${archive_digest}"
+    echo "未提供签名私钥：本次生成的是未签名安装包，只用于本地或手工安装，不能用于需要验签的升级"
 fi

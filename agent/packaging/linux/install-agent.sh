@@ -31,6 +31,8 @@ usage() {
   --prefix DIR             安装前缀；只替换 DIR/bin/edgepulse-agent
 
 升级模式不接受 --no-start；--config-dir 与 --log-dir 在升级模式中不使用。
+自动升级由 Agent 先对归档 SHA-256 验签再调用本脚本；手工 --upgrade 没有签名门槛，
+只校验包内 checksums.sha256，归档来源需要调用方自行确认。
 
 环境变量：
   SYSTEMD_UNIT_DIR   单元文件目录，默认 /etc/systemd/system；测试时指向临时目录
@@ -274,6 +276,9 @@ run_upgrade() {
     platform="$(sed -n 's/.*"platform"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${extraction_dir}/manifest.json" | head -n 1)"
     [[ "${platform}" == "${expected_platform}" ]] || rollback_upgrade "manifest.json 的 platform 不是 ${expected_platform}：${platform:-缺失}"
 
+    # 自动升级的归档真实性由 Agent 启动本脚本前的签名检查建立：签名覆盖归档 SHA-256，
+    # 因此下面的 checksums.sha256 校验的是已认证归档内的文件。手工 --upgrade 没有签名门槛，
+    # 只按这里的哈希核对，调用方需要自行确认归档来源。
     grep -Eq '^[0-9a-fA-F]{64}[[:space:]]+\*?edgepulse-agent$' "${extraction_dir}/checksums.sha256" ||
         rollback_upgrade "checksums.sha256 没有覆盖 edgepulse-agent"
     if ! (cd "${extraction_dir}" && sha256sum -c --strict checksums.sha256) >>"${upgrade_log}" 2>&1; then

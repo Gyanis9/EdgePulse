@@ -267,6 +267,9 @@ function Test-UpgradeArchiveEntries {
 
 function Test-UpgradeChecksums {
     param([Parameter(Mandatory = $true)][string]$Directory)
+    # 自动升级的归档真实性由 Agent 启动本脚本前的签名检查建立：签名覆盖归档 SHA-256，
+    # 因此这里校验的是已认证归档内的文件。手工 -Upgrade 没有签名门槛，只按这里的哈希核对，
+    # 调用方需要自行确认归档来源。
     $checksumsPath = Join-Path $Directory 'checksums.sha256'
     if (-not (Test-Path -LiteralPath $checksumsPath -PathType Leaf)) {
         throw '升级包不完整，缺少 checksums.sha256'

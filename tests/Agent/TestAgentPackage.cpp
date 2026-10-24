@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -65,11 +66,20 @@ namespace EdgePulse::Agent
          */
         struct LaunchRecord
         {
-            std::mutex               mutex;      ///< 保护字段
-            int                      calls{0};   ///< 启动次数
-            std::filesystem::path    executable; ///< 启动器路径
-            std::vector<std::string> arguments;  ///< 启动参数
+            std::mutex               mutex;       ///< 保护字段
+            int                      calls{0};    ///< 启动次数
+            std::filesystem::path    executable;  ///< 启动器路径
+            std::vector<std::string> arguments;   ///< 启动参数
             bool                     fail{false}; ///< 是否模拟启动失败
+        };
+
+        /**
+         * @brief 一份真实归档及其 SHA-256
+         */
+        struct PackageArchive
+        {
+            std::string bytes;  ///< 归档文件的完整字节
+            std::string digest; ///< 归档 SHA-256 小写十六进制
         };
 
         [[nodiscard]] AgentIdentity testIdentity()
@@ -87,50 +97,115 @@ namespace EdgePulse::Agent
         }
 
         /**
-         * @brief 构造一份签名前的 manifest 文本
-         * @param version 包版本
-         * @param platform 包平台
-         * @param keyId 签名 key id
-         * @param algorithm 签名算法
-         * @param agentBinary 清单里的 Agent 文件名；空串表示删掉这一项
-         * @return std::string 紧凑 JSON 文本
+         * @brief 在临时目录里构造一份带 manifest 与 checksums 的 tar.gz
+         * @param root 用例独占的临时目录
+         * @param version 归档版本
+         * @param platform 归档平台
+         * @return 成功返回归档字节与 SHA-256；失败返回中文原因
+         * @note 用例验证的是归档摘要签名，归档内容按打包脚本的顶层布局生成，不依赖打包脚本本身
          */
-        [[nodiscard]] std::string manifestText(const std::string &version, const std::string &platform, const std::string &keyId = "pkg-2026",
-                                               const std::string &algorithm = "ed25519-sha256", const std::string &agentBinary = "edgepulse-agent")
+        [[nodiscard]] std::expected<PackageArchive, std::string> buildPackageArchive(const std::filesystem::path &root, const std::string &version,
+                                                                                     const std::string &platform = std::string{kAgentPlatform})
         {
-            ConfigValue files = ConfigValue::array();
-            if (!agentBinary.empty())
+            const std::filesystem::path stageName = std::filesystem::path{"package"} / (version + "-" + platform);
+            const std::string           binary    = "EDGEPULSE-AGENT-BINARY-" + version;
+            const std::string           example   = "base_url: https://127.0.0.1:9443\n";
+            try
             {
-                files.push_back(ConfigValue::object({{"path", agentBinary}, {"size", 4096}, {"sha256", std::string(64, 'a')}}));
+                std::error_code error;
+                std::filesystem::create_directories(root / stageName, error);
+                if (error)
+                {
+                    return std::unexpected("无法创建归档暂存目录：" + error.message());
+                }
+                std::ofstream binaryStream(root / stageName / "edgepulse-agent", std::ios::binary | std::ios::trunc);
+                binaryStream.write(binary.data(), static_cast<std::streamsize>(binary.size()));
+                binaryStream.close();
+                if (!binaryStream)
+                {
+                    return std::unexpected("无法写入归档内的 Agent 二进制");
+                }
+                std::ofstream exampleStream(root / stageName / "agent.yaml.example", std::ios::binary | std::ios::trunc);
+                exampleStream.write(example.data(), static_cast<std::streamsize>(example.size()));
+                exampleStream.close();
+                if (!exampleStream)
+                {
+                    return std::unexpected("无法写入归档内的配置模板");
+                }
+
+                ConfigValue files = ConfigValue::array();
+                files.push_back(ConfigValue::object(
+                        {{"path", "agent.yaml.example"}, {"size", example.size()}, {"sha256", AsynGyanis::Core::Digest::sha256Hex(example)}}));
+                files.push_back(ConfigValue::object({{"path", "edgepulse-agent"}, {"size", binary.size()}, {"sha256", AsynGyanis::Core::Digest::sha256Hex(binary)}}));
+                const std::string manifest =
+                        ConfigValue::object({{"version", version}, {"platform", platform}, {"files", files}}).dump();
+                const std::string checksums = AsynGyanis::Core::Digest::sha256Hex(example) + "  agent.yaml.example\n" +
+                                              AsynGyanis::Core::Digest::sha256Hex(binary) + "  edgepulse-agent\n";
+                std::ofstream     manifestStream(root / stageName / "manifest.json", std::ios::binary | std::ios::trunc);
+                manifestStream.write(manifest.data(), static_cast<std::streamsize>(manifest.size()));
+                manifestStream.close();
+                if (!manifestStream)
+                {
+                    return std::unexpected("无法写入归档内的 manifest.json");
+                }
+                std::ofstream checksumsStream(root / stageName / "checksums.sha256", std::ios::binary | std::ios::trunc);
+                checksumsStream.write(checksums.data(), static_cast<std::streamsize>(checksums.size()));
+                checksumsStream.close();
+                if (!checksumsStream)
+                {
+                    return std::unexpected("无法写入归档内的 checksums.sha256");
+                }
+            } catch (const std::exception &failure)
+            {
+                return std::unexpected("构造归档暂存文件失败：" + std::string{failure.what()});
             }
-            files.push_back(ConfigValue::object({{"path", "agent.yaml.example"}, {"size", 128}, {"sha256", std::string(64, 'b')}}));
-            const ConfigValue manifest = ConfigValue::object(
-                    {{"version", version}, {"platform", platform}, {"signingKeyId", keyId}, {"signatureAlgorithm", algorithm}, {"files", files}});
-            return manifest.dump();
+
+            const std::filesystem::path archivePath = root / ("edgepulse-agent-" + version + "-" + platform + ".tar.gz");
+            const auto                  packed      = runProcess("tar",
+                                                       {"-czf",
+                                                        AsynGyanis::Platform::FileSystem::utf8FromPath(archivePath),
+                                                        "-C",
+                                                        AsynGyanis::Platform::FileSystem::utf8FromPath(root / stageName),
+                                                        "agent.yaml.example",
+                                                        "checksums.sha256",
+                                                        "edgepulse-agent",
+                                                        "manifest.json"},
+                                                       std::chrono::seconds{60});
+            if (!packed.succeeded())
+            {
+                return std::unexpected("无法构造测试归档：" + packed.failure + packed.output);
+            }
+
+            PackageArchive archive;
+            archive.bytes  = readTextFile(archivePath);
+            archive.digest = AsynGyanis::Core::Digest::sha256Hex(archive.bytes);
+            if (archive.bytes.empty())
+            {
+                return std::unexpected("测试归档为空");
+            }
+            return archive;
         }
 
         /**
          * @brief 构造 agent.update 的命令正文
          * @param version 目标版本
          * @param digest 归档 SHA-256
-         * @param signature Base64 签名
-         * @param manifest 被签名的 manifest 原文
+         * @param signature Base64 签名（覆盖归档摘要）
          * @param keyId 签名 key id
          * @param algorithm 签名算法
          * @param url 下载地址
          * @return ConfigValue 命令正文对象
+         * @note 不写入 manifest 字段；命令里的 manifest 不再参与信任判断
          */
-        [[nodiscard]] ConfigValue packagePayload(const std::string &version, const std::string &digest, const std::string &signature, const std::string &manifest,
-                                                 const std::string &keyId = "pkg-2026", const std::string &algorithm = "ed25519-sha256",
-                                                 const std::string &url = "/api/agent/update/download")
+        [[nodiscard]] ConfigValue packagePayload(const std::string &version, const std::string &digest, const std::string &signature, const std::string &keyId = "pkg-2026",
+                                                 const std::string &algorithm = "ed25519-sha256", const std::string &url = "/api/agent/update/download")
         {
             return ConfigValue::object({{"version", version},
                                         {"url", url},
                                         {"sha256", digest},
                                         {"signature", signature},
                                         {"signingKeyId", keyId},
-                                        {"algorithm", algorithm},
-                                        {"manifest", manifest}});
+                                        {"algorithm", algorithm}});
         }
 
         /**
@@ -174,14 +249,14 @@ namespace EdgePulse::Agent
                 }
                 m_state = std::make_unique<AgentState>(std::move(*opened));
 
-                m_configuration.baseUrl                      = "http://127.0.0.1:" + std::to_string(m_server->port());
-                m_configuration.allowPlaintextForTests       = true;
-                m_configuration.name                         = "edge-01";
-                m_configuration.requestTimeoutSeconds        = 10;
-                m_configuration.stateDirectory               = m_directory.path() / "state";
-                m_configuration.packageTrustedKeysDirectory  = m_directory.path() / "package-keys";
-                m_configuration.updateStagingDirectory       = m_directory.path() / "update-staging";
-                m_configuration.updateHealthTimeoutSeconds   = 30;
+                m_configuration.baseUrl                     = "http://127.0.0.1:" + std::to_string(m_server->port());
+                m_configuration.allowPlaintextForTests      = true;
+                m_configuration.name                        = "edge-01";
+                m_configuration.requestTimeoutSeconds       = 10;
+                m_configuration.stateDirectory              = m_directory.path() / "state";
+                m_configuration.packageTrustedKeysDirectory = m_directory.path() / "package-keys";
+                m_configuration.updateStagingDirectory      = m_directory.path() / "update-staging";
+                m_configuration.updateHealthTimeoutSeconds  = 30;
 
                 // 执行器启动前会检查安装器存在且可执行，用例统一放一个真实的临时脚本
                 const std::filesystem::path installer = m_directory.path() / "install-agent";
@@ -360,13 +435,13 @@ namespace EdgePulse::Agent
             }
 
         private:
-            TestSupport::TemporaryDirectory             m_directory;                       ///< 用例独占的临时目录
-            std::shared_ptr<PackageServerState>         m_serverState;                     ///< 服务端记录
-            std::unique_ptr<TestSupport::ServerHarness> m_server;                          ///< 回环服务器
-            std::unique_ptr<AgentState>                 m_state;                           ///< 真实状态库
-            AgentConfiguration                          m_configuration;                   ///< 执行器配置
-            std::shared_ptr<LaunchRecord>               m_launch;                          ///< 注入的启动器记录
-            std::atomic<int>                            m_stopRequests{0};                 ///< 停止回调次数
+            TestSupport::TemporaryDirectory             m_directory;   ///< 用例独占的临时目录
+            std::shared_ptr<PackageServerState>         m_serverState; ///< 服务端记录
+            std::unique_ptr<TestSupport::ServerHarness> m_server;      ///< 回环服务器
+            std::unique_ptr<AgentState>                 m_state;       ///< 真实状态库
+            AgentConfiguration                          m_configuration; ///< 执行器配置
+            std::shared_ptr<LaunchRecord>               m_launch;      ///< 注入的启动器记录
+            std::atomic<int>                            m_stopRequests{0}; ///< 停止回调次数
         };
 
         /**
@@ -441,31 +516,80 @@ namespace EdgePulse::Agent
             }
             return lines;
         }
+
+        /**
+         * @brief 在输出目录里找指定扩展名的归档
+         * @param output 输出目录
+         * @param extension 文件扩展名，如 .gz 或 .zip
+         * @return std::vector<std::filesystem::path> 归档列表
+         */
+        [[nodiscard]] std::vector<std::filesystem::path> findArchives(const std::filesystem::path &output, const std::string &extension)
+        {
+            std::vector<std::filesystem::path> archives;
+            std::error_code                    error;
+            for (const auto &entry: std::filesystem::directory_iterator(output, error))
+            {
+                if (!error && entry.is_regular_file() && entry.path().extension() == extension)
+                {
+                    archives.push_back(entry.path());
+                }
+            }
+            return archives;
+        }
+
+        /**
+         * @brief 取归档.zip 或 .tar.gz 的旁路文件路径
+         * @param archive 归档路径
+         * @param suffix 追加在完整归档名后的后缀，如 .sig 或 .json
+         * @return std::filesystem::path 旁路文件路径
+         */
+        [[nodiscard]] std::filesystem::path sidecarPath(const std::filesystem::path &archive, const std::string &suffix)
+        {
+            return std::filesystem::path{AsynGyanis::Platform::FileSystem::utf8FromPath(archive) + suffix};
+        }
+
+        /**
+         * @brief 列出 tar.gz 或 zip 的顶层条目
+         * @param archive 归档路径
+         * @return 成功返回条目列表；失败返回中文原因
+         */
+        [[nodiscard]] std::expected<std::vector<std::string>, std::string> archiveEntries(const std::filesystem::path &archive)
+        {
+            const auto listed = runProcess("tar", {"-tf", AsynGyanis::Platform::FileSystem::utf8FromPath(archive)}, std::chrono::seconds{60});
+            if (!listed.succeeded())
+            {
+                return std::unexpected("无法列出归档条目：" + listed.failure + listed.output);
+            }
+            return splitLines(listed.output);
+        }
     } // namespace
 
     TEST(AgentPackage, LaunchesVerifiedSignedPackageAndRequestsStop)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(4096, 'p');
-        PackageHarness   harness(archive);
-        const auto       key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform});
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        PackageHarness harness(archive->bytes);
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        const std::string signature = key->signDigest(archive->digest);
 
         std::error_code error;
         std::filesystem::create_directories(harness.healthMarkerPath().parent_path(), error);
         std::ofstream(harness.healthMarkerPath()) << "stale";
         ASSERT_TRUE(std::filesystem::exists(harness.healthMarkerPath()));
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+        // 命令里的 manifest 只是历史元数据；与归档不一致也不得影响升级
+        ConfigValue payload = packagePayload("2.0.0", archive->digest, signature);
+        payload["manifest"] = R"({"version":"0.0.1","platform":"plan9-x86_64"})";
+        const CommandResult result = harness.execute(payload.dump());
         ASSERT_TRUE(result.succeeded) << result.message;
 
         const auto parsed = AsynGyanis::Base::parseConfigValue(result.result);
         ASSERT_TRUE(parsed.has_value()) << result.result;
         EXPECT_EQ("2.0.0", parsed->value("version", std::string{}));
-        EXPECT_EQ(digest, parsed->value("sha256", std::string{}));
+        EXPECT_EQ(archive->digest, parsed->value("sha256", std::string{}));
         EXPECT_EQ("launched", parsed->value("update", std::string{}));
 
         const auto state = harness.updateState();
@@ -488,6 +612,7 @@ namespace EdgePulse::Agent
         ASSERT_EQ(1U, staged.size()) << "安装器还要消费暂存包，成功路径不得删除";
         const std::string stagedName = staged.front().filename().string();
         EXPECT_NE(std::string::npos, stagedName.find("2.0.0"));
+        EXPECT_EQ(archive->bytes, readTextFile(staged.front())) << "暂存包必须是校验过摘要的那份归档";
 
         const std::vector<std::string> arguments       = harness.launchArguments();
         const auto                     containsArgument = [&arguments](const std::string &expected)
@@ -523,34 +648,37 @@ namespace EdgePulse::Agent
 #endif
     }
 
-    TEST(AgentPackage, RejectsTamperedArchive)
+    TEST(AgentPackage, RejectsArchiveTamperedAfterSigning)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(2048, 't');
-        PackageHarness    harness(std::string(archive.size(), 'x'));
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform});
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+        PackageHarness harness(archive->bytes + "tampered-after-signing");
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        const std::string signature = key->signDigest(archive->digest);
+
+        const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, signature).dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("SHA-256")) << result.message;
         expectNoUpgradeLeftBehind(harness);
+        EXPECT_EQ(1, harness.downloads()) << "签名覆盖的是命令摘要，篡改只能在下载后按哈希拒绝";
     }
 
-    TEST(AgentPackage, RejectsInvalidManifestSignature)
+    TEST(AgentPackage, RejectsSignatureOverDifferentDigest)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 's');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest = manifestText("2.0.0", std::string{kAgentPlatform});
-        const std::string digest   = AsynGyanis::Core::Digest::sha256Hex(archive);
-        // 签名覆盖另一份 manifest，原文与签名不再匹配
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest + " "));
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+        PackageHarness harness(archive->bytes);
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        // 签名覆盖另一份摘要，与命令给出的归档摘要不匹配
+        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex("another-archive"));
+
+        const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, signature).dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("签名")) << result.message;
         expectNoUpgradeLeftBehind(harness);
@@ -559,94 +687,126 @@ namespace EdgePulse::Agent
 
     TEST(AgentPackage, RejectsUnknownKeyId)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'k');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform}, "missing-key");
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest, "missing-key").dump());
+        PackageHarness harness(archive->bytes);
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        const std::string signature = key->signDigest(archive->digest);
+
+        const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, signature, "missing-key").dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("签名")) << result.message;
         expectNoUpgradeLeftBehind(harness);
+        EXPECT_EQ(0, harness.downloads());
     }
 
-    TEST(AgentPackage, RejectsManifestVersionMismatch)
+    TEST(AgentPackage, RejectsEmptyTrustedKeysDirectory)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'v');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("1.9.0", std::string{kAgentPlatform});
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+        PackageHarness  harness(archive->bytes);
+        std::error_code error;
+        std::filesystem::create_directories(harness.trustedKeysDirectory(), error);
+        ASSERT_FALSE(error) << error.message();
+
+        const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, std::string(88, 'A')).dump());
         EXPECT_FALSE(result.succeeded);
-        EXPECT_NE(std::string::npos, result.message.find("版本")) << result.message;
+        EXPECT_NE(std::string::npos, result.message.find("公钥")) << result.message;
         expectNoUpgradeLeftBehind(harness);
-    }
-
-    TEST(AgentPackage, RejectsManifestPlatformMismatch)
-    {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'l');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", "plan9-x86_64");
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
-
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
-        EXPECT_FALSE(result.succeeded);
-        EXPECT_NE(std::string::npos, result.message.find("平台")) << result.message;
-        expectNoUpgradeLeftBehind(harness);
-    }
-
-    TEST(AgentPackage, RejectsManifestWithoutAgentBinary)
-    {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'b');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform}, "pkg-2026", "ed25519-sha256", "");
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
-
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
-        EXPECT_FALSE(result.succeeded);
-        EXPECT_NE(std::string::npos, result.message.find("edgepulse-agent")) << result.message;
-        expectNoUpgradeLeftBehind(harness);
+        EXPECT_EQ(0, harness.downloads());
     }
 
     TEST(AgentPackage, RejectsWrongAlgorithm)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'a');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform}, "pkg-2026", "rsa-sha256");
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest, "pkg-2026", "rsa-sha256").dump());
+        PackageHarness harness(archive->bytes);
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        const std::string signature = key->signDigest(archive->digest);
+
+        const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, signature, "pkg-2026", "rsa-sha256").dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("ed25519-sha256")) << result.message;
         expectNoUpgradeLeftBehind(harness);
+        EXPECT_EQ(0, harness.downloads());
+    }
+
+    TEST(AgentPackage, RejectsEmptySignatureOrSigningKeyId)
+    {
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
+
+        PackageHarness harness(archive->bytes);
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        const std::string signature = key->signDigest(archive->digest);
+
+        const CommandResult emptySignature = harness.execute(packagePayload("2.0.0", archive->digest, "").dump());
+        EXPECT_FALSE(emptySignature.succeeded);
+        EXPECT_NE(std::string::npos, emptySignature.message.find("signature")) << emptySignature.message;
+        expectNoUpgradeLeftBehind(harness);
+
+        const CommandResult emptyKeyId = harness.execute(packagePayload("2.0.0", archive->digest, signature, "").dump());
+        EXPECT_FALSE(emptyKeyId.succeeded);
+        EXPECT_NE(std::string::npos, emptyKeyId.message.find("signingKeyId")) << emptyKeyId.message;
+        expectNoUpgradeLeftBehind(harness);
+        EXPECT_EQ(0, harness.downloads());
+    }
+
+    TEST(AgentPackage, RejectsMissingOrEmptyVersion)
+    {
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
+
+        {
+            PackageHarness harness(archive->bytes);
+            const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+            ASSERT_TRUE(key.has_value()) << key.error();
+            const CommandResult result = harness.execute(packagePayload("", archive->digest, key->signDigest(archive->digest)).dump());
+            EXPECT_FALSE(result.succeeded);
+            EXPECT_NE(std::string::npos, result.message.find("version")) << result.message;
+            expectNoUpgradeLeftBehind(harness);
+            EXPECT_EQ(0, harness.downloads());
+        }
+        {
+            PackageHarness harness(archive->bytes);
+            const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+            ASSERT_TRUE(key.has_value()) << key.error();
+            const ConfigValue payload = ConfigValue::object({{"url", "/api/agent/update/download"},
+                                                            {"sha256", archive->digest},
+                                                            {"signature", key->signDigest(archive->digest)},
+                                                            {"signingKeyId", "pkg-2026"},
+                                                            {"algorithm", "ed25519-sha256"}});
+            const CommandResult result = harness.execute(payload.dump());
+            EXPECT_FALSE(result.succeeded);
+            EXPECT_NE(std::string::npos, result.message.find("version")) << result.message;
+            expectNoUpgradeLeftBehind(harness);
+            EXPECT_EQ(0, harness.downloads());
+        }
     }
 
     TEST(AgentPackage, RejectsNonHexSha256)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'h');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
-        ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform});
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", "not-a-sha256", signature, manifest).dump());
+        PackageHarness harness(archive->bytes);
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        const std::string signature = key->signDigest(archive->digest);
+
+        const CommandResult result = harness.execute(packagePayload("2.0.0", "not-a-sha256", signature).dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("sha256")) << result.message;
         expectNoUpgradeLeftBehind(harness);
@@ -655,19 +815,19 @@ namespace EdgePulse::Agent
 
     TEST(AgentPackage, DownloadHttpFailureLeavesNoUpgradeState)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(512, 'd');
-        const std::string digest  = AsynGyanis::Core::Digest::sha256Hex(archive);
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
 
         for (const int failingStatus: {404, 500})
         {
-            PackageHarness harness(archive);
+            PackageHarness harness(archive->bytes);
             harness.setDownloadStatus(failingStatus);
             const auto key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
             ASSERT_TRUE(key.has_value()) << key.error();
-            const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform});
-            const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+            const std::string signature = key->signDigest(archive->digest);
 
-            const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+            const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, signature).dump());
             EXPECT_FALSE(result.succeeded);
             EXPECT_NE(std::string::npos, result.message.find("HTTP " + std::to_string(failingStatus))) << result.message;
             expectNoUpgradeLeftBehind(harness);
@@ -677,21 +837,22 @@ namespace EdgePulse::Agent
 
     TEST(AgentPackage, LauncherFailureRevertsPendingState)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'f');
-        PackageHarness    harness(archive);
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
+
+        PackageHarness harness(archive->bytes);
         harness.setLauncherFailure();
         const auto key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
         ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform});
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        const std::string signature = key->signDigest(archive->digest);
 
         std::error_code error;
         std::filesystem::create_directories(harness.healthMarkerPath().parent_path(), error);
         std::ofstream(harness.healthMarkerPath()) << "stale";
         ASSERT_TRUE(std::filesystem::exists(harness.healthMarkerPath()));
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+        const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, signature).dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("安装器")) << result.message;
         expectNoUpgradeLeftBehind(harness, 1);
@@ -701,13 +862,14 @@ namespace EdgePulse::Agent
 
     TEST(AgentPackage, RejectsMissingInstallerBeforeWritingState)
     {
-        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'm');
-        PackageHarness    harness(archive);
-        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        TestSupport::TemporaryDirectory packageDirectory;
+        const auto                      archive = buildPackageArchive(packageDirectory.path(), "2.0.0");
+        ASSERT_TRUE(archive.has_value()) << archive.error();
+
+        PackageHarness harness(archive->bytes);
+        const auto     key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
         ASSERT_TRUE(key.has_value()) << key.error();
-        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform});
-        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
-        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+        const std::string signature = key->signDigest(archive->digest);
 
         std::error_code error;
         std::filesystem::create_directories(harness.healthMarkerPath().parent_path(), error);
@@ -715,7 +877,7 @@ namespace EdgePulse::Agent
         ASSERT_TRUE(std::filesystem::exists(harness.healthMarkerPath()));
         harness.removeInstaller();
 
-        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+        const CommandResult result = harness.execute(packagePayload("2.0.0", archive->digest, signature).dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("安装器")) << result.message;
         expectNoUpgradeLeftBehind(harness);
@@ -758,7 +920,7 @@ namespace EdgePulse::Agent
         EXPECT_EQ(record.version, updated->version) << "只改待上报结果不应动其它字段";
     }
 
-    TEST(AgentPackage, SignScriptProducesVerifiableSignature)
+    TEST(AgentPackage, SignScriptSignsArchiveDigestAndManifest)
     {
         if (!toolWorks("openssl", {"version"}, std::chrono::seconds{10}))
         {
@@ -786,32 +948,47 @@ namespace EdgePulse::Agent
                                    std::chrono::seconds{30});
         ASSERT_TRUE(exported.succeeded()) << exported.failure;
 
-        const std::string manifest = manifestText("2.0.0", std::string{kAgentPlatform});
-        const std::filesystem::path manifestPath = directory.write("manifest.json", manifest);
         const auto script = std::filesystem::path{EDGEPULSE_SOURCE_DIR} / "scripts" / "sign-agent-package.sh";
         ASSERT_TRUE(std::filesystem::exists(script)) << script;
 
-        const auto signedResult = runProcess(AsynGyanis::Platform::FileSystem::utf8FromPath(bashPath()),
-                                             {AsynGyanis::Platform::FileSystem::utf8FromPath(script), AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath),
-                                              AsynGyanis::Platform::FileSystem::utf8FromPath(manifestPath), "pkg-2026"},
-                                             std::chrono::seconds{30});
-        ASSERT_TRUE(signedResult.succeeded()) << signedResult.failure << signedResult.output;
+        // 通用输入：签归档文件的 SHA-256 摘要，写出 <文件>.sig
+        const std::string archiveBytes = "EDGEPULSE-AGENT-ARCHIVE-FOR-SIGNER";
+        const auto        archivePath  = directory.write("edgepulse-agent-2.0.0.tar.gz", archiveBytes);
+        const auto        signedArchive = runProcess(AsynGyanis::Platform::FileSystem::utf8FromPath(bashPath()),
+                                                     {AsynGyanis::Platform::FileSystem::utf8FromPath(script), AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath),
+                                                      AsynGyanis::Platform::FileSystem::utf8FromPath(archivePath), "pkg-2026"},
+                                                     std::chrono::seconds{30});
+        ASSERT_TRUE(signedArchive.succeeded()) << signedArchive.failure << signedArchive.output;
 
-        const std::filesystem::path signaturePath = manifestPath.parent_path() / "manifest.sig";
-        ASSERT_TRUE(std::filesystem::exists(signaturePath));
-        const std::string signature = readTextFile(signaturePath);
-        ASSERT_FALSE(signature.empty());
-
+        const std::filesystem::path archiveSignature = sidecarPath(archivePath, ".sig");
+        ASSERT_TRUE(std::filesystem::exists(archiveSignature)) << archiveSignature;
         const auto verifier = Firmware::FirmwareSignatureVerifier::loadFromDirectory(keyDir);
         ASSERT_TRUE(verifier.has_value()) << verifier.error();
-        const auto verified = verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(manifest), signature);
-        EXPECT_TRUE(verified.has_value()) << verified.error();
+        EXPECT_TRUE(verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(archiveBytes), readTextFile(archiveSignature)).has_value());
+        EXPECT_FALSE(verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(archiveBytes + "x"), readTextFile(archiveSignature)).has_value())
+                << "篡改归档后签名必须失败";
 
-        const std::string tampered = manifest + " ";
-        const auto        rejected = verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(tampered), signature);
-        EXPECT_FALSE(rejected.has_value()) << "篡改后的 manifest 必须验签失败";
+        // 已存在的签名默认不覆盖
+        const auto overwrite = runProcess(AsynGyanis::Platform::FileSystem::utf8FromPath(bashPath()),
+                                          {AsynGyanis::Platform::FileSystem::utf8FromPath(script), AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath),
+                                           AsynGyanis::Platform::FileSystem::utf8FromPath(archivePath), "pkg-2026"},
+                                          std::chrono::seconds{30});
+        EXPECT_FALSE(overwrite.succeeded()) << "已存在的签名文件不得被静默覆盖";
 
-        // key id 与 manifest 字段不一致时脚本必须拒绝
+        // manifest 行为保留：校验内嵌 key id 与算法，写出 manifest.sig
+        const ConfigValue manifestValue = ConfigValue::object(
+                {{"version", "2.0.0"}, {"platform", std::string{kAgentPlatform}}, {"signingKeyId", "pkg-2026"}, {"signatureAlgorithm", "ed25519-sha256"}});
+        const std::string manifest     = manifestValue.dump();
+        const auto        manifestPath = directory.write("manifest.json", manifest);
+        const auto        signedManifest = runProcess(AsynGyanis::Platform::FileSystem::utf8FromPath(bashPath()),
+                                                      {AsynGyanis::Platform::FileSystem::utf8FromPath(script), AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath),
+                                                       AsynGyanis::Platform::FileSystem::utf8FromPath(manifestPath), "pkg-2026"},
+                                                      std::chrono::seconds{30});
+        ASSERT_TRUE(signedManifest.succeeded()) << signedManifest.failure << signedManifest.output;
+        const std::filesystem::path manifestSignature = manifestPath.parent_path() / "manifest.sig";
+        ASSERT_TRUE(std::filesystem::exists(manifestSignature));
+        EXPECT_TRUE(verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(manifest), readTextFile(manifestSignature)).has_value());
+
         const auto mismatched = runProcess(AsynGyanis::Platform::FileSystem::utf8FromPath(bashPath()),
                                            {AsynGyanis::Platform::FileSystem::utf8FromPath(script), AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath),
                                             AsynGyanis::Platform::FileSystem::utf8FromPath(manifestPath), "another-key"},
@@ -819,7 +996,7 @@ namespace EdgePulse::Agent
         EXPECT_FALSE(mismatched.succeeded()) << "key id 与 manifest 不一致时必须拒绝签名";
     }
 
-    TEST(AgentPackage, PackageScriptSignsAndIncludesChecksums)
+    TEST(AgentPackage, PackageScriptSignsArchiveAndIncludesChecksums)
     {
         if (!toolWorks("openssl", {"version"}, std::chrono::seconds{10}))
         {
@@ -848,9 +1025,9 @@ namespace EdgePulse::Agent
                                    std::chrono::seconds{30});
         ASSERT_TRUE(exported.succeeded()) << exported.failure;
 
-        const auto script   = std::filesystem::path{EDGEPULSE_SOURCE_DIR} / "scripts" / "package-agent.sh";
-        const auto binary   = std::filesystem::path{EDGEPULSE_AGENT_TEST_HOOK_PATH};
-        const auto output   = directory.path() / "output";
+        const auto script = std::filesystem::path{EDGEPULSE_SOURCE_DIR} / "scripts" / "package-agent.sh";
+        const auto binary = std::filesystem::path{EDGEPULSE_AGENT_TEST_HOOK_PATH};
+        const auto output = directory.path() / "output";
         ASSERT_TRUE(std::filesystem::exists(script)) << script;
         ASSERT_TRUE(std::filesystem::exists(binary)) << binary;
 
@@ -861,17 +1038,45 @@ namespace EdgePulse::Agent
                                          std::chrono::seconds{120});
         ASSERT_TRUE(packaged.succeeded()) << packaged.failure << packaged.output;
 
-        std::vector<std::filesystem::path> archives;
-        for (const auto &entry: std::filesystem::directory_iterator(output))
-        {
-            if (entry.path().extension() == ".gz")
-            {
-                archives.push_back(entry.path());
-            }
-        }
+        const std::vector<std::filesystem::path> archives = findArchives(output, ".gz");
         ASSERT_EQ(1U, archives.size()) << "打包脚本应产出一个 tar.gz";
         const std::filesystem::path archive = archives.front();
         EXPECT_NE(std::string::npos, archive.filename().string().find("9.9.9"));
+
+        const std::string archiveBytes = readTextFile(archive);
+        const std::string archiveDigest = AsynGyanis::Core::Digest::sha256Hex(archiveBytes);
+        const auto        verifier      = Firmware::FirmwareSignatureVerifier::loadFromDirectory(keyDir);
+        ASSERT_TRUE(verifier.has_value()) << verifier.error();
+
+        const std::filesystem::path archiveSignature = sidecarPath(archive, ".sig");
+        const std::filesystem::path metadataPath     = sidecarPath(archive, ".json");
+        ASSERT_TRUE(std::filesystem::exists(archiveSignature)) << "签名包必须写出 <归档>.sig";
+        ASSERT_TRUE(std::filesystem::exists(metadataPath)) << "签名包必须写出 <归档>.json";
+        const std::string signature = readTextFile(archiveSignature);
+        EXPECT_TRUE(verifier->verify("pkg-2026", archiveDigest, signature).has_value()) << "签名必须覆盖归档本身的 SHA-256";
+        EXPECT_FALSE(verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(archiveBytes + "tampered"), signature).has_value());
+
+        const auto metadata = AsynGyanis::Base::parseConfigValue(readTextFile(metadataPath));
+        ASSERT_TRUE(metadata.has_value()) << readTextFile(metadataPath);
+        const std::string metadataPlatform = metadata->value("platform", std::string{});
+        EXPECT_EQ("9.9.9", metadata->value("version", std::string{}));
+        EXPECT_EQ(0U, metadataPlatform.rfind("linux-", 0)) << "bash 打包脚本面向 Linux 归档：" << metadataPlatform;
+        EXPECT_EQ(archiveDigest, metadata->value("sha256", std::string{}));
+        EXPECT_EQ(signature, metadata->value("signature", std::string{}));
+        EXPECT_EQ("pkg-2026", metadata->value("signingKeyId", std::string{}));
+        EXPECT_EQ("ed25519-sha256", metadata->value("algorithm", std::string{}));
+
+        const auto entries = archiveEntries(archive);
+        ASSERT_TRUE(entries.has_value()) << entries.error();
+        const bool hasManifestSignature = std::find(entries->begin(), entries->end(), "manifest.sig") != entries->end();
+        const bool hasChecksums         = std::find(entries->begin(), entries->end(), "checksums.sha256") != entries->end();
+        EXPECT_TRUE(hasManifestSignature) << "manifest.sig 必须在归档内";
+        EXPECT_TRUE(hasChecksums) << "checksums.sha256 必须在归档内";
+        for (const std::string &entry: *entries)
+        {
+            EXPECT_EQ(std::string::npos, entry.find(".tar.gz.sig")) << "归档签名旁路文件不得进入归档";
+            EXPECT_EQ(std::string::npos, entry.find(".tar.gz.json")) << "归档元数据旁路文件不得进入归档";
+        }
 
         const std::filesystem::path extract = directory.path() / "extract";
         std::filesystem::create_directories(extract, error);
@@ -884,8 +1089,8 @@ namespace EdgePulse::Agent
         const std::filesystem::path signaturePath = extract / "manifest.sig";
         const std::filesystem::path checksumsPath = extract / "checksums.sha256";
         ASSERT_TRUE(std::filesystem::exists(manifestPath));
-        ASSERT_TRUE(std::filesystem::exists(signaturePath)) << "签名包必须带 manifest.sig";
-        ASSERT_TRUE(std::filesystem::exists(checksumsPath)) << "签名包必须带 checksums.sha256";
+        ASSERT_TRUE(std::filesystem::exists(signaturePath)) << "包内必须有 manifest.sig";
+        ASSERT_TRUE(std::filesystem::exists(checksumsPath)) << "包内必须有 checksums.sha256";
 
         const std::string manifest = readTextFile(manifestPath);
         const auto        parsed   = AsynGyanis::Base::parseConfigValue(manifest);
@@ -902,11 +1107,8 @@ namespace EdgePulse::Agent
             }
         }
         EXPECT_TRUE(agentListed) << "manifest 必须列出 edgepulse-agent";
-
-        const auto verifier = Firmware::FirmwareSignatureVerifier::loadFromDirectory(keyDir);
-        ASSERT_TRUE(verifier.has_value()) << verifier.error();
-        const auto verified = verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(manifest), readTextFile(signaturePath));
-        EXPECT_TRUE(verified.has_value()) << verified.error();
+        EXPECT_TRUE(verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(manifest), readTextFile(signaturePath)).has_value())
+                << "包内 manifest.sig 是可选的纵深防御，必须能验证";
 
         std::size_t checkedFiles = 0;
         for (const std::string &line: splitLines(readTextFile(checksumsPath)))
@@ -922,5 +1124,106 @@ namespace EdgePulse::Agent
         }
         EXPECT_GT(checkedFiles, 0U);
         EXPECT_EQ(std::string::npos, readTextFile(checksumsPath).find("checksums.sha256")) << "校验文件不得把自身列进去";
+
+        // 没有私钥时不产出任何签名旁路，只用于本地或手工安装
+        const auto unsignedOutput = directory.path() / "unsigned";
+        const auto unsignedRun    = runProcess(AsynGyanis::Platform::FileSystem::utf8FromPath(bashPath()),
+                                            {AsynGyanis::Platform::FileSystem::utf8FromPath(script), "--version", "9.9.9", "--output",
+                                             AsynGyanis::Platform::FileSystem::utf8FromPath(unsignedOutput), "--binary",
+                                             AsynGyanis::Platform::FileSystem::utf8FromPath(binary)},
+                                            std::chrono::seconds{120});
+        ASSERT_TRUE(unsignedRun.succeeded()) << unsignedRun.failure << unsignedRun.output;
+        const std::vector<std::filesystem::path> unsignedArchives = findArchives(unsignedOutput, ".gz");
+        ASSERT_EQ(1U, unsignedArchives.size());
+        EXPECT_FALSE(std::filesystem::exists(sidecarPath(unsignedArchives.front(), ".sig")));
+        EXPECT_FALSE(std::filesystem::exists(sidecarPath(unsignedArchives.front(), ".json")));
     }
+
+#if defined(_WIN32)
+    TEST(AgentPackage, PowerShellPackageScriptSignsArchive)
+    {
+        if (!toolWorks("openssl", {"version"}, std::chrono::seconds{10}))
+        {
+            GTEST_SKIP() << "缺少 openssl，跳过 PowerShell 打包脚本冒烟";
+        }
+        if (!toolWorks("powershell.exe", {"-NoProfile", "-Command", "exit 0"}, std::chrono::seconds{20}))
+        {
+            GTEST_SKIP() << "缺少 PowerShell，跳过打包脚本冒烟";
+        }
+
+        TestSupport::TemporaryDirectory directory;
+        const std::filesystem::path     keyPath   = directory.path() / "signing-key.pem";
+        const std::filesystem::path     keyDir    = directory.path() / "keys";
+        const std::filesystem::path     publicKey = keyDir / "pkg-2026.pem";
+        std::error_code                 error;
+        std::filesystem::create_directories(keyDir, error);
+        ASSERT_FALSE(error) << error.message();
+
+        auto generated = runProcess("openssl", {"genpkey", "-algorithm", "ED25519", "-out", AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath)},
+                                    std::chrono::seconds{30});
+        ASSERT_TRUE(generated.succeeded()) << generated.failure;
+        auto exported = runProcess("openssl",
+                                   {"pkey", "-in", AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath), "-pubout", "-out",
+                                    AsynGyanis::Platform::FileSystem::utf8FromPath(publicKey)},
+                                   std::chrono::seconds{30});
+        ASSERT_TRUE(exported.succeeded()) << exported.failure;
+
+        const auto script = std::filesystem::path{EDGEPULSE_SOURCE_DIR} / "scripts" / "package-agent.ps1";
+        const auto binary = std::filesystem::path{EDGEPULSE_AGENT_TEST_HOOK_PATH};
+        const auto output = directory.path() / "output";
+        ASSERT_TRUE(std::filesystem::exists(script)) << script;
+
+        const auto packaged = runProcess("powershell.exe",
+                                         {"-NoProfile",
+                                          "-ExecutionPolicy",
+                                          "Bypass",
+                                          "-File",
+                                          AsynGyanis::Platform::FileSystem::utf8FromPath(script),
+                                          "-Version",
+                                          "9.9.8",
+                                          "-Output",
+                                          AsynGyanis::Platform::FileSystem::utf8FromPath(output),
+                                          "-Binary",
+                                          AsynGyanis::Platform::FileSystem::utf8FromPath(binary),
+                                          "-SigningKey",
+                                          AsynGyanis::Platform::FileSystem::utf8FromPath(keyPath),
+                                          "-SigningKeyId",
+                                          "pkg-2026"},
+                                         std::chrono::seconds{180});
+        ASSERT_TRUE(packaged.succeeded()) << packaged.failure << packaged.output;
+
+        const std::vector<std::filesystem::path> archives = findArchives(output, ".zip");
+        ASSERT_EQ(1U, archives.size()) << "PowerShell 打包脚本应产出一个 zip";
+        const std::filesystem::path archive     = archives.front();
+        const std::string           archiveBytes  = readTextFile(archive);
+        const std::string           archiveDigest = AsynGyanis::Core::Digest::sha256Hex(archiveBytes);
+        const auto                  verifier      = Firmware::FirmwareSignatureVerifier::loadFromDirectory(keyDir);
+        ASSERT_TRUE(verifier.has_value()) << verifier.error();
+
+        const std::filesystem::path archiveSignature = sidecarPath(archive, ".sig");
+        const std::filesystem::path metadataPath     = sidecarPath(archive, ".json");
+        ASSERT_TRUE(std::filesystem::exists(archiveSignature));
+        ASSERT_TRUE(std::filesystem::exists(metadataPath));
+        const std::string signature = readTextFile(archiveSignature);
+        EXPECT_TRUE(verifier->verify("pkg-2026", archiveDigest, signature).has_value());
+        EXPECT_FALSE(verifier->verify("pkg-2026", AsynGyanis::Core::Digest::sha256Hex(archiveBytes + "tampered"), signature).has_value());
+
+        const auto metadata = AsynGyanis::Base::parseConfigValue(readTextFile(metadataPath));
+        ASSERT_TRUE(metadata.has_value()) << readTextFile(metadataPath);
+        const std::string metadataPlatform = metadata->value("platform", std::string{});
+        EXPECT_EQ("9.9.8", metadata->value("version", std::string{}));
+        EXPECT_EQ(0U, metadataPlatform.rfind("windows-", 0)) << "PowerShell 打包脚本面向 Windows 归档：" << metadataPlatform;
+        EXPECT_EQ(archiveDigest, metadata->value("sha256", std::string{}));
+        EXPECT_EQ(signature, metadata->value("signature", std::string{}));
+        EXPECT_EQ("pkg-2026", metadata->value("signingKeyId", std::string{}));
+        EXPECT_EQ("ed25519-sha256", metadata->value("algorithm", std::string{}));
+
+        const auto entries = archiveEntries(archive);
+        ASSERT_TRUE(entries.has_value()) << entries.error();
+        const bool hasManifestSignature = std::find(entries->begin(), entries->end(), "manifest.sig") != entries->end();
+        const bool hasChecksums         = std::find(entries->begin(), entries->end(), "checksums.sha256") != entries->end();
+        EXPECT_TRUE(hasManifestSignature) << "zip 内必须有 manifest.sig";
+        EXPECT_TRUE(hasChecksums) << "zip 内必须有 checksums.sha256";
+    }
+#endif
 } // namespace EdgePulse::Agent
