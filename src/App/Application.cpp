@@ -878,19 +878,7 @@ namespace EdgePulse::App
         enrollmentDependencies.enrollments = m_enrollmentService.get();
         enrollmentDependencies.tenants     = m_tenantRepository.get();
         Device::registerEnrollmentRoutes(router, loop, enrollmentDependencies);
-        m_browserWebSocket->registerRoute(
-                router,
-                [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<std::optional<Web::BrowserSubscriptionScope>>
-                {
-                    const auto session = co_await auth->authenticate(loop, token);
-                    // 浏览器实时通道不接收 API 令牌；令牌只用于 HTTP 的有权限接口
-                    if (!session.has_value() || session->apiToken)
-                    {
-                        co_return std::nullopt;
-                    }
-                    co_return Web::BrowserSubscriptionScope{session->tenantId, session->platformAdmin};
-                },
-                m_configuration.allowedOrigins);
+        m_browserWebSocket->registerRoute(router, Web::browserTokenValidator(m_authService, loop), m_configuration.allowedOrigins);
         if (m_configuration.reverseProxyEnabled)
         {
             Web::ReverseProxyConfiguration proxyConfiguration;

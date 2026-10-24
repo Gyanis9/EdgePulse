@@ -1,5 +1,6 @@
 #include "Core/Http/WebSocketEndpoints.h"
 
+#include "Core/Auth/AuthService.h"
 #include "Core/Http/RealtimeTopics.h"
 
 #include "Base/Config/ConfigValue.h"
@@ -93,6 +94,21 @@ namespace EdgePulse::Web
     AsynGyanis::Net::WebSocketHub &BrowserWebSocket::hub() noexcept
     {
         return m_hub;
+    }
+
+    std::function<AsynGyanis::Core::Task<std::optional<BrowserSubscriptionScope>>(std::string_view)> browserTokenValidator(std::shared_ptr<Auth::AuthService> auth,
+                                                                                                                           AsynGyanis::Core::EventLoop       &loop)
+    {
+        return [auth = std::move(auth), &loop](const std::string_view token) -> AsynGyanis::Core::Task<std::optional<BrowserSubscriptionScope>>
+        {
+            const auto session = co_await auth->authenticate(loop, token);
+            // 浏览器实时通道不接收 API 令牌；令牌只用于 HTTP 的有权限接口
+            if (!session.has_value() || session->apiToken)
+            {
+                co_return std::nullopt;
+            }
+            co_return BrowserSubscriptionScope{session->tenantId, session->platformAdmin};
+        };
     }
 
     void BrowserWebSocket::registerRoute(AsynGyanis::Net::Router                                                                         &router,

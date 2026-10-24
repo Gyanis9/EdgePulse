@@ -1781,7 +1781,7 @@ namespace EdgePulse::System
                    [&loop, deps, authOf](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       const auto        session = co_await Web::requireSession(authOf(), loop, request, response, "", traceId);
+                       const auto        session = co_await Web::requireBrowserSession(authOf(), loop, request, response, traceId);
                        if (!session.has_value())
                        {
                            co_return;

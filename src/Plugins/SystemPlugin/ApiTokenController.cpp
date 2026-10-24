@@ -172,6 +172,8 @@ namespace EdgePulse::System
                             fail(response, created.error().httpStatus, created.error().message, traceId);
                             co_return;
                         }
+                        // 响应含一次性明文，禁止任何中间层缓存
+                        response.setHeader("Cache-Control", "no-store");
                         Common::writeSuccess(response, createdJson(*created), traceId);
                         co_return;
                     });
@@ -197,6 +199,8 @@ namespace EdgePulse::System
                             fail(response, rotated.error().httpStatus, rotated.error().message, traceId);
                             co_return;
                         }
+                        // 响应含一次性明文，禁止任何中间层缓存
+                        response.setHeader("Cache-Control", "no-store");
                         Common::writeSuccess(response, createdJson(*rotated), traceId);
                         co_return;
                     });

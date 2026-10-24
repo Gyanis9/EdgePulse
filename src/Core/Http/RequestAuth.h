@@ -68,6 +68,23 @@ namespace EdgePulse::Web
     }
 
     /**
+     * @brief 校验只要求登录的浏览器端点；API 令牌一律拒绝
+     * @param auth 认证服务
+     * @param loop 恢复协程用的事件循环
+     * @param request 当前请求
+     * @param response 当前响应
+     * @param traceId 请求标识
+     * @return std::optional<Auth::SessionRecord> 通过时返回浏览器会话；失败为空且响应已写好
+     * @note 令牌只能访问声明了具体权限的接口，无权限端点不接受令牌，避免绕过 scope 的旁路
+     */
+    [[nodiscard]] inline AsynGyanis::Core::Task<std::optional<Auth::SessionRecord>> requireBrowserSession(Auth::AuthService &auth, AsynGyanis::Core::EventLoop &loop,
+                                                                                                          AsynGyanis::Net::HttpRequest  &request,
+                                                                                                          AsynGyanis::Net::HttpResponse &response, const std::string_view traceId)
+    {
+        return requireSession(auth, loop, request, response, "", traceId);
+    }
+
+    /**
      * @brief 判断身份是否拥有权限码
      * @param session 身份
      * @param permission 权限码

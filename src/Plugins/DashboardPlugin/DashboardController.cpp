@@ -81,7 +81,7 @@ namespace EdgePulse::Dashboard
                    [&loop, deps](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       const auto        session = co_await Web::requireSession(*deps->auth, loop, request, response, "", traceId);
+                       const auto        session = co_await Web::requireBrowserSession(*deps->auth, loop, request, response, traceId);
                        if (!session.has_value())
                        {
                            co_return;

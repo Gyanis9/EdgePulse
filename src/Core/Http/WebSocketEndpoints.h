@@ -15,16 +15,27 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace AsynGyanis::Core
+{
+    class EventLoop;
+} // namespace AsynGyanis::Core
 
 namespace AsynGyanis::Net
 {
     class Router;
     class WebSocketPeer;
 } // namespace AsynGyanis::Net
+
+namespace EdgePulse::Auth
+{
+    class AuthService;
+} // namespace EdgePulse::Auth
 
 namespace EdgePulse::Web
 {
@@ -36,6 +47,16 @@ namespace EdgePulse::Web
         std::int64_t tenantId{0};          ///< 会话租户
         bool         platformAdmin{false}; ///< 平台管理员订阅跨租户主题
     };
+
+    /**
+     * @brief 生成浏览器实时通道的令牌校验器
+     * @param auth 认证服务
+     * @param loop 恢复协程用的事件循环
+     * @return 校验器；会话失效或身份来自 API 令牌时交回空
+     * @note 浏览器实时通道只接受浏览器会话，API 令牌不得升级
+     */
+    [[nodiscard]] std::function<AsynGyanis::Core::Task<std::optional<BrowserSubscriptionScope>>(std::string_view)> browserTokenValidator(std::shared_ptr<Auth::AuthService> auth,
+                                                                                                                                         AsynGyanis::Core::EventLoop       &loop);
 
     /**
      * @brief 浏览器 WebSocket 端点
