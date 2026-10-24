@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -117,6 +118,43 @@ namespace EdgePulse::App
             }
             return value;
         }
+
+        /**
+         * @brief 读取只接受十进制整数的配置
+         * @param configurationManager 已装载配置的读取入口
+         * @param key 配置键
+         * @param fallback 键缺失时的默认值
+         * @return 成功返回解析后的整数；失败返回中文原因，含键名与原始文本
+         * @note 引号标量在引擎里是字符串，getText 交回的是去掉引号后的文本，单靠文本解析会把 "45" 当成 45；
+         *       这里先要求底层值本身就是整数类型，再用 from_chars 走完整串，小数与带单位后缀的写法同样被拒绝
+         */
+        [[nodiscard]] std::expected<std::int64_t, ConfigurationError> readInteger(AsynGyanis::Base::ConfigManager &configurationManager, const std::string_view key,
+                                                                                  const std::int64_t fallback)
+        {
+            if (!configurationManager.has(key))
+            {
+                return fallback;
+            }
+            const std::optional<AsynGyanis::Base::ConfigValue> stored = configurationManager.getOptional(key);
+            const std::string                                   text   = trimCopy(configurationManager.getText(key));
+            const auto reject = [&]()
+            {
+                const std::string display = text.empty() ? "空值" : "“" + text + "”";
+                return std::unexpected(ConfigurationError{"配置项 " + std::string{key} + " 必须是十进制整数，不能加引号、写成小数或带单位，当前值不是整数：" + display});
+            };
+            if (!stored.has_value() || !stored->is_number_integer() || text.empty())
+            {
+                return reject();
+            }
+            std::int64_t value = 0;
+            // 指针没走完全部文本说明数字后面还跟着小数点、单位或别的字符
+            const auto [parsedEnd, parseError] = std::from_chars(text.data(), text.data() + text.size(), value);
+            if (parseError != std::errc{} || parsedEnd != text.data() + text.size())
+            {
+                return reject();
+            }
+            return value;
+        }
     } // namespace
 
     std::expected<ApplicationConfiguration, ConfigurationError> ApplicationConfiguration::load(const std::filesystem::path &configurationPath)
@@ -220,7 +258,12 @@ namespace EdgePulse::App
         }
         configuration.rateLimitBurstCapacity    = *burstCapacity;
         configuration.idleTimeoutMs             = configurationManager.getInt("server.limits.idle_timeout_ms", configuration.idleTimeoutMs);
-        configuration.h3IdleTimeoutSeconds      = configurationManager.getInt("server.quic.idle_timeout_seconds", configuration.h3IdleTimeoutSeconds);
+        const auto h3IdleTimeoutSeconds         = readInteger(configurationManager, "server.quic.idle_timeout_seconds", configuration.h3IdleTimeoutSeconds);
+        if (!h3IdleTimeoutSeconds)
+        {
+            return std::unexpected(h3IdleTimeoutSeconds.error());
+        }
+        configuration.h3IdleTimeoutSeconds      = *h3IdleTimeoutSeconds;
         configuration.readTimeoutMs             = configurationManager.getInt("server.limits.read_timeout_ms", configuration.readTimeoutMs);
         configuration.writeTimeoutMs            = configurationManager.getInt("server.limits.write_timeout_ms", configuration.writeTimeoutMs);
         configuration.maximumRequestBodyBytes   = configurationManager.getInt("server.parser_limits.maximum_body_size", configuration.maximumRequestBodyBytes);
@@ -349,7 +392,8 @@ namespace EdgePulse::App
         {
             return std::unexpected(ConfigurationError{"server.limits 下的超时毫秒数不能为负数；0 表示关闭该项保护"});
         }
-        // h3 空闲超时直接决定传输层何时收口，0 会让连接立即断开，超过一小时则是明显的误配
+        // QUIC 的空闲超时 0 表示不启用（RFC 9000 §18.2），连接可能一直挂着；拒绝 0 是为了保留有限上界，而不是防「立即断开」。
+        // 超过一小时对 h3 保活来说同样是明显的误配
         if (configuration.h3IdleTimeoutSeconds < 1 || configuration.h3IdleTimeoutSeconds > 3600)
         {
             return std::unexpected(ConfigurationError{"server.quic.idle_timeout_seconds 必须在 1 到 3600 之间"});

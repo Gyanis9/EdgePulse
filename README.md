@@ -176,7 +176,7 @@ bash scripts/firmware-signing-keygen.sh prod-2026
 bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 ```
 
-上传时带 `X-Firmware-Signature` 与 `X-Firmware-Key-Id`。启用门禁前，先重新上传历史未签名固件的签名版本。热重载只覆盖会话与验证码相关项；监听地址、端口与 `server.*` 限流参数需要重启生效。
+上传时带 `X-Firmware-Signature` 与 `X-Firmware-Key-Id`。启用门禁前，先重新上传历史未签名固件的签名版本。热重载只覆盖会话与验证码相关项；监听地址、端口与整个 `server` 段（含 `server.quic` 空闲超时）需要重启生效。
 
 ## 运行与端口
 

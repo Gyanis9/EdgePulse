@@ -101,7 +101,7 @@ namespace EdgePulse::App
         double                   requestsPerSecond{0.0};                              ///< 每个实例的全局请求速率上限，可为小数，0 表示关闭
         double                   rateLimitBurstCapacity{1.0};                         ///< 令牌桶容量，即允许的瞬时突发量
         std::int64_t             idleTimeoutMs{75000};                                ///< HTTP 连接空闲超时，0 表示关闭
-        std::int64_t             h3IdleTimeoutSeconds{30};                            ///< h3 传输层空闲超时，单位秒，必须为 1 到 3600
+        std::int64_t             h3IdleTimeoutSeconds{30};                            ///< h3 传输层空闲超时，单位秒，必须为 1 到 3600；0 在 QUIC 里表示不设超时，故拒绝
         std::int64_t             readTimeoutMs{60000};                                ///< HTTP 连接相邻两次读取的最长间隔，0 表示关闭
         std::int64_t             writeTimeoutMs{60000};                               ///< HTTP 响应产出时限，0 表示关闭
         std::int64_t             maximumRequestBodyBytes{16LL * 1024 * 1024};         ///< HTTP 解析器正文上限

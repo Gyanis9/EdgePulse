@@ -3,10 +3,12 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace
 {
@@ -122,7 +124,7 @@ TEST(ApplicationConfiguration, AcceptsH3IdleTimeout)
     EXPECT_EQ(45, configuration->h3IdleTimeoutSeconds);
 }
 
-// 钉住：0 会让连接立即收口，3601 超出允许上限，两者都在启动时被拒绝且报出键名
+// 钉住：0 在 QUIC 里表示不启用空闲超时（RFC 9000 §18.2），会失去有限上界；3601 超出允许上限。两者都在启动时被拒绝且报出键名
 TEST(ApplicationConfiguration, RejectsOutOfRangeH3IdleTimeout)
 {
     for (const std::string value: {"0", "3601"})
@@ -133,6 +135,38 @@ TEST(ApplicationConfiguration, RejectsOutOfRangeH3IdleTimeout)
         ASSERT_FALSE(configuration.has_value()) << "应拒绝 idle_timeout_seconds: " << value;
         EXPECT_NE(std::string::npos, configuration.error().message.find("server.quic.idle_timeout_seconds")) << value;
         EXPECT_NE(std::string::npos, configuration.error().message.find("1 到 3600")) << value;
+    }
+}
+
+// 钉住：引号、小数与带单位后缀的写法都不算整数，装载时直接报错，不静默回落到默认 30 秒
+TEST(ApplicationConfiguration, RejectsNonIntegerH3IdleTimeout)
+{
+    for (const std::string value: {"\"45\"", "45.0", "45s"})
+    {
+        const TemporaryConfigurationFile file("server:\n  quic:\n    idle_timeout_seconds: " + value + "\n");
+
+        const auto configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_FALSE(configuration.has_value()) << "应拒绝 idle_timeout_seconds: " << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("server.quic.idle_timeout_seconds")) << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("整数")) << value;
+    }
+}
+
+// 钉住：缺键时默认 30 秒，1 与 3600 是闭区间边界，都按原值暴露
+TEST(ApplicationConfiguration, H3IdleTimeoutDefaultsToThirtyAndAcceptsBounds)
+{
+    const TemporaryConfigurationFile absent("edgepulse:\n  threads: 1\n");
+    const auto defaultConfiguration = EdgePulse::App::ApplicationConfiguration::load(absent.path());
+    ASSERT_TRUE(defaultConfiguration.has_value()) << defaultConfiguration.error().message;
+    EXPECT_EQ(30, defaultConfiguration->h3IdleTimeoutSeconds);
+
+    for (const auto &[text, expected]: {std::pair{"1", std::int64_t{1}}, std::pair{"3600", std::int64_t{3600}}})
+    {
+        const TemporaryConfigurationFile file("server:\n  quic:\n    idle_timeout_seconds: " + std::string{text} + "\n");
+
+        const auto configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_TRUE(configuration.has_value()) << "应接受 idle_timeout_seconds: " << text << "：" << configuration.error().message;
+        EXPECT_EQ(expected, configuration->h3IdleTimeoutSeconds);
     }
 }
 
