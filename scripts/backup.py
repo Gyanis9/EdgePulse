@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""备份 EdgePulse 数据库、固件与非敏感配置，生成带 SHA-256 清单的归档。"""
+"""备份 EdgePulse 数据库、固件与非敏感配置，生成带 SHA-256 清单的归档。
+
+--mysql-container 只用于测试或受控运维环境：docker exec -e MYSQL_PWD=... 会把口令
+放进宿主机的 docker 进程参数，生产环境应使用宿主机客户端或受限执行环境。
+"""
 
 from __future__ import annotations
 
@@ -89,9 +93,36 @@ def warn_if_mysql_password_missing() -> None:
         print("提示：未设置 EDGEPULSE_DB_PASSWORD，MySQL 将按免密方式连接。", file=sys.stderr)
 
 
-def mysql_connection_arguments(args: argparse.Namespace) -> list[str]:
+def mysql_argv(
+    container: str | None,
+    password: str | None,
+    program: str,
+    arguments: list[str],
+    *,
+    stdin: bool = False,
+) -> list[str]:
+    """构造 MySQL 客户端命令；给容器时经 docker exec 在容器内执行。
+
+    容器模式下口令以 -e MYSQL_PWD=... 传给 docker，会出现在宿主机的进程参数里，
+    只适合测试或受控环境。stdin 决定是否给 docker exec 加 -i：不带 -i 时容器内
+    进程的 stdin 是空的，管道导入会读到 EOF 后静默成功而不写入任何数据。
+    """
+    if not container:
+        return [program, *arguments]
+    command = ["docker", "exec"]
+    if stdin:
+        command.append("-i")
+    if password is not None:
+        command.extend(["-e", f"MYSQL_PWD={password}"])
+    command.extend([container, program, *arguments])
+    return command
+
+
+def mysql_client_arguments(args: argparse.Namespace) -> list[str]:
+    """返回连接参数；容器模式交给容器内的 socket，不读宿主机的主机与端口。"""
+    if args.mysql_container:
+        return ["-u", args.db_user]
     return [
-        "mysql",
         "-h",
         args.db_host,
         "-P",
@@ -102,18 +133,25 @@ def mysql_connection_arguments(args: argparse.Namespace) -> list[str]:
 
 
 def query_mysql_version(args: argparse.Namespace) -> int:
-    command = mysql_connection_arguments(args) + [
-        "--batch",
-        "--skip-column-names",
-        "--database",
-        args.db_name,
-        "-e",
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-    ]
+    command = mysql_argv(
+        args.mysql_container,
+        os.environ.get("EDGEPULSE_DB_PASSWORD"),
+        "mysql",
+        mysql_client_arguments(args)
+        + [
+            "--batch",
+            "--skip-column-names",
+            "--database",
+            args.db_name,
+            "-e",
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        ],
+    )
     try:
         result = subprocess.run(command, capture_output=True, text=True, env=mysql_environment())
     except FileNotFoundError as exc:
-        raise BackupError("找不到 mysql 客户端，无法读取 MySQL 迁移版本") from exc
+        missing = "docker" if args.mysql_container else "mysql 客户端"
+        raise BackupError(f"找不到 {missing}，无法读取 MySQL 迁移版本") from exc
     if result.returncode != 0:
         detail = result.stderr.strip() or "mysql 返回非零退出码"
         raise BackupError(f"读取 MySQL 迁移版本失败：{detail}")
@@ -124,24 +162,24 @@ def query_mysql_version(args: argparse.Namespace) -> int:
 
 
 def dump_mysql(args: argparse.Namespace, target: Path) -> None:
-    command = [
+    command = mysql_argv(
+        args.mysql_container,
+        os.environ.get("EDGEPULSE_DB_PASSWORD"),
         "mysqldump",
-        "--single-transaction",
-        "--routines",
-        "--triggers",
-        "-h",
-        args.db_host,
-        "-P",
-        str(args.db_port),
-        "-u",
-        args.db_user,
-        args.db_name,
-    ]
+        [
+            "--single-transaction",
+            "--routines",
+            "--triggers",
+            *mysql_client_arguments(args),
+            args.db_name,
+        ],
+    )
     try:
         with target.open("wb") as output:
             result = subprocess.run(command, stdout=output, stderr=subprocess.PIPE, env=mysql_environment())
     except FileNotFoundError as exc:
-        raise BackupError("找不到 mysqldump，无法导出 MySQL") from exc
+        missing = "docker" if args.mysql_container else "mysqldump"
+        raise BackupError(f"找不到 {missing}，无法导出 MySQL") from exc
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise BackupError(f"mysqldump 执行失败：{detail or '退出码 ' + str(result.returncode)}")
@@ -338,10 +376,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="备份 EdgePulse 数据库、固件与非敏感配置。")
     parser.add_argument("--driver", choices=("sqlite", "mysql"), required=True, help="数据库驱动")
     parser.add_argument("--db-path", help="SQLite 数据库文件（sqlite 必填）")
-    parser.add_argument("--db-host", help="MySQL 主机（mysql 必填）")
+    parser.add_argument("--db-host", help="MySQL 主机（mysql 且未给 --mysql-container 时必填）")
     parser.add_argument("--db-port", type=int, default=3306, help="MySQL 端口，默认 3306")
     parser.add_argument("--db-name", help="MySQL 数据库名（mysql 必填）")
     parser.add_argument("--db-user", help="MySQL 用户名（mysql 必填）")
+    parser.add_argument(
+        "--mysql-container",
+        help="在指定 Docker 容器内执行 mysqldump 与版本查询，不依赖宿主机客户端",
+    )
     parser.add_argument("--firmware-dir", required=True, help="固件目录")
     parser.add_argument("--config-dir", help="配置目录；会跳过敏感文件")
     parser.add_argument("--output", required=True, help="输出 tar.gz 归档")
@@ -352,16 +394,16 @@ def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace
     if args.driver == "sqlite":
         if not args.db_path:
             parser.error("--driver sqlite 需要 --db-path")
+        if args.mysql_container:
+            parser.error("--mysql-container 只能与 --driver mysql 一起使用")
     else:
-        missing = [
-            flag
-            for flag, value in (
-                ("--db-host", args.db_host),
-                ("--db-name", args.db_name),
-                ("--db-user", args.db_user),
-            )
-            if not value
+        required = [
+            ("--db-name", args.db_name),
+            ("--db-user", args.db_user),
         ]
+        if not args.mysql_container:
+            required.insert(0, ("--db-host", args.db_host))
+        missing = [flag for flag, value in required if not value]
         if missing:
             parser.error("--driver mysql 需要 " + "、".join(missing))
     if args.db_port <= 0 or args.db_port > 65535:
