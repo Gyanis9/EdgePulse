@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 
 $scPath = Join-Path $env:SystemRoot 'System32\sc.exe'
 
-function Resolve-DirectoryPath {
+function Assert-SafeTargetPath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Option
@@ -26,32 +26,56 @@ function Resolve-DirectoryPath {
     if ($Path -match '[\r\n"]') {
         throw "$Option 不能包含换行或双引号：$Path"
     }
+    if ($Path -notmatch '^[A-Za-z]:\\') {
+        throw "$Option 只支持带盘符的本地绝对路径：$Path"
+    }
+
     $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
     $rootPath = [System.IO.Path]::GetPathRoot($fullPath).TrimEnd('\')
     if ([string]::IsNullOrWhiteSpace($fullPath) -or $fullPath -eq $rootPath) {
         throw "$Option 不能是盘符根目录：$Path"
     }
-    return $fullPath
-}
 
-function Assert-PurgeTarget {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $normalized = $Path.TrimEnd('\')
-    $protectedDirectories = @()
-    foreach ($candidate in @($env:SystemDrive, $env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:USERPROFILE)) {
-        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-            $protectedDirectories += $candidate.TrimEnd('\')
-        }
-    }
+    $protectedDirectories = @(
+        $env:SystemDrive,
+        $env:SystemRoot,
+        (Join-Path $env:SystemRoot 'System32'),
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)},
+        $env:ProgramData,
+        $env:USERPROFILE,
+        (Join-Path $env:SystemDrive 'Users')
+    )
     foreach ($protectedDirectory in $protectedDirectories) {
-        if ($normalized.Equals($protectedDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "拒绝删除系统目录：$Path"
+        if (-not [string]::IsNullOrWhiteSpace($protectedDirectory) -and $fullPath.Equals($protectedDirectory.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Option 不能指向系统目录：$fullPath"
         }
     }
-    $parent = Split-Path -Parent $normalized
-    if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $normalized) {
-        throw "拒绝删除过浅的目录：$Path"
+
+    foreach ($systemDirectory in @($env:SystemRoot, (Join-Path $env:SystemDrive 'Users'))) {
+        if ($fullPath.StartsWith($systemDirectory.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Option 不能位于系统目录之下：$fullPath"
+        }
     }
+
+    foreach ($sharedRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)) {
+        if (-not [string]::IsNullOrWhiteSpace($sharedRoot)) {
+            $normalizedRoot = $sharedRoot.TrimEnd('\')
+            if ($fullPath.StartsWith($normalizedRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $firstComponent = (($fullPath.Substring($normalizedRoot.Length + 1)) -split '\\')[0]
+                if (-not $firstComponent.Equals('EdgePulse', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "$Option 位于 $normalizedRoot 时第一级目录必须是 EdgePulse：$fullPath"
+                }
+            }
+        }
+    }
+
+    $relativePath = $fullPath.Substring($rootPath.Length).Trim('\')
+    $components = @($relativePath -split '\\' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($components.Count -lt 2) {
+        throw "$Option 至少要在盘符下有两级目录：$fullPath"
+    }
+    return $fullPath
 }
 
 function Invoke-Sc {
@@ -82,6 +106,22 @@ function Invoke-Sc {
     }
 }
 
+function Wait-ServiceThroughStartPending {
+    param(
+        [Parameter(Mandatory = $true)]$Service,
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [int]$TimeoutSeconds = 30
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($Service.Status -eq 'StartPending') {
+        if ((Get-Date) -gt $deadline) {
+            throw "服务 $ServiceName 在 $TimeoutSeconds 秒内仍未结束启动阶段：请手动确认服务状态后重新运行卸载脚本"
+        }
+        Start-Sleep -Milliseconds 250
+        $Service.Refresh()
+    }
+}
+
 function Assert-Administrator {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
@@ -96,13 +136,14 @@ function Uninstall-Agent {
     if ($ServiceName -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$') {
         throw "服务名不合法：$ServiceName（必须以字母或数字开头，只允许字母、数字、点、下划线与连字符，最长 256 个字符）"
     }
-    $InstallDir = Resolve-DirectoryPath -Path $InstallDir -Option '-InstallDir'
-    $DataDir = Resolve-DirectoryPath -Path $DataDir -Option '-DataDir'
+    $InstallDir = Assert-SafeTargetPath -Path $InstallDir -Option '-InstallDir'
+    $DataDir = Assert-SafeTargetPath -Path $DataDir -Option '-DataDir'
     if ($InstallDir -eq $DataDir -or $InstallDir.StartsWith($DataDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw '安装目录不能与数据目录相同，也不能位于数据目录之下：拒绝执行避免误删程序'
     }
     if ($Purge) {
-        Assert-PurgeTarget -Path $DataDir
+        # -Purge 递归删除的就是数据目录，按同一套规则再确认一次
+        $null = Assert-SafeTargetPath -Path $DataDir -Option '-Purge'
     }
     if (-not (Test-Path -LiteralPath $scPath -PathType Leaf)) {
         throw "找不到 sc.exe：$scPath"
@@ -112,6 +153,8 @@ function Uninstall-Agent {
     if ($null -eq $service) {
         Write-Host "服务不存在，跳过停止与删除：$ServiceName"
     } else {
+        # StartPending 阶段 SCM 尚未接受停止控制，先等它落定再决定停止
+        Wait-ServiceThroughStartPending -Service $service -ServiceName $ServiceName
         if ($service.Status -ne 'Stopped') {
             # StopPending 阶段再发停止控制会被 SCM 拒绝，直接等待其完成
             if ($service.Status -ne 'StopPending') {

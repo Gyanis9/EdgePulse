@@ -278,14 +278,14 @@ python scripts/check-docker-stack.py --build
 
 ## Agent
 
-`edgepulse-agent` 是边缘节点上的数据面进程，通过 9443 mTLS 接入控制面。Linux 发行包包含二进制、systemd 单元、安装/卸载脚本与配置模板，包内 `manifest.json` 逐文件记录 SHA-256。
+`edgepulse-agent` 是边缘节点上的数据面进程，通过 9443 mTLS 接入控制面。Linux 与 Windows 发行包都包含二进制、安装/卸载脚本与配置模板，Linux 包另含 systemd 单元，包内 `manifest.json` 逐文件记录 SHA-256。
 
-节点侧准备：
+Linux 节点侧准备：
 
 - 节点证书、私钥与 CA 默认读取 `/etc/edgepulse/agent.pem`、`/etc/edgepulse/agent-key.pem` 与 `/etc/edgepulse/ca.pem`，私钥权限保持 0600。开发环境可先运行 `bash scripts/dev-certs.sh`，再用 `bash scripts/gen-agent-certs.sh <节点名>` 为单个节点签发证书。
 - 在控制台签发一次性的 `enroll` 令牌（已有节点更换证书时签发 `rebind`），安装后写入 `/etc/edgepulse-agent/agent.env`，例如 `EDGEPULSE_AGENT_ENROLLMENT_TOKEN=...`。令牌只从环境变量读取，不写 YAML、不写日志。
 
-安装与卸载：
+安装与卸载（Linux）：
 
 ```bash
 # 在 Linux 上构建 Release 并打包；也可用 --binary 指定已有二进制
@@ -313,14 +313,15 @@ powershell -ExecutionPolicy Bypass -File scripts\package-agent.ps1 -Version 1.0.
 
 Expand-Archive build\agent-package\edgepulse-agent-1.0.0-windows-x86_64.zip -DestinationPath $env:TEMP\edgepulse-agent -Force
 # 以管理员身份打开 PowerShell 后安装；默认安装到 C:\Program Files\EdgePulse\Agent，
-# 数据放在 C:\ProgramData\EdgePulse\Agent，已有 agent.yaml 不会被覆盖，-NoStart 只安装不启动
-powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\install-agent.ps1
+# 数据放在 C:\ProgramData\EdgePulse\Agent，已有 agent.yaml 不会被覆盖。
+# 首次安装先加 -NoStart，准备好证书与配置后再 sc.exe start EdgePulseAgent
+powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\install-agent.ps1 -NoStart
 
 powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\uninstall-agent.ps1          # 保留数据
 powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\uninstall-agent.ps1 -Purge  # 一并删除数据
 ```
 
-服务名 `EdgePulseAgent`，账户 LocalSystem，安装器配置自动启动与 5 秒、10 秒、30 秒三次失败重启。注册令牌通过服务作用域环境变量提供（服务注册表项的 `Environment` 值）后重启服务；数据目录只授予 Administrators 与 SYSTEM，证书与私钥不要放到其他可写位置。运行日志在 `C:\ProgramData\EdgePulse\Agent\agent.log`，服务控制错误看 `Get-EventLog -LogName System -Source "Service Control Manager"`。当前 Windows 包未签名，安装器也不校验签名。完整步骤见 [docs/部署.md](docs/部署.md#14-agentwindows)。
+服务名默认 `EdgePulseAgent`，可用 `-ServiceName` 自定义，安装器会把同一个名字写进服务命令行的 `--service-name`；账户 LocalSystem，安装器配置自动启动与 5 秒、10 秒、30 秒三次失败重启。注册前把 `ca.pem`、`agent.pem` 与 `agent-key.pem` 放进 `C:\ProgramData\EdgePulse\Agent\certs`。注册令牌通过服务作用域环境变量提供（服务注册表项的 `Environment` 值）后重启服务；数据目录只授予 Administrators 与 SYSTEM，证书与私钥不要放到其他可写位置。运行日志在 `C:\ProgramData\EdgePulse\Agent\agent.log`，服务控制错误看 `Get-EventLog -LogName System -Source "Service Control Manager"`。当前 Windows 包未签名，安装器也不校验签名。完整步骤见 [docs/部署.md](docs/部署.md#14-agentwindows)。
 
 ## 项目结构
 
