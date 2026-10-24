@@ -218,6 +218,18 @@ SCHEMAS = {
         },
         "additionalProperties": False,
     },
+    "MfaCodeRequest": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {"code": {"type": "string", "description": "身份验证器生成的 6 位动态码"}},
+        "additionalProperties": False,
+    },
+    "OidcExchangeRequest": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {"code": {"type": "string", "description": "OIDC 回调签发的一次性 code"}},
+        "additionalProperties": False,
+    },
     "MfaRecoveryCodes": {
         "type": "object",
         "required": ["recoveryCodes"],

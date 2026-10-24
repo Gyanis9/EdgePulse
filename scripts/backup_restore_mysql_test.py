@@ -108,7 +108,7 @@ def main() -> int:
             password,
             database,
             "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY);"
-            "INSERT INTO schema_migrations VALUES (18);"
+            "INSERT INTO schema_migrations VALUES (19);"
             "CREATE TABLE probe (id BIGINT PRIMARY KEY, value VARCHAR(64));"
             "INSERT INTO probe VALUES (1, 'before');",
         )

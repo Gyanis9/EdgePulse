@@ -22,6 +22,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT = Path(__file__).resolve().parents[1]
+MIGRATIONS_DIR = ROOT / "migrations"
+MIGRATION_COUNT = len(list(MIGRATIONS_DIR.glob("V*__*.sql")))
 PROJECT = "edgepulse-acceptance"
 HTTP = "http://127.0.0.1:8080"
 OPS = "http://127.0.0.1:9100"
@@ -309,7 +311,7 @@ def main() -> int:
             "(SELECT COUNT(*) FROM sys_tenant));\"",
         )
         stored = mysql_check.stdout.strip().split("|")
-        report("MySQL 迁移、种子、角色部门、节点与租户落库", stored == ["14", "1", "2", "1", "1"], mysql_check.stdout.strip() or mysql_check.stderr.strip())
+        report("MySQL 迁移、种子、角色部门、节点与租户落库", stored == [str(MIGRATION_COUNT), "1", "2", "1", "1"], mysql_check.stdout.strip() or mysql_check.stderr.strip())
 
         redis_check = compose("exec", "-T", "redis", "redis-cli", "--no-auth-warning", "-a", values["EDGEPULSE_REDIS_PASSWORD"], "KEYS", "edgepulse:session:*")
         session_keys = [line for line in redis_check.stdout.splitlines() if line.strip()]

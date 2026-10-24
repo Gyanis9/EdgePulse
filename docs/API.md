@@ -32,7 +32,7 @@
 
 ### 1.1 两步验证
 
-启用 MFA 的账号在口令校验通过后不再直接拿到会话，登录响应变为 `{mfaRequired:true, challengeToken, expiresIn}`（`expiresIn` 为 300 秒），并带 `Cache-Control: no-store`；客户端用挑战令牌和动态码调用 `/api/auth/mfa/verify` 换取 `{token,expiresIn}`。OIDC 的 `/api/auth/oidc/exchange` 在需要第二步时返回同一形状，并附带 `returnPath`。挑战一次性消费、绑定发起口令登录的来源 IP，最多允许 5 次失败；失效、来源不符、次数用尽与验证码错误统一返回 401 和同一条文案。
+启用 MFA 的账号在口令校验通过后不再直接拿到会话，登录响应变为 `{mfaRequired:true, challengeToken, expiresIn}`（`expiresIn` 为 300 秒），并带 `Cache-Control: no-store`；客户端用挑战令牌和动态码调用 `/api/auth/mfa/verify` 换取 `{token,expiresIn}`。OIDC 的 `/api/auth/oidc/exchange` 在需要第二步时返回同一形状，并附带 `returnPath`。挑战一次性消费、绑定发起口令登录的来源 IP，单个挑战最多允许 5 次失败；失效、来源不符、次数用尽与验证码错误统一返回 401 和同一条文案。挑战失败同时计入按用户的 5 次/300 秒计数，到上限后正确口令也不再签发新挑战，登录返回 429。
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
@@ -42,11 +42,11 @@
 | POST | `/api/auth/mfa/disable` | 登录 | `{password,code}` → `data:null`；口令与未消费的动态码都要正确 |
 | POST | `/api/auth/mfa/verify` | 匿名 | `{challengeToken,code}` → `{token,expiresIn}`；动态码或恢复码均可 |
 | POST | `/api/auth/mfa/recovery-codes` | 登录 | `{code}` → `{recoveryCodes:[10 枚]}`；整组替换旧恢复码 |
-| POST | `/api/system/users/{id}/mfa/reset` | `system:user:edit` | 删除目标用户的两步验证记录与待启用缓存；越界目标与不存在都返回 404，未启用账号也返回成功 |
+| POST | `/api/system/users/{id}/mfa/reset` | `system:user:edit` | 删除目标用户的两步验证记录、待启用缓存与失败计数；越界目标与不存在都返回 404，未启用账号也返回成功 |
 
 - 恢复码格式为 `xxxx-xxxx`，大小写不敏感、每枚只能使用一次；使用 TOTP 登录或换发恢复码都会消费当前步号，刚用过的动态码需要等身份验证器刷新到下一步。
 - 上表的设置、启用、关闭、状态与换发恢复码只接受浏览器会话；API 令牌调用会返回 403。`/api/auth/mfa/verify` 与 OIDC 兑换属于匿名入口，不需要会话。
-- 启用、关闭与换发恢复码对错误动态码共用每用户 5 次/300 秒的失败上限，超过后返回 429；设置入口只复核口令，不调用该计数，口令复核失败也不计数。登录挑战的 5 次上限独立计算，恢复码登录尝试同样受挑战上限约束。
+- 启用、关闭、换发恢复码与设置口令复核共用每用户 5 次/300 秒的失败上限：错误动态码、错误设置口令与登录挑战失败都累计到同一计数，超过后返回 429；设置口令正确但尚未完成第二因素校验不会清零，只有完成一次挑战校验或成功的管理操作才清零。
 - `EDGEPULSE_MFA_KEY`（base64 编码的 32 字节）是秘密加密与恢复码 HMAC 的主密钥，非空但不是 32 字节时启动直接失败。未配置时设置、启用、关闭与换发恢复码返回 503；已启用账号的登录校验也会失败，管理员重置与状态查询仍可用，恢复访问需要恢复同一密钥或重置该账号。
 - 本版本是用户自助启用，没有租户级强制策略；管理员可在用户列表看到 `mfaEnabled` 并重置单个账号。
 
@@ -115,8 +115,8 @@ API 令牌用于自动化客户端，替代把浏览器会话令牌写进脚本�
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/api/system/api-tokens` | `system:token:list` | 按租户返回令牌摘要（含已吊销、已过期），不按 owner 或 scope 过滤，数组不分页 |
-| POST | `/api/system/api-tokens` | `system:token:add` | `{name,scopes,expiresInSeconds?}` → 摘要加一次性 `token` |
-| POST | `/api/system/api-tokens/{id}/rotate` | `system:token:edit` | 返回新 `token` 与 `previousValidUntil`，保留原到期时间 |
+| POST | `/api/system/api-tokens` | `system:token:add` | `{name,scopes,expiresInSeconds?}` → 摘要加一次性 `token`；只接受浏览器会话 |
+| POST | `/api/system/api-tokens/{id}/rotate` | `system:token:edit` | 返回新 `token` 与 `previousValidUntil`，保留原到期时间；只接受浏览器会话 |
 | DELETE | `/api/system/api-tokens/{id}` | `system:token:remove` | 只写 `revokedAt`，不物理删除；缺权限返回 403，标识不存在、跨租户、已吊销或超出令牌会话自身 scope 时返回 404 |
 
 创建示例：
@@ -161,7 +161,7 @@ curl -X DELETE http://127.0.0.1:8080/api/system/api-tokens/1900000000000001 \
 - 列表行只有 `id,name,prefix,scopes,expiresAt,lastUsedAt,revokedAt,createdAt`。创建与轮换响应带 `Cache-Control: no-store`。
 - 使用令牌时走与浏览器会话相同的 `Authorization: Bearer <token>`；每次请求重新读取 owner 与租户状态，并把令牌 `scopes` 与 owner 当前权限取交集。令牌吊销或过期、owner 或租户停用、权限被收回都会立即失效。
 - 令牌身份不是平台管理员（`platformAdmin=false`）。`/api/auth/me` 可用于自省；`/api/auth/routes`、`/api/auth/logout`、其他只要求登录的浏览器接口、浏览器 `/api/ws`、`PUT /api/auth/password` 以及无权限的 dashboard/字典/告警 SSE 等入口都会拒绝令牌身份。
-- 令牌会话可以为同一用户签发 scope 不宽于自身的子令牌，也能轮换/吊销本人且 scope 不宽于自身的令牌；列表始终按租户返回，不按 owner 或 scope 过滤；浏览器会话的轮换与吊销只需对应接口权限。轮换后旧明文在 `previousValidUntil`（当前时间加 1 小时）之前仍可用，新明文立即生效。
+- 令牌会话不能创建或轮换令牌：即使自身带 `system:token:add` 或 `system:token:edit`，创建与轮换也返回 403「请使用浏览器会话」。令牌会话仍可吊销本人且 scope 不宽于自身的令牌；列表始终按租户返回，不按 owner 或 scope 过滤；浏览器会话的创建、轮换与吊销只需对应接口权限。轮换后旧明文在 `previousValidUntil`（当前时间加 1 小时）之前仍可用，新明文立即生效。
 - 建议按最小权限拆分令牌，并在过期前轮换；怀疑泄露时直接吊销，相关行会保留供审计。
 
 ### 2.2 边缘反向代理
@@ -364,7 +364,7 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 
 ## 9. OpenAPI 契约
 
-`GET /api/openapi.json` 返回当前控制面的 OpenAPI 3.1 文档，响应头为 `content-type: application/json` 与 `cache-control: no-cache`。该接口匿名可读；生成物缺失、为空或不是以 `{` 开头的 JSON 对象时返回统一包络的 JSON 404，并带 `x-openapi-error: missing`，不会返回空 200。
+`GET /api/openapi.json` 返回当前控制面的 OpenAPI 3.1 文档，响应头为 `content-type: application/json` 与 `cache-control: no-cache`。该接口匿名可读；服务启动时解析一次契约文件，文件缺失、为空、JSON 语法不完整或缺少对象型 `paths` 与字符串 `openapi` 时返回统一包络的 JSON 404（`message` 为「OpenAPI 契约文件缺失或不可读」），并带 `x-openapi-error: missing`，不会返回空 200 或畸形文档。
 
 生产部署必须先执行 `scripts/build-web.sh`（或等价的前端构建），它会把 `frontend/public/openapi.json` 随前端产物复制进后端的 `web/`；只部署后端二进制时该接口会按缺失返回 404。服务启动时一次性读取 `web/openapi.json` 到内存，重建 `web/` 或替换契约文件后必须重启服务才会生效。
 

@@ -84,6 +84,17 @@ TEST(OpenApi, ServesGeneratedSpec)
     EXPECT_TRUE(paths["/api/auth/login"].contains("post"));
     ASSERT_TRUE(paths.contains("/api/auth/mfa/verify"));
     EXPECT_TRUE(paths["/api/auth/mfa/verify"].contains("post"));
+    ASSERT_TRUE(paths.contains("/api/auth/mfa/recovery-codes"));
+    const auto &recoveryBody = paths["/api/auth/mfa/recovery-codes"]["post"]["requestBody"]["content"]["application/json"]["schema"];
+    EXPECT_EQ("#/components/schemas/MfaCodeRequest", recoveryBody["$ref"].get<std::string>());
+    ASSERT_TRUE(paths.contains("/api/auth/oidc/exchange"));
+    const auto &exchangeBody = paths["/api/auth/oidc/exchange"]["post"]["requestBody"]["content"]["application/json"]["schema"];
+    EXPECT_EQ("#/components/schemas/OidcExchangeRequest", exchangeBody["$ref"].get<std::string>());
+    ASSERT_TRUE(paths.contains("/api/system/users/{id}/mfa/reset"));
+    const auto &resetOperation = paths["/api/system/users/{id}/mfa/reset"]["post"];
+    EXPECT_NE(std::string::npos, resetOperation["summary"].get<std::string>().find("重置"));
+    EXPECT_NE(std::string::npos, resetOperation["description"].get<std::string>().find("system:user:edit"));
+    EXPECT_EQ("#/components/schemas/Envelope", resetOperation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].get<std::string>());
     ASSERT_TRUE(paths.contains("/api/system/api-tokens"));
     EXPECT_TRUE(paths["/api/system/api-tokens"].contains("get"));
     ASSERT_TRUE(paths.contains("/api/telemetry/latest"));
@@ -128,6 +139,18 @@ TEST(OpenApi, ServesGeneratedSpec)
         }
     }
 
+    // 请求体 schema 只声明 code，避免调用方误以为可以复用 password 或 challengeToken
+    const auto &schemas = (*json)["components"]["schemas"];
+    for (const std::string_view name: {"MfaCodeRequest", "OidcExchangeRequest"})
+    {
+        ASSERT_TRUE(schemas.contains(std::string{name})) << name;
+        const auto &schema = schemas[std::string{name}];
+        ASSERT_TRUE(schema["required"].is_array()) << name;
+        ASSERT_EQ(1U, schema["required"].size()) << name;
+        EXPECT_EQ("code", schema["required"][0].get<std::string>()) << name;
+        EXPECT_TRUE(schema["properties"].contains("code")) << name;
+    }
+
     // CSV 导出不是 JSON 包络：契约里必须是 text/csv 的 200
     const std::array<std::string_view, 9> exportPaths = {
             "/api/system/users/export",      "/api/system/roles/export",   "/api/system/menus/export",      "/api/system/depts/export",       "/api/system/posts/export",
@@ -159,17 +182,20 @@ TEST(OpenApi, ServesGeneratedSpec)
     }
 }
 
-// 钉住：缺失、空文件与不是 JSON 对象的生成物都按缺失处理，且与 SPA 兜底的 404 可区分
+// 钉住：缺失、空文件、不是 JSON、截断或不含契约骨架的生成物都按缺失处理，且与 SPA 兜底的 404 可区分
 TEST(OpenApi, MissingSpecReturnsJson404)
 {
     const std::filesystem::path root = makeTempRoot();
-    for (const std::string_view name: {"absent", "empty", "blank", "invalid"})
+    for (const std::string_view name: {"absent", "empty", "blank", "invalid", "truncated", "scalar", "wrong-shape"})
     {
         std::filesystem::create_directories(root / name);
     }
     writeSpec(root / "empty", "");
     writeSpec(root / "blank", " \n\t\r\n");
     writeSpec(root / "invalid", "not a json document");
+    writeSpec(root / "truncated", R"({"openapi":"3.1.0","paths":{"})");
+    writeSpec(root / "scalar", "42");
+    writeSpec(root / "wrong-shape", R"({"openapi":3,"paths":[]})");
 
     const auto expectMissing = [](const std::filesystem::path &webRoot)
     {
@@ -182,7 +208,7 @@ TEST(OpenApi, MissingSpecReturnsJson404)
         const auto json = result.json();
         ASSERT_TRUE(json.has_value()) << result.body;
         EXPECT_EQ(404, (*json)["code"].get<int>());
-        EXPECT_EQ("openapi spec not found", (*json)["message"].get<std::string>());
+        EXPECT_EQ("OpenAPI 契约文件缺失或不可读", (*json)["message"].get<std::string>());
         EXPECT_TRUE((*json)["data"].is_null());
         EXPECT_FALSE((*json)["traceId"].get<std::string>().empty());
     };
@@ -191,6 +217,9 @@ TEST(OpenApi, MissingSpecReturnsJson404)
     expectMissing(root / "empty");
     expectMissing(root / "blank");
     expectMissing(root / "invalid");
+    expectMissing(root / "truncated");
+    expectMissing(root / "scalar");
+    expectMissing(root / "wrong-shape");
 
     std::error_code error;
     std::filesystem::remove_all(root, error);

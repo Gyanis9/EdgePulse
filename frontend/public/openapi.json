@@ -792,7 +792,18 @@
             "bearerAuth": []
           }
         ],
+        "description": "整组替换现有恢复码，旧恢复码立即失效；需要当前身份未消费过的 6 位动态码。",
         "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaCodeRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "成功",
@@ -1015,7 +1026,18 @@
         ],
         "summary": "用一次性 oidcCode 换取会话令牌",
         "security": [],
+        "description": "code 来自 OIDC 回调重定向参数，只能兑换一次；需要第二步验证时返回挑战形状。",
         "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OidcExchangeRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "成功",
@@ -5483,12 +5505,13 @@
         "tags": [
           "system"
         ],
-        "summary": "system POST /api/system/users/{id}/mfa/reset",
+        "summary": "重置目标用户的两步验证",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "description": "删除目标用户的两步验证记录、待启用缓存与失败计数，需要 system:user:edit；跨租户目标与不存在的用户都返回 404，未启用账号也返回成功。",
         "parameters": [
           {
             "name": "id",
@@ -5979,6 +6002,32 @@
           "code": {
             "type": "string",
             "description": "动态码或恢复码"
+          }
+        },
+        "additionalProperties": false
+      },
+      "MfaCodeRequest": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "身份验证器生成的 6 位动态码"
+          }
+        },
+        "additionalProperties": false
+      },
+      "OidcExchangeRequest": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "OIDC 回调签发的一次性 code"
           }
         },
         "additionalProperties": false

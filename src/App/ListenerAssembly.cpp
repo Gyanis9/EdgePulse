@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -23,23 +24,24 @@ namespace EdgePulse::App
     {
         constexpr std::string_view kOpenApiErrorHeader    = "x-openapi-error";
         constexpr std::string_view kOpenApiMissingValue   = "missing";
-        constexpr std::string_view kOpenApiMissingMessage = "openapi spec not found";
+        constexpr std::string_view kOpenApiMissingMessage = "OpenAPI 契约文件缺失或不可读";
 
         /**
-         * @brief 判断读入的生成物是否像一份 JSON 对象
+         * @brief 判断读入的生成物是否是一份完整的 OpenAPI JSON 对象
          * @param content 文件内容
-         * @return 跳过 UTF-8 BOM 与空白后首字符是 { 时为 true
+         * @return 语法完整、顶层是对象且含字符串 openapi 与对象 paths 时为 true
+         * @note 只检查契约骨架，不替代规范校验；被截断或改坏的生成物按缺失处理，避免把畸形内容当 200 发出去
          */
-        [[nodiscard]] bool looksLikeJsonObject(const std::string &content)
+        [[nodiscard]] bool isCompleteOpenApiDocument(const std::string &content)
         {
-            std::string_view           view{content};
-            constexpr std::string_view utf8Bom{"\xEF\xBB\xBF"};
-            if (view.starts_with(utf8Bom))
+            const std::optional<AsynGyanis::Base::ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(content);
+            if (!parsed.has_value() || !parsed->is_object())
             {
-                view.remove_prefix(utf8Bom.size());
+                return false;
             }
-            const std::size_t first = view.find_first_not_of(" \t\r\n");
-            return first != std::string_view::npos && view[first] == '{';
+            const auto openapi = parsed->find("openapi");
+            const auto paths   = parsed->find("paths");
+            return openapi != parsed->end() && openapi->is_string() && paths != parsed->end() && paths->is_object();
         }
     } // namespace
 
@@ -64,8 +66,8 @@ namespace EdgePulse::App
             std::ostringstream buffer;
             buffer << stream.rdbuf();
             const std::string content = buffer.str();
-            // 空文件或被截断成非对象的生成物按缺失处理，避免把畸形内容当 200 发出去
-            if (looksLikeJsonObject(content))
+            // 空文件、被截断或语法不完整的生成物按缺失处理；服务启动时解析一次，运行期只发原始字节
+            if (isCompleteOpenApiDocument(content))
             {
                 document = std::make_shared<const std::string>(content);
             }

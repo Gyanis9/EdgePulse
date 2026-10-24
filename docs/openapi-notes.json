@@ -95,6 +95,8 @@
     "/api/auth/mfa/recovery-codes": {
       "post": {
         "summary": "重新生成恢复码",
+        "description": "整组替换现有恢复码，旧恢复码立即失效；需要当前身份未消费过的 6 位动态码。",
+        "requestSchema": "MfaCodeRequest",
         "responseSchema": "MfaRecoveryCodes"
       }
     },
@@ -131,6 +133,8 @@
     "/api/auth/oidc/exchange": {
       "post": {
         "summary": "用一次性 oidcCode 换取会话令牌",
+        "description": "code 来自 OIDC 回调重定向参数，只能兑换一次；需要第二步验证时返回挑战形状。",
+        "requestSchema": "OidcExchangeRequest",
         "responseSchema": "Envelope",
         "security": []
       }
@@ -480,6 +484,18 @@
       "get": {
         "summary": "导出用户为 CSV",
         "responseContentType": "text/csv"
+      }
+    },
+    "/api/system/users/{id}/mfa/reset": {
+      "post": {
+        "summary": "重置目标用户的两步验证",
+        "description": "删除目标用户的两步验证记录、待启用缓存与失败计数，需要 system:user:edit；跨租户目标与不存在的用户都返回 404，未启用账号也返回成功。",
+        "responseSchema": "Envelope",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/api/telemetry/latest": {
