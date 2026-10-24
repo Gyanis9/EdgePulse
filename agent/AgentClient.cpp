@@ -1,5 +1,7 @@
 #include "AgentClient.h"
 
+#include "TelemetryCollector.h"
+
 #include "Base/Config/ConfigValue.h"
 
 #include "Core/Tls/TlsPolicy.h"
@@ -185,6 +187,7 @@ namespace EdgePulse::Agent
         }
         m_registerUrl  = m_baseUrl + "/api/agent/register";
         m_heartbeatUrl = m_baseUrl + "/api/agent/heartbeat";
+        m_telemetryUrl = m_baseUrl + "/api/agent/telemetry";
         m_commandsUrl  = m_baseUrl + "/api/agent/commands";
         m_agentNodesUrl = m_baseUrl + "/api/agent/nodes";
         m_firmwareUrl   = m_baseUrl + "/api/agent/firmware";
@@ -440,6 +443,57 @@ namespace EdgePulse::Agent
         const std::string           failure     = httpFailure("上报命令结果", httpStatus, response->body);
         const ResultPostDisposition disposition = isResultRetryableStatus(httpStatus) ? ResultPostDisposition::Retryable : ResultPostDisposition::Terminal;
         co_return ResultPostOutcome{disposition, httpStatus, failure};
+    }
+
+    AsynGyanis::Core::Task<std::expected<void, TelemetryFailure>> AgentClient::sendTelemetry(const std::int64_t nodeId,
+                                                                                              const AsynGyanis::Base::ConfigValue &samples)
+    {
+        if (!m_initializationError.empty() || m_client == nullptr)
+        {
+            co_return std::unexpected(TelemetryFailure{m_initializationError, true, 0});
+        }
+        if (nodeId <= 0)
+        {
+            co_return std::unexpected(TelemetryFailure{"节点标识无效，无法上报遥测", false, 0});
+        }
+        if (!samples.is_array() || samples.empty() || samples.size() > kTelemetryBatchLimit)
+        {
+            co_return std::unexpected(TelemetryFailure{"遥测样本必须是 1 到 " + std::to_string(kTelemetryBatchLimit) + " 条的 JSON 数组", false, 0});
+        }
+
+        const AsynGyanis::Base::ConfigValue requestBody = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"samples", samples}});
+        // HttpClientRequest::body 是 string_view：序列化结果必须落在协程帧里的具名局部量
+        const auto serialized = AsynGyanis::Base::serializeConfigValue(requestBody);
+        if (!serialized.has_value())
+        {
+            co_return std::unexpected(TelemetryFailure{"遥测请求正文无法序列化为 JSON", false, 0});
+        }
+        const std::string bodyText = *serialized;
+
+        AsynGyanis::Net::HttpClientRequest request;
+        request.method      = "POST";
+        request.body        = bodyText;
+        request.contentType = "application/json";
+
+        std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
+        try
+        {
+            response = co_await m_client->send(m_telemetryUrl, request, m_requestTimeout);
+        } catch (const std::exception &failure)
+        {
+            co_return std::unexpected(TelemetryFailure{"遥测上报请求异常：" + std::string{failure.what()}, true, 0});
+        }
+        if (response == nullptr)
+        {
+            co_return std::unexpected(TelemetryFailure{"遥测上报请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志", true, 0});
+        }
+        if (response->statusCode == 200)
+        {
+            co_return std::expected<void, TelemetryFailure>{};
+        }
+        const int  httpStatus = response->statusCode;
+        const bool retryable  = isResultRetryableStatus(httpStatus);
+        co_return std::unexpected(TelemetryFailure{httpFailure("遥测上报", httpStatus, response->body), retryable, httpStatus});
     }
 
     AsynGyanis::Core::Task<std::expected<AgentConfigSnapshot, std::string>> AgentClient::fetchConfig(const std::int64_t nodeId)

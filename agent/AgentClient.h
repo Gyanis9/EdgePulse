@@ -87,6 +87,16 @@ namespace EdgePulse::Agent
     };
 
     /**
+     * @brief 一次遥测上报的失败，带重试分类
+     */
+    struct TelemetryFailure
+    {
+        std::string message;          ///< 中文原因
+        bool        retryable{false}; ///< 传输失败、408、425、429 与 5xx 为 true
+        int         httpStatus{0};    ///< HTTP 状态码；0 表示没有拿到响应
+    };
+
+    /**
      * @brief 服务端当前下发的配置
      */
     struct AgentConfigSnapshot
@@ -155,6 +165,15 @@ namespace EdgePulse::Agent
                                                                       std::string_view message);
 
         /**
+         * @brief 上报一批遥测样本
+         * @param nodeId 节点标识
+         * @param samples 样本对象数组，1 到 500 条，每项形如 {metric,value,unit,collectedAt}
+         * @return 只有 HTTP 200 表示服务端已接受；失败带中文原因与重试分类
+         * @note 传输失败与 408、425、429、5xx 可重试；其余状态重试同一批不会改变结论
+         */
+        AsynGyanis::Core::Task<std::expected<void, TelemetryFailure>> sendTelemetry(std::int64_t nodeId, const AsynGyanis::Base::ConfigValue &samples);
+
+        /**
          * @brief 拉取服务端当前下发的配置
          * @param nodeId 节点 ID
          * @return 成功返回版本、正文与摘要；失败返回中文原因
@@ -206,6 +225,7 @@ namespace EdgePulse::Agent
         std::string                                  m_baseUrl;             ///< 去掉结尾斜杠的服务端基地址
         std::string                                  m_registerUrl;         ///< 注册接口的绝对地址
         std::string                                  m_heartbeatUrl;        ///< 心跳接口的绝对地址
+        std::string                                  m_telemetryUrl;        ///< 遥测接口的绝对地址
         std::string                                  m_commandsUrl;         ///< 命令接口的绝对地址前缀
         std::string                                  m_agentNodesUrl;       ///< Agent 节点接口的绝对地址前缀
         std::string                                  m_firmwareUrl;         ///< 固件任务接口的绝对地址前缀

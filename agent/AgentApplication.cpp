@@ -10,6 +10,8 @@
 #include "Executors/DiagnosticsExecutor.h"
 #include "Executors/FirmwareExecutor.h"
 #include "Executors/RestartExecutor.h"
+#include "Executors/TelemetryPublisher.h"
+#include "TelemetryCollector.h"
 
 #include "Platform/Platform.h"
 
@@ -20,6 +22,7 @@
 #include "Base/Log/Sinks/RollingFileSink.h"
 #include "Base/Runtime/Environment.h"
 
+#include "Core/Coroutine/AsyncExecutor.h"
 #include "Core/Coroutine/Task.h"
 #include "Core/EventLoop/EventLoop.h"
 #include "Core/EventLoop/Timer.h"
@@ -378,6 +381,59 @@ namespace EdgePulse::Agent
                 co_await timer.waitFor(std::chrono::seconds{intervalSeconds > 0 ? intervalSeconds : 15});
             }
         }
+
+        /**
+         * @brief 按间隔补报离线遥测并采集新一轮样本
+         * @param loop 事件循环
+         * @param collector 采集器，采集动作投到阻塞执行器上执行
+         * @param publisher 遥测上报器
+         * @param nodeId 节点标识
+         * @param intervalSeconds 采集间隔，单位秒
+         * @param stopRequested 停止标记
+         * @return 协程任务
+         * @note 每轮先补报既有队列，再等待间隔后采集并直报；任何一次失败都不结束协程，也不阻塞心跳与命令
+         */
+        AsynGyanis::Core::Task<> runTelemetry(AsynGyanis::Core::EventLoop &loop, std::shared_ptr<TelemetryCollector> collector, TelemetryPublisher &publisher,
+                                              const std::int64_t nodeId, const int intervalSeconds, const std::atomic<bool> &stopRequested)
+        {
+            for (;;)
+            {
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return;
+                }
+                co_await publisher.flush(nodeId);
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return;
+                }
+
+                AsynGyanis::Core::Timer timer(loop);
+                co_await timer.waitFor(std::chrono::seconds{intervalSeconds > 0 ? intervalSeconds : 30});
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return;
+                }
+
+                std::vector<TelemetrySample> samples;
+                try
+                {
+                    samples = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::vector<TelemetrySample>>(loop, [collector] { return collector->collect(); });
+                } catch (const std::exception &failure)
+                {
+                    LOG_WARN_FMT("遥测采集任务提交失败，本轮跳过：{}", failure.what());
+                    continue;
+                } catch (...)
+                {
+                    LOG_WARN("遥测采集任务提交失败：未知异常，本轮跳过");
+                    continue;
+                }
+                if (!samples.empty())
+                {
+                    co_await publisher.publish(nodeId, samples);
+                }
+            }
+        }
     } // namespace
 
     AgentApplication::AgentApplication(AgentConfiguration configuration, const bool consoleMode) : m_configuration(std::move(configuration)), m_consoleMode(consoleMode)
@@ -412,6 +468,7 @@ namespace EdgePulse::Agent
 
             installLogging(m_configuration);
             LOG_INFO_FMT("Agent 已启动，节点名 {}", m_configuration.name);
+            auto telemetryCollector = std::make_shared<TelemetryCollector>(m_configuration.telemetryDiskPath);
 
             const auto identity = AgentIdentity::load(m_configuration);
             if (!identity.has_value())
@@ -459,13 +516,14 @@ namespace EdgePulse::Agent
             std::vector<std::shared_ptr<CommandExecutor>> executors;
             executors.push_back(std::make_shared<ConfigExecutor>(client, m_configuration, *nodeId));
             executors.push_back(std::make_shared<FirmwareExecutor>(client, *state, m_configuration, *nodeId));
-            // 指标采集由后续的遥测任务接入；当前没有来源时诊断按空数组降级
-            executors.push_back(std::make_shared<DiagnosticsExecutor>(*state, m_configuration, agentVersion, DiagnosticsExecutor::MetricsProvider{}));
+            // 诊断指标由遥测采集器提供，提供者本身在诊断工作线程上执行
+            executors.push_back(std::make_shared<DiagnosticsExecutor>(*state, m_configuration, agentVersion, [telemetryCollector] { return telemetryCollector->metricsJson(); }));
             // 服务托管接入后，回调必须在命令结果入队并上报完成之后再重启进程，否则结果会随进程退出丢失；
             // 当前没有可用的重启动作，执行器按失败返回，避免向服务端谎报已经重启
             executors.push_back(std::make_shared<RestartExecutor>(RestartExecutor::RestartCallback{}));
-            CommandDispatcher           dispatcher(client, *state, std::move(executors));
-            AgentWebSocket              webSocket(loop, m_configuration);
+            CommandDispatcher  dispatcher(client, *state, std::move(executors));
+            AgentWebSocket     webSocket(loop, m_configuration);
+            TelemetryPublisher telemetryPublisher(client, *state);
 
             RuntimeFlags flags;
             flags.heartbeatIntervalSeconds = m_configuration.heartbeatIntervalSeconds;
@@ -489,6 +547,7 @@ namespace EdgePulse::Agent
                 LOG_INFO("配置已关闭 WebSocket，命令通道立即使用轮询");
             }
             frames.push_back(runPolling(loop, dispatcher, m_configuration.commandPollIntervalSeconds, flags, m_stopRequested));
+            frames.push_back(runTelemetry(loop, telemetryCollector, telemetryPublisher, *nodeId, m_configuration.telemetryIntervalSeconds, m_stopRequested));
             // 循环尚未开始运行，此时入本地就绪队列；帧由上面那个容器持有到 run() 结束
             for (auto &frame: frames)
             {
