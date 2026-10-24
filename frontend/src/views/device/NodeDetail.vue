@@ -71,7 +71,7 @@ const latest = ref<TelemetryPoint[]>([])
 const alarms = ref<AlarmRow[]>([])
 const commands = ref<CommandRow[]>([])
 const loading = ref(false)
-const configKey = ref(0)
+const configPanel = ref<InstanceType<typeof NodeConfigPanel> | null>(null)
 const telemetryError = ref('')
 const alarmsError = ref('')
 const commandsError = ref('')
@@ -199,9 +199,8 @@ async function revokeCertificate() {
 }
 
 async function refreshAll() {
-  // 配置面板自己持有草稿与修订列表，页面刷新时一并重建，避免概览与配置页签读数分叉
-  configKey.value += 1
-  await load()
+  // 配置面板自己持有草稿与修订列表，刷新时原地重载；有未保存修改时由面板保留草稿并提示
+  await Promise.all([configPanel.value?.reload(), load()])
 }
 
 function backToList() {
@@ -376,7 +375,7 @@ onMounted(load)
         </div>
       </Panel>
 
-      <NodeConfigPanel v-show="tab === 'config'" :key="configKey" :node-id="nodeId" @updated="load" />
+      <NodeConfigPanel v-show="tab === 'config'" ref="configPanel" :node-id="nodeId" @updated="load" />
     </template>
   </div>
 </template>

@@ -22,6 +22,7 @@ const saving = ref(false)
 const rollingBack = ref<number | null>(null)
 const error = ref('')
 const conflict = ref(false)
+const dirty = ref(false)
 
 const hasConfig = computed(() => Boolean(config.value && config.value.desired.version > 0))
 // 面板不分页，只展示最近一页修订；标题同时给出真实总数与已加载条数
@@ -59,6 +60,7 @@ async function load(): Promise<boolean> {
     const [current] = await Promise.all([deviceApi.nodes.config.get(props.nodeId), loadRevisions()])
     config.value = current
     editor.value = pretty(current.desired.content)
+    dirty.value = false
     return true
   } catch (failure) {
     toastError(failure, '节点配置加载失败')
@@ -66,6 +68,18 @@ async function load(): Promise<boolean> {
   } finally {
     loading.value = false
   }
+}
+
+function markDirty() {
+  dirty.value = true
+}
+
+async function reload() {
+  if (dirty.value) {
+    pushToast('有未保存的配置修改，已保留草稿；保存或回滚后再刷新', 'info')
+    return
+  }
+  await load()
 }
 
 async function save() {
@@ -96,6 +110,7 @@ async function save() {
     config.value = saved
     editor.value = pretty(saved.desired.content)
     note.value = ''
+    dirty.value = false
     pushToast('期望配置已下发，等待 Agent 上报')
     emit('updated')
     await loadRevisions()
@@ -130,6 +145,7 @@ async function rollback(revision: NodeConfigRevisionRow) {
     })
     config.value = rolled
     editor.value = pretty(rolled.desired.content)
+    dirty.value = false
     pushToast(`已回滚到 v${revision.version}，等待 Agent 上报`)
     emit('updated')
     await loadRevisions()
@@ -141,6 +157,8 @@ async function rollback(revision: NodeConfigRevisionRow) {
 }
 
 onMounted(load)
+
+defineExpose({ reload })
 </script>
 
 <template>
@@ -148,7 +166,7 @@ onMounted(load)
     <div v-if="config && !config.inSync" class="drift-banner" role="status">
       <Tag tone="danger" dot>配置漂移</Tag>
       <span>期望版本 v{{ config.desired.version }}，Agent 实际版本 v{{ config.reported.version }}。</span>
-      <Button variant="text" size="sm" icon="refresh" @click="load">刷新</Button>
+      <Button variant="text" size="sm" icon="refresh" @click="reload">刷新</Button>
     </div>
 
     <EmptyState v-if="config && !hasConfig && !loading" title="尚未下发配置" desc="在下方编辑 JSON 对象，下发后右侧会显示 Agent 的实际上报。" icon="sliders" />
@@ -181,7 +199,7 @@ onMounted(load)
     <Panel title="下发期望配置" :meta="config ? `当前 v${config.desired.version}` : ''">
       <div class="panel-body config-stack">
         <Field label="配置内容（JSON 对象）" required hint="保存时会携带当前期望版本，版本被他人推进后需要刷新再改">
-          <TextInput v-model="editor" multiline :rows="12" class="config-editor" placeholder='{"interval":30}' />
+          <TextInput v-model="editor" multiline :rows="12" class="config-editor" placeholder='{"interval":30}' @input="markDirty" />
         </Field>
         <Field label="变更备注" hint="选填；会记入配置修订历史">
           <TextInput v-model="note" placeholder="例如 调整采集间隔" />
