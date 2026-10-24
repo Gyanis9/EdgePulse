@@ -4,6 +4,7 @@
 #include "Base/Config/ConfigValue.h"
 #include "Plugins/AuthPlugin/AuthController.h"
 #include "Plugins/AuthPlugin/OidcController.h"
+#include "Core/Auth/ApiTokenService.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Auth/OidcService.h"
 #include "Core/Auth/CaptchaService.h"
@@ -264,6 +265,9 @@ namespace EdgePulse::App
             { co_await lifecycle->onHeartbeat(loop, node, becameOnline); };
             m_agentRegistry  = std::make_shared<Device::AgentRegistry>(m_nodeRepository, std::move(agentOptions));
             m_userRepository = std::make_shared<System::UserRepository>(m_database);
+            // 令牌服务依赖用户仓储，装配顺序在认证服务之后，用迟绑定挂回唯一的鉴权入口
+            m_apiTokenService = std::make_shared<Auth::ApiTokenService>(m_database, m_userRepository, m_tenantRepository);
+            m_authService->setApiTokenService(m_apiTokenService);
             if (m_configuration.oidcEnabled)
             {
                 Auth::OidcConfiguration oidcConfiguration;

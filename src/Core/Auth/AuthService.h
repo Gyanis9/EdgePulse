@@ -35,6 +35,8 @@ namespace EdgePulse::System
 
 namespace EdgePulse::Auth
 {
+    class ApiTokenService;
+
     /**
      * @brief 认证失败的可恢复错误
      */
@@ -100,6 +102,13 @@ namespace EdgePulse::Auth
          */
         AuthService(std::shared_ptr<Common::Database> database, std::shared_ptr<SessionStore> sessions, std::shared_ptr<CaptchaService> captcha, std::shared_ptr<LoginAudit> audit,
                     std::shared_ptr<Cache::KeyValueStore> cache, std::shared_ptr<System::TenantRepository> tenants, AuthOptions options = {});
+
+        /**
+         * @brief 挂接 API 令牌服务，使会话未命中时继续按令牌认证
+         * @param apiTokens 令牌服务；空表示只接受会话令牌
+         * @note 登录装配在用户仓储之后完成，故用迟绑定而不是调整构造参数顺序
+         */
+        void setApiTokenService(std::shared_ptr<ApiTokenService> apiTokens);
 
         /**
          * @brief 验证码 + 口令登录
@@ -204,11 +213,20 @@ namespace EdgePulse::Auth
          */
         AsynGyanis::Core::Task<> recordAudit(AsynGyanis::Core::EventLoop &loop, LoginAuditEntry entry);
 
+        /**
+         * @brief 判断租户是否启用，状态经短 TTL 缓存
+         * @param loop 恢复协程用的事件循环
+         * @param tenantId 租户标识
+         * @return bool 租户存在且启用
+         */
+        AsynGyanis::Core::Task<bool> tenantEnabled(AsynGyanis::Core::EventLoop &loop, std::int64_t tenantId);
+
         std::shared_ptr<SessionStore>             m_sessions;       ///< 会话表
         std::shared_ptr<CaptchaService>           m_captcha;        ///< 验证码
         std::shared_ptr<LoginAudit>               m_loginAudit;     ///< 登录审计
         std::shared_ptr<Cache::KeyValueStore>     m_cache;          ///< 登录失败计数
         std::shared_ptr<System::TenantRepository> m_tenants;        ///< 租户注册表
+        std::shared_ptr<ApiTokenService>          m_apiTokens;      ///< API 令牌；空表示未启用
         System::UserRepository                    m_users;          ///< 用户仓储
         System::MenuRepository                    m_menus;          ///< 菜单仓储
         AuthOptions                               m_options;        ///< 口令与锁定策略

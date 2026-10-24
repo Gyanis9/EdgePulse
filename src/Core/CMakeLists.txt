@@ -1,4 +1,6 @@
 add_library(edgepulse-core STATIC
+        Auth/ApiTokenRepository.cpp
+        Auth/ApiTokenService.cpp
         Auth/AuthService.cpp
         Auth/CaptchaService.cpp
         Auth/LoginAudit.cpp

@@ -4,6 +4,7 @@
 #include "Base/Api/ErrorCatalog.h"
 #include "Base/Security/PasswordHash.h"
 #include "Base/Runtime/TimeFormat.h"
+#include "Core/Auth/ApiTokenService.h"
 #include "Core/Coroutine/AsyncExecutor.h"
 #include "Core/System/TenantRepository.h"
 
@@ -41,6 +42,11 @@ namespace EdgePulse::Auth
         m_sessions(std::move(sessions)), m_captcha(std::move(captcha)), m_loginAudit(std::move(audit)), m_cache(std::move(cache)), m_tenants(std::move(tenants)), m_users(database),
         m_menus(std::move(database)), m_options(options), m_passwordPolicy(options.passwordMinimumLength, options.passwordRequireComplexity)
     {
+    }
+
+    void AuthService::setApiTokenService(std::shared_ptr<ApiTokenService> apiTokens)
+    {
+        m_apiTokens = std::move(apiTokens);
     }
 
     AsynGyanis::Core::Task<> AuthService::recordAudit(AsynGyanis::Core::EventLoop &loop, LoginAuditEntry entry)
@@ -195,6 +201,10 @@ namespace EdgePulse::Auth
             co_return std::nullopt;
         }
         std::optional<SessionRecord> session = co_await m_sessions->validateAndTouch(loop, token);
+        if (!session.has_value() && m_apiTokens)
+        {
+            session = co_await m_apiTokens->authenticate(loop, token);
+        }
         if (!session.has_value())
         {
             co_return std::nullopt;
@@ -203,22 +213,27 @@ namespace EdgePulse::Auth
         {
             co_return session;
         }
-        // 停用租户后不能等会话自然过期：用短 TTL 缓存租户状态，更新租户时主动失效
-        const std::string                key     = tenantStatusKey(session->tenantId);
-        const std::optional<std::string> cached  = co_await m_cache->get(loop, key);
-        bool                             enabled = cached.has_value() && *cached == "1";
-        if (!cached.has_value() || (*cached != "1" && *cached != "0"))
-        {
-            const auto tenant = co_await m_tenants->findById(loop, session->tenantId);
-            enabled           = tenant.has_value() && tenant->status == 1;
-            static_cast<void>(co_await m_cache->set(loop, key, enabled ? "1" : "0", kTenantStatusTtl));
-        }
-        if (!enabled)
+        if (!co_await tenantEnabled(loop, session->tenantId))
         {
             static_cast<void>(co_await m_sessions->remove(loop, token));
             co_return std::nullopt;
         }
         co_return session;
+    }
+
+    AsynGyanis::Core::Task<bool> AuthService::tenantEnabled(AsynGyanis::Core::EventLoop &loop, const std::int64_t tenantId)
+    {
+        // 停用租户后不能等会话自然过期：用短 TTL 缓存租户状态，更新租户时主动失效
+        const std::string                key     = tenantStatusKey(tenantId);
+        const std::optional<std::string> cached  = co_await m_cache->get(loop, key);
+        bool                             enabled = cached.has_value() && *cached == "1";
+        if (!cached.has_value() || (*cached != "1" && *cached != "0"))
+        {
+            const auto tenant = co_await m_tenants->findById(loop, tenantId);
+            enabled           = tenant.has_value() && tenant->status == 1;
+            static_cast<void>(co_await m_cache->set(loop, key, enabled ? "1" : "0", kTenantStatusTtl));
+        }
+        co_return enabled;
     }
 
     AsynGyanis::Core::Task<void> AuthService::invalidateTenant(AsynGyanis::Core::EventLoop &loop, const std::int64_t tenantId)

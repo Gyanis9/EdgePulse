@@ -44,6 +44,7 @@ namespace AsynGyanis::Core
 
 namespace EdgePulse::Auth
 {
+    class ApiTokenService;
     class AuthService;
     class CaptchaService;
     class DataScopeService;
@@ -225,6 +226,7 @@ namespace EdgePulse::App
         std::shared_ptr<Auth::CaptchaService>                     m_captchaService;         ///< 验证码
         std::shared_ptr<Auth::LoginAudit>                         m_loginAudit;             ///< 登录审计
         std::shared_ptr<Auth::AuthService>                        m_authService;            ///< 认证服务
+        std::shared_ptr<Auth::ApiTokenService>                    m_apiTokenService;        ///< API 令牌服务
         std::unique_ptr<Auth::OidcService>                        m_oidcService;            ///< OIDC 登录
         std::shared_ptr<Web::BrowserWebSocket>                    m_browserWebSocket;       ///< 浏览器 WebSocket 与节点扇出
         std::shared_ptr<Device::NodeRepository>                   m_nodeRepository;         ///< 节点仓储
