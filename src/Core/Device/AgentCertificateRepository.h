@@ -60,7 +60,7 @@ namespace EdgePulse::Device
          * @brief 按节点列出证书签发历史
          * @param loop 恢复协程用的事件循环
          * @param nodeId 节点标识
-         * @return 按签发时间倒序的历史；租户边界外的节点返回空
+         * @return 按签发时间倒序的历史，最多 200 条；租户边界外的节点返回空
          */
         AsynGyanis::Core::Task<std::vector<AgentCertificateRecord>> listByNode(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
 

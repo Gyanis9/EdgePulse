@@ -16,6 +16,7 @@ namespace EdgePulse::Device
     namespace
     {
         constexpr const char *kCertificateColumns = "id, tenant_id, node_id, serial, fingerprint, subject, not_before, not_after, status, issued_at, revoked_at";
+        constexpr int         kHistoryLimit       = 200; ///< 单节点一次最多返回的历史条数
 
         [[nodiscard]] AgentCertificateRecord readCertificate(const AsynGyanis::Database::DatabaseResult &result)
         {
@@ -58,8 +59,10 @@ namespace EdgePulse::Device
                         filter += " AND tenant_id = ?";
                         parameters.emplace_back(tenant.tenantId);
                     }
+                    parameters.emplace_back(static_cast<std::int64_t>(kHistoryLimit));
                     const auto rows = Sql::executeOrThrow(
-                            connection, std::string{"SELECT "} + kCertificateColumns + " FROM biz_agent_certificate" + filter + " ORDER BY issued_at DESC, id DESC", parameters);
+                            connection, std::string{"SELECT "} + kCertificateColumns + " FROM biz_agent_certificate" + filter + " ORDER BY issued_at DESC, id DESC LIMIT ?",
+                            parameters);
                     std::vector<AgentCertificateRecord> records;
                     while (rows->next())
                     {

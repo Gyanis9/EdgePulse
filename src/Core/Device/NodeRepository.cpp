@@ -438,22 +438,26 @@ namespace EdgePulse::Device
                                 }
                                 return std::expected<AgentUpsertOutcome, AgentUpsertFailure>{AgentUpsertOutcome{std::move(node), true, true}};
                             }
-                            const bool                                               becameOnline = current->status != "online";
-                            const std::array<AsynGyanis::Database::DatabaseValue, 8> parameters{registration.agentVersion,
-                                                                                                registration.certFingerprint,
-                                                                                                nullableText(registration.certNotAfter),
-                                                                                                nullableText(registration.labelsJson),
-                                                                                                now,
-                                                                                                now,
-                                                                                                current->id,
-                                                                                                current->version};
+                            const bool                                                becameOnline = current->status != "online";
+                            const std::int64_t                                        keepPrevious = sameCertificate ? 1 : 0;
+                            const std::array<AsynGyanis::Database::DatabaseValue, 10> parameters{registration.agentVersion,
+                                                                                                 registration.certFingerprint,
+                                                                                                 nullableText(registration.certNotAfter),
+                                                                                                 keepPrevious,
+                                                                                                 keepPrevious,
+                                                                                                 nullableText(registration.labelsJson),
+                                                                                                 now,
+                                                                                                 now,
+                                                                                                 current->id,
+                                                                                                 current->version};
                             // 走到这里说明本次出示的证书已被事务内确认允许写入（同指纹、已消费令牌或 off 模式），才清掉旧的吊销时间
-                            // 重新入场或改绑不是续期：旧证书没有重叠窗口，previous 两列必须一并清空
+                            // 同指纹重注册发生在重叠窗口内，不能提前清掉 previous；改绑或重新入场才按新证书语义清空
                             // 版本条件把读取与写入绑成一次比较交换：期间提交的吊销或改绑会让这次更新落空，而不是被覆盖
                             const auto update = Sql::executeOrThrow(
                                     connection,
                                     "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
-                                    "previous_cert_fingerprint = '', previous_cert_not_after = NULL, "
+                                    "previous_cert_fingerprint = CASE WHEN ? = 1 THEN previous_cert_fingerprint ELSE '' END, "
+                                    "previous_cert_not_after = CASE WHEN ? = 1 THEN previous_cert_not_after ELSE NULL END, "
                                     "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0",
                                     parameters);
                             if (update->affectedRowCount() == 0)
@@ -466,6 +470,14 @@ namespace EdgePulse::Device
                                 }
                                 return std::unexpected(AgentUpsertFailure::ConcurrentRegistration);
                             }
+                            if (!sameCertificate)
+                            {
+                                // 改绑清空了节点 previous，历史里的旧 active 行必须同步退出 active；
+                                // 否则吊销与审计会按历史找到已经不属于该节点的证书
+                                Sql::executeOrThrowVoid(connection,
+                                                        "UPDATE biz_agent_certificate SET status = 'previous' WHERE tenant_id = ? AND node_id = ? AND status = 'active'",
+                                                        std::vector<AsynGyanis::Database::DatabaseValue>{current->tenantId, current->id});
+                            }
                             Sql::executeOrThrowVoid(connection, "COMMIT");
                             if (!consumedAction.empty())
                             {
@@ -477,8 +489,11 @@ namespace EdgePulse::Device
                             node.certFingerprint = registration.certFingerprint;
                             node.certNotAfter    = registration.certNotAfter;
                             node.certRevokedAt.clear();
-                            node.previousCertFingerprint.clear();
-                            node.previousCertNotAfter.clear();
+                            if (!sameCertificate)
+                            {
+                                node.previousCertFingerprint.clear();
+                                node.previousCertNotAfter.clear();
+                            }
                             node.labelsJson = registration.labelsJson;
                             node.lastSeen   = now;
                             node.version    = current->version + 1;
@@ -577,6 +592,10 @@ namespace EdgePulse::Device
                             return std::unexpected("轮换 Agent 证书失败：旧证书指纹必须是 64 位十六进制");
                         }
                         rotation.previousFingerprint = *normalizedPrevious;
+                    } else
+                    {
+                        // 没有旧证书就没有重叠窗口，调用方带来的截止时间不能落库
+                        rotation.previousNotAfter.clear();
                     }
                     if (rotation.serial.empty() || rotation.serial.size() > 64)
                     {
@@ -590,6 +609,10 @@ namespace EdgePulse::Device
                     {
                         return std::unexpected("轮换 Agent 证书失败：证书生效时间与到期时间不能为空");
                     }
+                    if (rotation.notAfter <= rotation.notBefore)
+                    {
+                        return std::unexpected("轮换 Agent 证书失败：证书到期时间必须晚于生效时间");
+                    }
                     try
                     {
                         Sql::executeOrThrowVoid(connection, "BEGIN");
@@ -599,6 +622,18 @@ namespace EdgePulse::Device
                         {
                             rollbackQuietly(connection);
                             return false;
+                        }
+                        // 版本冲突先于指纹比较：并发轮换推进版本后，调用方应拿到可重试冲突，
+                        // 而不是把上一枚已经过期的指纹误判成输入非法
+                        if (expectedVersion != current->version)
+                        {
+                            rollbackQuietly(connection);
+                            return false;
+                        }
+                        if (rotation.fingerprint == current->certFingerprint)
+                        {
+                            rollbackQuietly(connection);
+                            return std::unexpected("轮换 Agent 证书失败：新证书指纹不能与节点当前证书相同");
                         }
                         // previous 只能是被替换的当前证书；否则调用方可以借轮换把任意指纹塞进重叠窗口
                         if (rotation.previousFingerprint != current->certFingerprint)

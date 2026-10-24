@@ -115,7 +115,7 @@ namespace EdgePulse::Device
         std::string fingerprint;         ///< 新证书 SHA-256 指纹，小写
         std::string notAfter;            ///< 新证书到期时间，UTC
         std::string previousFingerprint; ///< 被替换的旧证书指纹；空表示没有旧证书
-        std::string previousNotAfter;    ///< 旧证书退出重叠窗口的时间，可空
+        std::string previousNotAfter;    ///< 旧证书退出重叠窗口的时间；previousFingerprint 为空时忽略
         std::string serial;              ///< 新证书序列号
         std::string subject;             ///< 新证书主题
         std::string notBefore;           ///< 新证书生效时间，UTC
@@ -218,6 +218,7 @@ namespace EdgePulse::Device
          * @param registration 注册输入
          * @return 成功返回节点与在线转换标记；令牌校验在同一事务内完成
          * @note 新建、改绑与同指纹重注册的判定只信事务内读到的节点状态；整段事务在可重试的并发失败后重来一次
+         * @note 同指纹重注册保留 previous，改绑清空 previous 并把该节点的旧 active 历史改为 previous
          */
         AsynGyanis::Core::Task<std::expected<AgentUpsertOutcome, AgentUpsertFailure>> upsertAgent(AsynGyanis::Core::EventLoop &loop, AgentUpsert registration);
 
@@ -240,7 +241,7 @@ namespace EdgePulse::Device
          * @param rotation 新证书字段与被替换的旧证书字段
          * @return true 轮换完成
          * @return false 节点不存在、已删除、已吊销或版本不匹配；事务已回滚，无任何写入
-         * @return unexpected 数据库失败，文本为中文原因
+         * @return unexpected 输入非法（新旧指纹、序列号、主题、时间顺序，或新指纹与当前证书相同）或数据库失败，文本为中文原因
          */
         AsynGyanis::Core::Task<std::expected<bool, std::string>> rotateCertificate(AsynGyanis::Core::EventLoop &loop, System::TenantScope tenant, std::int64_t nodeId,
                                                                                    std::int64_t expectedVersion, AgentCertificateRotation rotation);

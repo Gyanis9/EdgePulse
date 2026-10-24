@@ -265,3 +265,261 @@ TEST(AgentCertificateRepository, RotationAndHistoryStayInsideTenant)
     EXPECT_EQ(1U, runner.run(certificates->listByNode(runner.loop(), nodeId)).size());
     EXPECT_FALSE(runner.run(nodes->scoped(EdgePulse::System::TenantScope{2, false})->findById(runner.loop(), nodeId)).has_value());
 }
+
+// 钉住：版本已被并发推进时，即使调用方拿着旧指纹，也应得到可重试冲突而不是指纹不一致
+TEST(AgentCertificateRepository, StaleVersionAndFingerprintReturnConflict)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    const std::string oldFingerprint(64, 'a');
+    const std::string newFingerprint(64, 'b');
+    const std::string conflictingFingerprint(64, 'c');
+    const auto        seeded = registerNode(runner, *nodes, "edge-cert-stale", oldFingerprint, "2026-11-01 00:00:00", 1);
+    ASSERT_TRUE(seeded.has_value());
+    const std::int64_t nodeId  = seeded->id;
+    const std::int64_t version = seeded->version;
+    insertActiveHistory(context.databasePath(), 1, nodeId, oldFingerprint, "2026-11-01 00:00:00");
+
+    const auto rotated =
+            runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, nodeId, version, makeRotation(newFingerprint, oldFingerprint)));
+    ASSERT_TRUE(rotated.has_value()) << rotated.error();
+    ASSERT_TRUE(*rotated);
+
+    // 旧版本 + 旧指纹：冲突判定必须先于指纹比较，调用方才能重新读取后重试
+    const auto conflict =
+            runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, nodeId, version, makeRotation(conflictingFingerprint, oldFingerprint)));
+    ASSERT_TRUE(conflict.has_value()) << conflict.error();
+    EXPECT_FALSE(*conflict);
+
+    const std::optional<EdgePulse::Device::NodeRecord> unchanged = runner.run(nodes->findById(runner.loop(), nodeId));
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(newFingerprint, unchanged->certFingerprint);
+    EXPECT_EQ(oldFingerprint, unchanged->previousCertFingerprint);
+    EXPECT_EQ(version + 1, unchanged->version);
+
+    const auto                                                   certificates = std::make_shared<EdgePulse::Device::AgentCertificateRepository>(context.database);
+    const std::vector<EdgePulse::Device::AgentCertificateRecord> history      = runner.run(certificates->listByNode(runner.loop(), nodeId));
+    ASSERT_EQ(2U, history.size());
+    EXPECT_EQ(newFingerprint, history[0].fingerprint);
+    EXPECT_EQ("active", history[0].status);
+    EXPECT_EQ(oldFingerprint, history[1].fingerprint);
+    EXPECT_EQ("previous", history[1].status);
+}
+
+// 钉住：重叠窗口内的同证书重注册不是改绑，previous 必须保留到原定截止时间
+TEST(AgentCertificateRepository, ReRegistrationKeepsPreviousOverlap)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    const std::string oldFingerprint(64, 'a');
+    const std::string newFingerprint(64, 'b');
+    const auto        seeded = registerNode(runner, *nodes, "edge-cert-reregister", oldFingerprint, "2026-11-01 00:00:00", 1);
+    ASSERT_TRUE(seeded.has_value());
+    const std::int64_t nodeId  = seeded->id;
+    const std::int64_t version = seeded->version;
+    insertActiveHistory(context.databasePath(), 1, nodeId, oldFingerprint, "2026-11-01 00:00:00");
+
+    const EdgePulse::Device::AgentCertificateRotation rotation = makeRotation(newFingerprint, oldFingerprint);
+    const auto rotated = runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, nodeId, version, rotation));
+    ASSERT_TRUE(rotated.has_value()) << rotated.error();
+    ASSERT_TRUE(*rotated);
+
+    const auto reRegistered = registerNode(runner, *nodes, "edge-cert-reregister", newFingerprint, rotation.notAfter, 1);
+    ASSERT_TRUE(reRegistered.has_value());
+    EXPECT_EQ(newFingerprint, reRegistered->certFingerprint);
+    EXPECT_EQ(oldFingerprint, reRegistered->previousCertFingerprint);
+    EXPECT_EQ(rotation.previousNotAfter, reRegistered->previousCertNotAfter);
+
+    const std::optional<EdgePulse::Device::NodeRecord> stored = runner.run(nodes->findById(runner.loop(), nodeId));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(newFingerprint, stored->certFingerprint);
+    EXPECT_EQ(oldFingerprint, stored->previousCertFingerprint);
+    EXPECT_EQ(rotation.previousNotAfter, stored->previousCertNotAfter);
+
+    const auto                                                   certificates = std::make_shared<EdgePulse::Device::AgentCertificateRepository>(context.database);
+    const std::vector<EdgePulse::Device::AgentCertificateRecord> history      = runner.run(certificates->listByNode(runner.loop(), nodeId));
+    ASSERT_EQ(2U, history.size());
+    EXPECT_EQ(newFingerprint, history[0].fingerprint);
+    EXPECT_EQ("active", history[0].status);
+    EXPECT_EQ(oldFingerprint, history[1].fingerprint);
+    EXPECT_EQ("previous", history[1].status);
+}
+
+// 钉住：改绑清掉节点 previous 时，历史里的旧 active 行也必须退出 active，吊销与审计才不会作用在错证书上
+TEST(AgentCertificateRepository, RebindClosesStaleActiveHistory)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    const std::string oldFingerprint(64, 'a');
+    const std::string renewedFingerprint(64, 'b');
+    const std::string reboundFingerprint(64, 'd');
+    const auto        seeded = registerNode(runner, *nodes, "edge-cert-rebind-history", oldFingerprint, "2026-11-01 00:00:00", 1);
+    ASSERT_TRUE(seeded.has_value());
+    const std::int64_t nodeId  = seeded->id;
+    const std::int64_t version = seeded->version;
+    insertActiveHistory(context.databasePath(), 1, nodeId, oldFingerprint, "2026-11-01 00:00:00");
+
+    const auto rotated =
+            runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, nodeId, version, makeRotation(renewedFingerprint, oldFingerprint)));
+    ASSERT_TRUE(rotated.has_value()) << rotated.error();
+    ASSERT_TRUE(*rotated);
+
+    const auto rebound = registerNode(runner, *nodes, "edge-cert-rebind-history", reboundFingerprint, "2027-11-01 00:00:00", 1);
+    ASSERT_TRUE(rebound.has_value());
+    EXPECT_EQ(reboundFingerprint, rebound->certFingerprint);
+    EXPECT_TRUE(rebound->previousCertFingerprint.empty());
+
+    const auto                                                   certificates = std::make_shared<EdgePulse::Device::AgentCertificateRepository>(context.database);
+    const std::vector<EdgePulse::Device::AgentCertificateRecord> history      = runner.run(certificates->listByNode(runner.loop(), nodeId));
+    ASSERT_EQ(2U, history.size());
+    for (const EdgePulse::Device::AgentCertificateRecord &record: history)
+    {
+        EXPECT_NE("active", record.status) << record.fingerprint;
+    }
+    EXPECT_EQ(renewedFingerprint, history[0].fingerprint);
+    EXPECT_EQ("previous", history[0].status);
+    EXPECT_EQ(oldFingerprint, history[1].fingerprint);
+    EXPECT_EQ("previous", history[1].status);
+}
+
+// 钉住：未知节点按不存在处理，返回 false 而不是输入错误
+TEST(AgentCertificateRepository, UnknownNodeReturnsFalse)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    const auto unknown =
+            runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, 987654321, 1, makeRotation(std::string(64, 'b'), std::string(64, 'a'))));
+    ASSERT_TRUE(unknown.has_value()) << unknown.error();
+    EXPECT_FALSE(*unknown);
+}
+
+// 钉住：已吊销节点只能重新入场，续期不能把证书重新挂回去
+TEST(AgentCertificateRepository, RevokedNodeRotationReturnsFalse)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    const std::string oldFingerprint(64, 'a');
+    const std::string newFingerprint(64, 'b');
+    const auto        seeded = registerNode(runner, *nodes, "edge-cert-revoked", oldFingerprint, "2026-11-01 00:00:00", 1);
+    ASSERT_TRUE(seeded.has_value());
+    const std::int64_t nodeId = seeded->id;
+
+    const std::optional<EdgePulse::Device::NodeRecord> revoked = runner.run(nodes->revokeCertificate(runner.loop(), nodeId));
+    ASSERT_TRUE(revoked.has_value());
+    ASSERT_FALSE(revoked->certRevokedAt.empty());
+
+    const auto rejected =
+            runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, nodeId, revoked->version, makeRotation(newFingerprint, oldFingerprint)));
+    ASSERT_TRUE(rejected.has_value()) << rejected.error();
+    EXPECT_FALSE(*rejected);
+
+    const std::optional<EdgePulse::Device::NodeRecord> stored = runner.run(nodes->findById(runner.loop(), nodeId));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_TRUE(stored->certFingerprint.empty());
+    EXPECT_FALSE(stored->certRevokedAt.empty());
+    EXPECT_TRUE(stored->previousCertFingerprint.empty());
+    const auto certificates = std::make_shared<EdgePulse::Device::AgentCertificateRepository>(context.database);
+    EXPECT_TRUE(runner.run(certificates->listByNode(runner.loop(), nodeId)).empty());
+}
+
+// 钉住：新指纹、旧指纹、序列号、主题与时间都在写库前校验，且校验失败不推进版本
+TEST(AgentCertificateRepository, RejectsInvalidCertificateFields)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    const std::string oldFingerprint(64, 'a');
+    const std::string newFingerprint(64, 'b');
+    const auto        seeded = registerNode(runner, *nodes, "edge-cert-invalid", oldFingerprint, "2026-11-01 00:00:00", 1);
+    ASSERT_TRUE(seeded.has_value());
+    const std::int64_t nodeId  = seeded->id;
+    const std::int64_t version = seeded->version;
+
+    const auto expectRejected = [&](const EdgePulse::Device::AgentCertificateRotation &rotation, const std::string &reason)
+    {
+        const auto result = runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, nodeId, version, rotation));
+        ASSERT_FALSE(result.has_value()) << reason;
+        EXPECT_NE(std::string::npos, result.error().find(reason));
+    };
+
+    EdgePulse::Device::AgentCertificateRotation rotation = makeRotation(newFingerprint, oldFingerprint);
+    rotation.fingerprint                                 = "not-a-fingerprint";
+    expectRejected(rotation, "64 位十六进制");
+
+    rotation                     = makeRotation(newFingerprint, oldFingerprint);
+    rotation.previousFingerprint = "not-a-fingerprint";
+    expectRejected(rotation, "旧证书指纹");
+
+    rotation        = makeRotation(newFingerprint, oldFingerprint);
+    rotation.serial = "";
+    expectRejected(rotation, "序列号");
+
+    rotation         = makeRotation(newFingerprint, oldFingerprint);
+    rotation.subject = std::string(256, 's');
+    expectRejected(rotation, "主题");
+
+    rotation           = makeRotation(newFingerprint, oldFingerprint);
+    rotation.notBefore = "";
+    rotation.notAfter  = "";
+    expectRejected(rotation, "时间");
+
+    rotation           = makeRotation(newFingerprint, oldFingerprint);
+    rotation.notBefore = "2027-01-01 00:00:00";
+    rotation.notAfter  = "2026-01-01 00:00:00";
+    expectRejected(rotation, "晚于");
+
+    rotation                     = makeRotation(oldFingerprint, oldFingerprint);
+    rotation.previousFingerprint = oldFingerprint;
+    expectRejected(rotation, "相同");
+
+    const std::optional<EdgePulse::Device::NodeRecord> unchanged = runner.run(nodes->findById(runner.loop(), nodeId));
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(oldFingerprint, unchanged->certFingerprint);
+    EXPECT_EQ(version, unchanged->version);
+    EXPECT_TRUE(unchanged->previousCertFingerprint.empty());
+    const auto certificates = std::make_shared<EdgePulse::Device::AgentCertificateRepository>(context.database);
+    EXPECT_TRUE(runner.run(certificates->listByNode(runner.loop(), nodeId)).empty());
+}
+
+// 钉住：没有旧证书时不允许写重叠截止时间，避免空 previous 也留下一个可被误读的时间点
+TEST(AgentCertificateRepository, EmptyPreviousFingerprintDropsOverlapDeadline)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    const auto                              nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    const std::string newFingerprint(64, 'b');
+    const auto        seeded = registerNode(runner, *nodes, "edge-cert-no-previous", "", "", 1);
+    ASSERT_TRUE(seeded.has_value());
+    const std::int64_t nodeId  = seeded->id;
+    const std::int64_t version = seeded->version;
+
+    EdgePulse::Device::AgentCertificateRotation rotation = makeRotation(newFingerprint, "");
+    rotation.previousNotAfter                            = "2026-10-30 00:00:00";
+    const auto rotated                                   = runner.run(nodes->rotateCertificate(runner.loop(), EdgePulse::System::TenantScope{1, false}, nodeId, version, rotation));
+    ASSERT_TRUE(rotated.has_value()) << rotated.error();
+    ASSERT_TRUE(*rotated);
+
+    const std::optional<EdgePulse::Device::NodeRecord> stored = runner.run(nodes->findById(runner.loop(), nodeId));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(newFingerprint, stored->certFingerprint);
+    EXPECT_TRUE(stored->previousCertFingerprint.empty());
+    EXPECT_TRUE(stored->previousCertNotAfter.empty());
+
+    const auto                                                   certificates = std::make_shared<EdgePulse::Device::AgentCertificateRepository>(context.database);
+    const std::vector<EdgePulse::Device::AgentCertificateRecord> history      = runner.run(certificates->listByNode(runner.loop(), nodeId));
+    ASSERT_EQ(1U, history.size());
+    EXPECT_EQ(newFingerprint, history[0].fingerprint);
+    EXPECT_EQ("active", history[0].status);
+}
