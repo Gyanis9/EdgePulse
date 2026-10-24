@@ -5,6 +5,7 @@ import { EmptyState, Metric, SectionLabel, Select, Tag } from '@/components/ui'
 import TrendChart from '@/components/charts/TrendChart.vue'
 import { deviceApi, fleetApi, type NodeRow, type TelemetryPoint } from '@/api'
 import { toastError } from '@/composables/toast'
+import { formatMetricValue } from '@/utils/metric'
 
 const route = useRoute()
 const nodes = ref<NodeRow[]>([])
@@ -112,19 +113,20 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <Metric label="指标" :value="latest.length" unit="项" />
         <Metric label="采样点" :value="points.length" unit="个" />
       </div>
-      <div class="metric-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-top:16px">
+      <div class="metric-grid">
         <button
           v-for="point in latest"
           :key="point.metric"
           type="button"
-          class="lift"
+          class="metric-card lift"
           :class="{ 'is-active': point.metric === metric }"
-          style="text-align:left;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--surface)"
           @click="metric = point.metric"
         >
-          <div class="soft" style="font-size:12px">{{ point.metric }}</div>
-          <div class="tnum" style="font-size:24px;font-weight:650">{{ point.value }}<span class="soft" style="font-size:12px"> {{ point.unit }}</span></div>
-          <div class="mono faint" style="font-size:11px">{{ point.collectedAt }}</div>
+          <div class="metric-name soft">{{ point.metric }}</div>
+          <div class="metric-value tnum" :title="`${point.value} ${point.unit}`">
+            {{ formatMetricValue(point.value, point.unit) }}<span class="metric-unit soft">{{ point.unit }}</span>
+          </div>
+          <div class="metric-time mono faint">{{ point.collectedAt }}</div>
         </button>
         <EmptyState v-if="!latestLoading && !latest.length" title="暂无遥测" desc="Agent 上报后会显示指标。" icon="line-chart" />
       </div>
@@ -140,3 +142,49 @@ onBeforeUnmount(() => window.clearInterval(timer))
     </section>
   </div>
 </template>
+
+<style scoped>
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.metric-card {
+  min-width: 0;
+  overflow: hidden;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.metric-name,
+.metric-time {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-name { font-size: 12px; }
+.metric-time { font-size: 11px; }
+
+.metric-value {
+  overflow: hidden;
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-unit {
+  margin-left: 2px;
+  font-size: 12px;
+}
+</style>

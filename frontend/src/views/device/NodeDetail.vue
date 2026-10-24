@@ -8,6 +8,7 @@ import { pathOf } from '@/composables/auth'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { copyText } from '@/utils/clipboard'
+import { formatMetricValue } from '@/utils/metric'
 
 type Tab = 'overview' | 'telemetry' | 'alarms' | 'commands' | 'firmware' | 'config'
 const TABS: Array<{ label: string; value: Tab }> = [
@@ -312,7 +313,7 @@ onMounted(load)
           <p v-if="telemetryError" class="form-error" style="margin: 0">{{ telemetryError }}</p>
           <DataTable :columns="telemetryColumns" :data="latest" :min-width="620" empty-text="该节点还没有上报遥测">
             <template #cell-metric="{ row }"><span class="mono">{{ row.metric }}</span></template>
-            <template #cell-value="{ row }"><span class="tnum">{{ row.value }}</span></template>
+            <template #cell-value="{ row }"><span class="tnum">{{ formatMetricValue(row.value, row.unit) }}</span></template>
             <template #cell-unit="{ row }"><span class="soft">{{ row.unit || '—' }}</span></template>
             <template #cell-collectedAt="{ row }"><span class="mono soft">{{ row.collectedAt }}</span></template>
           </DataTable>
