@@ -1,0 +1,48 @@
+# EdgePulse Agent Windows 配置样例
+# 默认安装目录 C:\Program Files\EdgePulse\Agent，数据目录 C:\ProgramData\EdgePulse\Agent；
+# install-agent.ps1 使用 -InstallDir 与 -DataDir 时会同步替换本文件中的这两个前缀。
+# 相对路径按本文件所在目录解析；注册令牌与换绑令牌只从环境变量读取，不写在本文件里。
+
+agent:
+  server:
+    base_url: https://127.0.0.1:9443
+    ca_file: C:\ProgramData\EdgePulse\Agent\certs\ca.pem
+    certificate_file: C:\ProgramData\EdgePulse\Agent\certs\agent.pem
+    private_key_file: C:\ProgramData\EdgePulse\Agent\certs\agent-key.pem
+    tenant_code: default
+    name: edge-01
+    enrollment_token_env: EDGEPULSE_AGENT_ENROLLMENT_TOKEN
+    rebind_token_env: EDGEPULSE_AGENT_REBIND_TOKEN
+    heartbeat_interval_seconds: 30
+    command_poll_interval_seconds: 15
+    websocket_enabled: true
+    request_timeout_seconds: 30
+    # 只供本地测试使用；生产环境必须保持 false
+    allow_plaintext_for_tests: false
+  telemetry:
+    interval_seconds: 30
+    disk_path: C:\
+  state:
+    directory: C:\ProgramData\EdgePulse\Agent
+  logging:
+    file: C:\ProgramData\EdgePulse\Agent\agent.log
+    level: info
+    max_size_mb: 32
+    max_backup: 5
+  executors:
+    config:
+      path: C:\ProgramData\EdgePulse\Agent\config.json
+      apply_hook: ""
+      maximum_bytes: 65536
+    firmware:
+      # 固件安装钩子按节点自行配置；留空时固件部署会直接按失败上报
+      install_hook: ""
+      trusted_keys_dir: C:\ProgramData\EdgePulse\Agent\firmware-keys
+      staging_directory: C:\ProgramData\EdgePulse\Agent\firmware
+    diagnostics:
+      log_tail_bytes: 65536
+  update:
+    package_trusted_keys_dir: C:\ProgramData\EdgePulse\Agent\update\keys
+    installer_script: C:\Program Files\EdgePulse\Agent\install-agent.ps1
+    health_timeout_seconds: 60
+    staging_directory: C:\ProgramData\EdgePulse\Agent\update

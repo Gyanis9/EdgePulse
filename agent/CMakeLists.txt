@@ -17,6 +17,7 @@ target_include_directories(edgepulse-agent-core PUBLIC ${PROJECT_SOURCE_DIR}/src
 target_compile_definitions(edgepulse-agent-core PRIVATE EDGEPULSE_AGENT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(edgepulse-agent-core PUBLIC EdgePulse::Core AsynGyanis::Net AsynGyanis::Database AsynGyanis::Core AsynGyanis::Base OpenSSL::Crypto)
 if(WIN32)
+    target_sources(edgepulse-agent-core PRIVATE ServiceHost.cpp)
     target_link_libraries(edgepulse-agent-core PUBLIC advapi32)
 endif()
 edgepulse_enable_warnings(edgepulse-agent-core)

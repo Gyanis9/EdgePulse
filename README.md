@@ -305,6 +305,23 @@ sudo /tmp/edgepulse-agent/uninstall-agent.sh --purge  # 一并删除
 
 默认路径为配置 `/etc/edgepulse-agent`、状态 `/var/lib/edgepulse-agent`、日志 `/var/log/edgepulse-agent`；`--prefix`、`--config-dir`、`--state-dir`、`--log-dir` 可整体改到自定义位置，单元里的 `ExecStart`、`EnvironmentFile` 与 `ReadWritePaths` 会同步替换。运行状态看 `systemctl status edgepulse-agent`，日志看 `journalctl -u edgepulse-agent -f`，完整步骤见 [docs/部署.md](docs/部署.md#13-agentlinux)。
 
+Windows：
+
+```powershell
+# 构建 Release 并打包，输出 build\agent-package\edgepulse-agent-<version>-windows-x86_64.zip
+powershell -ExecutionPolicy Bypass -File scripts\package-agent.ps1 -Version 1.0.0
+
+Expand-Archive build\agent-package\edgepulse-agent-1.0.0-windows-x86_64.zip -DestinationPath $env:TEMP\edgepulse-agent -Force
+# 以管理员身份打开 PowerShell 后安装；默认安装到 C:\Program Files\EdgePulse\Agent，
+# 数据放在 C:\ProgramData\EdgePulse\Agent，已有 agent.yaml 不会被覆盖，-NoStart 只安装不启动
+powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\install-agent.ps1
+
+powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\uninstall-agent.ps1          # 保留数据
+powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\uninstall-agent.ps1 -Purge  # 一并删除数据
+```
+
+服务名 `EdgePulseAgent`，账户 LocalSystem，安装器配置自动启动与 5 秒、10 秒、30 秒三次失败重启。注册令牌通过服务作用域环境变量提供（服务注册表项的 `Environment` 值）后重启服务；数据目录只授予 Administrators 与 SYSTEM，证书与私钥不要放到其他可写位置。运行日志在 `C:\ProgramData\EdgePulse\Agent\agent.log`，服务控制错误看 `Get-EventLog -LogName System -Source "Service Control Manager"`。当前 Windows 包未签名，安装器也不校验签名。完整步骤见 [docs/部署.md](docs/部署.md#14-agentwindows)。
+
 ## 项目结构
 
 ```text
@@ -314,7 +331,7 @@ src/
 ├─ Plugins/    功能插件：认证、系统、监控、工作台、设备、遥测、告警、固件、命令、运维
 ├─ App/        配置、生命周期、监听器与工作线程装配
 └─ Main/       进程入口
-agent/        生产 Agent 源码与 Linux 打包脚本
+agent/        生产 Agent 源码与 Linux/Windows 打包脚本
 frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
 3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
 migrations/    SQL 迁移 V1–V18，已应用文件不可修改

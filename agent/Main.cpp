@@ -3,6 +3,10 @@
 #include "AgentIdentity.h"
 #include "AgentVersion.h"
 
+#ifdef _WIN32
+#include "ServiceHost.h"
+#endif
+
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -81,11 +85,20 @@ int main(const int argc, char **argv)
         return 0;
     }
 
-    if (options.service)
+    if (options.service && options.console)
     {
-        std::cerr << "服务托管尚未接入：当前版本请使用 --console 前台运行，或在系统服务配置中等待后续版本提供 --service\n";
+        std::cerr << "--service 与 --console 不能同时使用：服务模式由 SCM 启动，前台调试请只保留 --console\n";
+        return 2;
+    }
+
+#ifndef _WIN32
+    // 配置校验与指纹打印是跨平台的诊断动作，保留其优先级；单纯的 --service 在非 Windows 构建中不可用
+    if (options.service && !options.checkConfiguration && !options.printFingerprint)
+    {
+        std::cerr << "当前平台不支持 --service：Windows 服务托管只在 Windows 构建中提供，请改用 --console 前台运行\n";
         return 1;
     }
+#endif
 
     try
     {
@@ -113,6 +126,13 @@ int main(const int argc, char **argv)
             std::cout << identity->fingerprint << '\n';
             return 0;
         }
+
+#ifdef _WIN32
+        if (options.service)
+        {
+            return EdgePulse::Agent::ServiceHost::run(*configuration);
+        }
+#endif
 
         EdgePulse::Agent::AgentApplication application(*configuration, options.console);
         return application.run();
