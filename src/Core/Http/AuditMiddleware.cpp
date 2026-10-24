@@ -84,6 +84,10 @@ namespace EdgePulse::Web
 
         [[nodiscard]] std::string actionOf(const std::string_view method, const std::string_view path)
         {
+            if (path.ends_with("/mfa/reset"))
+            {
+                return "重置两步验证";
+            }
             if (path.ends_with("/status"))
             {
                 return "状态变更";

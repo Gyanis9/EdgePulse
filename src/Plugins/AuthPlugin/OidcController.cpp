@@ -82,7 +82,9 @@ namespace EdgePulse::Auth
                         const OidcExchangeResult result = co_await oidc.exchange(loop, Json::stringField(*body, "code"), request.remoteIp(), traceId);
                         if (!result.ok)
                         {
-                            Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, result.error, traceId);
+                            // 兑换失败保留服务层给出的状态：MFA 暂不可用是 503，不是凭据无效
+                            const int status = result.httpStatus > 0 ? result.httpStatus : Common::kCodeUnauthorized;
+                            Common::writeFailure(response, status, status, result.error, traceId);
                             co_return;
                         }
                         if (result.mfaRequired)

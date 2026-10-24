@@ -85,6 +85,7 @@ namespace EdgePulse::Auth
         int         expiresIn{0};          ///< 会话有效期
         std::string returnPath;            ///< 登录前想去的路径
         std::string error;                 ///< 中文失败原因
+        int         httpStatus{0};         ///< 失败时应回给客户端的 HTTP 状态；ok 为真时为 0
         bool        mfaRequired{false};    ///< 本地账号已启用两步验证
         std::string challengeToken;        ///< 两步验证挑战令牌
         int         challengeExpiresIn{0}; ///< 挑战有效期，单位秒

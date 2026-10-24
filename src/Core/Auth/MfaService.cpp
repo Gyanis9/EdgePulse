@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,7 @@ namespace EdgePulse::Auth
     {
         constexpr std::string_view     kSetupCachePrefix = "edgepulse:mfa:setup:";
         constexpr std::chrono::seconds kSetupTtl{600};
+        constexpr std::string_view     kAttemptCachePrefix          = "edgepulse:mfa:attempt:";
         constexpr std::string_view     kChallengeCachePrefix        = "edgepulse:mfa:challenge:";
         constexpr std::size_t          kChallengeTokenBytes         = 24;
         constexpr std::size_t          kMaximumChallengeTokenLength = 128;
@@ -167,14 +169,36 @@ namespace EdgePulse::Auth
         }
 
         /**
+         * @brief 按用户的会话态失败计数键
+         * @param userId 用户标识
+         * @return std::string 键
+         */
+        [[nodiscard]] std::string attemptCacheKey(const std::int64_t userId)
+        {
+            return std::string{kAttemptCachePrefix} + std::to_string(userId);
+        }
+
+        /**
+         * @brief 当前 Unix 秒，用于挑战的绝对过期时刻
+         * @return std::int64_t 秒数
+         */
+        [[nodiscard]] std::int64_t nowEpochSeconds()
+        {
+            return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+
+        /**
          * @brief 把挑战序列化成缓存值
          * @param challenge 挑战内容
          * @return std::string JSON 对象文本
          */
         [[nodiscard]] std::string serializeChallenge(const MfaChallenge &challenge)
         {
-            return AsynGyanis::Base::ConfigValue::object(
-                           {{"userId", challenge.userId}, {"tenantId", challenge.tenantId}, {"clientIp", challenge.clientIp}, {"attempts", challenge.attempts}})
+            return AsynGyanis::Base::ConfigValue::object({{"userId", challenge.userId},
+                                                          {"tenantId", challenge.tenantId},
+                                                          {"clientIp", challenge.clientIp},
+                                                          {"attempts", challenge.attempts},
+                                                          {"expiresAt", challenge.expiresAt}})
                     .dump();
         }
 
@@ -182,7 +206,7 @@ namespace EdgePulse::Auth
          * @brief 解析缓存里的挑战
          * @param token 令牌
          * @param text 缓存值
-         * @return std::optional<MfaChallenge> 字段齐全且用户与租户为正时返回
+         * @return std::optional<MfaChallenge> 字段齐全、用户与租户为正且未过绝对期限时返回
          */
         [[nodiscard]] std::optional<MfaChallenge> parseChallenge(const std::string_view token, const std::string_view text)
         {
@@ -197,6 +221,12 @@ namespace EdgePulse::Auth
             {
                 return std::nullopt;
             }
+            const std::optional<std::int64_t> expiresAt = Json::optionalInteger(*parsed, "expiresAt");
+            if (!expiresAt.has_value() || *expiresAt <= nowEpochSeconds())
+            {
+                // 旧格式没有绝对过期时刻，升级后按失效处理，避免滑动续命
+                return std::nullopt;
+            }
             MfaChallenge challenge;
             challenge.token                            = std::string{token};
             challenge.userId                           = *userId;
@@ -204,6 +234,7 @@ namespace EdgePulse::Auth
             challenge.clientIp                         = Json::stringField(*parsed, "clientIp");
             const std::optional<std::int64_t> attempts = Json::optionalInteger(*parsed, "attempts");
             challenge.attempts                         = attempts.has_value() ? std::max(0, static_cast<int>(*attempts)) : 0;
+            challenge.expiresAt                        = *expiresAt;
             return challenge;
         }
 
@@ -282,6 +313,11 @@ namespace EdgePulse::Auth
         {
             return MfaError{409, std::move(message)};
         }
+
+        [[nodiscard]] MfaError tooManyRequests(std::string message)
+        {
+            return MfaError{429, std::move(message)};
+        }
     } // namespace
 
     MfaService::MfaService(std::shared_ptr<Common::Database> database, std::shared_ptr<Cache::KeyValueStore> cache, std::string encryptionKey) :
@@ -299,10 +335,11 @@ namespace EdgePulse::Auth
         try
         {
             MfaChallenge challenge;
-            challenge.token    = Common::randomTokenHex(kChallengeTokenBytes);
-            challenge.userId   = userId;
-            challenge.tenantId = tenantId;
-            challenge.clientIp = std::move(clientIp);
+            challenge.token     = Common::randomTokenHex(kChallengeTokenBytes);
+            challenge.userId    = userId;
+            challenge.tenantId  = tenantId;
+            challenge.clientIp  = std::move(clientIp);
+            challenge.expiresAt = nowEpochSeconds() + kChallengeTtlSeconds;
             if (!co_await m_cache->set(loop, challengeCacheKey(challenge.token), serializeChallenge(challenge), std::chrono::seconds{kChallengeTtlSeconds}))
             {
                 co_return std::nullopt;
@@ -329,24 +366,54 @@ namespace EdgePulse::Auth
         co_return parseChallenge(token, *stored);
     }
 
-    AsynGyanis::Core::Task<bool> MfaService::recordChallengeFailure(AsynGyanis::Core::EventLoop &loop, MfaChallenge challenge)
+    AsynGyanis::Core::Task<ChallengeFailureOutcome> MfaService::recordChallengeFailure(AsynGyanis::Core::EventLoop &loop, MfaChallenge challenge)
     {
         if (challenge.token.empty())
         {
-            co_return false;
+            co_return ChallengeFailureOutcome::WriteFailed;
+        }
+        const std::int64_t remaining = challenge.expiresAt - nowEpochSeconds();
+        if (remaining <= 0)
+        {
+            co_return ChallengeFailureOutcome::Expired;
         }
         ++challenge.attempts;
         if (challenge.attempts >= kChallengeMaxAttempts)
         {
             // 第 5 次失败不再写回，令牌在上一次 take 时已经删除
-            co_return false;
+            co_return ChallengeFailureOutcome::LimitReached;
         }
-        co_return co_await m_cache->set(loop, challengeCacheKey(challenge.token), serializeChallenge(challenge), std::chrono::seconds{kChallengeTtlSeconds});
+        const bool retained = co_await m_cache->set(loop, challengeCacheKey(challenge.token), serializeChallenge(challenge), std::chrono::seconds{remaining});
+        co_return retained ? ChallengeFailureOutcome::Retained : ChallengeFailureOutcome::WriteFailed;
     }
 
     bool MfaService::keyConfigured() const noexcept
     {
         return m_key.size() == kMfaKeyBytes;
+    }
+
+    AsynGyanis::Core::Task<bool> MfaService::attemptLimitReached(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
+    {
+        const std::optional<std::string> stored = co_await m_cache->get(loop, attemptCacheKey(userId));
+        if (!stored.has_value())
+        {
+            co_return false;
+        }
+        std::int64_t failures = 0;
+        const auto   result   = std::from_chars(stored->data(), stored->data() + stored->size(), failures);
+        co_return result.ec == std::errc{} && failures >= kAttemptMaxFailures;
+    }
+
+    AsynGyanis::Core::Task<> MfaService::recordAttemptFailure(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
+    {
+        static_cast<void>(co_await m_cache->increment(loop, attemptCacheKey(userId), std::chrono::seconds{kAttemptTtlSeconds}));
+        co_return;
+    }
+
+    AsynGyanis::Core::Task<> MfaService::clearAttemptFailures(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)
+    {
+        static_cast<void>(co_await m_cache->erase(loop, attemptCacheKey(userId)));
+        co_return;
     }
 
     std::optional<std::string> MfaService::decryptSecret(const MfaRecord &record) const
@@ -432,6 +499,10 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(conflict("两步验证已启用，如需更换密钥请先关闭两步验证"));
         }
+        if (co_await attemptLimitReached(loop, session.userId))
+        {
+            co_return std::unexpected(tooManyRequests("两步验证尝试过于频繁：请 5 分钟后再试"));
+        }
 
         const std::optional<std::string> pending = co_await m_cache->get(loop, setupCacheKey(session.userId));
         if (!pending.has_value() || pending->empty())
@@ -451,6 +522,7 @@ namespace EdgePulse::Auth
         const std::optional<std::int64_t> matchedStep = matchingStepForSecret(*pendingSecret, trimCopy(code), Totp::currentStep(), 0);
         if (!matchedStep.has_value())
         {
+            co_await recordAttemptFailure(loop, session.userId);
             co_return std::unexpected(unauthorized("验证码错误，请确认身份验证器时间后重试"));
         }
 
@@ -480,6 +552,7 @@ namespace EdgePulse::Auth
             co_return std::unexpected(conflict("两步验证状态已被并发修改，请刷新后重试"));
         }
         static_cast<void>(co_await m_cache->erase(loop, setupCacheKey(session.userId)));
+        co_await clearAttemptFailures(loop, session.userId);
         co_return recoveryCodes;
     }
 
@@ -495,15 +568,21 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(notFound("两步验证未启用"));
         }
+        if (co_await attemptLimitReached(loop, session.userId))
+        {
+            co_return std::unexpected(tooManyRequests("两步验证尝试过于频繁：请 5 分钟后再试"));
+        }
         // 与 verify 共用步号水位：登录时刚用过的口令不能再关闭两步验证
         const std::optional<std::int64_t> matched = matchingStep(*existing, trimCopy(code), Totp::currentStep(), existing->lastUsedStep);
         if (!matched.has_value())
         {
+            co_await recordAttemptFailure(loop, session.userId);
             co_return std::unexpected(unauthorized("验证码错误或已使用，请等待身份验证器刷新后重试"));
         }
         // 先条件消费再删除：并发 verify 抢先用掉同一步时，这里拿到 false 而不是删掉记录
         if (!co_await repository->consumeStep(loop, session.userId, *matched, Common::nowDateTimeUtc()))
         {
+            co_await recordAttemptFailure(loop, session.userId);
             co_return std::unexpected(unauthorized("验证码错误或已使用，请等待身份验证器刷新后重试"));
         }
         if (!co_await repository->remove(loop, session.userId))
@@ -511,6 +590,7 @@ namespace EdgePulse::Auth
             co_return std::unexpected(notFound("两步验证未启用"));
         }
         static_cast<void>(co_await m_cache->erase(loop, setupCacheKey(session.userId)));
+        co_await clearAttemptFailures(loop, session.userId);
         co_return std::expected<void, MfaError>{};
     }
 
@@ -527,10 +607,15 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(notFound("两步验证未启用"));
         }
+        if (co_await attemptLimitReached(loop, session.userId))
+        {
+            co_return std::unexpected(tooManyRequests("两步验证尝试过于频繁：请 5 分钟后再试"));
+        }
         // 与登录共用步号水位：刚用于登录或关闭的验证码不能再签发恢复码
         const std::optional<std::int64_t> matched = matchingStep(*existing, trimCopy(code), Totp::currentStep(), existing->lastUsedStep);
         if (!matched.has_value() || !co_await repository->consumeStep(loop, session.userId, *matched, Common::nowDateTimeUtc()))
         {
+            co_await recordAttemptFailure(loop, session.userId);
             co_return std::unexpected(unauthorized("验证码错误或已使用，请等待身份验证器刷新后重试"));
         }
 
@@ -545,6 +630,7 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(conflict("两步验证记录已被并发修改，请刷新后重试"));
         }
+        co_await clearAttemptFailures(loop, session.userId);
         co_return recoveryCodes;
     }
 
@@ -609,6 +695,7 @@ namespace EdgePulse::Auth
     {
         const bool removed = co_await m_repository.scoped({0, true})->remove(loop, userId);
         static_cast<void>(co_await m_cache->erase(loop, setupCacheKey(userId)));
+        co_await clearAttemptFailures(loop, userId);
         co_return removed;
     }
 } // namespace EdgePulse::Auth

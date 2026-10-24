@@ -2,10 +2,14 @@
 #include "Base/Config/ConfigValue.h"
 #include "Base/Database/Database.h"
 #include "Base/Database/SqlHelpers.h"
+#include "Base/Runtime/TimeFormat.h"
+#include "Base/Security/RandomToken.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Auth/DataScopeService.h"
 #include "Core/Auth/MfaService.h"
+#include "Core/Auth/OidcService.h"
 #include "Core/Auth/Totp.h"
+#include "Core/Cache/KeyValueStore.h"
 #include "Core/Cache/MemoryKeyValueStore.h"
 #include "Core/Http/AuditMiddleware.h"
 #include "Core/Http/MiddlewareSetup.h"
@@ -18,6 +22,7 @@
 #include "Core/System/UserRepository.h"
 #include "Plugins/AuthPlugin/AuthController.h"
 #include "Plugins/AuthPlugin/MfaController.h"
+#include "Plugins/AuthPlugin/OidcController.h"
 #include "Plugins/MonitorPlugin/MonitorController.h"
 #include "Plugins/SystemPlugin/SystemController.h"
 #include "Plugins/SystemPlugin/TenantController.h"
@@ -28,11 +33,15 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <expected>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -83,6 +92,81 @@ namespace
     [[nodiscard]] std::vector<std::pair<std::string, std::string>> bearer(const std::string &token)
     {
         return {{"Authorization", "Bearer " + token}};
+    }
+
+    /**
+     * @brief 把挑战缓存写入改成失败的包装，用于验证 503 不被改写成 401
+     */
+    class FailingChallengeStore final : public EdgePulse::Cache::KeyValueStore
+    {
+    public:
+        explicit FailingChallengeStore(std::shared_ptr<EdgePulse::Cache::KeyValueStore> inner) : m_inner(std::move(inner))
+        {
+        }
+
+        AsynGyanis::Core::Task<std::optional<std::string>> get(AsynGyanis::Core::EventLoop &loop, std::string key) override
+        {
+            co_return co_await m_inner->get(loop, std::move(key));
+        }
+
+        AsynGyanis::Core::Task<std::optional<std::string>> take(AsynGyanis::Core::EventLoop &loop, std::string key) override
+        {
+            co_return co_await m_inner->take(loop, std::move(key));
+        }
+
+        AsynGyanis::Core::Task<bool> set(AsynGyanis::Core::EventLoop &loop, std::string key, std::string value, std::chrono::seconds ttl) override
+        {
+            if (key.starts_with("edgepulse:mfa:challenge:"))
+            {
+                co_return false;
+            }
+            co_return co_await m_inner->set(loop, std::move(key), std::move(value), ttl);
+        }
+
+        AsynGyanis::Core::Task<bool> erase(AsynGyanis::Core::EventLoop &loop, std::string key) override
+        {
+            co_return co_await m_inner->erase(loop, std::move(key));
+        }
+
+        AsynGyanis::Core::Task<std::int64_t> increment(AsynGyanis::Core::EventLoop &loop, std::string key, std::chrono::seconds ttl) override
+        {
+            co_return co_await m_inner->increment(loop, std::move(key), ttl);
+        }
+
+        [[nodiscard]] std::string_view backendName() const noexcept override
+        {
+            return m_inner->backendName();
+        }
+
+    private:
+        std::shared_ptr<EdgePulse::Cache::KeyValueStore> m_inner; ///< 实际存储
+    };
+
+    /**
+     * @brief 把协程结果搬进 promise，供同一条事件循环上的并发用例各自等待
+     */
+    template<typename ResultType>
+    AsynGyanis::Core::Task<> forwardInto(AsynGyanis::Core::Task<ResultType> task, std::shared_ptr<std::promise<ResultType>> promise)
+    {
+        try
+        {
+            if constexpr (std::is_void_v<ResultType>)
+            {
+                co_await task;
+                promise->set_value();
+            } else
+            {
+                promise->set_value(co_await task);
+            }
+        } catch (...)
+        {
+            promise->set_exception(std::current_exception());
+        }
+    }
+
+    [[nodiscard]] std::int64_t nowEpochSeconds()
+    {
+        return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
     [[nodiscard]] std::optional<AsynGyanis::Base::ConfigValue> responseData(const HttpResult &result)
@@ -141,10 +225,13 @@ namespace
 
     struct OperAuditRow
     {
-        std::string url;
-        std::string title;
-        std::string params;
-        std::string errorMessage;
+        std::string  url;
+        std::string  title;
+        std::string  params;
+        std::string  errorMessage;
+        std::int64_t operId{0};
+        std::string  ip;
+        int          result{0};
     };
 
     struct LoginFailureState
@@ -180,7 +267,7 @@ namespace
     [[nodiscard]] std::vector<OperAuditRow> readOperAudits(const AuthTestContext &context)
     {
         const auto                connection = openDirect(context);
-        const auto                result     = connection->execute("SELECT url, title, params, error_msg FROM sys_oper_log ORDER BY oper_time, id");
+        const auto                result     = connection->execute("SELECT url, title, params, error_msg, oper_id, ip, result FROM sys_oper_log ORDER BY oper_time, id");
         std::vector<OperAuditRow> rows;
         if (!result)
         {
@@ -189,7 +276,8 @@ namespace
         while (result->next())
         {
             rows.push_back(OperAuditRow{EdgePulse::Sql::text(*result, "url"), EdgePulse::Sql::text(*result, "title"), EdgePulse::Sql::text(*result, "params"),
-                                        EdgePulse::Sql::text(*result, "error_msg")});
+                                        EdgePulse::Sql::text(*result, "error_msg"), EdgePulse::Sql::integer(*result, "oper_id"), EdgePulse::Sql::text(*result, "ip"),
+                                        static_cast<int>(EdgePulse::Sql::integer(*result, "result"))});
         }
         return rows;
     }
@@ -260,13 +348,18 @@ protected:
         m_logs       = std::make_shared<EdgePulse::System::LogRepository>(m_context->database);
         m_dataScopes = std::make_shared<EdgePulse::Auth::DataScopeService>(m_context->database);
         m_tenants    = std::make_shared<EdgePulse::System::TenantRepository>(m_context->database);
-        m_server     = std::make_unique<ServerHarness>(
+        EdgePulse::Auth::OidcConfiguration oidcConfiguration;
+        oidcConfiguration.enabled    = true;
+        oidcConfiguration.tenantCode = "default";
+        m_oidc                       = std::make_unique<EdgePulse::Auth::OidcService>(oidcConfiguration, *m_users, *m_tenants, *m_context->cache, *m_context->auth);
+        m_server                     = std::make_unique<ServerHarness>(
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
                     EdgePulse::Web::applySecurityHeaders(router);
                     EdgePulse::Web::registerAuditMiddleware(router, loop, *m_context->auth, *m_logs);
                     EdgePulse::Auth::registerRoutes(router, loop, *m_context->auth, *m_context->captcha, true);
-                    EdgePulse::Auth::registerMfaRoutes(router, loop, *m_context->auth, *m_mfa);
+                    EdgePulse::Auth::registerMfaRoutes(router, loop, *m_context->auth, *m_mfa, *m_logs);
+                    EdgePulse::Auth::registerOidcRoutes(router, loop, *m_oidc);
                     EdgePulse::System::SystemDependencies systemDependencies;
                     systemDependencies.auth         = m_context->auth.get();
                     systemDependencies.dataScopes   = m_dataScopes.get();
@@ -293,6 +386,7 @@ protected:
     void TearDown() override
     {
         m_server.reset();
+        m_oidc.reset();
         m_mfa.reset();
         m_context.reset();
     }
@@ -338,9 +432,9 @@ protected:
     }
 
     /**
-     * @brief 用当前会话设置并启用两步验证
+     * @brief 用当前会话与当前口令设置并启用两步验证
      */
-    [[nodiscard]] MfaActivation activateMfa(const std::string &token)
+    [[nodiscard]] MfaActivation activateMfa(const std::string &token, const std::string &password)
     {
         MfaActivation activation;
         const auto    before = m_server->get("/api/auth/mfa", bearer(token));
@@ -353,7 +447,8 @@ protected:
         }
         EXPECT_FALSE(beforeData->value("enabled", true));
 
-        const auto setup = m_server->post("/api/auth/mfa/setup", "{}", "application/json", bearer(token));
+        const AsynGyanis::Base::ConfigValue setupBody = AsynGyanis::Base::ConfigValue::object({{"password", password}});
+        const auto                          setup     = m_server->post("/api/auth/mfa/setup", setupBody.dump(), "application/json", bearer(token));
         EXPECT_EQ(200, setup.status) << setup.body;
         EXPECT_EQ(std::string{"no-store"}, setup.header("Cache-Control").value_or(""));
         activation.secret = stringData(setup, "secret");
@@ -363,9 +458,10 @@ protected:
             return activation;
         }
 
-        activation.enableStep                          = Totp::currentStep();
-        const AsynGyanis::Base::ConfigValue enableBody = AsynGyanis::Base::ConfigValue::object({{"code", Totp::code(activation.secret, activation.enableStep)}});
-        const auto                          enabled    = m_server->post("/api/auth/mfa/enable", enableBody.dump(), "application/json", bearer(token));
+        activation.enableStep = Totp::currentStep();
+        const AsynGyanis::Base::ConfigValue enableBody =
+                AsynGyanis::Base::ConfigValue::object({{"password", password}, {"code", Totp::code(activation.secret, activation.enableStep)}});
+        const auto enabled = m_server->post("/api/auth/mfa/enable", enableBody.dump(), "application/json", bearer(token));
         EXPECT_EQ(200, enabled.status) << enabled.body;
         EXPECT_EQ(std::string{"no-store"}, enabled.header("Cache-Control").value_or(""));
         const auto enabledData = responseData(enabled);
@@ -436,6 +532,17 @@ protected:
         return data->value("token", std::string{});
     }
 
+    /**
+     * @brief 直接写入一份 OIDC 一次性 code，模拟回调已经完成身份校验
+     */
+    [[nodiscard]] std::string issueOidcCode(EventLoopRunner &runner, const std::int64_t userId, const std::string &returnPath)
+    {
+        const std::string code   = EdgePulse::Common::randomTokenHex(24);
+        const auto        stored = AsynGyanis::Base::ConfigValue::object({{"userId", userId}, {"returnPath", returnPath}});
+        EXPECT_TRUE(runner.run(m_context->cache->set(runner.loop(), "oidc:code:" + code, stored.dump(), std::chrono::seconds{120})));
+        return code;
+    }
+
     [[nodiscard]] std::int64_t createRole(const std::string &token, const std::string &name, const std::string &code)
     {
         const std::string body     = AsynGyanis::Base::ConfigValue::object(
@@ -499,6 +606,7 @@ protected:
     std::shared_ptr<EdgePulse::System::LogRepository>        m_logs;
     std::shared_ptr<EdgePulse::Auth::DataScopeService>       m_dataScopes;
     std::shared_ptr<EdgePulse::System::TenantRepository>     m_tenants;
+    std::unique_ptr<EdgePulse::Auth::OidcService>            m_oidc;
     std::unique_ptr<ServerHarness>                           m_server;
 };
 
@@ -508,7 +616,7 @@ TEST_F(MfaEndpointsTest, LoginIssuesChallengeAndVerifiesTotp)
     const std::string token = loginToken("admin", "admin123");
     ASSERT_FALSE(token.empty());
 
-    const MfaActivation activation = activateMfa(token);
+    const MfaActivation activation = activateMfa(token, "admin123");
     ASSERT_FALSE(activation.secret.empty());
     ASSERT_EQ(10U, activation.recoveryCodes.size());
 
@@ -543,12 +651,39 @@ TEST_F(MfaEndpointsTest, LoginIssuesChallengeAndVerifiesTotp)
     }
 }
 
+// 钉住：设置与启用都要当前口令，光有会话不能登记新的第二因素
+TEST_F(MfaEndpointsTest, SetupAndEnableRequireCurrentPassword)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+
+    EXPECT_EQ(400, m_server->post("/api/auth/mfa/setup", "{}", "application/json", bearer(token)).status);
+    const auto wrongSetup = AsynGyanis::Base::ConfigValue::object({{"password", "not-the-password"}});
+    EXPECT_EQ(401, m_server->post("/api/auth/mfa/setup", wrongSetup.dump(), "application/json", bearer(token)).status);
+
+    const auto rightSetup = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}});
+    const auto setup      = m_server->post("/api/auth/mfa/setup", rightSetup.dump(), "application/json", bearer(token));
+    ASSERT_EQ(200, setup.status) << setup.body;
+    const std::string secret = stringData(setup, "secret");
+    ASSERT_FALSE(secret.empty());
+
+    const std::int64_t enableStep = Totp::currentStep();
+    const std::string  enableCode = Totp::code(secret, enableStep);
+    const auto         onlyCode   = AsynGyanis::Base::ConfigValue::object({{"code", enableCode}});
+    EXPECT_EQ(400, m_server->post("/api/auth/mfa/enable", onlyCode.dump(), "application/json", bearer(token)).status);
+    const auto wrongPassword = AsynGyanis::Base::ConfigValue::object({{"password", "not-the-password"}, {"code", enableCode}});
+    EXPECT_EQ(401, m_server->post("/api/auth/mfa/enable", wrongPassword.dump(), "application/json", bearer(token)).status);
+    // 口令失败发生在验证码校验之前，没有消费待启用秘密的步号
+    const auto enableBody = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}, {"code", enableCode}});
+    EXPECT_EQ(200, m_server->post("/api/auth/mfa/enable", enableBody.dump(), "application/json", bearer(token)).status);
+}
+
 // 钉住：连续错码 5 次销毁挑战，第 6 次即使口令正确也拒绝
 TEST_F(MfaEndpointsTest, FiveWrongCodesDestroyChallenge)
 {
     const std::string token = loginToken("admin", "admin123");
     ASSERT_FALSE(token.empty());
-    const MfaActivation activation = activateMfa(token);
+    const MfaActivation activation = activateMfa(token, "admin123");
     ASSERT_FALSE(activation.secret.empty());
 
     const std::string challenge = startChallenge("admin", "admin123");
@@ -562,6 +697,12 @@ TEST_F(MfaEndpointsTest, FiveWrongCodesDestroyChallenge)
     const std::int64_t correctStep = std::max(Totp::currentStep(), activation.enableStep + 1);
     EXPECT_EQ(401, verifyChallenge(challenge, Totp::code(activation.secret, correctStep)).status);
 
+    // 第 5 次失败按次数上限留痕，而不是与缓存写入失败混成一句
+    const std::vector<LoginAuditRow> audits  = readLoginAudits(*m_context);
+    const std::int64_t               adminId = userIdByUsername(*m_context, "admin");
+    EXPECT_NE(audits.end(),
+              std::find_if(audits.begin(), audits.end(), [adminId](const LoginAuditRow &row) { return row.userId == adminId && row.message == "两步验证失败次数已达上限"; }));
+
     // 账号本身没有因挑战失败被锁定，重新登录仍可拿到新挑战
     const std::string freshChallenge = startChallenge("admin", "admin123");
     ASSERT_FALSE(freshChallenge.empty());
@@ -569,12 +710,219 @@ TEST_F(MfaEndpointsTest, FiveWrongCodesDestroyChallenge)
     EXPECT_FALSE(verifyChallengeToken(freshChallenge, Totp::code(activation.secret, correctStep)).empty());
 }
 
+// 钉住：挑战续期写入失败与次数上限分成两条审计文案
+TEST_F(MfaEndpointsTest, ChallengeRenewalWriteFailureIsAuditedDistinctly)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+
+    EventLoopRunner runner;
+    const auto      challenge = runner.run(m_mfa->createChallenge(runner.loop(), adminId, 1, "127.0.0.1"));
+    ASSERT_TRUE(challenge.has_value());
+
+    auto failingStore = std::make_shared<FailingChallengeStore>(m_context->cache);
+    auto brokenMfa    = std::make_shared<MfaService>(m_context->database, failingStore, encodedMfaKey());
+    m_context->auth->setMfaService(brokenMfa);
+
+    const auto rejected = runner.run(m_context->auth->verifyMfa(runner.loop(), *challenge, wrongCode(activation.secret, Totp::currentStep()), "127.0.0.1", "trace-mfa-write"));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(401, rejected.error().httpStatus);
+
+    const std::vector<LoginAuditRow> audits = readLoginAudits(*m_context);
+    EXPECT_NE(audits.end(),
+              std::find_if(audits.begin(), audits.end(), [adminId](const LoginAuditRow &row) { return row.userId == adminId && row.message == "两步验证失败且挑战续期写入失败"; }));
+}
+
+// 钉住：关闭接口连续错码 5 次后，正确验证码也被按用户失败计数挡住
+TEST_F(MfaEndpointsTest, DisableFailureLimitBlocksCorrectCode)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+
+    const std::string badCode = wrongCode(activation.secret, Totp::currentStep());
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+        const auto body = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}, {"code", badCode}});
+        EXPECT_EQ(401, m_server->post("/api/auth/mfa/disable", body.dump(), "application/json", bearer(token)).status) << "attempt " << attempt;
+    }
+
+    const std::int64_t correctStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    const auto         correctBody = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}, {"code", Totp::code(activation.secret, correctStep)}});
+    EXPECT_EQ(429, m_server->post("/api/auth/mfa/disable", correctBody.dump(), "application/json", bearer(token)).status);
+    EXPECT_TRUE(listMfaEnabled(token, "admin"));
+}
+
+// 钉住：换发恢复码连续错码 5 次后，正确验证码也被按用户失败计数挡住
+TEST_F(MfaEndpointsTest, RecoveryCodeRegenerationFailureLimitBlocksCorrectCode)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+
+    const std::string badCode = wrongCode(activation.secret, Totp::currentStep());
+    const auto        badBody = AsynGyanis::Base::ConfigValue::object({{"code", badCode}});
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+        EXPECT_EQ(401, m_server->post("/api/auth/mfa/recovery-codes", badBody.dump(), "application/json", bearer(token)).status) << "attempt " << attempt;
+    }
+
+    const std::int64_t correctStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    const auto         correctBody = AsynGyanis::Base::ConfigValue::object({{"code", Totp::code(activation.secret, correctStep)}});
+    EXPECT_EQ(429, m_server->post("/api/auth/mfa/recovery-codes", correctBody.dump(), "application/json", bearer(token)).status);
+}
+
+// 钉住：一次成功的管理操作清空共享失败计数，后续仍保有完整的 5 次机会
+TEST_F(MfaEndpointsTest, SuccessfulManagementOperationClearsFailureLimit)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+
+    const std::string badCode = wrongCode(activation.secret, Totp::currentStep());
+    const auto        badBody = AsynGyanis::Base::ConfigValue::object({{"code", badCode}});
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        EXPECT_EQ(401, m_server->post("/api/auth/mfa/recovery-codes", badBody.dump(), "application/json", bearer(token)).status) << "attempt " << attempt;
+    }
+
+    const std::int64_t regenerateStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    const auto         regenerateBody = AsynGyanis::Base::ConfigValue::object({{"code", Totp::code(activation.secret, regenerateStep)}});
+    ASSERT_EQ(200, m_server->post("/api/auth/mfa/recovery-codes", regenerateBody.dump(), "application/json", bearer(token)).status);
+
+    // 若成功没有清零，计数会从 3 起算，第二次错码就会撞到上限
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+        const auto body = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}, {"code", badCode}});
+        EXPECT_EQ(401, m_server->post("/api/auth/mfa/disable", body.dump(), "application/json", bearer(token)).status) << "attempt " << attempt;
+    }
+}
+
+// 钉住：已启用时重新设置返回 409，未启用时关闭返回 404
+TEST_F(MfaEndpointsTest, SetupWhenEnabledAndDisableWhenMissing)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+
+    const auto disableBody = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}, {"code", "123456"}});
+    EXPECT_EQ(404, m_server->post("/api/auth/mfa/disable", disableBody.dump(), "application/json", bearer(token)).status);
+
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const auto setupBody = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}});
+    EXPECT_EQ(409, m_server->post("/api/auth/mfa/setup", setupBody.dump(), "application/json", bearer(token)).status);
+}
+
+// 钉住：挑战绑定的来源 IP 与本次请求不一致时拒绝，且挑战已被消费
+TEST_F(MfaEndpointsTest, ChallengeRejectsDifferentClientIp)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+
+    EventLoopRunner runner;
+    const auto      challenge = runner.run(m_mfa->createChallenge(runner.loop(), adminId, 1, "198.51.100.10"));
+    ASSERT_TRUE(challenge.has_value());
+    const std::int64_t loginStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    const std::string  code      = Totp::code(activation.secret, loginStep);
+
+    const auto rejected = runner.run(m_context->auth->verifyMfa(runner.loop(), *challenge, code, "198.51.100.11", "trace-mfa-ip"));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(401, rejected.error().httpStatus);
+
+    // 校验入口先 take 再比 IP，挑战不会留给同一令牌的下一次尝试
+    const auto retry = runner.run(m_context->auth->verifyMfa(runner.loop(), *challenge, code, "198.51.100.10", "trace-mfa-ip"));
+    EXPECT_FALSE(retry.has_value());
+
+    const std::vector<LoginAuditRow> audits = readLoginAudits(*m_context);
+    EXPECT_NE(audits.end(),
+              std::find_if(audits.begin(), audits.end(), [adminId](const LoginAuditRow &row) { return row.userId == adminId && row.message == "两步验证来源与登录请求不一致"; }));
+}
+
+// 钉住：挑战寿命是签发时刻起算的绝对 300 秒，失败重写不延长
+TEST_F(MfaEndpointsTest, ExpiredChallengeIsRejected)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+
+    EventLoopRunner runner;
+    const auto      challenge = runner.run(m_mfa->createChallenge(runner.loop(), adminId, 1, "127.0.0.1"));
+    ASSERT_TRUE(challenge.has_value());
+
+    const auto expired =
+            AsynGyanis::Base::ConfigValue::object({{"userId", adminId}, {"tenantId", 1}, {"clientIp", "127.0.0.1"}, {"attempts", 0}, {"expiresAt", nowEpochSeconds() - 1}});
+    ASSERT_TRUE(runner.run(m_context->cache->set(runner.loop(), "edgepulse:mfa:challenge:" + *challenge, expired.dump(), std::chrono::seconds{300})));
+    EXPECT_FALSE(runner.run(m_mfa->takeChallenge(runner.loop(), *challenge)).has_value());
+
+    const std::int64_t loginStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    const auto         rejected  = runner.run(m_context->auth->verifyMfa(runner.loop(), *challenge, Totp::code(activation.secret, loginStep), "127.0.0.1", "trace-mfa-expired"));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(401, rejected.error().httpStatus);
+}
+
+// 钉住：同一挑战并发校验只有一方能拿到挑战并签发会话
+TEST_F(MfaEndpointsTest, ConcurrentVerifyIssuesExactlyOneSession)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+
+    EventLoopRunner runner;
+    const auto      challenge = runner.run(m_mfa->createChallenge(runner.loop(), adminId, 1, "127.0.0.1"));
+    ASSERT_TRUE(challenge.has_value());
+    const std::int64_t loginStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    const std::string  code      = Totp::code(activation.secret, loginStep);
+
+    using Outcome     = std::expected<EdgePulse::Auth::LoginResult, EdgePulse::Auth::AuthError>;
+    auto first        = std::make_shared<std::promise<Outcome>>();
+    auto second       = std::make_shared<std::promise<Outcome>>();
+    auto firstResult  = first->get_future();
+    auto secondResult = second->get_future();
+
+    AsynGyanis::Core::Task<> firstTask  = forwardInto(m_context->auth->verifyMfa(runner.loop(), *challenge, code, "127.0.0.1", "trace-mfa-concurrent-1"), first);
+    AsynGyanis::Core::Task<> secondTask = forwardInto(m_context->auth->verifyMfa(runner.loop(), *challenge, code, "127.0.0.1", "trace-mfa-concurrent-2"), second);
+    runner.loop().scheduler().scheduleRemote(firstTask.handle());
+    runner.loop().scheduler().scheduleRemote(secondTask.handle());
+
+    ASSERT_EQ(std::future_status::ready, firstResult.wait_for(std::chrono::seconds{5}));
+    ASSERT_EQ(std::future_status::ready, secondResult.wait_for(std::chrono::seconds{5}));
+    const Outcome one       = firstResult.get();
+    const Outcome two       = secondResult.get();
+    const int     successes = (one.has_value() ? 1 : 0) + (two.has_value() ? 1 : 0);
+    EXPECT_EQ(1, successes);
+    if (one.has_value())
+    {
+        EXPECT_FALSE(one->token.empty());
+    }
+    if (two.has_value())
+    {
+        EXPECT_FALSE(two->token.empty());
+    }
+}
+
 // 钉住：恢复码可完成一次登录，同一枚第二次提交被拒绝
 TEST_F(MfaEndpointsTest, RecoveryCodeWorksOnce)
 {
     const std::string token = loginToken("admin", "admin123");
     ASSERT_FALSE(token.empty());
-    const MfaActivation activation = activateMfa(token);
+    const MfaActivation activation = activateMfa(token, "admin123");
     ASSERT_GE(activation.recoveryCodes.size(), 2U);
 
     const std::string challenge = startChallenge("admin", "admin123");
@@ -599,7 +947,7 @@ TEST_F(MfaEndpointsTest, DisableRequiresPasswordAndFreshTotp)
 {
     const std::string token = loginToken("admin", "admin123");
     ASSERT_FALSE(token.empty());
-    const MfaActivation activation = activateMfa(token);
+    const MfaActivation activation = activateMfa(token, "admin123");
     ASSERT_FALSE(activation.secret.empty());
 
     // 启用时用过的口令不能关闭
@@ -623,6 +971,14 @@ TEST_F(MfaEndpointsTest, DisableRequiresPasswordAndFreshTotp)
     ASSERT_EQ(200, disabled.status) << disabled.body;
     EXPECT_EQ(std::string{"no-store"}, disabled.header("Cache-Control").value_or(""));
 
+    const std::int64_t              adminId    = userIdByUsername(*m_context, "admin");
+    const std::vector<OperAuditRow> operAudits = readOperAudits(*m_context);
+    const auto disableAudit = std::find_if(operAudits.begin(), operAudits.end(),
+                                           [adminId](const OperAuditRow &row) { return row.url == "/api/auth/mfa/disable" && row.operId == adminId && row.result == 1; });
+    ASSERT_NE(operAudits.end(), disableAudit);
+    EXPECT_EQ(std::string{"两步验证 · 关闭"}, disableAudit->title);
+    EXPECT_FALSE(disableAudit->ip.empty());
+
     const HttpResult afterDisable = attemptLogin("admin", "admin123");
     ASSERT_EQ(200, afterDisable.status) << afterDisable.body;
     const auto afterData = responseData(afterDisable);
@@ -645,7 +1001,7 @@ TEST_F(MfaEndpointsTest, AdminResetScopesPermissionAndAudit)
 
     const std::string targetToken = loginToken("mfa-target", "userpass1");
     ASSERT_FALSE(targetToken.empty());
-    const MfaActivation activation = activateMfa(targetToken);
+    const MfaActivation activation = activateMfa(targetToken, "userpass1");
     ASSERT_FALSE(activation.secret.empty());
     EXPECT_TRUE(listMfaEnabled(adminToken, "mfa-target"));
 
@@ -677,7 +1033,13 @@ TEST_F(MfaEndpointsTest, AdminResetScopesPermissionAndAudit)
 
     const std::vector<OperAuditRow> operAudits = readOperAudits(*m_context);
     const std::string               resetUrl   = "/api/system/users/" + std::to_string(targetId) + "/mfa/reset";
-    EXPECT_NE(operAudits.end(), std::find_if(operAudits.begin(), operAudits.end(), [&resetUrl](const OperAuditRow &row) { return row.url == resetUrl; }));
+    const std::int64_t              adminId    = userIdByUsername(*m_context, "admin");
+    const auto resetAudit = std::find_if(operAudits.begin(), operAudits.end(),
+                                         [&resetUrl, adminId](const OperAuditRow &row) { return row.url == resetUrl && row.operId == adminId && row.result == 1; });
+    ASSERT_NE(operAudits.end(), resetAudit);
+    EXPECT_EQ(std::string{"用户管理 · 重置两步验证"}, resetAudit->title);
+    EXPECT_EQ(adminId, resetAudit->operId);
+    EXPECT_FALSE(resetAudit->ip.empty());
 
     const std::vector<LoginAuditRow> loginAudits = readLoginAudits(*m_context);
     for (const OperAuditRow &row: operAudits)
@@ -692,12 +1054,12 @@ TEST_F(MfaEndpointsTest, AdminResetScopesPermissionAndAudit)
     }
 }
 
-// 钉住：管理员可为已启用用户重置恢复码，旧恢复码随即失效
+// 钉住：用户可用未消费的 TOTP 自助换发恢复码，旧恢复码随即失效
 TEST_F(MfaEndpointsTest, RegeneratesRecoveryCodes)
 {
     const std::string token = loginToken("admin", "admin123");
     ASSERT_FALSE(token.empty());
-    const MfaActivation activation = activateMfa(token);
+    const MfaActivation activation = activateMfa(token, "admin123");
     ASSERT_FALSE(activation.secret.empty());
 
     const std::int64_t codeStep = std::max(Totp::currentStep(), activation.enableStep + 1);
@@ -721,6 +1083,105 @@ TEST_F(MfaEndpointsTest, RegeneratesRecoveryCodes)
     EXPECT_EQ(401, verifyChallenge(challenge, activation.recoveryCodes.front()).status);
     const std::string freshToken = verifyChallengeToken(challenge, freshCodes.front());
     EXPECT_FALSE(freshToken.empty());
+}
+
+// 钉住：设置、启用与换发恢复码都留下带用户与 IP 的操作审计，且不含秘密或验证码
+TEST_F(MfaEndpointsTest, ManagementActionsAreAuditedWithoutSecrets)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+
+    const std::int64_t regenerateStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    const std::string  regenerateCode = Totp::code(activation.secret, regenerateStep);
+    const auto         regenerateBody = AsynGyanis::Base::ConfigValue::object({{"code", regenerateCode}});
+    ASSERT_EQ(200, m_server->post("/api/auth/mfa/recovery-codes", regenerateBody.dump(), "application/json", bearer(token)).status);
+
+    const std::vector<OperAuditRow> rows = readOperAudits(*m_context);
+    const auto findByUrl = [&rows](const std::string &url) { return std::find_if(rows.begin(), rows.end(), [&url](const OperAuditRow &row) { return row.url == url; }); };
+
+    const auto setupRow = findByUrl("/api/auth/mfa/setup");
+    ASSERT_NE(rows.end(), setupRow);
+    EXPECT_EQ(std::string{"两步验证 · 开始设置"}, setupRow->title);
+    EXPECT_EQ(adminId, setupRow->operId);
+    EXPECT_FALSE(setupRow->ip.empty());
+
+    const auto enableRow = findByUrl("/api/auth/mfa/enable");
+    ASSERT_NE(rows.end(), enableRow);
+    EXPECT_EQ(std::string{"两步验证 · 启用"}, enableRow->title);
+    EXPECT_EQ(adminId, enableRow->operId);
+
+    const auto recoveryRow = findByUrl("/api/auth/mfa/recovery-codes");
+    ASSERT_NE(rows.end(), recoveryRow);
+    EXPECT_EQ(std::string{"两步验证 · 重置恢复码"}, recoveryRow->title);
+    EXPECT_EQ(adminId, recoveryRow->operId);
+
+    const std::vector<std::string> oneTimeCodes{regenerateCode, Totp::code(activation.secret, activation.enableStep)};
+    for (const OperAuditRow &row: rows)
+    {
+        EXPECT_FALSE(containsAnyAuditSecret(row.params, activation)) << row.params;
+        EXPECT_FALSE(containsAnyAuditSecret(row.title, activation)) << row.title;
+        EXPECT_FALSE(containsAnyAuditSecret(row.errorMessage, activation)) << row.errorMessage;
+        for (const std::string &code: oneTimeCodes)
+        {
+            EXPECT_EQ(std::string::npos, row.params.find(code)) << row.params;
+            EXPECT_EQ(std::string::npos, row.errorMessage.find(code)) << row.errorMessage;
+        }
+    }
+}
+
+// 钉住：OIDC 一次性 code 兑换时，已启用 MFA 的账号返回挑战形状而不是会话
+TEST_F(MfaEndpointsTest, OidcExchangeReturnsMfaChallengeShape)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+
+    EventLoopRunner   runner;
+    const std::string code     = issueOidcCode(runner, adminId, "/nodes");
+    const auto        exchange = AsynGyanis::Base::ConfigValue::object({{"code", code}});
+    const HttpResult  response = m_server->post("/api/auth/oidc/exchange", exchange.dump(), "application/json");
+    ASSERT_EQ(200, response.status) << response.body;
+    EXPECT_EQ(std::string{"no-store"}, response.header("Cache-Control").value_or(""));
+    const auto data = responseData(response);
+    ASSERT_TRUE(data.has_value());
+    EXPECT_TRUE(data->value("mfaRequired", false));
+    EXPECT_FALSE(data->contains("token"));
+    EXPECT_EQ(std::string{"/nodes"}, data->value("returnPath", std::string{}));
+    EXPECT_EQ(static_cast<std::int64_t>(MfaService::kChallengeTtlSeconds), data->value("expiresIn", std::int64_t{0}));
+    const std::string challenge = data->value("challengeToken", std::string{});
+    ASSERT_FALSE(challenge.empty());
+
+    const std::int64_t verifyStep = std::max(Totp::currentStep(), activation.enableStep + 1);
+    EXPECT_FALSE(verifyChallengeToken(challenge, Totp::code(activation.secret, verifyStep)).empty());
+}
+
+// 钉住：两步验证挑战签发失败时兑换接口保留 503，而不是折成 401
+TEST_F(MfaEndpointsTest, OidcExchangePreservesMfaUnavailableStatus)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+
+    auto failingStore = std::make_shared<FailingChallengeStore>(m_context->cache);
+    auto brokenMfa    = std::make_shared<MfaService>(m_context->database, failingStore, encodedMfaKey());
+    m_context->auth->setMfaService(brokenMfa);
+
+    EventLoopRunner   runner;
+    const std::string code     = issueOidcCode(runner, adminId, "/nodes");
+    const auto        exchange = AsynGyanis::Base::ConfigValue::object({{"code", code}});
+    const HttpResult  response = m_server->post("/api/auth/oidc/exchange", exchange.dump(), "application/json");
+    EXPECT_EQ(503, response.status) << response.body;
+    EXPECT_EQ(std::string::npos, response.body.find("\"code\":401")) << response.body;
 }
 
 // 钉住：OIDC 等外部身份签发路径对已启用 MFA 的用户返回挑战而不是会话

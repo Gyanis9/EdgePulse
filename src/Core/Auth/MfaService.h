@@ -43,11 +43,23 @@ namespace EdgePulse::Auth
      */
     struct MfaChallenge
     {
-        std::string  token;       ///< 一次性挑战令牌
-        std::int64_t userId{0};   ///< 待验证的用户
-        std::int64_t tenantId{0}; ///< 用户归属租户
-        std::string  clientIp;    ///< 发起口令登录的来源 IP
-        int          attempts{0}; ///< 已失败的验证次数
+        std::string  token;        ///< 一次性挑战令牌
+        std::int64_t userId{0};    ///< 待验证的用户
+        std::int64_t tenantId{0};  ///< 用户归属租户
+        std::string  clientIp;     ///< 发起口令登录的来源 IP
+        int          attempts{0};  ///< 已失败的验证次数
+        std::int64_t expiresAt{0}; ///< 绝对过期时刻，Unix 秒
+    };
+
+    /**
+     * @brief 登录挑战失败后的去向
+     */
+    enum class ChallengeFailureOutcome
+    {
+        Retained,     ///< 挑战按剩余时间与次数写回
+        LimitReached, ///< 达到失败上限，挑战不再保留
+        Expired,      ///< 挑战已过绝对有效期
+        WriteFailed   ///< 挑战续期写入缓存失败
     };
 
     /**
@@ -75,6 +87,8 @@ namespace EdgePulse::Auth
      *          状态、校验与管理员重置仍可安全执行。
      * @note TOTP 校验本身不计数；登录挑战的次数上限由 createChallenge/recordChallengeFailure
      *       维护，挑战最多接受 5 次失败，随后连同缓存一起销毁。
+     * @note 持有会话的启用、关闭与换发恢复码入口共用一份按用户的失败计数，键为
+     *       edgepulse:mfa:attempt: 加用户标识，窗口 300 秒，最多 5 次，第 6 次起直接返回 429。
      * @note 恢复码以主密钥为键做 HMAC-SHA256 后落库，只有数据库泄露不足以离线还原 40 位随机码。
      */
     class MfaService
@@ -85,6 +99,12 @@ namespace EdgePulse::Auth
 
         /// 登录挑战允许的最大失败次数
         static constexpr int kChallengeMaxAttempts = 5;
+
+        /// 会话态入口（启用、关闭、换发恢复码）允许的最大失败次数
+        static constexpr int kAttemptMaxFailures = 5;
+
+        /// 会话态失败计数窗口，单位秒
+        static constexpr int kAttemptTtlSeconds = 300;
 
         /**
          * @brief 构造
@@ -101,6 +121,7 @@ namespace EdgePulse::Auth
          * @param tenantId 用户归属租户
          * @param clientIp 来源 IP，校验时必须与登录请求一致
          * @return std::optional<std::string> 成功返回一次性令牌；随机源或缓存不可用时为空
+         * @note 挑战的有效期是签发时刻起算的 300 秒绝对时长，失败重写不会延长
          */
         AsynGyanis::Core::Task<std::optional<std::string>> createChallenge(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::int64_t tenantId, std::string clientIp);
 
@@ -114,12 +135,13 @@ namespace EdgePulse::Auth
         AsynGyanis::Core::Task<std::optional<MfaChallenge>> takeChallenge(AsynGyanis::Core::EventLoop &loop, std::string_view token);
 
         /**
-         * @brief 记录一次失败并把挑战按剩余次数重写回缓存
+         * @brief 记录一次失败并把挑战按剩余时间与次数重写回缓存
          * @param loop 恢复协程用的事件循环
          * @param challenge 本次取出的挑战
-         * @return bool 挑战仍可继续校验时为 true；达到失败上限或缓存写入失败时为 false
+         * @return ChallengeFailureOutcome 写回、达到上限、已过期或写入失败的区分
+         * @note 有效期按挑战里的绝对过期时刻计算，失败不会把 300 秒重新往后推
          */
-        AsynGyanis::Core::Task<bool> recordChallengeFailure(AsynGyanis::Core::EventLoop &loop, MfaChallenge challenge);
+        AsynGyanis::Core::Task<ChallengeFailureOutcome> recordChallengeFailure(AsynGyanis::Core::EventLoop &loop, MfaChallenge challenge);
 
         /**
          * @brief 生成新秘密，加密后写入待启用缓存
@@ -135,8 +157,10 @@ namespace EdgePulse::Auth
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份
          * @param code 身份验证器当前的 6 位验证码
-         * @return 成功返回 10 枚明文恢复码，只出现这一次；设置过期返回 400，验证码错误返回 401，已启用返回 409
+         * @return 成功返回 10 枚明文恢复码，只出现这一次；设置过期返回 400，验证码错误返回 401，已启用返回 409，
+         *         失败次数用尽返回 429
          * @note 命中步号会写成 last_used_step，setup 口令不能在启用后继续用于登录校验
+         * @note 调用方必须先复核当前口令；本方法只负责验证码与失败计数
          */
         AsynGyanis::Core::Task<std::expected<std::vector<std::string>, MfaError>> enable(AsynGyanis::Core::EventLoop &loop, SessionRecord session, std::string code);
 
@@ -145,8 +169,10 @@ namespace EdgePulse::Auth
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份
          * @param code 身份验证器当前的 6 位验证码
-         * @return 成功为空；未启用返回 404，验证码错误或已消费返回 401，未配置主密钥返回 503
+         * @return 成功为空；未启用返回 404，验证码错误或已消费返回 401，未配置主密钥返回 503，
+         *         失败次数用尽返回 429
          * @note 与 verify 共用步号水位：登录时用过的口令不能再关闭两步验证
+         * @note 调用方必须先复核当前口令；本方法只负责验证码与失败计数
          */
         AsynGyanis::Core::Task<std::expected<void, MfaError>> disable(AsynGyanis::Core::EventLoop &loop, SessionRecord session, std::string code);
 
@@ -155,7 +181,8 @@ namespace EdgePulse::Auth
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份
          * @param code 身份验证器当前的 6 位验证码
-         * @return 成功返回 10 枚新恢复码，只出现这一次；未启用返回 404，验证码错误或已消费返回 401
+         * @return 成功返回 10 枚新恢复码，只出现这一次；未启用返回 404，验证码错误或已消费返回 401，
+         *         失败次数用尽返回 429
          * @note 命中步号会推进 last_used_step，生成恢复码的验证码不能继续用于登录
          */
         AsynGyanis::Core::Task<std::expected<std::vector<std::string>, MfaError>> regenerateRecoveryCodes(AsynGyanis::Core::EventLoop &loop, SessionRecord session,
@@ -200,7 +227,7 @@ namespace EdgePulse::Auth
         AsynGyanis::Core::Task<MfaStatus> status(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
         /**
-         * @brief 管理员重置：删除记录与待启用缓存
+         * @brief 管理员重置：删除记录、待启用缓存与该用户的失败计数
          * @param loop 恢复协程用的事件循环
          * @param userId 目标用户标识；调用方负责确认目标在当前租户内并持有 system:user:edit
          * @return bool 是否删掉一条记录
@@ -214,6 +241,28 @@ namespace EdgePulse::Auth
          * @return bool 构造时成功解出 32 字节时为 true
          */
         [[nodiscard]] bool keyConfigured() const noexcept;
+
+        /**
+         * @brief 查询按用户的会话态失败计数是否已到上限
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         * @return bool 计数不小于 kAttemptMaxFailures 时为 true
+         */
+        AsynGyanis::Core::Task<bool> attemptLimitReached(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
+
+        /**
+         * @brief 会话态验证失败一次，计数窗口首次创建时开始计时
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         */
+        AsynGyanis::Core::Task<> recordAttemptFailure(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
+
+        /**
+         * @brief 清空按用户的会话态失败计数
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         */
+        AsynGyanis::Core::Task<> clearAttemptFailures(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
         /**
          * @brief 解密记录里的秘密

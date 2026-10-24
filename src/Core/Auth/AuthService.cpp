@@ -209,9 +209,25 @@ namespace EdgePulse::Auth
         }
         if (!verified)
         {
-            const bool retained = co_await m_mfa->recordChallengeFailure(loop, *challenge);
-            co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, retained ? "两步验证失败" : "两步验证失败次数已达上限", traceId, user->id,
-                                                       user->departmentId, user->tenantId});
+            const ChallengeFailureOutcome outcome = co_await m_mfa->recordChallengeFailure(loop, *challenge);
+            std::string                   message = "两步验证失败";
+            switch (outcome)
+            {
+                case ChallengeFailureOutcome::Retained:
+                    break;
+                case ChallengeFailureOutcome::LimitReached:
+                    message = "两步验证失败次数已达上限";
+                    break;
+                case ChallengeFailureOutcome::Expired:
+                    message = "两步验证挑战已过期";
+                    break;
+                case ChallengeFailureOutcome::WriteFailed:
+                    // 挑战已在上一次 take 时删除；写回失败与次数上限是两种原因，审计分开留痕
+                    message = "两步验证失败且挑战续期写入失败";
+                    LOG_ERROR_FMT("两步验证挑战续期写入失败：user={} id={}", user->username, user->id);
+                    break;
+            }
+            co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, message, traceId, user->id, user->departmentId, user->tenantId});
             co_return std::unexpected(invalidChallenge());
         }
 

@@ -137,7 +137,8 @@ namespace EdgePulse::Auth
          * @param clientIp 本次请求的来源 IP，必须与发起登录时一致
          * @param traceId 请求标识
          * @return 成功返回 token 与有效期；挑战失效、来源不符、次数用尽或验证码错误返回 401
-         * @note 挑战在取出时即从缓存删除；失败会按次数写回，第 5 次失败后不再保留
+         * @note 挑战在取出时即从缓存删除；失败会按次数写回，第 5 次失败后不再保留。
+         *       有效期是签发时刻起算的绝对 300 秒，失败重写不会延长期限。
          */
         AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> verifyMfa(AsynGyanis::Core::EventLoop &loop, std::string challengeToken, std::string code,
                                                                                 std::string clientIp, std::string traceId);
@@ -160,6 +161,9 @@ namespace EdgePulse::Auth
          * @param traceId 请求标识
          * @param auditMessage 登录审计文案
          * @return 成功返回 token 与有效期；账号不存在或停用时返回 401
+         * @warning 直接签发会话，不检查两步验证。只允许在调用方已经独立完成第二因素校验后使用；
+         *          任何接受口令或外部身份的入口都必须走 login/issueSessionOrChallengeForUser 或
+         *          verifyMfa，否则会绕过已启用账号的 MFA。
          * @note 调用方必须已完成外部身份校验（如 OIDC）
          */
         AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> issueSessionForUser(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string clientIp,

@@ -768,7 +768,7 @@ namespace EdgePulse::App
         Web::registerAuditMiddleware(router, loop, *m_authService, *m_logRepository);
         registerHealthRoutes(router);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
-        Auth::registerMfaRoutes(router, loop, *m_authService, *m_mfaService);
+        Auth::registerMfaRoutes(router, loop, *m_authService, *m_mfaService, *m_logRepository);
         if (m_oidcService)
         {
             Auth::registerOidcRoutes(router, loop, *m_oidcService);

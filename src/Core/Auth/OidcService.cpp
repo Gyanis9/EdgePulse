@@ -259,7 +259,8 @@ namespace EdgePulse::Auth
         OidcExchangeResult result;
         if (code.empty())
         {
-            result.error = "缺少一次性登录凭据";
+            result.error      = "缺少一次性登录凭据";
+            result.httpStatus = 400;
             co_return result;
         }
         // 一次性凭据只能兑换一次：取值与删除原子完成，并发兑换只会有一方拿到记录
@@ -272,20 +273,24 @@ namespace EdgePulse::Auth
         }
         if (!value.has_value() || !value->is_object())
         {
-            result.error = "一次性登录凭据已过期，请重新登录";
+            result.error      = "一次性登录凭据已过期，请重新登录";
+            result.httpStatus = 401;
             co_return result;
         }
         const auto userId = Json::optionalInteger(*value, "userId");
         if (!userId.has_value())
         {
-            result.error = "一次性登录凭据不完整";
+            result.error      = "一次性登录凭据不完整";
+            result.httpStatus = 401;
             co_return result;
         }
         result.returnPath = Json::stringField(*value, "returnPath");
         const auto issued = co_await m_auth.issueSessionOrChallengeForUser(loop, *userId, std::move(clientIp), std::move(traceId), "OIDC 登录成功");
         if (!issued.has_value())
         {
-            result.error = issued.error().message;
+            // 保留失败来源：MFA 挑战签发失败是 503，不能被兑换接口统一折成 401
+            result.error      = issued.error().message;
+            result.httpStatus = issued.error().httpStatus;
             co_return result;
         }
         if (issued->mfaRequired)
