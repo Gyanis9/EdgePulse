@@ -106,3 +106,29 @@ test('system api exposes catalog endpoints used by management pages', async () =
     'GET /api/monitor/login-logs/heatmap?days=30',
   ])
 })
+
+test('system api maps api token list, create, rotate and revoke calls', async () => {
+  const calls: Array<{ url: string; method: string; body?: string }> = []
+  const fetcher = async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body as string | undefined })
+    return new Response(JSON.stringify({ code: 200, message: 'success', data: { id: 7 }, traceId: 't' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  const api = createSystemApi(createHttpClient({ baseUrl: '/api', tokenProvider: () => 'token', fetcher }))
+
+  await api.apiTokens.list()
+  await api.apiTokens.create({ name: 'ci', scopes: ['device:node:list'], expiresInSeconds: 86400 })
+  await api.apiTokens.rotate(7)
+  await api.apiTokens.remove(7)
+
+  assert.deepEqual(calls.map(call => `${call.method} ${call.url}`), [
+    'GET /api/system/api-tokens',
+    'POST /api/system/api-tokens',
+    'POST /api/system/api-tokens/7/rotate',
+    'DELETE /api/system/api-tokens/7',
+  ])
+  assert.deepEqual(JSON.parse(calls[1].body ?? '{}'), { name: 'ci', scopes: ['device:node:list'], expiresInSeconds: 86400 })
+  assert.equal(calls[2].body, undefined)
+})

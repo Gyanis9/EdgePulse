@@ -34,6 +34,12 @@ test('system user page loads from the management API', async ({ page }) => {
   await expect(page.getByText('用户列表')).toBeVisible()
   await page.goto('/system/notification')
   await expect(page.getByRole('heading', { name: '通知渠道', exact: true })).toBeVisible()
+  const tokenList = page.waitForResponse(
+    response => response.url().includes('/api/system/api-tokens') && response.request().method() === 'GET',
+  )
+  await page.goto('/system/apitoken')
+  await expect(page.getByRole('heading', { name: 'API 令牌', exact: true })).toBeVisible()
+  expect((await tokenList).status()).toBe(200)
 })
 
 test('device domain pages render with live data endpoints', async ({ page }) => {

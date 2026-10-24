@@ -119,6 +119,32 @@ export interface NotificationChannelWriteRequest {
   tenantId?: number
 }
 
+export interface ApiTokenRow {
+  id: number
+  name: string
+  prefix: string
+  scopes: string[]
+  expiresAt: string
+  lastUsedAt: string | null
+  revokedAt: string | null
+  createdAt: string
+}
+
+export interface ApiTokenCreateRequest {
+  name: string
+  scopes: string[]
+  expiresInSeconds?: number
+}
+
+/** 一次性明文只随创建与轮换响应返回；previousValidUntil 是轮换后旧令牌仍可用的截止时间 */
+export interface ApiTokenCreated {
+  id: number
+  name: string
+  token: string
+  expiresAt: string
+  previousValidUntil?: string
+}
+
 export interface RoleWriteRequest {
   name?: string
   code?: string
@@ -272,6 +298,12 @@ export function createSystemApi(client: HttpClient) {
     notifications: {
       ...crudPage<NotificationChannelRow, NotificationChannelWriteRequest>(client, '/system/notifications'),
       deliveries: (query?: QueryParams) => client.get<PageResult<NotificationDeliveryRow>>('/system/notifications/deliveries', query),
+    },
+    apiTokens: {
+      list: () => client.get<ApiTokenRow[]>('/system/api-tokens'),
+      create: (body: ApiTokenCreateRequest) => client.post<ApiTokenCreated>('/system/api-tokens', body),
+      rotate: (id: number) => client.post<ApiTokenCreated>(`/system/api-tokens/${id}/rotate`),
+      remove: (id: number) => client.delete<void>(`/system/api-tokens/${id}`),
     },
     roles: {
       ...crudPage<Record<string, unknown>, RoleWriteRequest>(client, '/system/roles'),
