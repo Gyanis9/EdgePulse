@@ -878,7 +878,8 @@ namespace EdgePulse::App
                 [auth = m_authService, &loop](const std::string_view token) -> AsynGyanis::Core::Task<std::optional<Web::BrowserSubscriptionScope>>
                 {
                     const auto session = co_await auth->authenticate(loop, token);
-                    if (!session.has_value())
+                    // 浏览器实时通道不接收 API 令牌；令牌只用于 HTTP 的有权限接口
+                    if (!session.has_value() || session->apiToken)
                     {
                         co_return std::nullopt;
                     }

@@ -33,9 +33,10 @@ namespace EdgePulse::Web
      * @param loop 恢复协程用的事件循环
      * @param request 当前请求
      * @param response 当前响应
-     * @param permission 需要的权限码；空表示只要求登录
+     * @param permission 需要的权限码；空表示只要求登录，且只接受浏览器会话
      * @param traceId 请求标识
      * @return std::optional<Auth::SessionRecord> 通过时返回身份；失败为空
+     * @note API 令牌必须声明具体权限才可访问，防止绕过 scope 使用无权限端点的旁路能力
      */
     [[nodiscard]] inline AsynGyanis::Core::Task<std::optional<Auth::SessionRecord>> requireSession(Auth::AuthService &auth, AsynGyanis::Core::EventLoop &loop,
                                                                                                    AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response,
@@ -51,6 +52,11 @@ namespace EdgePulse::Web
         if (!session.has_value())
         {
             Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, "未登录或会话已过期", traceId);
+            co_return std::nullopt;
+        }
+        if (session->apiToken && permission.empty())
+        {
+            Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "API 令牌不能访问该接口", traceId);
             co_return std::nullopt;
         }
         if (!permission.empty() && std::find(session->permissions.begin(), session->permissions.end(), permission) == session->permissions.end())

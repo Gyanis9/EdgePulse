@@ -260,6 +260,11 @@ namespace EdgePulse::Auth
     AsynGyanis::Core::Task<std::expected<void, AuthError>> AuthService::changePassword(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session, std::string oldPassword,
                                                                                        std::string newPassword)
     {
+        // 改密只接受浏览器登录会话；令牌泄露不应连带接管账户口令
+        if (session.apiToken)
+        {
+            co_return std::unexpected(AuthError{Common::kCodeForbidden, Common::kCodeForbidden, "API 令牌不能修改账户密码"});
+        }
         if (const auto validation = validatePassword(newPassword); !validation)
         {
             co_return std::unexpected(AuthError{Common::kCodeBadRequest, Common::kCodeBadRequest, validation.error()});

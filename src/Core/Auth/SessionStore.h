@@ -41,6 +41,7 @@ namespace EdgePulse::Auth
         std::string              tenantCode{"default"}; ///< 租户编码
         std::string              tenantName;            ///< 租户名称
         bool                     platformAdmin{false};  ///< 是否平台管理员
+        bool                     apiToken{false};       ///< 是否由 API 令牌换来的身份；此类会话不写入会话表
         std::string              username;              ///< 登录名
         std::string              nickname;              ///< 显示名
         std::int64_t             departmentId{0};       ///< 部门标识

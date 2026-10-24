@@ -106,7 +106,7 @@ namespace EdgePulse::Auth
         /**
          * @brief 挂接 API 令牌服务，使会话未命中时继续按令牌认证
          * @param apiTokens 令牌服务；空表示只接受会话令牌
-         * @note 登录装配在用户仓储之后完成，故用迟绑定而不是调整构造参数顺序
+         * @note 只在启动装配阶段调用一次，不做运行期替换；登录装配在用户仓储之后完成，故用迟绑定而不是调整构造参数顺序
          */
         void setApiTokenService(std::shared_ptr<ApiTokenService> apiTokens);
 

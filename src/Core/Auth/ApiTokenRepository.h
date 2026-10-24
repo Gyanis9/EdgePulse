@@ -115,20 +115,22 @@ namespace EdgePulse::Auth
          * @param newHash 新明文的 SHA-256 十六进制
          * @param newPrefix 新明文的前 12 个字符
          * @param previousValidUntil 旧哈希可用截止时间，UTC
-         * @return bool 是否命中且当前哈希仍等于期望值
+         * @param now 当前 UTC 时间；到期时间不晚于它的行不再更新
+         * @return bool 是否命中且当前哈希仍等于期望值、令牌仍未过期
          */
         AsynGyanis::Core::Task<bool> replaceHash(AsynGyanis::Core::EventLoop &loop, std::int64_t id, std::string expectedHash, std::string newHash, std::string newPrefix,
-                                                 std::string previousValidUntil);
+                                                 std::string previousValidUntil, std::string now);
 
         /**
          * @brief 条件写入最近使用时间
          * @param loop 恢复协程用的事件循环
+         * @param tenantId 归属租户，写路径也显式带边界
          * @param id 令牌标识
          * @param usedAt 本次鉴权时间，UTC
          * @param cutoff 节流下限；最近使用时间晚于它时不写库
          * @return bool 是否发生一次写入
          */
-        AsynGyanis::Core::Task<bool> touchLastUsed(AsynGyanis::Core::EventLoop &loop, std::int64_t id, std::string usedAt, std::string cutoff);
+        AsynGyanis::Core::Task<bool> touchLastUsed(AsynGyanis::Core::EventLoop &loop, std::int64_t tenantId, std::int64_t id, std::string usedAt, std::string cutoff);
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装

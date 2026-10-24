@@ -207,40 +207,43 @@ namespace EdgePulse::Auth
     }
 
     AsynGyanis::Core::Task<bool> ApiTokenRepository::replaceHash(AsynGyanis::Core::EventLoop &loop, const std::int64_t id, std::string expectedHash, std::string newHash,
-                                                                 std::string newPrefix, std::string previousValidUntil)
+                                                                 std::string newPrefix, std::string previousValidUntil, std::string now)
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
                 [id, expectedHash = std::move(expectedHash), newHash = std::move(newHash), newPrefix = std::move(newPrefix), previousValidUntil = std::move(previousValidUntil),
-                 tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> bool
+                 now = std::move(now), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> bool
                 {
-                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{newHash, newPrefix, expectedHash, previousValidUntil, id, expectedHash};
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{newHash, newPrefix, expectedHash, previousValidUntil, id, expectedHash, now};
                     std::string                                      clause;
                     if (!tenant.allTenants)
                     {
                         clause = " AND tenant_id = ?";
                         parameters.emplace_back(tenant.tenantId);
                     }
-                    // 期望哈希作为乐观锁：并发轮换只有一个请求能命中
+                    // 期望哈希作为乐观锁；到期条件与期望哈希一起放在 UPDATE 里，堵住读出后过期的竞态
                     const auto result = Sql::executeOrThrow(connection,
                                                             "UPDATE sys_api_token SET token_hash = ?, token_prefix = ?, previous_hash = ?, previous_valid_until = ? WHERE id = ? "
-                                                            "AND token_hash = ? AND revoked_at IS NULL" +
+                                                            "AND token_hash = ? AND revoked_at IS NULL AND expires_at > ?" +
                                                                     clause,
                                                             parameters);
                     return result->affectedRowCount() > 0;
                 });
     }
 
-    AsynGyanis::Core::Task<bool> ApiTokenRepository::touchLastUsed(AsynGyanis::Core::EventLoop &loop, const std::int64_t id, std::string usedAt, std::string cutoff)
+    AsynGyanis::Core::Task<bool> ApiTokenRepository::touchLastUsed(AsynGyanis::Core::EventLoop &loop, const std::int64_t tenantId, const std::int64_t id, std::string usedAt,
+                                                                   std::string cutoff)
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [id, usedAt = std::move(usedAt), cutoff = std::move(cutoff)](AsynGyanis::Database::DatabaseConnection &connection) -> bool
+                [tenantId, id, usedAt = std::move(usedAt), cutoff = std::move(cutoff)](AsynGyanis::Database::DatabaseConnection &connection) -> bool
                 {
-                    const std::vector<AsynGyanis::Database::DatabaseValue> parameters{usedAt, id, cutoff};
+                    const std::vector<AsynGyanis::Database::DatabaseValue> parameters{usedAt, id, tenantId, cutoff};
                     // 条件更新保证同一令牌一分钟内最多写一次，且不会覆盖并发请求刚写入的时间
                     const auto result = Sql::executeOrThrow(
-                            connection, "UPDATE sys_api_token SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < ?)", parameters);
+                            connection,
+                            "UPDATE sys_api_token SET last_used_at = ? WHERE id = ? AND tenant_id = ? AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < ?)",
+                            parameters);
                     return result->affectedRowCount() > 0;
                 });
     }
