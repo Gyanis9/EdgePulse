@@ -109,6 +109,33 @@ TEST(ApplicationConfiguration, RejectsNonNumericRateLimit)
     EXPECT_NE(std::string::npos, trailingConfiguration.error().message.find("10rps"));
 }
 
+// 钉住：h3 传输层空闲超时从 server.quic.idle_timeout_seconds 读出，45 秒原样暴露
+TEST(ApplicationConfiguration, AcceptsH3IdleTimeout)
+{
+    const TemporaryConfigurationFile file(R"(server:
+  quic:
+    idle_timeout_seconds: 45
+)");
+
+    const auto configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+    ASSERT_TRUE(configuration.has_value()) << configuration.error().message;
+    EXPECT_EQ(45, configuration->h3IdleTimeoutSeconds);
+}
+
+// 钉住：0 会让连接立即收口，3601 超出允许上限，两者都在启动时被拒绝且报出键名
+TEST(ApplicationConfiguration, RejectsOutOfRangeH3IdleTimeout)
+{
+    for (const std::string value: {"0", "3601"})
+    {
+        const TemporaryConfigurationFile file("server:\n  quic:\n    idle_timeout_seconds: " + value + "\n");
+
+        const auto configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_FALSE(configuration.has_value()) << "应拒绝 idle_timeout_seconds: " << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("server.quic.idle_timeout_seconds")) << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("1 到 3600")) << value;
+    }
+}
+
 // 钉住：NaN 与无穷能被浮点解析接受，但必须被有限性检查挡在启动之前
 TEST(ApplicationConfiguration, RejectsNonFiniteRateLimit)
 {

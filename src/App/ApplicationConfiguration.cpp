@@ -220,6 +220,7 @@ namespace EdgePulse::App
         }
         configuration.rateLimitBurstCapacity    = *burstCapacity;
         configuration.idleTimeoutMs             = configurationManager.getInt("server.limits.idle_timeout_ms", configuration.idleTimeoutMs);
+        configuration.h3IdleTimeoutSeconds      = configurationManager.getInt("server.quic.idle_timeout_seconds", configuration.h3IdleTimeoutSeconds);
         configuration.readTimeoutMs             = configurationManager.getInt("server.limits.read_timeout_ms", configuration.readTimeoutMs);
         configuration.writeTimeoutMs            = configurationManager.getInt("server.limits.write_timeout_ms", configuration.writeTimeoutMs);
         configuration.maximumRequestBodyBytes   = configurationManager.getInt("server.parser_limits.maximum_body_size", configuration.maximumRequestBodyBytes);
@@ -347,6 +348,11 @@ namespace EdgePulse::App
         if (configuration.idleTimeoutMs < 0 || configuration.readTimeoutMs < 0 || configuration.writeTimeoutMs < 0)
         {
             return std::unexpected(ConfigurationError{"server.limits 下的超时毫秒数不能为负数；0 表示关闭该项保护"});
+        }
+        // h3 空闲超时直接决定传输层何时收口，0 会让连接立即断开，超过一小时则是明显的误配
+        if (configuration.h3IdleTimeoutSeconds < 1 || configuration.h3IdleTimeoutSeconds > 3600)
+        {
+            return std::unexpected(ConfigurationError{"server.quic.idle_timeout_seconds 必须在 1 到 3600 之间"});
         }
         if (configuration.maximumRequestBodyBytes <= 0)
         {

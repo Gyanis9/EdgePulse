@@ -94,6 +94,8 @@ server:
     idle_timeout_ms: 75000
     read_timeout_ms: 60000
     write_timeout_ms: 60000
+  quic:
+    idle_timeout_seconds: 30  # h3 传输层空闲超时，1..3600；server.limits.idle_timeout_ms 不控制 h3
   parser_limits:
     maximum_body_size: 268435456
   rate_limit:

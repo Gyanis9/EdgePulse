@@ -167,6 +167,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `edgepulse.security.allow_private_webhooks` | `true` | `false` | 打开后跳过整个私网/保留段分类，仅云元数据主机名/地址与链路本地元数据段（169.254/16、fe80::/10）仍拒绝；CGNAT、文档/基准测试段、组播、240/4、IPv6 ULA 等也会放行，只用于受信的自托管网关 |
 | `server.rate_limit.requests_per_second` | `0.0` | `0.0`（建议按容量设置） | 全局限流，整数或小数均可，`0` 关闭 |
 | `server.rate_limit.burst_capacity` | `1.0` | `1.0`（建议覆盖并发突发） | 令牌桶容量，必须不小于 `1` |
+| `server.quic.idle_timeout_seconds` | `30` | `30` | h3 传输层空闲超时（秒），1–3600；`server.limits.idle_timeout_ms` 不控制 h3 连接空闲 |
 
 固件签名密钥只把公钥放进信任键目录，私钥留在签名工作站：
 

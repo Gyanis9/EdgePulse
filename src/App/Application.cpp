@@ -476,6 +476,7 @@ namespace EdgePulse::App
                 AsynGyanis::Net::QuicServer::Configuration quicConfiguration;
                 quicConfiguration.certificateFile = serverCertificate.string();
                 quicConfiguration.privateKeyFile  = serverKey.string();
+                quicConfiguration.idleTimeout     = std::chrono::seconds{m_configuration.h3IdleTimeoutSeconds};
                 m_h3Router                        = std::make_unique<AsynGyanis::Net::Router>();
                 m_h3Router->get("/api/probe/h3",
                                 [](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
