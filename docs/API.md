@@ -1,7 +1,8 @@
 # EdgePulse API
 
 - 基础路径：`/api`
-- 版本前缀：当前没有 `/v1`，`/api` 直接承载现行契约；版本化前缀、OpenAPI 与幂等键在 Roadmap 中
+- 版本前缀：当前没有 `/v1`，`/api` 直接承载现行契约；版本化前缀仍在 Roadmap 中
+- 契约：`GET /api/openapi.json` 返回 OpenAPI 3.1 文档，生成与校验方式见第 9 节
 - 认证：除匿名端点外，`Authorization: Bearer <token>`
 - 响应包络：`{ "code": 200, "message": "ok", "data": ..., "traceId": "..." }`
 - 分页：`{ "pageNum": 1, "pageSize": 10, "total": 0, "rows": [] }`；`pageSize` 上限 100
@@ -258,3 +259,19 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 | 429 | 验证码签发过频、登录失败过频、公开 API 全局限流 |
 | 500 | 数据库/文件/未知内部故障 |
 | 503 | 服务未就绪或停机排空 |
+
+## 9. OpenAPI 契约
+
+`GET /api/openapi.json` 返回当前控制面的 OpenAPI 3.1 文档，响应头为 `content-type: application/json` 与 `cache-control: no-cache`。该接口匿名可读；生成物缺失时返回统一包络的 JSON 404。
+
+契约的事实来源是 `src/**/*.cpp` 里的 `router.get/post/put/del/patch` 与流式变体字面量，摘要、请求/响应 schema 与安全要求由 `docs/openapi-notes.json` 补齐；`frontend/public/openapi.json` 是生成物，不要手工编辑。
+
+```bash
+# 重新生成（Python 3，仅标准库）
+python scripts/generate-openapi.py
+
+# 只校验，不写文件；与生成物逐字节不一致时退出 1
+python scripts/generate-openapi.py --check
+```
+
+CI 的后端任务在构建前执行 `--check`，路由或 notes 改动后忘记重新生成会让任务失败。契约覆盖浏览器与自动化 API；Agent 通道、`/api/ws`、SSE（`/api/events/*`）、健康探针与反向代理通配前缀不在其中。

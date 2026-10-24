@@ -31,6 +31,39 @@ namespace EdgePulse::App
                    });
     }
 
+    void registerOpenApiRoute(AsynGyanis::Net::Router &router, const std::filesystem::path &webRoot)
+    {
+        std::shared_ptr<const std::string> document;
+        std::ifstream                      stream(webRoot / "openapi.json", std::ios::binary);
+        if (stream)
+        {
+            std::ostringstream buffer;
+            buffer << stream.rdbuf();
+            document = std::make_shared<const std::string>(buffer.str());
+        }
+
+        router.get("/api/openapi.json",
+                   [document](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   {
+                       const std::string traceId = Web::resolveRequestId(request);
+                       if (!document)
+                       {
+                           Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "openapi spec not found", traceId);
+                           co_return;
+                       }
+                       response.setStatus(200);
+                       response.setHeader("Content-Type", "application/json");
+                       // 契约随版本发布更新，浏览器与网关都应每次回源取最新文档
+                       response.setHeader("Cache-Control", "no-cache");
+                       if (!traceId.empty())
+                       {
+                           response.setHeader(Common::kRequestIdHeader, traceId);
+                       }
+                       response.setOwnedBody(*document);
+                       co_return;
+                   });
+    }
+
     void registerSiteFallback(AsynGyanis::Net::Router &router, const std::filesystem::path &webRoot)
     {
         std::error_code                    error;

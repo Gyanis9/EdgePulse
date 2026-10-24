@@ -1,0 +1,444 @@
+{
+  "_comment": "OpenAPI 摘要与 schema 覆盖表。paths[path][method] 支持 summary、description、requestSchema、responseSchema、security、envelope。responseSchema 描述包络里的 data，省略或写 Envelope 表示整个响应就是统一包络；envelope=false 表示响应体就是该 schema。security 省略时默认 Bearer，写 [] 表示匿名。未列出的端点由生成器给通用摘要与 Envelope。",
+  "paths": {
+    "/api/alarm-rules": {
+      "get": {
+        "summary": "列出告警规则",
+        "responseSchema": "AlarmRuleList"
+      },
+      "post": {
+        "summary": "创建告警规则",
+        "responseSchema": "AlarmRule"
+      }
+    },
+    "/api/alarm-rules/{id}": {
+      "put": {
+        "summary": "更新告警规则",
+        "responseSchema": "AlarmRule"
+      },
+      "delete": {
+        "summary": "删除告警规则",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/alarms": {
+      "get": {
+        "summary": "分页查询告警，并返回未恢复总数",
+        "responseSchema": "AlarmPage"
+      }
+    },
+    "/api/alarms/{id}": {
+      "get": {
+        "summary": "查询单条告警",
+        "responseSchema": "Alarm"
+      }
+    },
+    "/api/alarms/{id}/ack": {
+      "put": {
+        "summary": "确认告警",
+        "responseSchema": "Alarm"
+      }
+    },
+    "/api/alarms/{id}/resolve": {
+      "put": {
+        "summary": "恢复告警",
+        "responseSchema": "Alarm"
+      }
+    },
+    "/api/auth/captcha": {
+      "get": {
+        "summary": "签发一次性图形验证码",
+        "responseSchema": "CaptchaChallenge",
+        "security": []
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "summary": "登录；启用两步验证时先返回挑战",
+        "requestSchema": "LoginRequest",
+        "responseSchema": "LoginResponse",
+        "security": []
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "summary": "注销当前会话",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "summary": "读取当前登录身份与权限",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/auth/mfa": {
+      "get": {
+        "summary": "读取两步验证状态与剩余恢复码数量",
+        "responseSchema": "MfaStatus"
+      }
+    },
+    "/api/auth/mfa/disable": {
+      "post": {
+        "summary": "关闭两步验证；需要当前口令与动态码",
+        "requestSchema": "MfaEnableRequest",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/auth/mfa/enable": {
+      "post": {
+        "summary": "启用两步验证并返回恢复码",
+        "requestSchema": "MfaEnableRequest",
+        "responseSchema": "MfaRecoveryCodes"
+      }
+    },
+    "/api/auth/mfa/recovery-codes": {
+      "post": {
+        "summary": "重新生成恢复码",
+        "responseSchema": "MfaRecoveryCodes"
+      }
+    },
+    "/api/auth/mfa/setup": {
+      "post": {
+        "summary": "开始设置两步验证，返回共享密钥与 otpauth URI",
+        "requestSchema": "MfaSetupRequest",
+        "responseSchema": "MfaSetupResponse"
+      }
+    },
+    "/api/auth/mfa/verify": {
+      "post": {
+        "summary": "完成两步验证挑战并签发会话令牌",
+        "requestSchema": "MfaVerifyRequest",
+        "responseSchema": "LoginResponse",
+        "security": []
+      }
+    },
+    "/api/auth/oidc/callback": {
+      "get": {
+        "summary": "OIDC 回调；重定向回前端并附带一次性 oidcCode",
+        "description": "成功与失败都以 302 回到前端，失败时带 oidcError。",
+        "responseSchema": "Envelope",
+        "security": []
+      }
+    },
+    "/api/auth/oidc/enabled": {
+      "get": {
+        "summary": "查询是否启用 OIDC 登录",
+        "responseSchema": "Envelope",
+        "security": []
+      }
+    },
+    "/api/auth/oidc/exchange": {
+      "post": {
+        "summary": "用一次性 oidcCode 换取会话令牌",
+        "responseSchema": "Envelope",
+        "security": []
+      }
+    },
+    "/api/auth/oidc/start": {
+      "get": {
+        "summary": "开始 OIDC 登录；重定向到身份提供方",
+        "description": "成功时返回 302 到 IdP；return 只接受本站绝对路径。",
+        "responseSchema": "Envelope",
+        "security": []
+      }
+    },
+    "/api/auth/password": {
+      "put": {
+        "summary": "修改当前用户口令",
+        "requestSchema": "PasswordChangeRequest",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/auth/routes": {
+      "get": {
+        "summary": "读取当前用户可见的菜单树",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/commands": {
+      "get": {
+        "summary": "分页查询命令",
+        "responseSchema": "CommandPage"
+      },
+      "post": {
+        "summary": "向节点下发命令",
+        "requestSchema": "CommandCreateRequest",
+        "responseSchema": "Command"
+      }
+    },
+    "/api/commands/batch": {
+      "post": {
+        "summary": "批量下发命令，可指定计划执行时间",
+        "requestSchema": "CommandBatchRequest",
+        "responseSchema": "CommandBatchResponse"
+      }
+    },
+    "/api/commands/batch/{batchId}/cancel": {
+      "put": {
+        "summary": "取消批次中仍在等待或执行中的命令",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/commands/{id}/cancel": {
+      "put": {
+        "summary": "取消单条命令",
+        "responseSchema": "Command"
+      }
+    },
+    "/api/dashboard/summary": {
+      "get": {
+        "summary": "工作台汇总读数",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/enrollment-tokens": {
+      "get": {
+        "summary": "列出注册令牌",
+        "responseSchema": "Envelope"
+      },
+      "post": {
+        "summary": "签发注册令牌；明文只在本次响应返回",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/enrollment-tokens/{id}": {
+      "delete": {
+        "summary": "吊销未使用的注册令牌",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/firmware": {
+      "get": {
+        "summary": "分页查询固件",
+        "responseSchema": "FirmwarePage"
+      },
+      "post": {
+        "summary": "流式上传固件；正文为二进制，签名经 X-Firmware-Signature 与 X-Firmware-Key-Id 头传入",
+        "responseSchema": "Firmware"
+      }
+    },
+    "/api/firmware/policy": {
+      "get": {
+        "summary": "读取固件签名策略与信任键列表",
+        "responseSchema": "FirmwarePolicy"
+      }
+    },
+    "/api/firmware/{id}": {
+      "delete": {
+        "summary": "删除固件",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/firmware/{id}/deploy": {
+      "post": {
+        "summary": "向节点部署固件，可带 batchSize 做分批灰度",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/firmware/{id}/rollback": {
+      "post": {
+        "summary": "按任务记录的上一版本回滚节点固件",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/firmware/{id}/tasks": {
+      "get": {
+        "summary": "列出固件的部署任务",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/health": {
+      "get": {
+        "summary": "存活检查，返回服务器时间",
+        "responseSchema": "Envelope",
+        "security": []
+      }
+    },
+    "/api/monitor/login-logs": {
+      "get": {
+        "summary": "分页查询登录日志",
+        "responseSchema": "PageResult"
+      },
+      "delete": {
+        "summary": "清空登录日志",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/login-logs/heatmap": {
+      "get": {
+        "summary": "登录时间热力图与失败聚合",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/login-logs/stats": {
+      "get": {
+        "summary": "登录日志统计",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/login-logs/{id}": {
+      "delete": {
+        "summary": "删除单条登录日志",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/oper-logs": {
+      "get": {
+        "summary": "分页查询操作日志",
+        "responseSchema": "PageResult"
+      },
+      "delete": {
+        "summary": "清空操作日志",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/oper-logs/stats": {
+      "get": {
+        "summary": "操作日志统计",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/oper-logs/timeline": {
+      "get": {
+        "summary": "按日聚合的操作日志时间线",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/oper-logs/{id}": {
+      "delete": {
+        "summary": "删除单条操作日志",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/node-groups": {
+      "get": {
+        "summary": "列出节点分组",
+        "responseSchema": "Envelope"
+      },
+      "post": {
+        "summary": "创建节点分组",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/node-groups/{id}": {
+      "put": {
+        "summary": "更新节点分组",
+        "responseSchema": "Envelope"
+      },
+      "delete": {
+        "summary": "删除节点分组；仍有子分组或节点时返回 409",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/nodes": {
+      "get": {
+        "summary": "分页查询节点",
+        "responseSchema": "NodePage"
+      },
+      "post": {
+        "summary": "创建节点",
+        "requestSchema": "NodeCreateRequest",
+        "responseSchema": "Node"
+      }
+    },
+    "/api/nodes/{id}": {
+      "get": {
+        "summary": "读取节点详情，包含配置同步状态",
+        "responseSchema": "Node"
+      },
+      "put": {
+        "summary": "更新节点；version 不匹配时返回 409",
+        "requestSchema": "NodeUpdateRequest",
+        "responseSchema": "Node"
+      },
+      "delete": {
+        "summary": "删除节点",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/nodes/{id}/certificate/revoke": {
+      "post": {
+        "summary": "吊销节点证书并关闭其 Agent 通道",
+        "responseSchema": "Node"
+      }
+    },
+    "/api/nodes/{id}/config": {
+      "get": {
+        "summary": "读取设备影子的期望配置、上报配置与同步状态",
+        "responseSchema": "Envelope"
+      },
+      "put": {
+        "summary": "下发期望配置；expectedVersion 不匹配时返回 409",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/nodes/{id}/config/revisions": {
+      "get": {
+        "summary": "分页读取节点配置修订",
+        "responseSchema": "PageResult"
+      }
+    },
+    "/api/nodes/{id}/config/rollback": {
+      "post": {
+        "summary": "把历史修订作为新版本重新下发",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "summary": "读取本 OpenAPI 3.1 契约",
+        "responseSchema": "OpenApiDocument",
+        "envelope": false,
+        "security": []
+      }
+    },
+    "/api/ops/protocols": {
+      "get": {
+        "summary": "读取监听端口与协议开关",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/ops/summary": {
+      "get": {
+        "summary": "运维总览读数",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/system/api-tokens": {
+      "get": {
+        "summary": "列出当前租户的 API 令牌",
+        "responseSchema": "ApiTokenList"
+      },
+      "post": {
+        "summary": "创建 API 令牌；明文只在本次响应返回",
+        "requestSchema": "ApiTokenCreateRequest",
+        "responseSchema": "ApiToken"
+      }
+    },
+    "/api/system/api-tokens/{id}": {
+      "delete": {
+        "summary": "吊销 API 令牌",
+        "responseSchema": "Envelope"
+      }
+    },
+    "/api/system/api-tokens/{id}/rotate": {
+      "post": {
+        "summary": "轮换 API 令牌；旧明文在一个重叠窗口内仍有效",
+        "responseSchema": "ApiToken"
+      }
+    },
+    "/api/telemetry/latest": {
+      "get": {
+        "summary": "读取节点最新遥测点",
+        "responseSchema": "TelemetryPointList"
+      }
+    },
+    "/api/telemetry/series": {
+      "get": {
+        "summary": "读取节点指标时间序列，最多 2000 点",
+        "responseSchema": "TelemetryPointList"
+      }
+    }
+  }
+}

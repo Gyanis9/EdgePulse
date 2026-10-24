@@ -26,6 +26,8 @@ jobs:
         run: conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
       - name: Configure
         run: cmake --preset debug
+      - name: Check OpenAPI drift
+        run: python scripts/generate-openapi.py --check
       - name: Build
         run: cmake --build --preset debug
       - name: Build agent targets
@@ -119,6 +121,8 @@ jobs:
         run: conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
       - name: Configure
         run: cmake --preset debug
+      - name: Check OpenAPI drift
+        run: python3 scripts/generate-openapi.py --check
       - name: Build
         run: cmake --build --preset debug
       - name: Build agent targets

@@ -77,9 +77,11 @@ add_executable(edgepulse-protocol-tests
         Protocol/TestMfaEndpoints.cpp
         Protocol/TestNodeConfigEndpoints.cpp
         Protocol/TestNodeEndpoints.cpp
+        Protocol/TestOpenApi.cpp
         Protocol/TestRateLimit.cpp
         Protocol/TestReverseProxy.cpp
         Protocol/TestSystemEndpoints.cpp)
+target_compile_definitions(edgepulse-protocol-tests PRIVATE EDGEPULSE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(edgepulse-protocol-tests PRIVATE EdgePulse::App edgepulse-test-support GTest::gtest_main)
 edgepulse_enable_warnings(edgepulse-protocol-tests)
 set_target_properties(edgepulse-protocol-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

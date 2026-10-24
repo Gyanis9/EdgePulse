@@ -783,6 +783,7 @@ namespace EdgePulse::App
         // 吊销后的会话既拿不到重放响应也写不出占位行
         Web::applyIdempotency(router, loop, m_idempotencyRepository, *m_authService, m_configuration.reverseProxyPrefix);
         registerHealthRoutes(router);
+        registerOpenApiRoute(router, m_webRoot);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
         Auth::registerMfaRoutes(router, loop, *m_authService, *m_mfaService, *m_logRepository);
         if (m_oidcService)
