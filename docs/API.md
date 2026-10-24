@@ -159,7 +159,7 @@ curl -X DELETE http://127.0.0.1:8080/api/system/api-tokens/1900000000000001 \
 
 - `name` 为 1–64 个字符；`scopes` 必须是非空字符串数组，每一项都要落在 owner 当前权限内，重复项直接返回 400 而不是静默去重；有效期省略或为 0 时取 30 天，其余限制在 300 到 31536000 秒。
 - 列表行只有 `id,name,prefix,scopes,expiresAt,lastUsedAt,revokedAt,createdAt`。创建与轮换响应带 `Cache-Control: no-store`。
-- 使用令牌时走与浏览器会话相同的 `Authorization: Bearer <token>`；每次请求重新读取 owner 与租户状态，并把令牌 `scopes` 与 owner 当前权限取交集。令牌吊销或过期立即失效，owner 或租户停用在一个 5 秒租户状态缓存 TTL 内失效（平台管理员不受租户启停限制），权限被收回后同步失效。
+- 使用令牌时走与浏览器会话相同的 `Authorization: Bearer <token>`；每次请求重新读取 owner 与租户状态，并把令牌 `scopes` 与 owner 当前权限取交集。令牌吊销或过期、owner 或租户停用、权限被收回都会立即失效。
 - 令牌身份不是平台管理员（`platformAdmin=false`）。`/api/auth/me` 可用于自省；`/api/auth/routes`、`/api/auth/logout`、其他只要求登录的浏览器接口、浏览器 `/api/ws`、`PUT /api/auth/password` 以及无权限的 dashboard/字典/告警 SSE 等入口都会拒绝令牌身份。
 - 令牌会话可以为同一用户签发 scope 不宽于自身的子令牌，也能轮换/吊销本人且 scope 不宽于自身的令牌；列表始终按租户返回，不按 owner 或 scope 过滤；浏览器会话的轮换与吊销只需对应接口权限。轮换后旧明文在 `previousValidUntil`（当前时间加 1 小时）之前仍可用，新明文立即生效。
 - 建议按最小权限拆分令牌，并在过期前轮换；怀疑泄露时直接吊销，相关行会保留供审计。

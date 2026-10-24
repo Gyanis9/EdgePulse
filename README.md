@@ -225,7 +225,7 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 ## 安全模型
 
 - 浏览器会话：32 字节不透明 Bearer token，存在 Redis 或进程内存储，TTL 默认 7200 秒并滑动续期；不使用 Cookie 承载会话。
-- API Token：明文形如 `ep_api_` 加 64 位十六进制，只在创建或轮换响应出现一次；数据库只存 SHA-256 与前缀。令牌继承 owner 的身份但 `platformAdmin` 恒为 false，每次请求按 owner 当前权限与令牌 scope 的交集授权；令牌吊销/过期立即失效，owner 或租户停用在一个 5 秒缓存 TTL 内失效（平台管理员豁免）。`/api/auth/me` 保留给令牌自省；`/api/auth/routes`、`/api/auth/logout` 等浏览器会话端点、浏览器 WebSocket 与改密入口会拒绝令牌。
+- API Token：明文形如 `ep_api_` 加 64 位十六进制，只在创建或轮换响应出现一次；数据库只存 SHA-256 与前缀。令牌继承 owner 的身份但 `platformAdmin` 恒为 false，每次请求按 owner 当前权限与令牌 scope 的交集授权；令牌吊销/过期、owner 或租户停用都会立即失效。`/api/auth/me` 保留给令牌自省；`/api/auth/routes`、`/api/auth/logout` 等浏览器会话端点、浏览器 WebSocket 与改密入口会拒绝令牌。
 - TOTP 两步验证：秘密用 `EDGEPULSE_MFA_KEY` 做 AES-256-GCM 加密后落库（可解密用于校验），恢复码用同一主密钥做 HMAC-SHA256 后存储（不可逆）；两者都不以明文落库。登录挑战放在缓存中、300 秒过期、最多 5 次失败并绑定来源 IP；启用、关闭与换发恢复码对错误动态码另有每用户 5 次/300 秒的失败上限，设置入口不计数。MFA 是用户自助启用，没有租户级强制策略。
 - 幂等键：只在带 Bearer 的写请求上生效，按令牌与幂等键的 SHA-256 分区；请求指纹覆盖方法、完整 URI、表示头、权限摘要与正文，权限降级后同键重试返回 409 而不是旧的已授权响应。401、403、5xx 与超过 256 KiB 的响应不缓存，认证、Agent、令牌、用户/租户写入与流式上传路径整段排除，避免一次性明文或口令进入幂等表。
 - Agent 身份：9443 在 TLS 层校验客户端证书；注册自报的 SHA-256 指纹必须等于本条连接出示的叶证书；心跳、遥测、命令与固件状态都按叶证书绑定节点。吊销会清空指纹、置离线并以 1008 关闭已建立的 Agent WebSocket。
