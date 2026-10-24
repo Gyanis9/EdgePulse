@@ -14,6 +14,8 @@
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
 #include "Net/Http/Routing/Router.h"
+#include "Net/WebSocket/WebSocketPeer.h"
+#include "Net/WebSocket/WebSocketUpgradePolicy.h"
 
 #include <gtest/gtest.h>
 
@@ -180,9 +182,11 @@ namespace EdgePulse::Agent
         /**
          * @brief 构造升级健康用例的配置文本
          * @param port 回环服务器端口
+         * @param websocketEnabled 是否启用 WebSocket 命令通道
+         * @param pollIntervalSeconds 命令轮询间隔
          * @return std::string YAML 配置
          */
-        [[nodiscard]] std::string updateHealthConfiguration(const std::uint16_t port)
+        [[nodiscard]] std::string updateHealthConfiguration(const std::uint16_t port, const bool websocketEnabled = false, const int pollIntervalSeconds = 5)
         {
             return std::string{"agent:\n"
                                "  server:\n"
@@ -194,14 +198,93 @@ namespace EdgePulse::Agent
                                "    certificate_file: agent.pem\n"
                                "    private_key_file: agent-key.pem\n"
                                "    name: edge-01\n"
-                               "    websocket_enabled: false\n"
+                               "    websocket_enabled: " +
+                               (websocketEnabled ? "true" : "false") +
+                               "\n"
                                "    heartbeat_interval_seconds: 5\n"
-                               "    command_poll_interval_seconds: 5\n"
+                               "    command_poll_interval_seconds: " +
+                               std::to_string(pollIntervalSeconds) +
+                               "\n"
                                "    request_timeout_seconds: 5\n"
                                "  state:\n"
                                "    directory: state\n"
                                "  logging:\n"
                                "    file: state/agent.log\n"};
+        }
+
+        /**
+         * @brief 命令结果上报的捕获点
+         */
+        struct CommandPostCapture
+        {
+            std::mutex               mutex;    ///< 保护 paths 与 bodies
+            std::vector<std::string> paths;    ///< 收到的上报路径
+            std::vector<std::string> bodies;   ///< 收到的上报正文
+            std::atomic<int>         posts{0}; ///< 已收到的上报次数
+
+            /**
+             * @brief 记录一次上报
+             * @param path 请求路径
+             * @param body 请求正文
+             */
+            void record(std::string path, std::string body)
+            {
+                const std::lock_guard lock(mutex);
+                paths.push_back(std::move(path));
+                bodies.push_back(std::move(body));
+                posts.fetch_add(1, std::memory_order_release);
+            }
+
+            /**
+             * @brief 取路径副本
+             * @param index 序号
+             * @return std::string 路径
+             */
+            [[nodiscard]] std::string pathAt(const std::size_t index)
+            {
+                const std::lock_guard lock(mutex);
+                return index < paths.size() ? paths[index] : std::string{};
+            }
+
+            /**
+             * @brief 取正文副本
+             * @param index 序号
+             * @return std::string 正文
+             */
+            [[nodiscard]] std::string bodyAt(const std::size_t index)
+            {
+                const std::lock_guard lock(mutex);
+                return index < bodies.size() ? bodies[index] : std::string{};
+            }
+        };
+
+        /**
+         * @brief 安装命令结果上报路由
+         * @param router 目标路由器
+         * @param capture 捕获点
+         */
+        void installResultRoute(AsynGyanis::Net::Router &router, const std::shared_ptr<CommandPostCapture> &capture)
+        {
+            router.post("/api/agent/commands/:id/result",
+                        [capture](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                        {
+                            capture->record(std::string{request.path()}, std::string{request.body()});
+                            response.setStatus(200);
+                            response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-result"})");
+                            co_return;
+                        });
+        }
+
+        /**
+         * @brief 构造一条诊断命令的响应正文
+         * @param commandId 命令标识
+         * @return std::string JSON 响应
+         */
+        [[nodiscard]] std::string diagnosticsCommandResponse(const std::int64_t commandId)
+        {
+            const AsynGyanis::Base::ConfigValue command =
+                    AsynGyanis::Base::ConfigValue::object({{"id", commandId}, {"nodeId", 77}, {"type", "diagnostics.collect"}, {"payload", "{}"}, {"timeoutSeconds", 30}});
+            return AsynGyanis::Base::ConfigValue::object({{"code", 200}, {"message", "ok"}, {"data", command}, {"traceId", "trace-next"}}).dump();
         }
     } // namespace
 
@@ -830,5 +913,305 @@ agent:
         EXPECT_NE(std::string::npos, message.find("9.9.9"));
         EXPECT_NE(std::string::npos, message.find(runningVersion));
         EXPECT_NE(std::string::npos, message.find("不一致"));
+    }
+    TEST(AgentApplication, PollsCommandWhenWebSocketCannotConnect)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto heartbeats = std::make_shared<std::atomic<int>>(0);
+        auto posts      = std::make_shared<CommandPostCapture>();
+        auto served     = std::make_shared<std::atomic<bool>>(false);
+
+        TestSupport::ServerHarness server(
+                [heartbeats, posts, served](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                {
+                    router.post("/api/agent/register",
+                                [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77},"traceId":"trace-register"})");
+                                    co_return;
+                                });
+                    router.post("/api/agent/heartbeat",
+                                [heartbeats](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    heartbeats->fetch_add(1, std::memory_order_acq_rel);
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":5},"traceId":"trace-heartbeat"})");
+                                    co_return;
+                                });
+                    // 没有 /api/agent/ws 路由：WebSocket 握手必然失败，命令只能靠启动即运行的轮询取到
+                    router.get("/api/agent/commands/next",
+                               [served](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                               {
+                                   response.setStatus(200);
+                                   if (!served->exchange(true, std::memory_order_acq_rel))
+                                   {
+                                       response.setBody(diagnosticsCommandResponse(1501));
+                                   } else
+                                   {
+                                       response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-next"})");
+                                   }
+                                   co_return;
+                               });
+                    installResultRoute(router, posts);
+                });
+
+        const auto       configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port(), true));
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool executed = waitFor(std::chrono::seconds{10}, [&posts] { return posts->posts.load(std::memory_order_acquire) >= 1; });
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        ASSERT_TRUE(executed) << "WebSocket 不可用时启动轮询必须在时限内执行命令";
+        ASSERT_TRUE(stopped) << "停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+        EXPECT_NE(std::string::npos, posts->pathAt(0).find("/1501/"));
+        const auto result = AsynGyanis::Base::parseConfigValue(posts->bodyAt(0));
+        ASSERT_TRUE(result.has_value()) << posts->bodyAt(0);
+        EXPECT_EQ("succeeded", result->value("status", std::string{}));
+    }
+
+    TEST(AgentApplication, HeartbeatPollCatchesCommandWhileWebSocketConnected)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto heartbeats = std::make_shared<std::atomic<int>>(0);
+        auto hellos     = std::make_shared<std::atomic<int>>(0);
+        auto posts      = std::make_shared<CommandPostCapture>();
+        auto served     = std::make_shared<std::atomic<bool>>(false);
+
+        TestSupport::ServerHarness server(
+                [heartbeats, hellos, posts, served](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                {
+                    router.post("/api/agent/register",
+                                [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77},"traceId":"trace-register"})");
+                                    co_return;
+                                });
+                    router.post("/api/agent/heartbeat",
+                                [heartbeats](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    heartbeats->fetch_add(1, std::memory_order_acq_rel);
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":5},"traceId":"trace-heartbeat"})");
+                                    co_return;
+                                });
+                    router.get("/api/agent/commands/next",
+                               [heartbeats, hellos, served](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                               {
+                                   response.setStatus(200);
+                                   // 命令只在通道登记并完成一次心跳之后才可见；此时轮询已被暂停
+                                   if (hellos->load(std::memory_order_acquire) > 0 && heartbeats->load(std::memory_order_acquire) > 0 &&
+                                       !served->exchange(true, std::memory_order_acq_rel))
+                                   {
+                                       response.setBody(diagnosticsCommandResponse(1502));
+                                   } else
+                                   {
+                                       response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-next"})");
+                                   }
+                                   co_return;
+                               });
+                    router.get("/api/agent/ws",
+                               [hellos](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                               {
+                                   AsynGyanis::Net::WebSocketUpgradePolicy policy;
+                                   policy.originMode = AsynGyanis::Net::WebSocketOriginMode::AllowAny;
+                                   response.upgradeToWebSocket(
+                                           [hellos](AsynGyanis::Net::WebSocketPeer &peer) -> AsynGyanis::Core::Task<>
+                                           {
+                                               const auto hello = co_await peer.receive();
+                                               if (!hello.has_value())
+                                               {
+                                                   co_return;
+                                               }
+                                               hellos->fetch_add(1, std::memory_order_acq_rel);
+                                               static_cast<void>(co_await peer.sendText(R"({"type":"hello","ok":true})"));
+                                               for (;;)
+                                               {
+                                                   const auto frame = co_await peer.receive();
+                                                   if (!frame.has_value())
+                                                   {
+                                                       co_return;
+                                                   }
+                                                   if (frame->opCode == AsynGyanis::Net::WebSocketOpCode::Text && frame->payload.find("\"ping\"") != std::string::npos)
+                                                   {
+                                                       static_cast<void>(co_await peer.sendText(R"({"type":"pong"})"));
+                                                   }
+                                               }
+                                           },
+                                           std::move(policy));
+                                   co_return;
+                               });
+                    installResultRoute(router, posts);
+                });
+
+        // 轮询间隔远大于心跳：启动时那一轮取不到命令，之后只能由心跳补拉取到
+        const auto       configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port(), true, 600));
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool executed = waitFor(std::chrono::seconds{20}, [&posts] { return posts->posts.load(std::memory_order_acquire) >= 1; });
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        ASSERT_GT(hellos->load(std::memory_order_acquire), 0) << "WebSocket 通道未完成 hello";
+        ASSERT_TRUE(executed) << "心跳补拉未在时限内执行通道建立后出现的命令";
+        ASSERT_TRUE(stopped) << "停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+        EXPECT_NE(std::string::npos, posts->pathAt(0).find("/1502/"));
+    }
+
+    TEST(AgentApplication, StopRequestedDuringFailingRegistrationReturnsPromptly)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto                       attempts = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server(
+                [attempts](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                {
+                    router.post("/api/agent/register",
+                                [attempts](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    const int attempt = attempts->fetch_add(1, std::memory_order_acq_rel) + 1;
+                                    response.setStatus(attempt == 1 ? 500 : 200);
+                                    response.setBody(attempt == 1 ? R"({"code":500,"message":"暂时不可用","data":null,"traceId":"trace-register"})"
+                                                                  : R"({"code":200,"message":"ok","data":{"id":77},"traceId":"trace-register"})");
+                                    co_return;
+                                });
+                    router.post("/api/agent/heartbeat",
+                                [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":5},"traceId":"trace-heartbeat"})");
+                                    co_return;
+                                });
+                    router.get("/api/agent/commands/next",
+                               [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                               {
+                                   response.setStatus(200);
+                                   response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-next"})");
+                                   co_return;
+                               });
+                });
+
+        const auto       configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        ASSERT_TRUE(waitFor(std::chrono::seconds{8}, [&attempts] { return attempts->load(std::memory_order_acquire) >= 1; })) << "注册请求未发出";
+        const auto stopStarted = std::chrono::steady_clock::now();
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{6}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        const auto elapsed = std::chrono::steady_clock::now() - stopStarted;
+        runner.join();
+
+        ASSERT_TRUE(stopped) << "注册阶段的停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire)) << "注册阶段收到停止请求应按服务停止返回 0";
+        EXPECT_LE(elapsed, std::chrono::seconds{2}) << "注册退避必须按一秒切片检查停止标记";
+    }
+
+    TEST(AgentApplication, WritesHealthMarkerFromExpectedVersionAfterFirstHeartbeat)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server([heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto                 configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+
+        const std::filesystem::path expectedMarker = directory.path() / "state" / "update-expected";
+        const std::filesystem::path healthMarker   = directory.path() / "state" / "update-health";
+        std::error_code             error;
+        std::filesystem::create_directories(expectedMarker.parent_path(), error);
+        ASSERT_FALSE(error) << error.message();
+        std::ofstream(expectedMarker, std::ios::binary | std::ios::trunc) << kAgentVersion << "\n";
+        ASSERT_TRUE(std::filesystem::exists(expectedMarker));
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool marked          = waitFor(std::chrono::seconds{10}, [&healthMarker] { return std::filesystem::exists(healthMarker); });
+        const bool expectedCleared = waitFor(std::chrono::seconds{5}, [&expectedMarker] { return !std::filesystem::exists(expectedMarker); });
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        ASSERT_TRUE(marked) << "手工升级的 update-expected 未触发健康标记";
+        ASSERT_TRUE(expectedCleared) << "确认健康后必须删除 update-expected";
+        ASSERT_TRUE(stopped) << "停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+        EXPECT_EQ(std::string{kAgentVersion}, readTextFile(healthMarker));
+
+        auto state = AgentState::open(directory.path() / "state" / "agent.db");
+        ASSERT_TRUE(state.has_value()) << state.error();
+        EXPECT_TRUE(state->takeResults(10).empty()) << "手工升级没有待上报的命令结果";
+    }
+
+    TEST(AgentApplication, KeepsExpectedVersionMarkerWhenItDiffersFromRunningVersion)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server([heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto                 configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+
+        const std::filesystem::path expectedMarker = directory.path() / "state" / "update-expected";
+        const std::filesystem::path healthMarker   = directory.path() / "state" / "update-health";
+        std::error_code             error;
+        std::filesystem::create_directories(expectedMarker.parent_path(), error);
+        ASSERT_FALSE(error) << error.message();
+        std::ofstream(expectedMarker, std::ios::binary | std::ios::trunc) << "9.9.9\n";
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool heartbeat = waitFor(std::chrono::seconds{10}, [&heartbeats] { return heartbeats->load(std::memory_order_acquire) >= 1; });
+        std::this_thread::sleep_for(std::chrono::milliseconds{300});
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        ASSERT_TRUE(heartbeat) << "Agent 未在时限内完成首次心跳";
+        ASSERT_TRUE(stopped) << "停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+        EXPECT_FALSE(std::filesystem::exists(healthMarker)) << "版本不符不得写健康标记";
+        ASSERT_TRUE(std::filesystem::exists(expectedMarker)) << "版本不符必须保留标记供安装器回滚";
+        EXPECT_EQ(0U, readTextFile(expectedMarker).find("9.9.9"));
     }
 } // namespace EdgePulse::Agent

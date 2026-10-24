@@ -26,8 +26,7 @@ namespace EdgePulse::Agent
 {
     namespace
     {
-        constexpr std::chrono::seconds kCommandReceiveWait{60}; ///< 等待下一条服务端消息的时限，超时只继续等
-        constexpr int                  kPollingFailureThreshold{3}; ///< 连续失败达到该次数后启用轮询
+        constexpr std::chrono::seconds kKeepalivePingInterval{30}; ///< 收帧等待上限；到点发一条文本 ping 后继续等
 
         /// WebSocket 重连退避，单位为秒；连续失败超过表长后一直使用最后一档
         constexpr std::array<int, 6> kWebSocketBackoffSeconds{1, 2, 5, 15, 30, 60};
@@ -52,14 +51,9 @@ namespace EdgePulse::Agent
         return kWebSocketBackoffSeconds[index];
     }
 
-    WebSocketFallbackState::WebSocketFallbackState(const bool pollingInitiallyActive) : m_pollingActive(pollingInitiallyActive)
-    {
-    }
-
     void WebSocketFallbackState::recordConnected()
     {
         m_connected           = true;
-        m_pollingActive       = false;
         m_consecutiveFailures = 0;
     }
 
@@ -72,15 +66,11 @@ namespace EdgePulse::Agent
     {
         m_connected = false;
         ++m_consecutiveFailures;
-        if (m_consecutiveFailures >= kPollingFailureThreshold)
-        {
-            m_pollingActive = true;
-        }
     }
 
     bool WebSocketFallbackState::shouldPoll() const
     {
-        return m_pollingActive && !m_connected;
+        return !m_connected;
     }
 
     int WebSocketFallbackState::consecutiveFailures() const
@@ -215,11 +205,17 @@ namespace EdgePulse::Agent
 
         for (;;)
         {
-            const auto frame = co_await client->receiveFor(kCommandReceiveWait);
+            const auto frame = co_await client->receiveFor(kKeepalivePingInterval);
             if (!frame.has_value())
             {
                 if (frame.error().kind == AsynGyanis::Net::WebSocketSessionErrorKind::ReceiveTimedOut && client->isOpen())
                 {
+                    // 文本 ping 让服务端的空闲计时看到流量；发送失败说明通路已坏，交给上层重连
+                    if (!co_await client->sendText(R"({"type":"ping"})"))
+                    {
+                        LOG_WARN("WebSocket 保活 ping 发送失败，关闭连接后重连");
+                        break;
+                    }
                     continue;
                 }
                 LOG_WARN_FMT("WebSocket 命令通道读取结束：{}", frame.error().message);
@@ -242,6 +238,10 @@ namespace EdgePulse::Agent
             }
 
             const std::string type = stringField(*value, "type");
+            if (type == "pong")
+            {
+                continue;
+            }
             if (type == "ping")
             {
                 if (!co_await client->sendText(R"({"type":"pong"})"))

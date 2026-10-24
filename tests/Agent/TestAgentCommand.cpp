@@ -7,6 +7,7 @@
 #include "CertificateFixture.h"
 #include "CommandDispatcher.h"
 #include "Executors/CommandExecutor.h"
+#include "Executors/RestartExecutor.h"
 #include "TestSupport/HttpClientHarness.h"
 #include "TestSupport/TemporaryDirectory.h"
 
@@ -439,47 +440,45 @@ namespace EdgePulse::Agent
         EXPECT_NE(std::string::npos, paths[1].find("/1202/"));
     }
 
-    TEST(AgentCommand, WebSocketFallbackKeepsPollingOffBeforeThreeFailures)
+    TEST(AgentCommand, WebSocketFallbackPollsUntilChannelConnected)
     {
         WebSocketFallbackState fallback;
-        EXPECT_FALSE(fallback.shouldPoll());
+        EXPECT_TRUE(fallback.shouldPoll()) << "启动时通道尚未确认，必须立即轮询";
         EXPECT_EQ(0, fallback.consecutiveFailures());
 
         fallback.recordConnectFailure();
-        EXPECT_FALSE(fallback.shouldPoll());
+        EXPECT_TRUE(fallback.shouldPoll()) << "连接失败期间轮询必须继续";
         EXPECT_EQ(1, fallback.consecutiveFailures());
 
         fallback.recordConnectFailure();
-        EXPECT_FALSE(fallback.shouldPoll());
-        EXPECT_EQ(2, fallback.consecutiveFailures());
-    }
-
-    TEST(AgentCommand, WebSocketFallbackEnablesPollingOnThirdFailure)
-    {
-        WebSocketFallbackState fallback;
-        fallback.recordConnectFailure();
-        fallback.recordConnectFailure();
-        EXPECT_FALSE(fallback.shouldPoll());
-
-        fallback.recordConnectFailure();
         EXPECT_TRUE(fallback.shouldPoll());
-        EXPECT_EQ(3, fallback.consecutiveFailures());
-    }
-
-    TEST(AgentCommand, WebSocketFallbackConnectedResetsFailuresAndPausesPolling)
-    {
-        WebSocketFallbackState fallback;
-        fallback.recordConnectFailure();
-        fallback.recordConnectFailure();
-        fallback.recordConnectFailure();
-        ASSERT_TRUE(fallback.shouldPoll());
+        EXPECT_EQ(2, fallback.consecutiveFailures());
 
         fallback.recordConnected();
-        EXPECT_FALSE(fallback.shouldPoll());
+        EXPECT_FALSE(fallback.shouldPoll()) << "只有 hello 确认的连接会暂停轮询";
         EXPECT_EQ(0, fallback.consecutiveFailures());
+    }
+
+    TEST(AgentCommand, WebSocketFallbackResumesPollingAfterNormalDisconnect)
+    {
+        WebSocketFallbackState fallback;
+        fallback.recordConnected();
+        ASSERT_FALSE(fallback.shouldPoll());
 
         fallback.recordDisconnected();
-        EXPECT_FALSE(fallback.shouldPoll()) << "正常断开后轮询应保持暂停，直到再次连续失败三次";
+        EXPECT_TRUE(fallback.shouldPoll()) << "正常断开后轮询必须立即恢复，不能等连续失败三次";
+        EXPECT_EQ(0, fallback.consecutiveFailures());
+    }
+
+    TEST(AgentCommand, WebSocketFallbackFailureCountOnlyDrivesBackoff)
+    {
+        WebSocketFallbackState fallback;
+        for (int attempt = 0; attempt < 5; ++attempt)
+        {
+            fallback.recordConnectFailure();
+            EXPECT_TRUE(fallback.shouldPoll()) << "失败次数不改变轮询判定";
+        }
+        EXPECT_EQ(5, fallback.consecutiveFailures());
     }
 
     TEST(AgentCommand, WebSocketFallbackBackoffTable)
@@ -574,6 +573,73 @@ namespace EdgePulse::Agent
         ASSERT_TRUE(hello.has_value()) << helloPayload;
         EXPECT_EQ("hello", hello->value("type", std::string{}));
         EXPECT_EQ(77, hello->value("nodeId", 0));
+    }
+
+    TEST(AgentCommand, RestartRunsAfterResultAcknowledged)
+    {
+        auto capture = std::make_shared<ResultCapture>();
+
+        TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, EventLoop &) { installResultRoute(router, capture); });
+
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openState(directory);
+        ASSERT_TRUE(state.has_value()) << state.error();
+
+        AgentLoop   loop;
+        AgentClient client(loop.loop(), plaintextConfiguration(server.port()), testIdentity());
+
+        std::atomic<bool> handlerRan{false};
+        std::atomic<bool> rowGoneAtHandler{false};
+        std::atomic<int>  postsAtHandler{0};
+        auto              restartExecutor = std::make_shared<RestartExecutor>(true);
+        CommandDispatcher dispatcher(client, *state, {restartExecutor},
+                                     [&handlerRan, &rowGoneAtHandler, &postsAtHandler, &state, &capture]() -> Task<>
+                                     {
+                                         handlerRan.store(true, std::memory_order_release);
+                                         postsAtHandler.store(capture->posts.load(std::memory_order_acquire), std::memory_order_release);
+                                         rowGoneAtHandler.store(!state->hasResult(1401), std::memory_order_release);
+                                         co_return;
+                                     });
+        LoopStopGuard     stopGuard{loop};
+
+        ASSERT_TRUE(loop.run(dispatcher.onWebSocketCommand(AgentCommand{1401, "agent.restart", "{}", 30}), std::chrono::seconds{15}, "重启命令分发"));
+
+        ASSERT_EQ(1, capture->posts.load(std::memory_order_acquire));
+        const auto posted = AsynGyanis::Base::parseConfigValue(capture->bodyAt(0));
+        ASSERT_TRUE(posted.has_value()) << capture->bodyAt(0);
+        EXPECT_EQ("succeeded", posted->value("status", std::string{}));
+        EXPECT_TRUE(handlerRan.load(std::memory_order_acquire)) << "重启处理器必须被调用";
+        EXPECT_EQ(1, postsAtHandler.load(std::memory_order_acquire)) << "重启必须发生在结果上报尝试之后";
+        EXPECT_TRUE(rowGoneAtHandler.load(std::memory_order_acquire)) << "服务端已确认的结果行必须在重启前删除";
+    }
+
+    TEST(AgentCommand, RestartStillRunsWhenResultCannotBeDelivered)
+    {
+        auto capture = std::make_shared<ResultCapture>();
+        capture->status.store(500, std::memory_order_release);
+
+        TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, EventLoop &) { installResultRoute(router, capture); });
+
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openState(directory);
+        ASSERT_TRUE(state.has_value()) << state.error();
+
+        AgentLoop         loop;
+        AgentClient       client(loop.loop(), plaintextConfiguration(server.port()), testIdentity());
+        std::atomic<bool> handlerRan{false};
+        auto              restartExecutor = std::make_shared<RestartExecutor>(true);
+        CommandDispatcher dispatcher(client, *state, {restartExecutor},
+                                     [&handlerRan]() -> Task<>
+                                     {
+                                         handlerRan.store(true, std::memory_order_release);
+                                         co_return;
+                                     });
+        LoopStopGuard     stopGuard{loop};
+
+        ASSERT_TRUE(loop.run(dispatcher.onWebSocketCommand(AgentCommand{1402, "agent.restart", "{}", 30}), std::chrono::seconds{15}, "重启命令分发"));
+
+        EXPECT_TRUE(handlerRan.load(std::memory_order_acquire)) << "上报失败也必须重启，队列会在新进程继续补报";
+        EXPECT_TRUE(state->hasResult(1402)) << "未确认的结果行必须留在队列里";
     }
 
     TEST(AgentCommand, UnsupportedTypeIsReportedAsFailed)

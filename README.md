@@ -308,7 +308,7 @@ sudo /tmp/edgepulse-agent/uninstall-agent.sh          # 保留配置、状态与
 sudo /tmp/edgepulse-agent/uninstall-agent.sh --purge  # 一并删除
 ```
 
-普通安装会把安装器复制到 `<prefix>/lib/edgepulse/install-agent.sh`，并把配置里的 `agent.update.installer_script` 替换为该路径。控制面下发 `agent.update` 时，命令给出归档 SHA-256 与覆盖该摘要的 Ed25519 签名；Agent 验签通过才下载，并核验下载摘要一致，然后调用安装器 `--upgrade`。安装器校验已认证归档内的 `checksums.sha256`、manifest 版本与平台，清理旧标记、备份旧二进制、停止服务，只替换二进制，再等待新版本在首次成功心跳后写出的 `<state>/update-health`；超时或启动失败则恢复旧二进制、写入 `<state>/update-rollback` 并重启旧版本。升级成功与回滚都会用最终结论替换此前“安装器已启动”的结果，同一命令只上报一条；替换前失败时安装器用旧二进制重新启动服务。安装器日志在 `<state>/update-installer.log`。打包时提供 `--signing-key` 与 `--signing-key-id` 会写出 `<包名>.sig` 与 `<包名>.json`，Agent 用 `agent.update.package_trusted_keys_dir` 里的公钥验证归档签名；手工运行安装器只校验哈希，不验签名。
+普通安装会把安装器复制到 `<prefix>/lib/edgepulse/install-agent.sh`，并把配置里的 `agent.update.installer_script` 替换为该路径。控制面下发 `agent.update` 时，命令给出归档 SHA-256 与覆盖该摘要的 Ed25519 签名；Agent 验签通过才下载，并核验下载摘要一致，然后调用安装器 `--upgrade`。安装器校验已认证归档内的 `checksums.sha256`、manifest 版本与平台，清理旧标记、备份旧二进制、停止服务，只替换二进制，再写入 `<state>/update-expected` 并等待新版本在首次成功心跳后写出的 `<state>/update-health`；超时或启动失败则恢复旧二进制、写入 `<state>/update-rollback` 并重启旧版本。升级成功与回滚都会用最终结论替换此前“安装器已启动”的结果，同一命令只上报一条；替换前失败时安装器用旧二进制重新启动服务。手工 `--upgrade` 没有待上报命令，新版本按 `update-expected` 的版本确认健康；内容与运行版本不符时保留标记，由安装器回滚。安装器日志在 `<state>/update-installer.log`。打包时提供 `--signing-key` 与 `--signing-key-id` 会写出 `<包名>.sig` 与 `<包名>.json`，Agent 用 `agent.update.package_trusted_keys_dir` 里的公钥验证归档签名；手工运行安装器只校验哈希，不验签名。
 
 默认路径为配置 `/etc/edgepulse-agent`、状态 `/var/lib/edgepulse-agent`、日志 `/var/log/edgepulse-agent`；`--prefix`、`--config-dir`、`--state-dir`、`--log-dir` 可整体改到自定义位置，单元里的 `ExecStart`、`EnvironmentFile` 与 `ReadWritePaths` 会同步替换。运行状态看 `systemctl status edgepulse-agent`，日志看 `journalctl -u edgepulse-agent -f`，完整步骤见 [docs/部署.md](docs/部署.md#13-agentlinux)。
 
@@ -330,7 +330,9 @@ powershell -ExecutionPolicy Bypass -File $env:TEMP\edgepulse-agent\uninstall-age
 
 服务名默认 `EdgePulseAgent`，可用 `-ServiceName` 自定义，安装器会把同一个名字写进服务命令行的 `--service-name`；账户 LocalSystem，安装器配置自动启动与 5 秒、10 秒、30 秒三次失败重启。注册前把 `ca.pem`、`agent.pem` 与 `agent-key.pem` 放进 `C:\ProgramData\EdgePulse\Agent\certs`。注册令牌通过服务作用域环境变量提供（服务注册表项的 `Environment` 值）后重启服务；数据目录只授予 Administrators 与 SYSTEM，证书与私钥不要放到其他可写位置。运行日志在 `C:\ProgramData\EdgePulse\Agent\agent.log`，服务控制错误看 `Get-EventLog -LogName System -Source "Service Control Manager"`。
 
-Windows 升级同样由 `agent.update` 触发：Agent 先对命令里的归档摘要验签，下载后核对摘要，再调用安装器 `-Upgrade`；安装器校验已认证归档内的 `checksums.sha256`、manifest 版本与平台，清理旧标记、备份 exe、停服务、替换 exe，并等待新版本在首次成功心跳后写出 `C:\ProgramData\EdgePulse\Agent\update-health`；超时或启动失败则恢复 exe、写入 `update-rollback` 并启动旧服务，替换前失败时也会重新启动已停止的旧服务。升级结果替换此前“安装器已启动”的结果。升级模式固定服务名 `EdgePulseAgent`，配置、状态与安装脚本副本保持不变；日志在 `C:\ProgramData\EdgePulse\Agent\update-installer.log`。完整步骤见 [docs/部署.md](docs/部署.md#14-agentwindows)。
+Windows 升级同样由 `agent.update` 触发：Agent 先对命令里的归档摘要验签，下载后核对摘要，再调用安装器 `-Upgrade`；安装器校验已认证归档内的 `checksums.sha256`、manifest 版本与平台，清理旧标记、备份 exe、停服务、替换 exe，写入 `<数据目录>\update-expected` 并等待新版本在首次成功心跳后写出 `C:\ProgramData\EdgePulse\Agent\update-health`；超时或启动失败则恢复 exe、写入 `update-rollback` 并启动旧服务，替换前失败时也会重新启动已停止的旧服务。手工 `-Upgrade` 同样靠 `update-expected` 确认健康。升级结果替换此前“安装器已启动”的结果。升级模式固定服务名 `EdgePulseAgent`，配置、状态与安装脚本副本保持不变；日志在 `C:\ProgramData\EdgePulse\Agent\update-installer.log`。完整步骤见 [docs/部署.md](docs/部署.md#14-agentwindows)。
+
+`agent.restart` 由 Agent 在命令结果入队并尝试上报之后触发：Linux 通过 `systemd-run --collect` 启动延迟的 `systemctl restart edgepulse-agent`，Windows 通过脱离的 `powershell.exe` 调用 `Restart-Service -Name 'EdgePulseAgent' -Force`，随后当前进程请求停止。启动器失败只记 ERROR 并保持进程运行，不会谎报重启成功；Windows 自定义服务名不支持该命令。
 
 ## 项目结构
 

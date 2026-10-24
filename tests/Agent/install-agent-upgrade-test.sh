@@ -77,6 +77,9 @@ make_package() {
     cat > "${stage}/edgepulse-agent" <<EOF
 #!/usr/bin/env bash
 # fake edgepulse-agent ${version}
+if [[ -f "\${FAKE_AGENT_STATE_DIR}/update-expected" ]]; then
+    cp "\${FAKE_AGENT_STATE_DIR}/update-expected" "\${FAKE_AGENT_STATE_DIR}/expected-seen"
+fi
 if [[ -f "\${FAKE_AGENT_STATE_DIR}/healthy" ]]; then
     printf '%s\\n' "${version}" > "\${FAKE_AGENT_STATE_DIR}/update-health"
 fi
@@ -143,6 +146,8 @@ fi
 grep -q 'fake edgepulse-agent 2.0.0' "${success_prefix}/bin/edgepulse-agent" || fail "替换后的二进制不是新版本"
 [[ ! -e "${success_prefix}/bin/edgepulse-agent.previous" ]] || fail "成功后应删除二进制备份"
 [[ ! -e "${success_state}/update-health" ]] || fail "成功后应删除健康标记"
+[[ ! -e "${success_state}/update-expected" ]] || fail "成功后应删除期望版本标记"
+[[ "$(cat "${success_state}/expected-seen" 2>/dev/null || true)" == "2.0.0" ]] || fail "新版本未在启动前看到 update-expected"
 grep -q "升级成功" "${success_state}/update-installer.log" || fail "升级日志缺少成功记录"
 say "PASS: 成功路径替换二进制、等待健康标记并清理备份"
 say "成功路径日志：${success_state}/update-installer.log"
@@ -171,6 +176,8 @@ fi
 [[ -f "${timeout_state}/update-rollback" ]] || fail "超时后缺少 update-rollback"
 [[ "$(cat "${timeout_state}/update-rollback")" == "2.0.0" ]] || fail "回滚标记内容不是目标版本"
 [[ ! -e "${timeout_prefix}/bin/edgepulse-agent.previous" ]] || fail "回滚后应删除二进制备份"
+[[ ! -e "${timeout_state}/update-expected" ]] || fail "回滚后应删除期望版本标记"
+[[ "$(cat "${timeout_state}/expected-seen" 2>/dev/null || true)" == "2.0.0" ]] || fail "新版本未在启动前看到 update-expected"
 grep -q "回滚完成" "${timeout_state}/update-installer.log" || fail "升级日志缺少回滚记录"
 say "PASS: 超时路径恢复旧二进制、写入回滚标记并以非零退出"
 say "超时路径日志：${timeout_state}/update-installer.log，回滚标记内容 $(cat "${timeout_state}/update-rollback")"
@@ -212,6 +219,7 @@ if grep -q "服务与二进制未改动" "${corrupt_state}/update-installer.log"
     fail "替换前失败时不应声称服务与二进制未改动"
 fi
 [[ ! -e "${corrupt_state}/update-rollback" ]] || fail "替换前失败不应写回滚标记"
+[[ ! -e "${corrupt_state}/update-expected" ]] || fail "替换前失败不应留下期望版本标记"
 say "PASS: 校验失败时安装器以非零退出并用旧二进制重新启动旧服务"
 say "校验失败路径日志：${corrupt_state}/update-installer.log"
 grep -E "升级失败|旧版本服务已重新启动" "${corrupt_state}/update-installer.log" | sed 's/^/  /'

@@ -40,9 +40,10 @@ namespace EdgePulse::Agent
      */
     struct CommandResult
     {
-        bool        succeeded{false}; ///< 是否成功；对应上报状态 succeeded 或 failed
-        std::string result{"{}"};     ///< 结果正文，JSON 文本
-        std::string message;          ///< 面向运维的中文说明
+        bool        succeeded{false};          ///< 是否成功；对应上报状态 succeeded 或 failed
+        std::string result{"{}"};              ///< 结果正文，JSON 文本
+        std::string message;                   ///< 面向运维的中文说明
+        bool        restartAfterResult{false}; ///< 结果入队并尝试上报后是否触发服务重启
     };
 
     /**

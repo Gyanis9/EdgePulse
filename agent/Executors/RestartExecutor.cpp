@@ -1,15 +1,10 @@
 #include "Executors/RestartExecutor.h"
 
 #include "Base/Config/ConfigValue.h"
-#include "Base/Log/LogMacros.h"
-
-#include <exception>
-#include <string>
-#include <utility>
 
 namespace EdgePulse::Agent
 {
-    RestartExecutor::RestartExecutor(RestartCallback restartCallback) : m_restartCallback(std::move(restartCallback))
+    RestartExecutor::RestartExecutor(const bool restartConfigured) : m_restartConfigured(restartConfigured)
     {
     }
 
@@ -23,23 +18,12 @@ namespace EdgePulse::Agent
         static_cast<void>(loop);
         static_cast<void>(command);
 
-        if (!m_restartCallback)
+        if (!m_restartConfigured)
         {
-            co_return CommandResult{false, "{}", "未配置重启回调，无法执行 agent.restart"};
-        }
-
-        try
-        {
-            m_restartCallback();
-        } catch (const std::exception &failure)
-        {
-            co_return CommandResult{false, "{}", "触发重启失败：" + std::string{failure.what()}};
-        } catch (...)
-        {
-            co_return CommandResult{false, "{}", "触发重启失败：未知异常"};
+            co_return CommandResult{false, "{}", "未配置重启处理器，无法执行 agent.restart"};
         }
 
         const AsynGyanis::Base::ConfigValue result = AsynGyanis::Base::ConfigValue::object({{"status", "restarting"}});
-        co_return CommandResult{true, result.dump(), "重启请求已受理"};
+        co_return CommandResult{true, result.dump(), "重启请求已受理，结果上报后重启服务", true};
     }
 } // namespace EdgePulse::Agent

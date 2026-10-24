@@ -12,6 +12,7 @@
 #include "Executors/RestartExecutor.h"
 #include "Executors/TelemetryPublisher.h"
 #include "Executors/UpdateExecutor.h"
+#include "ProcessRunner.h"
 #include "TelemetryCollector.h"
 
 #include "Platform/FileSystem/AtomicFileWriter.h"
@@ -40,9 +41,11 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -50,6 +53,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if !ASYN_PLATFORM_WIN32
+#include <unistd.h>
+#endif
 
 namespace EdgePulse::Agent
 {
@@ -62,6 +69,7 @@ namespace EdgePulse::Agent
         constexpr int kMinimumHeartbeatSeconds      = 5;   ///< 心跳间隔下限
         constexpr int kMaximumHeartbeatSeconds      = 600; ///< 心跳间隔上限
         constexpr int kHeartbeatFailureWarningCount = 3;   ///< 连续失败达到该次数时额外告警一次
+        constexpr int kWebSocketFailureAlertCount   = 3;   ///< WebSocket 连续失败达到该次数时额外告警一次
 
         /**
          * @brief 取当前 UTC 时刻的秒级文本
@@ -78,7 +86,7 @@ namespace EdgePulse::Agent
          */
         struct RuntimeFlags
         {
-            WebSocketFallbackState fallback;               ///< WebSocket 与轮询的降级状态
+            WebSocketFallbackState fallback;                     ///< WebSocket 与轮询的降级状态
             int                    heartbeatIntervalSeconds{30}; ///< 当前心跳间隔，服务端可下发新值
         };
 
@@ -162,18 +170,20 @@ namespace EdgePulse::Agent
         }
 
         /**
-         * @brief 按 5 秒、10 秒、30 秒、60 秒的退避反复注册，直到成功、被拒绝或 409 次数用尽
+         * @brief 按 5 秒、10 秒、30 秒、60 秒的退避反复注册，直到成功、被拒绝、409 次数用尽或收到停止请求
          * @param loop 事件循环
          * @param client 注册客户端
          * @param registrationToken 注册或换绑令牌
          * @param agentVersion 当前版本
          * @param requestTimeoutSeconds 单次请求时限
-         * @return 成功返回节点 ID；403、其他不可重试的失败或 409 达到上限时返回空
+         * @param stopRequested 停止标记；等待请求与退避期间每秒检查一次
+         * @return 成功返回节点 ID；403、其他不可重试的失败、409 达到上限或收到停止请求时返回空
          * @details 服务端用 409 同时表示永久名字冲突与并发注册冲突，客户端不解析原因文本，
-         *          只在单次启动内累计到固定次数后按永久冲突终止。
+         *          只在单次启动内累计到固定次数后按永久冲突终止。退避按一秒切片，
+         *          SIGTERM 落在注册阶段时最多一秒就能退出，不会把服务停机拖过 SCM 的等待上限。
          */
         [[nodiscard]] std::optional<std::int64_t> registerWithBackoff(AsynGyanis::Core::EventLoop &loop, AgentClient &client, const std::string &registrationToken,
-                                                                      const std::string &agentVersion, const int requestTimeoutSeconds)
+                                                                      const std::string &agentVersion, const int requestTimeoutSeconds, const std::atomic<bool> &stopRequested)
         {
             std::jthread                          loopThread([&loop] { loop.run(); });
             std::vector<AsynGyanis::Core::Task<>> pendingTasks;
@@ -189,20 +199,42 @@ namespace EdgePulse::Agent
                     loopThread.join();
                 }
             };
+            const auto stopRequestedNow = [&stopRequested]() { return stopRequested.load(std::memory_order_acquire); };
 
             for (std::size_t attempt = 0;; ++attempt)
             {
+                if (stopRequestedNow())
+                {
+                    LOG_INFO("注册阶段收到停止请求，已放弃注册");
+                    stopLoop();
+                    return std::nullopt;
+                }
+
                 auto promise = std::make_shared<std::promise<RegistrationOutcome>>();
                 auto future  = promise->get_future();
                 auto task    = awaitRegistration(client, registrationToken, agentVersion, promise);
                 loop.scheduler().scheduleRemote(task.handle());
                 pendingTasks.push_back(std::move(task));
 
-                if (future.wait_for(waitLimit) != std::future_status::ready)
+                const auto deadline = std::chrono::steady_clock::now() + waitLimit;
+                for (;;)
                 {
-                    LOG_ERROR_FMT("注册请求在 {} 秒内没有返回，停止启动", waitLimit.count());
-                    stopLoop();
-                    return std::nullopt;
+                    if (future.wait_for(std::chrono::milliseconds{200}) == std::future_status::ready)
+                    {
+                        break;
+                    }
+                    if (stopRequestedNow())
+                    {
+                        LOG_INFO("注册请求等待期间收到停止请求，已放弃注册");
+                        stopLoop();
+                        return std::nullopt;
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline)
+                    {
+                        LOG_ERROR_FMT("注册请求在 {} 秒内没有返回，停止启动", waitLimit.count());
+                        stopLoop();
+                        return std::nullopt;
+                    }
                 }
 
                 const RegistrationOutcome outcome = future.get();
@@ -237,7 +269,16 @@ namespace EdgePulse::Agent
                 }
                 const int delaySeconds = delays[std::min<std::size_t>(attempt, delays.size() - 1)];
                 LOG_WARN_FMT("注册失败：{}，{} 秒后重试", failure.message, delaySeconds);
-                std::this_thread::sleep_for(std::chrono::seconds{delaySeconds});
+                for (int elapsed = 0; elapsed < delaySeconds; ++elapsed)
+                {
+                    if (stopRequestedNow())
+                    {
+                        LOG_INFO("注册退避期间收到停止请求，已放弃注册");
+                        stopLoop();
+                        return std::nullopt;
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds{1});
+                }
             }
         }
 
@@ -254,7 +295,7 @@ namespace EdgePulse::Agent
          * @param firstHealthyHeartbeat 首次成功心跳后的确认动作，可为空
          * @return 协程任务
          * @note 心跳失败只记日志并继续下一轮，任何心跳失败都不会结束 Agent；
-         *       确认动作只在第一次成功心跳后执行一次，之后的心跳不再重复
+         *       每次成功心跳后先补拉一次命令再上报结果，确认动作只在第一次成功心跳后执行一次
          */
         AsynGyanis::Core::Task<> runHeartbeat(AsynGyanis::Core::EventLoop &loop, AgentClient &client, AgentState &state, CommandDispatcher &dispatcher, const std::int64_t nodeId,
                                               std::string agentVersion, RuntimeFlags &flags, const std::atomic<bool> &stopRequested,
@@ -305,6 +346,9 @@ namespace EdgePulse::Agent
                             co_await firstHealthyHeartbeat();
                         }
                     }
+                    // hello 与通道登记之间存在空窗：即使 WebSocket 已连接，也每轮心跳补拉一次，
+                    // 让空窗里创建的命令最迟在一个心跳周期内被执行；重复投递由分发器去重
+                    co_await dispatcher.pollOnce();
                     const ResultFlush flushed = co_await dispatcher.flushResults();
                     if (flushed.failed)
                     {
@@ -331,7 +375,8 @@ namespace EdgePulse::Agent
          * @param flags 循环线程共享状态
          * @param stopRequested 停止标记
          * @return 协程任务
-         * @note 连续失败 3 次后启用轮询；通道确认可用期间轮询暂停
+         * @note 轮询在启动与任何断开期间运行，只有 hello 确认的连接会暂停它；
+         *       连续失败达到 3 次时额外告警一次，重连退避仍按失败次数增长
          */
         AsynGyanis::Core::Task<> runWebSocket(AsynGyanis::Core::EventLoop &loop, AgentWebSocket &socket, CommandDispatcher &dispatcher, const std::int64_t nodeId,
                                               std::string agentVersion, RuntimeFlags &flags, const std::atomic<bool> &stopRequested)
@@ -345,6 +390,7 @@ namespace EdgePulse::Agent
                 } else
                 {
                     flags.fallback.recordDisconnected();
+                    LOG_INFO("WebSocket 命令通道已断开，命令轮询恢复");
                 }
             };
 
@@ -359,14 +405,14 @@ namespace EdgePulse::Agent
                 if (outcome.has_value())
                 {
                     LOG_INFO("WebSocket 命令通道已关闭，将重新连接");
+                    flags.fallback.recordDisconnected();
                 } else
                 {
-                    const bool pollingBefore = flags.fallback.shouldPoll();
                     flags.fallback.recordConnectFailure();
                     LOG_WARN_FMT("WebSocket 命令通道不可用（连续 {} 次）：{}", flags.fallback.consecutiveFailures(), outcome.error());
-                    if (!pollingBefore && flags.fallback.shouldPoll())
+                    if (flags.fallback.consecutiveFailures() == kWebSocketFailureAlertCount)
                     {
-                        LOG_WARN("WebSocket 连续失败 3 次，已启用命令轮询兜底");
+                        LOG_WARN("WebSocket 已连续失败 3 次，命令轮询继续兜底");
                     }
                 }
 
@@ -409,6 +455,75 @@ namespace EdgePulse::Agent
                 AsynGyanis::Core::Timer timer(loop);
                 co_await timer.waitFor(std::chrono::seconds{intervalSeconds > 0 ? intervalSeconds : 15});
             }
+        }
+
+        /**
+         * @brief 取当前进程标识，用于拼出唯一的 systemd 重启单元名
+         * @return std::uint64_t 进程标识
+         */
+        [[nodiscard]] std::uint64_t currentProcessIdentifier()
+        {
+#if ASYN_PLATFORM_WIN32
+            return static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+            return static_cast<std::uint64_t>(::getpid());
+#endif
+        }
+
+        /**
+         * @brief 通过系统服务管理器重启 Agent，成功启动后请求当前进程停止
+         * @param loop 事件循环
+         * @param requestStop 请求当前进程停止的回调
+         * @return 协程任务
+         * @details 启动器在阻塞执行器上脱离运行，避免 systemd-run 或 powershell 的启动耗时占住循环。
+         *          Linux 用 transient 单元延迟执行 systemctl restart，Windows 用 Restart-Service；
+         *          启动失败只记 ERROR 并保持进程运行，因为命令结果已经入队，不能假装重启成功。
+         *          Windows 安装器固定把服务注册为 EdgePulseAgent，自定义服务名不支持本命令。
+         */
+        AsynGyanis::Core::Task<> restartAgentService(AsynGyanis::Core::EventLoop &loop, const std::function<void()> &requestStop)
+        {
+            std::expected<void, std::string> launched;
+            try
+            {
+                launched = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                        loop,
+                        []() -> std::expected<void, std::string>
+                        {
+#if ASYN_PLATFORM_WIN32
+                            return launchDetached("powershell.exe", {"-NoProfile", "-Command", "Restart-Service -Name 'EdgePulseAgent' -Force"});
+#else
+                            const std::string unit = "--unit=edgepulse-agent-restart-" + std::to_string(currentProcessIdentifier());
+                            return launchDetached("systemd-run", {"--collect", unit, "--property=Type=exec", "systemctl", "restart", "edgepulse-agent.service"});
+#endif
+                        });
+            } catch (const std::exception &failure)
+            {
+                launched = std::unexpected("提交服务重启任务失败：" + std::string{failure.what()});
+            } catch (...)
+            {
+                launched = std::unexpected("提交服务重启任务失败：未知异常");
+            }
+            if (!launched.has_value())
+            {
+                LOG_ERROR_FMT("agent.restart 启动服务重启失败：{}", launched.error());
+                co_return;
+            }
+
+            LOG_INFO("agent.restart 已启动服务重启，当前进程即将退出");
+            if (requestStop)
+            {
+                try
+                {
+                    requestStop();
+                } catch (const std::exception &failure)
+                {
+                    LOG_WARN_FMT("agent.restart 请求当前进程停止失败：{}", failure.what());
+                } catch (...)
+                {
+                    LOG_WARN("agent.restart 请求当前进程停止失败：未知异常");
+                }
+            }
+            co_return;
         }
 
         /**
@@ -531,6 +646,97 @@ namespace EdgePulse::Agent
             }
             co_return removed;
         }
+
+        /**
+         * @brief 在阻塞执行器上读取升级标记文本
+         * @param loop 事件循环
+         * @param path 标记路径
+         * @return 协程任务；标记不存在时返回空 optional，读取失败返回中文原因
+         * @note 内容去掉首尾空白；只用于版本这类单行文本
+         */
+        AsynGyanis::Core::Task<std::expected<std::optional<std::string>, std::string>> readMarker(AsynGyanis::Core::EventLoop &loop, std::filesystem::path path)
+        {
+            std::expected<std::optional<std::string>, std::string> read;
+            try
+            {
+                read = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<std::optional<std::string>, std::string>>(
+                        loop,
+                        [path]() -> std::expected<std::optional<std::string>, std::string>
+                        {
+                            const std::string pathText = AsynGyanis::Platform::FileSystem::utf8FromPath(path);
+                            std::error_code   filesystemError;
+                            if (!std::filesystem::exists(path, filesystemError))
+                            {
+                                if (filesystemError)
+                                {
+                                    return std::unexpected("检查升级标记 " + pathText + " 失败：" + filesystemError.message());
+                                }
+                                return std::optional<std::string>{};
+                            }
+                            std::ifstream stream(path, std::ios::binary);
+                            if (!stream)
+                            {
+                                return std::unexpected("读取升级标记 " + pathText + " 失败");
+                            }
+                            std::string content{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+                            if (stream.bad())
+                            {
+                                return std::unexpected("读取升级标记 " + pathText + " 失败");
+                            }
+                            const auto isSpace = [](const char character) { return character == ' ' || character == '\t' || character == '\r' || character == '\n'; };
+                            while (!content.empty() && isSpace(content.back()))
+                            {
+                                content.pop_back();
+                            }
+                            std::size_t begin = 0;
+                            while (begin < content.size() && isSpace(content[begin]))
+                            {
+                                ++begin;
+                            }
+                            return std::optional<std::string>{content.substr(begin)};
+                        });
+            } catch (const std::exception &failure)
+            {
+                read = std::unexpected("提交升级标记读取任务失败：" + std::string{failure.what()});
+            } catch (...)
+            {
+                read = std::unexpected("提交升级标记读取任务失败：未知异常");
+            }
+            co_return read;
+        }
+
+        /**
+         * @brief 在阻塞执行器上写入升级健康标记
+         * @param loop 事件循环
+         * @param path 健康标记路径
+         * @param agentVersion 当前运行版本
+         * @return 协程任务；失败返回中文原因
+         */
+        AsynGyanis::Core::Task<std::expected<void, std::string>> writeHealthMarker(AsynGyanis::Core::EventLoop &loop, std::filesystem::path path, std::string agentVersion)
+        {
+            std::expected<void, std::string> written;
+            try
+            {
+                written = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                        loop,
+                        [path, agentVersion = std::move(agentVersion)]() -> std::expected<void, std::string>
+                        {
+                            std::string writeError;
+                            if (!AsynGyanis::Platform::AtomicFileWriter::writeText(path, agentVersion, std::nullopt, &writeError))
+                            {
+                                return std::unexpected("写入升级健康标记 " + AsynGyanis::Platform::FileSystem::utf8FromPath(path) + " 失败：" + writeError);
+                            }
+                            return {};
+                        });
+            } catch (const std::exception &failure)
+            {
+                written = std::unexpected("提交升级健康标记写入任务失败：" + std::string{failure.what()});
+            } catch (...)
+            {
+                written = std::unexpected("提交升级健康标记写入任务失败：未知异常");
+            }
+            co_return written;
+        }
     } // namespace
 
     AgentApplication::AgentApplication(AgentConfiguration configuration, const bool consoleMode) : m_configuration(std::move(configuration)), m_consoleMode(consoleMode)
@@ -556,7 +762,22 @@ namespace EdgePulse::Agent
             co_return;
         }
 
+        const std::filesystem::path healthMarker   = m_configuration.stateDirectory / "update-health";
         const std::filesystem::path rollbackMarker = m_configuration.stateDirectory / "update-rollback";
+        const std::filesystem::path expectedMarker = m_configuration.stateDirectory / "update-expected";
+
+        // 期望版本标记由安装器在启动新版本之前写入，手工 --upgrade 没有待上报结果时也靠它确认健康
+        std::optional<std::string> expectedVersion;
+        const auto                 expectedRead = co_await readMarker(loop, expectedMarker);
+        if (expectedRead.has_value())
+        {
+            expectedVersion = *expectedRead;
+        } else
+        {
+            // 读不出标记不能连待上报的升级结果一起丢掉，否则每次启动都会重复处理同一行
+            LOG_ERROR_FMT("{}，本次按没有期望版本标记处理", expectedRead.error());
+        }
+
         if (update->pendingResult.empty())
         {
             // 没有待上报结果时回滚标记只可能是上一次升级清理失败的残留，已无法补报，删掉免得下次启动重复判断
@@ -565,6 +786,30 @@ namespace EdgePulse::Agent
             {
                 LOG_WARN_FMT("清理残留的升级回滚标记失败：{}", removed.error());
             }
+
+            if (!expectedVersion.has_value())
+            {
+                co_return;
+            }
+            if (*expectedVersion != agentVersion)
+            {
+                // 标记留给安装器：版本不符说明新二进制没有真正跑起来，安装器会据此回滚
+                LOG_WARN_FMT("升级期望版本 {} 与当前运行版本 {} 不一致，保留 update-expected 等待安装器回滚", *expectedVersion, agentVersion);
+                co_return;
+            }
+
+            const auto written = co_await writeHealthMarker(loop, healthMarker, agentVersion);
+            if (!written.has_value())
+            {
+                LOG_ERROR_FMT("{}", written.error());
+                co_return;
+            }
+            const auto deleted = co_await removeMarker(loop, expectedMarker);
+            if (!deleted.has_value())
+            {
+                LOG_WARN_FMT("{}", deleted.error());
+            }
+            LOG_INFO_FMT("手工升级健康标记已写入，版本 {}", agentVersion);
             co_return;
         }
 
@@ -576,7 +821,7 @@ namespace EdgePulse::Agent
         }
         const bool rollbackPending = *rollbackFound;
 
-        const auto parsed = AsynGyanis::Base::parseConfigValue(update->pendingResult);
+        const auto   parsed    = AsynGyanis::Base::parseConfigValue(update->pendingResult);
         std::int64_t commandId = 0;
         if (parsed.has_value() && parsed->is_object())
         {
@@ -625,8 +870,7 @@ namespace EdgePulse::Agent
             {
                 message = "升级目标版本 " + update->version + " 与当前运行版本 " + agentVersion + " 不一致";
             }
-            const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object(
-                    {{"status", "failed"}, {"result", "{}"}, {"message", message}});
+            const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object({{"status", "failed"}, {"result", "{}"}, {"message", message}});
             // 安装器启动时已为同一命令入队过一条成功结果，直接入队会被唯一索引丢弃，必须整行替换
             const auto replaced = state.replaceResult(commandId, payload.dump());
             if (!replaced.has_value())
@@ -660,36 +904,15 @@ namespace EdgePulse::Agent
             co_return;
         }
 
-        const std::filesystem::path healthMarker = m_configuration.stateDirectory / "update-health";
-        std::expected<void, std::string> written;
-        try
-        {
-            written = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
-                    loop,
-                    [healthMarker, agentVersion]() -> std::expected<void, std::string>
-                    {
-                        std::string writeError;
-                        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(healthMarker, agentVersion, std::nullopt, &writeError))
-                        {
-                            return std::unexpected("写入升级健康标记 " + AsynGyanis::Platform::FileSystem::utf8FromPath(healthMarker) + " 失败：" + writeError);
-                        }
-                        return {};
-                    });
-        } catch (const std::exception &failure)
-        {
-            written = std::unexpected("提交升级健康标记写入任务失败：" + std::string{failure.what()});
-        } catch (...)
-        {
-            written = std::unexpected("提交升级健康标记写入任务失败：未知异常");
-        }
+        const auto written = co_await writeHealthMarker(loop, healthMarker, agentVersion);
         if (!written.has_value())
         {
             LOG_ERROR_FMT("{}", written.error());
             co_return;
         }
 
-        const AsynGyanis::Base::ConfigValue detail  = AsynGyanis::Base::ConfigValue::object({{"version", agentVersion}});
-        const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object({{"status", "succeeded"}, {"result", detail.dump()}, {"message", "升级成功"}});
+        const AsynGyanis::Base::ConfigValue detail   = AsynGyanis::Base::ConfigValue::object({{"version", agentVersion}});
+        const AsynGyanis::Base::ConfigValue payload  = AsynGyanis::Base::ConfigValue::object({{"status", "succeeded"}, {"result", detail.dump()}, {"message", "升级成功"}});
         const auto                          replaced = state.replaceResult(commandId, payload.dump());
         if (!replaced.has_value())
         {
@@ -698,12 +921,26 @@ namespace EdgePulse::Agent
         }
 
         UpdateStateRecord record = *update;
-        record.healthyAt          = utcNowText();
+        record.healthyAt         = utcNowText();
         record.pendingResult.clear();
         const auto saved = state.setUpdateState(record);
         if (!saved.has_value())
         {
             LOG_ERROR_FMT("升级健康标记已写入，但记录确认时刻或清除待上报结果失败：{}", saved.error());
+        }
+        if (expectedVersion.has_value())
+        {
+            if (*expectedVersion == agentVersion)
+            {
+                const auto deleted = co_await removeMarker(loop, expectedMarker);
+                if (!deleted.has_value())
+                {
+                    LOG_WARN_FMT("{}", deleted.error());
+                }
+            } else
+            {
+                LOG_WARN_FMT("升级期望版本 {} 与当前运行版本 {} 不一致，保留 update-expected 等待安装器回滚", *expectedVersion, agentVersion);
+            }
         }
         LOG_INFO_FMT("升级健康标记已写入，版本 {}，命令 {} 已按成功上报", agentVersion, commandId);
         co_return;
@@ -728,6 +965,14 @@ namespace EdgePulse::Agent
             installLogging(m_configuration);
             LOG_INFO_FMT("Agent 已启动，节点名 {}", m_configuration.name);
             auto telemetryCollector = std::make_shared<TelemetryCollector>(m_configuration.telemetryDiskPath);
+
+            // 注册阶段还没有常驻循环；先接管信号，SIGTERM 只置停止标记，由每秒一次的注册等待自行收口
+            std::optional<AsynGyanis::Core::GracefulShutdown> shutdown;
+            if (m_consoleMode)
+            {
+                shutdown.emplace();
+                shutdown->onShutdown([this] { requestStop(); });
+            }
 
             const auto identity = AgentIdentity::load(m_configuration);
             if (!identity.has_value())
@@ -757,10 +1002,15 @@ namespace EdgePulse::Agent
                 // 注册阶段的循环在注册结束后停止，而 EventLoop 的停止请求是粘性的，常驻段必须另起一条循环
                 AsynGyanis::Core::EventLoop registrationLoop;
                 AgentClient                 registrationClient(registrationLoop, m_configuration, *identity);
-                nodeId = registerWithBackoff(registrationLoop, registrationClient, registrationToken, agentVersion, m_configuration.requestTimeoutSeconds);
+                nodeId = registerWithBackoff(registrationLoop, registrationClient, registrationToken, agentVersion, m_configuration.requestTimeoutSeconds, m_stopRequested);
             }
             if (!nodeId.has_value())
             {
+                if (m_stopRequested.load(std::memory_order_acquire))
+                {
+                    LOG_INFO("注册完成前收到停止请求，Agent 按服务停止退出");
+                    return 0;
+                }
                 return 1;
             }
 
@@ -770,8 +1020,8 @@ namespace EdgePulse::Agent
             state->set("cert_expiry", identity->expiresAt);
             LOG_INFO_FMT("注册成功，节点 {} 的 ID 为 {}，指纹与版本已写入状态库", m_configuration.name, *nodeId);
 
-            AsynGyanis::Core::EventLoop loop;
-            AgentClient                 client(loop, m_configuration, *identity);
+            AsynGyanis::Core::EventLoop                   loop;
+            AgentClient                                   client(loop, m_configuration, *identity);
             std::vector<std::shared_ptr<CommandExecutor>> executors;
             executors.push_back(std::make_shared<ConfigExecutor>(client, m_configuration, *nodeId));
             executors.push_back(std::make_shared<FirmwareExecutor>(client, *state, m_configuration, *nodeId));
@@ -779,20 +1029,21 @@ namespace EdgePulse::Agent
             executors.push_back(std::make_shared<UpdateExecutor>(client, *state, m_configuration, UpdateExecutor::Launcher{}, [this] { requestStop(); }));
             // 诊断指标由遥测采集器提供，提供者本身在诊断工作线程上执行
             executors.push_back(std::make_shared<DiagnosticsExecutor>(*state, m_configuration, agentVersion, [telemetryCollector] { return telemetryCollector->metricsJson(); }));
-            // 服务托管接入后，回调必须在命令结果入队并上报完成之后再重启进程，否则结果会随进程退出丢失；
-            // 当前没有可用的重启动作，执行器按失败返回，避免向服务端谎报已经重启
-            executors.push_back(std::make_shared<RestartExecutor>(RestartExecutor::RestartCallback{}));
-            CommandDispatcher  dispatcher(client, *state, std::move(executors));
+            // 重启动作必须在命令结果入队并尝试上报之后执行，否则结果会随进程退出丢失；
+            // 平台服务管理器（systemd 或 SCM）负责把进程重新拉起来
+            executors.push_back(std::make_shared<RestartExecutor>(true));
+            CommandDispatcher  dispatcher(client, *state, std::move(executors),
+                                          [this, &loop]() -> AsynGyanis::Core::Task<> { co_await restartAgentService(loop, [this] { requestStop(); }); });
             AgentWebSocket     webSocket(loop, m_configuration);
             TelemetryPublisher telemetryPublisher(client, *state);
 
             RuntimeFlags flags;
             flags.heartbeatIntervalSeconds = m_configuration.heartbeatIntervalSeconds;
-            flags.fallback                 = WebSocketFallbackState{!m_configuration.websocketEnabled};
 
-            std::optional<AsynGyanis::Core::GracefulShutdown> shutdown;
             if (m_consoleMode)
             {
+                // 常驻段的收尾动作要跑在循环线程上；注册阶段的观察者在这里换成绑定循环的实例
+                shutdown.reset();
                 shutdown.emplace(loop);
                 shutdown->onShutdown([this] { requestStop(); });
             }
@@ -825,9 +1076,16 @@ namespace EdgePulse::Agent
                 LOG_INFO_FMT("Agent 已进入常驻运行，心跳间隔 {} 秒，轮询间隔 {} 秒", flags.heartbeatIntervalSeconds, m_configuration.commandPollIntervalSeconds);
                 loop.run();
             }
+            const bool stoppedByFailure = loop.snapshot().stoppedByFailure;
             {
                 const std::lock_guard lock(m_loopMutex);
                 m_loop = nullptr;
+            }
+            if (stoppedByFailure)
+            {
+                // 非零退出让 systemd 的 Restart= 与 SCM 的失败恢复动作真正触发，而不是把崩溃当正常停机
+                LOG_ERROR("Agent 事件循环因未捕获异常停止，以退出码 1 结束");
+                return 1;
             }
             LOG_INFO("Agent 已停止");
             return 0;

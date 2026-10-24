@@ -329,6 +329,7 @@ function Invoke-AgentUpgrade {
     $logPath = Join-Path $StateDir 'update-installer.log'
     $healthMarker = Join-Path $StateDir 'update-health'
     $rollbackMarker = Join-Path $StateDir 'update-rollback'
+    $expectedMarker = Join-Path $StateDir 'update-expected'
     $binaryPath = Join-Path $InstallDir 'edgepulse-agent.exe'
     $backupPath = $binaryPath + '.previous'
     $version = ''
@@ -379,6 +380,9 @@ function Invoke-AgentUpgrade {
         if (Test-Path -LiteralPath $rollbackMarker) {
             Remove-Item -LiteralPath $rollbackMarker -Force -ErrorAction Stop
         }
+        if (Test-Path -LiteralPath $expectedMarker) {
+            Remove-Item -LiteralPath $expectedMarker -Force -ErrorAction Stop
+        }
 
         # 备份在停服务之前完成；停服务失败时二进制未改动，回滚分支不会触发
         Copy-Item -LiteralPath $binaryPath -Destination $backupPath -Force
@@ -408,6 +412,13 @@ function Invoke-AgentUpgrade {
         $binaryReplaced = $true
         Copy-Item -LiteralPath $newBinary -Destination $binaryPath -Force
         Write-UpgradeLog -LogPath $logPath -Message "已替换二进制，等待健康标记 $healthMarker 出现版本 $version"
+        # 手工升级没有 Agent 写入的待上报结果；期望版本标记让新版本首次心跳确认健康，安装器据此决定成功或回滚
+        try {
+            $encoding = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($expectedMarker, $version + [Environment]::NewLine, $encoding)
+        } catch {
+            throw "写入升级期望版本标记 $expectedMarker 失败：$($_.Exception.Message)"
+        }
 
         Invoke-Sc -Arguments "start $ServiceName" -Description "启动服务 $ServiceName"
         $startedService = Get-Service -Name $ServiceName
@@ -439,6 +450,14 @@ function Invoke-AgentUpgrade {
         } catch {
             Write-UpgradeLog -LogPath $logPath -Message "警告：清理备份或健康标记失败：$($_.Exception.Message)"
         }
+        # 新版本确认健康后会先删掉期望版本标记，这里只剩版本不符时的残留
+        if (Test-Path -LiteralPath $expectedMarker) {
+            try {
+                Remove-Item -LiteralPath $expectedMarker -Force -ErrorAction Stop
+            } catch {
+                Write-UpgradeLog -LogPath $logPath -Message "警告：清理期望版本标记失败：$($_.Exception.Message)"
+            }
+        }
         Write-UpgradeLog -LogPath $logPath -Message "升级成功：版本 $version 已通过健康检查"
     } catch {
         $failure = $_.Exception.Message
@@ -456,6 +475,13 @@ function Invoke-AgentUpgrade {
                 }
             } catch {
                 Write-UpgradeLog -LogPath $logPath -Message "警告：停止新版本服务失败：$($_.Exception.Message)"
+            }
+            if (Test-Path -LiteralPath $expectedMarker) {
+                try {
+                    Remove-Item -LiteralPath $expectedMarker -Force -ErrorAction Stop
+                } catch {
+                    Write-UpgradeLog -LogPath $logPath -Message "警告：删除升级期望版本标记 $expectedMarker 失败：$($_.Exception.Message)"
+                }
             }
             try {
                 Copy-Item -LiteralPath $backupPath -Destination $binaryPath -Force
@@ -481,6 +507,9 @@ function Invoke-AgentUpgrade {
         } else {
             if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
                 Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $expectedMarker) {
+                Remove-Item -LiteralPath $expectedMarker -Force -ErrorAction SilentlyContinue
             }
             # 启动器进程已经退出，旧服务可能处于停止状态；替换前失败也要把它重新拉起来
             $oldService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue

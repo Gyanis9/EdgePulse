@@ -27,7 +27,7 @@ usage() {
 升级选项：
   --upgrade 包             升级包（tar.gz），包内 checksums.sha256 必须覆盖 edgepulse-agent
   --health-timeout 秒      等待新版本健康标记的秒数，必须为正整数
-  --state-dir DIR          状态目录；健康标记与回滚标记位于该目录
+  --state-dir DIR          状态目录；健康标记、回滚标记与期望版本标记位于该目录
   --prefix DIR             安装前缀；只替换 DIR/bin/edgepulse-agent
 
 升级模式不接受 --no-start；--config-dir 与 --log-dir 在升级模式中不使用。
@@ -174,6 +174,7 @@ log_upgrade() {
 abort_before_replace() {
     local reason="$1"
     log_upgrade "升级失败：${reason}"
+    rm -f -- "${state_dir}/update-expected" 2>/dev/null || true
     if systemctl is-active --quiet edgepulse-agent.service; then
         log_upgrade "旧版本服务仍在运行，二进制未改动"
     elif systemctl start edgepulse-agent.service >>"${upgrade_log}" 2>&1; then
@@ -193,6 +194,9 @@ rollback_upgrade() {
     fi
     log_upgrade "升级失败：${reason}"
     systemctl stop edgepulse-agent.service >>"${upgrade_log}" 2>&1 || true
+    if ! rm -f -- "${state_dir}/update-expected"; then
+        log_upgrade "警告：删除升级期望标记 ${state_dir}/update-expected 失败"
+    fi
 
     if [[ -f "${upgrade_backup}" ]]; then
         if install -m 0755 -- "${upgrade_backup}" "${upgrade_binary}"; then
@@ -289,8 +293,8 @@ run_upgrade() {
     upgrade_backup="${upgrade_binary}.previous"
     [[ -f "${upgrade_binary}" ]] || rollback_upgrade "找不到现有二进制 ${upgrade_binary}"
     # 旧标记必须在启动新版本之前清掉；清理失败时不替换二进制，由 abort_before_replace 保证旧服务仍在运行
-    if ! rm -f -- "${state_dir}/update-health" "${state_dir}/update-rollback"; then
-        abort_before_replace "无法删除旧的升级健康标记或回滚标记"
+    if ! rm -f -- "${state_dir}/update-health" "${state_dir}/update-rollback" "${state_dir}/update-expected"; then
+        abort_before_replace "无法删除旧的升级健康标记、回滚标记或期望版本标记"
     fi
 
     if ! cp -p -- "${upgrade_binary}" "${upgrade_backup}"; then
@@ -307,6 +311,11 @@ run_upgrade() {
     install -m 0755 -- "${extraction_dir}/edgepulse-agent" "${upgrade_binary}" || rollback_upgrade "替换二进制失败"
     log_upgrade "已替换二进制，等待健康标记 ${state_dir}/update-health 出现版本 ${upgrade_version}"
 
+    # 手工升级没有 Agent 写入的待上报结果；期望版本标记让新版本首次心跳确认健康，安装器据此决定成功或回滚
+    if ! printf '%s\n' "${upgrade_version}" > "${state_dir}/update-expected"; then
+        rollback_upgrade "写入升级期望版本标记 ${state_dir}/update-expected 失败"
+    fi
+
     if ! systemctl start edgepulse-agent.service >>"${upgrade_log}" 2>&1; then
         rollback_upgrade "启动新版本服务失败"
     fi
@@ -315,7 +324,8 @@ run_upgrade() {
         if [[ -f "${state_dir}/update-health" ]]; then
             observed="$(cat -- "${state_dir}/update-health" 2>/dev/null || true)"
             if [[ "${observed}" == "${upgrade_version}" ]]; then
-                rm -f -- "${upgrade_backup}" "${state_dir}/update-health" || log_upgrade "警告：清理旧二进制备份或健康标记失败"
+                rm -f -- "${upgrade_backup}" "${state_dir}/update-health" "${state_dir}/update-expected" ||
+                    log_upgrade "警告：清理旧二进制备份、健康标记或期望版本标记失败"
                 log_upgrade "升级成功：版本 ${upgrade_version} 已通过健康检查"
                 exit 0
             fi

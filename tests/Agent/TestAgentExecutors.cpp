@@ -493,10 +493,9 @@ namespace EdgePulse::Agent
         EXPECT_LE(diagnostics->value("logTail", std::string{}).size(), 256U * 1024U);
     }
 
-    TEST(AgentExecutors, RestartInvokesInjectedCallbackOnly)
+    TEST(AgentExecutors, RestartMarksResultWithoutRestartingDirectly)
     {
-        std::atomic<bool> restarted{false};
-        RestartExecutor   executor([&restarted] { restarted.store(true, std::memory_order_release); });
+        RestartExecutor executor(true);
         EXPECT_TRUE(executor.supports("agent.restart"));
 
         AgentLoop     loop;
@@ -504,7 +503,15 @@ namespace EdgePulse::Agent
         const auto    outcome = loop.run(executor.execute(loop.loop(), AgentCommand{1, "agent.restart", "{}", 30}), std::chrono::seconds{10}, "重启命令");
         ASSERT_TRUE(outcome.has_value());
         EXPECT_TRUE(outcome->succeeded);
-        EXPECT_TRUE(restarted.load(std::memory_order_acquire));
+        EXPECT_TRUE(outcome->restartAfterResult) << "重启必须交给分发器在结果上报之后触发";
+        EXPECT_NE(std::string::npos, outcome->message.find("结果上报后"));
+
+        RestartExecutor unconfigured(false);
+        const auto      failed = loop.run(unconfigured.execute(loop.loop(), AgentCommand{2, "agent.restart", "{}", 30}), std::chrono::seconds{10}, "未配置重启");
+        ASSERT_TRUE(failed.has_value());
+        EXPECT_FALSE(failed->succeeded);
+        EXPECT_FALSE(failed->restartAfterResult);
+        EXPECT_NE(std::string::npos, failed->message.find("未配置"));
     }
 
     TEST(AgentExecutors, ProcessRunnerSucceedsAndPreservesArgumentsWithoutShell)

@@ -39,39 +39,40 @@ namespace EdgePulse::Agent
 
     /**
      * @brief WebSocket 通道与命令轮询之间的降级状态
-     * @details 连续失败达到 3 次后启用轮询；通道通过 hello 确认可用时暂停轮询并清零失败计数。
-     *          正常断开只标记通道不可用，轮询保持暂停，直到再次连续失败 3 次。
+     * @details 轮询在启动时立即运行，只有通道通过 hello 确认可用后才暂停；任何断开都恢复轮询。
+     *          连续失败次数只用于重连退避与日志，不参与是否轮询的判定。这样在 hello 与通道
+     *          登记之间的空窗里创建的命令不会滞留到下一次连接失败。
      * @note 只在事件循环线程上使用，内部不做同步。
      */
     class WebSocketFallbackState
     {
     public:
         /**
-         * @brief 构造降级状态
-         * @param pollingInitiallyActive 初始是否启用轮询；关闭 WebSocket 时为 true
+         * @brief 构造降级状态；初始未连接，轮询因此是运行的
          */
-        explicit WebSocketFallbackState(bool pollingInitiallyActive = false);
+        WebSocketFallbackState() = default;
 
         /**
          * @brief 记录通道通过 hello 确认可用
+         * @details 暂停轮询并清零失败计数
          */
         void recordConnected();
 
         /**
-         * @brief 记录通道正常断开
-         * @details 不清零失败计数；轮询暂停状态保持不变
+         * @brief 记录通道断开
+         * @details 不清零失败计数；轮询立即恢复
          */
         void recordDisconnected();
 
         /**
          * @brief 记录一次连接失败
-         * @details 连续失败达到 3 次后启用轮询
+         * @details 只累计失败次数供重连退避使用；轮询在断开的任意时刻都运行
          */
         void recordConnectFailure();
 
         /**
          * @brief 轮询是否应当运行
-         * @return 已触发降级且通道当前不可用时返回 true
+         * @return 通道当前未连接时返回 true；只有 hello 已确认的连接会暂停轮询
          */
         [[nodiscard]] bool shouldPoll() const;
 
@@ -82,15 +83,15 @@ namespace EdgePulse::Agent
         [[nodiscard]] int consecutiveFailures() const;
 
     private:
-        bool m_connected{false};           ///< 通道是否已通过 hello 确认
-        bool m_pollingActive{false};       ///< 是否已启用轮询
-        int  m_consecutiveFailures{0};     ///< 连续连接失败次数
+        bool m_connected{false};       ///< 通道是否已通过 hello 确认
+        int  m_consecutiveFailures{0}; ///< 连续连接失败次数
     };
 
     /**
      * @brief 按配置建立 wss 或 ws 命令通道，完成 hello 并分发服务端推送
      * @details 地址从 base_url 派生：https 换成 wss、http 换成 ws，路径固定为 /api/agent/ws。
-     *          连接、hello 与心跳式文本 ping 都在本类处理，命令交给 CommandDispatcher。
+     *          连接、hello 与每 30 秒一次的文本 ping 都在本类处理，命令交给 CommandDispatcher。
+     *          文本 ping 用于避免服务端的空闲关闭；服务端回 pong 或主动发 ping 时分别忽略与应答。
      * @note 所有方法都只在构造时给出的那个事件循环线程上调用。
      */
     class AgentWebSocket

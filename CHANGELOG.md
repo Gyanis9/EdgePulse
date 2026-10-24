@@ -11,6 +11,7 @@
 - 生产 `edgepulse-agent`：Linux systemd 与 Windows SCM 两种托管形态，安装/卸载脚本、逐文件 SHA-256 清单与可选 Ed25519 签名包。
 - Agent 本地 SQLite 状态库与离线队列：遥测与命令结果按 FIFO 保留，服务端确认后删除，重启后继续补报。
 - Agent 心跳、命令 WebSocket 长连接与轮询兜底，以及 `config.apply`、`diagnostics.collect`、`firmware.update`、`agent.restart`、`agent.update` 执行器。
+- Agent 命令通道保活与补拉：每 30 秒发送文本 ping，启动与断开期间保持轮询，每次成功心跳后补拉一次命令，避免 hello 与通道登记空窗里的命令滞留。
 - Agent 遥测采集 CPU、内存与磁盘占用率，诊断命令复用同一组指标。
 - 签名升级包与健康/回滚：Ed25519 验签、manifest 校验、首次成功心跳写健康标记，超时或启动失败时恢复旧二进制并补报失败。
 - `scripts/check-agent-e2e.py` 端到端验收与 CI 的 Agent 任务：真实 server/agent 二进制覆盖注册、心跳、遥测、配置、诊断、签名固件、离线补报、重启、吊销与改绑。
@@ -30,6 +31,9 @@
 ### Changed
 
 - Agent 执行外部程序不经过 shell，统一限时并限制输出；未知命令类型按失败上报。
+- `agent.restart` 已接通 Linux systemd 与 Windows SCM：命令结果先入队并尝试上报，之后才通过脱离的 `systemd-run` 或 `Restart-Service` 重启服务；启动器失败只记 ERROR，不谎报成功。
+- Agent 安装器在启动新版本前写入 `update-expected`，手工 `--upgrade` 因此也能通过首次成功心跳确认健康；版本不符时保留标记由安装器回滚。
+- Agent 事件循环因未捕获异常停止时以退出码 1 结束，注册阶段的停止请求按一秒切片响应，服务管理器可正确触发重启。
 - Linux/Windows Agent 安装器在替换前校验清单与哈希，升级只替换二进制，保留配置、状态与安装器副本。
 - Agent 心跳、遥测、命令与固件状态请求必须携带与登记一致的客户端证书；明文链路不再被视为可信身份。
 - 节点离线与恢复由统一生命周期处理，重复扫描或并发心跳不会重复生成离线告警。

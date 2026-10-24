@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,18 +45,23 @@ namespace EdgePulse::Agent
     class CommandDispatcher
     {
     public:
+        /// 结果入队并尝试上报之后执行的服务重启动作
+        using RestartHandler = std::function<AsynGyanis::Core::Task<>()>;
+
         /**
          * @brief 装配命令分发
          * @param client 与服务端通信的客户端
          * @param state 本地状态库
          * @param executors 命令执行器；类型没有对应执行器时按失败上报
+         * @param restartHandler 结果入队与上报尝试之后执行的重启处理器；为空表示不支持重启
          */
-        CommandDispatcher(AgentClient &client, AgentState &state, std::vector<std::shared_ptr<CommandExecutor>> executors);
+        CommandDispatcher(AgentClient &client, AgentState &state, std::vector<std::shared_ptr<CommandExecutor>> executors, RestartHandler restartHandler = {});
 
         /**
          * @brief 处理一条来自 WebSocket 的命令
          * @param command 已解析的命令
-         * @details 重复投递只记日志并跳过；执行结果入队后立即尝试上报一次
+         * @details 重复投递只记日志并跳过；执行结果入队后立即尝试上报一次。
+         *          结果标记要求重启时，在上报尝试之后调用重启处理器。
          */
         AsynGyanis::Core::Task<> onWebSocketCommand(AgentCommand command);
 
@@ -83,8 +89,15 @@ namespace EdgePulse::Agent
         /**
          * @brief 执行一条已去重的命令并把结果写入队列
          * @param command 已解析的命令
+         * @return 结果是否要求在本轮上报之后重启服务
          */
-        AsynGyanis::Core::Task<> execute(AgentCommand command);
+        AsynGyanis::Core::Task<bool> execute(AgentCommand command);
+
+        /**
+         * @brief 在结果入队并尝试上报之后调用重启处理器
+         * @details 处理器抛出的异常就地记 ERROR，不允许带走事件循环
+         */
+        AsynGyanis::Core::Task<> triggerRestart();
 
         /**
          * @brief 取状态库里的节点标识
@@ -102,6 +115,7 @@ namespace EdgePulse::Agent
         AgentClient                                  &m_client;          ///< 服务端通信客户端
         AgentState                                   &m_state;           ///< 本地状态库
         std::vector<std::shared_ptr<CommandExecutor>> m_executors;       ///< 命令执行器
+        RestartHandler                                m_restartHandler;  ///< 结果上报后的重启动作
         std::unordered_set<std::int64_t>              m_inFlight;        ///< 正在执行或等待上报的命令标识
         bool                                          m_flushing{false}; ///< 是否有一次结果上报正在进行
     };

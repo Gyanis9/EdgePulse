@@ -102,8 +102,8 @@ namespace EdgePulse::Agent
         return command;
     }
 
-    CommandDispatcher::CommandDispatcher(AgentClient &client, AgentState &state, std::vector<std::shared_ptr<CommandExecutor>> executors) :
-        m_client(client), m_state(state), m_executors(std::move(executors))
+    CommandDispatcher::CommandDispatcher(AgentClient &client, AgentState &state, std::vector<std::shared_ptr<CommandExecutor>> executors, RestartHandler restartHandler) :
+        m_client(client), m_state(state), m_executors(std::move(executors)), m_restartHandler(std::move(restartHandler))
     {
     }
 
@@ -129,7 +129,7 @@ namespace EdgePulse::Agent
         m_state.enqueueResult(commandId, resultPayload(payload, "命令失败结果无法序列化为 JSON，已改用固定文本"));
     }
 
-    AsynGyanis::Core::Task<> CommandDispatcher::execute(AgentCommand command)
+    AsynGyanis::Core::Task<bool> CommandDispatcher::execute(AgentCommand command)
     {
         m_inFlight.insert(command.id);
 
@@ -167,10 +167,31 @@ namespace EdgePulse::Agent
             outcome = CommandResult{false, "{}", "执行命令 " + command.type + " 时发生未知异常"};
         }
 
+        const bool                          restartAfterResult = outcome.succeeded && outcome.restartAfterResult;
         const AsynGyanis::Base::ConfigValue payload =
                 AsynGyanis::Base::ConfigValue::object({{"status", outcome.succeeded ? "succeeded" : "failed"}, {"result", outcome.result}, {"message", outcome.message}});
         m_state.enqueueResult(command.id, resultPayload(payload, "命令执行结果无法序列化为 JSON，已改用固定文本"));
         m_inFlight.erase(command.id);
+        co_return restartAfterResult;
+    }
+
+    AsynGyanis::Core::Task<> CommandDispatcher::triggerRestart()
+    {
+        if (!m_restartHandler)
+        {
+            LOG_ERROR("命令要求重启，但分发器没有配置重启处理器");
+            co_return;
+        }
+        try
+        {
+            co_await m_restartHandler();
+        } catch (const std::exception &failure)
+        {
+            LOG_ERROR_FMT("执行服务重启处理器失败：{}", failure.what());
+        } catch (...)
+        {
+            LOG_ERROR("执行服务重启处理器失败：未知异常");
+        }
         co_return;
     }
 
@@ -187,11 +208,16 @@ namespace EdgePulse::Agent
             co_return;
         }
 
-        co_await execute(std::move(command));
-        const ResultFlush flushed = co_await flushResults();
+        const bool        restartAfterResult = co_await execute(std::move(command));
+        const ResultFlush flushed            = co_await flushResults();
         if (flushed.failed)
         {
             LOG_WARN("命令结果未获服务端确认，已留在本地队列等待重试");
+        }
+        if (restartAfterResult)
+        {
+            // 结果行已入队并尝试上报；即使上报失败也重启，队列会在新进程里继续补报
+            co_await triggerRestart();
         }
         co_return;
     }
@@ -295,11 +321,11 @@ namespace EdgePulse::Agent
             }
 
             // 服务端只认 succeeded 与 failed；队列里的其他取值一律按失败提交
-            const std::string rawStatus = textField(*payload, "status", "failed");
-            const std::string status    = rawStatus == "succeeded" ? "succeeded" : "failed";
-            const std::string result    = textField(*payload, "result", "{}");
-            const std::string message   = textField(*payload, "message");
-            const ResultPostOutcome posted = co_await m_client.reportCommandResult(row.commandId, *node, status, result, message);
+            const std::string       rawStatus = textField(*payload, "status", "failed");
+            const std::string       status    = rawStatus == "succeeded" ? "succeeded" : "failed";
+            const std::string       result    = textField(*payload, "result", "{}");
+            const std::string       message   = textField(*payload, "message");
+            const ResultPostOutcome posted    = co_await m_client.reportCommandResult(row.commandId, *node, status, result, message);
             if (posted.disposition == ResultPostDisposition::Terminal)
             {
                 // 终态拒绝不会因重试而改变；保留会永久挡住后续结果并让队列上限丢数据
