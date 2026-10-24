@@ -29,6 +29,7 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/OutboundUrlGuard.h"
 #include "Plugins/DevicePlugin/AgentController.h"
+#include "Core/Device/AgentCertificateAuthority.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/EnrollmentRepository.h"
 #include "Core/Device/EnrollmentService.h"
@@ -232,6 +233,21 @@ namespace EdgePulse::App
             m_nodeConfigRepository   = std::make_shared<Device::NodeConfigRepository>(m_database);
             m_enrollmentRepository   = std::make_shared<Device::EnrollmentRepository>(m_database);
             m_enrollmentService      = std::make_shared<Device::EnrollmentService>(m_enrollmentRepository);
+            // CA 私钥只在装配阶段读入；未启用时也保留一个禁用实例，后续路由按 enabled() 短路
+            Device::AgentCaOptions agentCaOptions;
+            agentCaOptions.enabled         = m_configuration.agentCaEnabled;
+            agentCaOptions.certificateFile = m_configuration.agentCaCertificateFile;
+            agentCaOptions.keyFile         = m_configuration.agentCaKeyFile;
+            agentCaOptions.validityDays    = m_configuration.agentCaValidityDays;
+            agentCaOptions.overlapHours    = m_configuration.agentCaOverlapHours;
+            auto agentCertificateAuthority = Device::AgentCertificateAuthority::load(agentCaOptions);
+            if (!agentCertificateAuthority)
+            {
+                error = "Agent 内部 CA 初始化失败：" + agentCertificateAuthority.error();
+                return false;
+            }
+            m_agentCa = std::make_unique<Device::AgentCertificateAuthority>(std::move(*agentCertificateAuthority));
+            LOG_INFO_FMT("Agent 内部 CA：{}", m_agentCa->enabled() ? "已启用" : "未启用");
             m_nodeService            = std::make_shared<Device::NodeService>(m_nodeRepository);
             m_alarmRepository        = std::make_shared<Alarm::AlarmRepository>(m_database);
             m_notificationRepository = std::make_shared<Notification::NotificationRepository>(m_database);

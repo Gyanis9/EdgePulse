@@ -67,6 +67,7 @@ namespace EdgePulse::Cache
 
 namespace EdgePulse::Device
 {
+    class AgentCertificateAuthority;
     class AgentRegistry;
     class EnrollmentRepository;
     class EnrollmentService;
@@ -236,6 +237,7 @@ namespace EdgePulse::App
         std::shared_ptr<Device::NodeRepository>                   m_fleetNodes;             ///< 离线扫描用的全租户节点视图
         std::shared_ptr<Device::EnrollmentRepository>             m_enrollmentRepository;   ///< 一次性注册令牌仓储
         std::shared_ptr<Device::EnrollmentService>                m_enrollmentService;      ///< 一次性注册令牌服务
+        std::unique_ptr<Device::AgentCertificateAuthority>        m_agentCa;                ///< Agent 内部 CA 签发器
         std::shared_ptr<Device::NodeService>                      m_nodeService;            ///< 节点服务
         std::shared_ptr<Device::NodeConfigRepository>             m_nodeConfigRepository;   ///< 配置影子仓储
         std::shared_ptr<Device::NodeConfigService>                m_nodeConfigService;      ///< 配置影子服务

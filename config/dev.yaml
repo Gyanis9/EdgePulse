@@ -54,6 +54,13 @@ edgepulse:
     heartbeat_interval_seconds: 10
     heartbeat_timeout_seconds: 30
     offline_sweep_seconds: 5
+  agent_ca:
+    # 开发档复用 scripts/dev-certs.sh 生成的 CA；私钥在 var/certs 下，已被 .gitignore 排除
+    enabled: true
+    certificate_file: var/certs/ca.pem
+    key_file: var/certs/ca-key.pem
+    validity_days: 30
+    overlap_hours: 24
   udp_telemetry:
     enabled: false
     address: 0.0.0.0

@@ -19,6 +19,7 @@ add_library(edgepulse-core STATIC
         Command/AgentChannelRegistry.cpp
         Command/CommandRepository.cpp
         Device/AgentAuthorization.cpp
+        Device/AgentCertificateAuthority.cpp
         Device/AgentCertificateRepository.cpp
         Device/AgentRegistry.cpp
         Device/CertificateBinding.cpp

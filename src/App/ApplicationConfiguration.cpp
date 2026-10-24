@@ -212,6 +212,9 @@ namespace EdgePulse::App
         configuration.certificateDirectory   = configurationManager.getString("edgepulse.cert_dir", configuration.certificateDirectory);
         configuration.agentFingerprint       = configurationManager.getString("edgepulse.agent.fingerprint", configuration.agentFingerprint);
         configuration.enrollmentMode         = configurationManager.getString("edgepulse.agent.enrollment_mode", configuration.enrollmentMode);
+        configuration.agentCaEnabled         = configurationManager.getBool("edgepulse.agent_ca.enabled", configuration.agentCaEnabled);
+        configuration.agentCaCertificateFile = configurationManager.getString("edgepulse.agent_ca.certificate_file", configuration.agentCaCertificateFile);
+        configuration.agentCaKeyFile         = configurationManager.getString("edgepulse.agent_ca.key_file", configuration.agentCaKeyFile);
         configuration.heartbeatIntervalSeconds =
                 static_cast<int>(configurationManager.getInt("edgepulse.agent.heartbeat_interval_seconds", configuration.heartbeatIntervalSeconds));
         configuration.heartbeatTimeoutSeconds = static_cast<int>(configurationManager.getInt("edgepulse.agent.heartbeat_timeout_seconds", configuration.heartbeatTimeoutSeconds));
@@ -307,6 +310,52 @@ namespace EdgePulse::App
         if (configuration.enrollmentMode != "off" && configuration.enrollmentMode != "required")
         {
             return std::unexpected(ConfigurationError{"edgepulse.agent.enrollment_mode 只能是 off 或 required，当前值：" + configuration.enrollmentMode});
+        }
+        const auto agentCaValidityDays = readInteger(configurationManager, "edgepulse.agent_ca.validity_days", configuration.agentCaValidityDays);
+        if (!agentCaValidityDays)
+        {
+            return std::unexpected(agentCaValidityDays.error());
+        }
+        if (*agentCaValidityDays < 1 || *agentCaValidityDays > 3650)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.agent_ca.validity_days 必须在 1 到 3650 之间"});
+        }
+        configuration.agentCaValidityDays = static_cast<int>(*agentCaValidityDays);
+        const auto agentCaOverlapHours = readInteger(configurationManager, "edgepulse.agent_ca.overlap_hours", configuration.agentCaOverlapHours);
+        if (!agentCaOverlapHours)
+        {
+            return std::unexpected(agentCaOverlapHours.error());
+        }
+        if (*agentCaOverlapHours < 1 || *agentCaOverlapHours > 168)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.agent_ca.overlap_hours 必须在 1 到 168 之间"});
+        }
+        configuration.agentCaOverlapHours = static_cast<int>(*agentCaOverlapHours);
+        if (configuration.agentCaEnabled)
+        {
+            if (configuration.agentCaCertificateFile.empty() || configuration.agentCaKeyFile.empty())
+            {
+                return std::unexpected(ConfigurationError{"启用 Agent CA 时 edgepulse.agent_ca.certificate_file 与 key_file 不能为空"});
+            }
+            std::error_code agentCaFileError;
+            if (!std::filesystem::exists(configuration.agentCaCertificateFile, agentCaFileError) || agentCaFileError)
+            {
+                return std::unexpected(ConfigurationError{"启用 Agent CA 时找不到 CA 证书文件：" + configuration.agentCaCertificateFile +
+                                                          "；请准备该文件或关闭 edgepulse.agent_ca.enabled"});
+            }
+            if (!std::filesystem::is_regular_file(configuration.agentCaCertificateFile, agentCaFileError) || agentCaFileError)
+            {
+                return std::unexpected(ConfigurationError{"启用 Agent CA 时 CA 证书路径不是普通文件：" + configuration.agentCaCertificateFile});
+            }
+            if (!std::filesystem::exists(configuration.agentCaKeyFile, agentCaFileError) || agentCaFileError)
+            {
+                return std::unexpected(ConfigurationError{"启用 Agent CA 时找不到 CA 私钥文件：" + configuration.agentCaKeyFile +
+                                                          "；请准备该文件或关闭 edgepulse.agent_ca.enabled"});
+            }
+            if (!std::filesystem::is_regular_file(configuration.agentCaKeyFile, agentCaFileError) || agentCaFileError)
+            {
+                return std::unexpected(ConfigurationError{"启用 Agent CA 时 CA 私钥路径不是普通文件：" + configuration.agentCaKeyFile});
+            }
         }
         if (configuration.firmwareRequireSignature && configuration.firmwareTrustedKeysDirectory.empty())
         {

@@ -69,6 +69,11 @@ namespace EdgePulse::App
         bool                     allowPrivateWebhooks{false};                         ///< 是否放行普通私网、回环、CGNAT、组播、保留与文档示例段；云元数据及链路本地地址始终拒绝
         std::string              agentFingerprint;                                    ///< 允许的 Agent 证书 SHA-256 指纹，空表示只校验 CA
         std::string              enrollmentMode{"off"};                               ///< 注册模式：off 或 required
+        bool                     agentCaEnabled{false};                               ///< 是否启用控制面内部 CA 自动签发 Agent 证书
+        std::string              agentCaCertificateFile{"var/certs/ca.pem"};          ///< Agent CA 证书链 PEM
+        std::string              agentCaKeyFile{"var/certs/ca-key.pem"};              ///< Agent CA 私钥 PEM，POSIX 上要求 0600 或更严
+        int                      agentCaValidityDays{30};                             ///< 签发证书有效期，1 到 3650 天
+        int                      agentCaOverlapHours{24};                             ///< 旧证书重叠窗口，1 到 168 小时
         int                      heartbeatIntervalSeconds{30};                        ///< Agent 期望心跳间隔，随心跳响应下发
         int                      heartbeatTimeoutSeconds{90};                         ///< 超过该秒数未心跳即判离线
         int                      offlineSweepSeconds{30};                             ///< 离线扫描周期

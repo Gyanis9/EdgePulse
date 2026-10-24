@@ -451,6 +451,8 @@ class Session:
             (r"^(\s*)migrations_dir: migrations\s*$", rf"\g<1>migrations_dir: '{(ROOT / 'migrations').as_posix()}'", "migrations_dir"),
             (r'^(\s*)enrollment_mode: "off"\s*$', r'\g<1>enrollment_mode: "required"', "agent.enrollment_mode"),
             (r"^(\s*)heartbeat_interval_seconds: 10\s*$", r"\g<1>heartbeat_interval_seconds: 5", "agent.heartbeat_interval_seconds"),
+            (r"^(\s*)certificate_file: var/certs/ca\.pem\s*$", rf"\g<1>certificate_file: '{(CERTS / 'ca.pem').as_posix()}'", "agent_ca.certificate_file"),
+            (r"^(\s*)key_file: var/certs/ca-key\.pem\s*$", rf"\g<1>key_file: '{(CERTS / 'ca-key.pem').as_posix()}'", "agent_ca.key_file"),
         ]
         self.server_config.write_text(patch_lines(source, replacements), encoding="utf-8")
 
@@ -580,7 +582,7 @@ def close_stream(stream: object) -> None:
 
 
 def ensure_dev_certificates() -> str:
-    required = ["ca.pem", "server.pem", "server-key.pem", "agent.pem", "agent-key.pem"]
+    required = ["ca.pem", "ca-key.pem", "server.pem", "server-key.pem", "agent.pem", "agent-key.pem"]
     if all((CERTS / name).exists() for name in required):
         return ""
     if shutil.which("bash") is None:

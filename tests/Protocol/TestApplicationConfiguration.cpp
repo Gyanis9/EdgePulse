@@ -45,6 +45,64 @@ namespace
     };
 } // namespace
 
+// 钉住：Agent CA 未配置时保持关闭，默认有效期 30 天、重叠 24 小时；边界值按原值暴露
+TEST(ApplicationConfiguration, AgentCaDefaultsAndAcceptsBounds)
+{
+    const TemporaryConfigurationFile absent("edgepulse:\n  threads: 1\n");
+    const auto                       defaultConfiguration = EdgePulse::App::ApplicationConfiguration::load(absent.path());
+    ASSERT_TRUE(defaultConfiguration.has_value()) << defaultConfiguration.error().message;
+    EXPECT_FALSE(defaultConfiguration->agentCaEnabled);
+    EXPECT_EQ("var/certs/ca.pem", defaultConfiguration->agentCaCertificateFile);
+    EXPECT_EQ("var/certs/ca-key.pem", defaultConfiguration->agentCaKeyFile);
+    EXPECT_EQ(30, defaultConfiguration->agentCaValidityDays);
+    EXPECT_EQ(24, defaultConfiguration->agentCaOverlapHours);
+
+    const TemporaryConfigurationFile bounds(R"(edgepulse:
+  agent_ca:
+    validity_days: 1
+    overlap_hours: 168
+)");
+    const auto boundConfiguration = EdgePulse::App::ApplicationConfiguration::load(bounds.path());
+    ASSERT_TRUE(boundConfiguration.has_value()) << boundConfiguration.error().message;
+    EXPECT_EQ(1, boundConfiguration->agentCaValidityDays);
+    EXPECT_EQ(168, boundConfiguration->agentCaOverlapHours);
+}
+
+// 钉住：有效期与重叠窗口越界时在装载阶段报出键名，不交给签发器运行时才发现
+TEST(ApplicationConfiguration, RejectsAgentCaOutOfRange)
+{
+    for (const std::string value: {"0", "3651"})
+    {
+        const TemporaryConfigurationFile file("edgepulse:\n  agent_ca:\n    validity_days: " + value + "\n");
+        const auto                       configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_FALSE(configuration.has_value()) << "应拒绝 validity_days: " << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("edgepulse.agent_ca.validity_days")) << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("1 到 3650")) << value;
+    }
+    for (const std::string value: {"0", "169"})
+    {
+        const TemporaryConfigurationFile file("edgepulse:\n  agent_ca:\n    overlap_hours: " + value + "\n");
+        const auto                       configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_FALSE(configuration.has_value()) << "应拒绝 overlap_hours: " << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("edgepulse.agent_ca.overlap_hours")) << value;
+        EXPECT_NE(std::string::npos, configuration.error().message.find("1 到 168")) << value;
+    }
+}
+
+// 钉住：启用 Agent CA 但 CA 文件不存在时拒绝启动，错误里带出路径与关闭开关的提示
+TEST(ApplicationConfiguration, RejectsEnabledAgentCaWithMissingFiles)
+{
+    const auto missing = std::filesystem::temp_directory_path() /
+                         ("edgepulse-agent-ca-missing-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".pem");
+    const TemporaryConfigurationFile file("edgepulse:\n  agent_ca:\n    enabled: true\n    certificate_file: '" + missing.generic_string() +
+                                          "'\n    key_file: '" + missing.generic_string() + "-key.pem'\n");
+
+    const auto configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+    ASSERT_FALSE(configuration.has_value());
+    EXPECT_NE(std::string::npos, configuration.error().message.find("找不到 CA 证书文件"));
+    EXPECT_NE(std::string::npos, configuration.error().message.find("edgepulse.agent_ca.enabled"));
+}
+
 // 钉住：配置允许 8 位口令与小数速率，不把合法的开发档当成越界
 TEST(ApplicationConfiguration, AcceptsEightCharacterPasswordPolicyAndFractionalRateLimit)
 {

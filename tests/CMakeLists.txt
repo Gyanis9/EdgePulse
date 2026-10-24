@@ -15,6 +15,7 @@ target_link_libraries(edgepulse-test-support
 edgepulse_enable_warnings(edgepulse-test-support)
 
 add_executable(edgepulse-unit-tests
+        Unit/TestAgentCertificateAuthority.cpp
         Unit/TestCaptchaService.cpp
         Unit/TestCertificateBinding.cpp
         Unit/TestCsvWriter.cpp
