@@ -180,9 +180,13 @@ def build_agent_environment(extra: dict[str, str]) -> dict[str, str]:
 
 
 def port_is_free(port: int) -> bool:
-    """用独占绑定判断端口是否空闲；连接探测会被本机防火墙丢包而误判。"""
+    """用绑定冲突判断端口是否被监听；连接探测会被本机防火墙丢包而误判。"""
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        if os.name != "nt":
+            # 服务端停止后已关闭的连接会让端口进入 TIME_WAIT；不带 SO_REUSEADDR 的绑定会把它误判成仍有监听者。
+            # Windows 上 SO_REUSEADDR 允许抢占正在监听的端口，反而会让检查失真，所以只在 POSIX 上加。
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(("127.0.0.1", port))
         return True
     except OSError:
