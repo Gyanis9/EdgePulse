@@ -108,6 +108,14 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_api_token') WHERE name = 'idx_api_token_previous'"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_idempotency') WHERE name = 'idx_idempotency_expires'"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_user_mfa') WHERE name = 'idx_user_mfa_tenant'"));
+        // 租户列表与过期清理都走这条复合索引，列序反了会退化成回表扫描
+        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_info('idx_api_token_tenant') "
+                                                     "WHERE (name = 'tenant_id' AND seqno = 0) OR (name = 'revoked_at' AND seqno = 1) OR (name = 'expires_at' AND seqno = 2)"));
+        // 令牌哈希全局唯一、幂等键按令牌成对唯一：并发写入的去重只靠这两条唯一索引兜底
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_api_token') AS il, pragma_index_info(il.name) AS ii "
+                                                     "WHERE il.\"unique\" = 1 AND ii.name = 'token_hash'"));
+        EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_idempotency') AS il, pragma_index_info(il.name) AS ii "
+                                                     "WHERE il.\"unique\" = 1 AND ii.name IN ('token_hash', 'key_hash')"));
         // 令牌表按令牌哈希查、幂等表按令牌与非空响应体回放：两处缺列都会让后续接口在运行期才发现
         EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('sys_api_token') WHERE name IN ('token_hash', 'previous_hash')"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('sys_idempotency') WHERE name = 'response_body'"));
