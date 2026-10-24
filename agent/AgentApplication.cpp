@@ -41,6 +41,8 @@ namespace EdgePulse::Agent
     {
         using RegistrationOutcome = std::expected<std::int64_t, RegistrationFailure>;
 
+        constexpr int kMaximumConflictResponses = 3; ///< 单次启动允许的 409 响应次数，达到后按永久名字冲突停止
+
         /**
          * @brief 确保目录存在
          * @param directory 目标目录
@@ -83,34 +85,33 @@ namespace EdgePulse::Agent
         }
 
         /**
-         * @brief 按配置里的环境变量名读取注册令牌
-         * @param configuration 已校验的配置
-         * @return std::string 令牌文本；变量未设置或为空时返回空串
+         * @brief 按环境变量名读取令牌
+         * @param variableName 环境变量名
+         * @return std::string 令牌文本；变量名为空、未设置或为空时返回空串
          * @note 返回值只用于本次注册请求，不写日志、不写状态库
          */
-        [[nodiscard]] std::string enrollmentTokenFromEnvironment(const AgentConfiguration &configuration)
+        [[nodiscard]] std::string tokenFromEnvironment(const std::string &variableName)
         {
-            if (configuration.enrollmentTokenEnv.empty())
+            if (variableName.empty())
             {
                 return {};
             }
-            return Common::environmentValue(configuration.enrollmentTokenEnv).value_or("");
+            return Common::environmentValue(variableName).value_or("");
         }
 
         /**
          * @brief 在事件循环上执行一次注册并把结果交回等待方
          * @param client 注册客户端
-         * @param enrollmentToken 注册令牌
+         * @param token 注册或换绑令牌
          * @param agentVersion 当前版本
          * @param promise 结果通道
          * @return 协程任务
          */
-        AsynGyanis::Core::Task<> awaitRegistration(AgentClient &client, std::string enrollmentToken, std::string agentVersion,
-                                                   std::shared_ptr<std::promise<RegistrationOutcome>> promise)
+        AsynGyanis::Core::Task<> awaitRegistration(AgentClient &client, std::string token, std::string agentVersion, std::shared_ptr<std::promise<RegistrationOutcome>> promise)
         {
             try
             {
-                promise->set_value(co_await client.registerAgent(std::move(enrollmentToken), std::move(agentVersion)));
+                promise->set_value(co_await client.registerAgent(std::move(token), std::move(agentVersion)));
             } catch (const std::exception &failure)
             {
                 promise->set_value(std::unexpected(RegistrationFailure{"注册协程异常：" + std::string{failure.what()}, false, false}));
@@ -122,21 +123,24 @@ namespace EdgePulse::Agent
         }
 
         /**
-         * @brief 按 5 秒、10 秒、30 秒、60 秒的退避反复注册，直到成功或被拒绝
+         * @brief 按 5 秒、10 秒、30 秒、60 秒的退避反复注册，直到成功、被拒绝或 409 次数用尽
          * @param loop 事件循环
          * @param client 注册客户端
-         * @param enrollmentToken 注册令牌
+         * @param registrationToken 注册或换绑令牌
          * @param agentVersion 当前版本
          * @param requestTimeoutSeconds 单次请求时限
-         * @return 成功返回节点 ID；403 或不可重试的失败返回空
+         * @return 成功返回节点 ID；403、其他不可重试的失败或 409 达到上限时返回空
+         * @details 服务端用 409 同时表示永久名字冲突与并发注册冲突，客户端不解析原因文本，
+         *          只在单次启动内累计到固定次数后按永久冲突终止。
          */
-        [[nodiscard]] std::optional<std::int64_t> registerWithBackoff(AsynGyanis::Core::EventLoop &loop, AgentClient &client, const std::string &enrollmentToken,
+        [[nodiscard]] std::optional<std::int64_t> registerWithBackoff(AsynGyanis::Core::EventLoop &loop, AgentClient &client, const std::string &registrationToken,
                                                                       const std::string &agentVersion, const int requestTimeoutSeconds)
         {
             std::jthread                          loopThread([&loop] { loop.run(); });
             std::vector<AsynGyanis::Core::Task<>> pendingTasks;
             const std::array<int, 4>              delays{5, 10, 30, 60};
-            const auto                            waitLimit = std::chrono::seconds{requestTimeoutSeconds + 15};
+            const auto                            waitLimit         = std::chrono::seconds{requestTimeoutSeconds + 15};
+            int                                   conflictResponses = 0;
 
             const auto stopLoop = [&loop, &loopThread]()
             {
@@ -151,7 +155,7 @@ namespace EdgePulse::Agent
             {
                 auto promise = std::make_shared<std::promise<RegistrationOutcome>>();
                 auto future  = promise->get_future();
-                auto task    = awaitRegistration(client, enrollmentToken, agentVersion, promise);
+                auto task    = awaitRegistration(client, registrationToken, agentVersion, promise);
                 loop.scheduler().scheduleRemote(task.handle());
                 pendingTasks.push_back(std::move(task));
 
@@ -180,6 +184,17 @@ namespace EdgePulse::Agent
                     LOG_ERROR_FMT("{}", failure.message);
                     stopLoop();
                     return std::nullopt;
+                }
+                if (failure.httpStatus == 409)
+                {
+                    ++conflictResponses;
+                    if (conflictResponses >= kMaximumConflictResponses)
+                    {
+                        LOG_ERROR_FMT("注册已累计 {} 次返回 HTTP 409，节点名可能已被其他租户或已删除节点占用；请更换 agent.server.name，或联系管理员清理同名节点后重启",
+                                      kMaximumConflictResponses);
+                        stopLoop();
+                        return std::nullopt;
+                    }
                 }
                 const int delaySeconds = delays[std::min<std::size_t>(attempt, delays.size() - 1)];
                 LOG_WARN_FMT("注册失败：{}，{} 秒后重试", failure.message, delaySeconds);
@@ -226,11 +241,16 @@ namespace EdgePulse::Agent
                 return 1;
             }
 
-            const std::string           enrollmentToken = enrollmentTokenFromEnvironment(m_configuration);
+            const bool        rebindTokenSelected = state->get("node_id").has_value() && !m_configuration.rebindTokenEnv.empty();
+            const std::string registrationToken   = tokenFromEnvironment(rebindTokenSelected ? m_configuration.rebindTokenEnv : m_configuration.enrollmentTokenEnv);
+            if (rebindTokenSelected)
+            {
+                LOG_INFO_FMT("状态库已有节点标识，本次注册从换绑令牌环境变量读取令牌");
+            }
             const std::string           agentVersion{EDGEPULSE_AGENT_VERSION};
             AsynGyanis::Core::EventLoop loop;
             AgentClient                 client(loop, m_configuration, *identity);
-            const auto                  nodeId = registerWithBackoff(loop, client, enrollmentToken, agentVersion, m_configuration.requestTimeoutSeconds);
+            const auto                  nodeId = registerWithBackoff(loop, client, registrationToken, agentVersion, m_configuration.requestTimeoutSeconds);
             if (!nodeId.has_value())
             {
                 return 1;

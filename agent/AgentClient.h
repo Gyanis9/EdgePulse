@@ -40,6 +40,7 @@ namespace EdgePulse::Agent
         std::string message;                      ///< 面向运维的中文原因，不含令牌
         bool        retryable{false};             ///< 是否值得按退避重试
         bool        authorizationRejected{false}; ///< 服务端 403，表示令牌或指纹被拒
+        int         httpStatus{0};                ///< 失败响应的 HTTP 状态码；0 表示未拿到响应
     };
 
     /**

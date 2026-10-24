@@ -138,7 +138,8 @@ namespace EdgePulse::Agent
         }
         if (status < 200 || status >= 300)
         {
-            co_return std::unexpected(RegistrationFailure{"注册返回 HTTP " + std::to_string(status) + "：" + envelopeMessage(response->body), isRetryableStatus(status), false});
+            co_return std::unexpected(
+                    RegistrationFailure{"注册返回 HTTP " + std::to_string(status) + "：" + envelopeMessage(response->body), isRetryableStatus(status), false, status});
         }
 
         const std::optional<AsynGyanis::Base::ConfigValue> envelope = AsynGyanis::Base::parseConfigValue(response->body);
