@@ -77,3 +77,5 @@ target_link_libraries(edgepulse-protocol-tests PRIVATE EdgePulse::App edgepulse-
 edgepulse_enable_warnings(edgepulse-protocol-tests)
 set_target_properties(edgepulse-protocol-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 gtest_discover_tests(edgepulse-protocol-tests DISCOVERY_MODE PRE_TEST)
+
+add_subdirectory(Agent)

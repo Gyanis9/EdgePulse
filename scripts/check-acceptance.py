@@ -515,7 +515,7 @@ def check_sse_alarm(token: str, node_id: int) -> None:
 def check_agent_websocket(token: str) -> int | None:
     """启动带 --ws 的 Agent 示例，断言命令经长连接推送并由示例回写结果；返回示例注册的节点标识。"""
     fingerprint = (CERTS / "agent-fingerprint.txt").read_text(encoding="utf-8").strip()
-    agent = executable(ROOT / "build" / "debug" / "samples" / "edgepulse-agent")
+    agent = executable(ROOT / "build" / "debug" / "samples" / "edgepulse-agent-probe")
     process = subprocess.Popen(
         [str(agent), "--ca", str(CERTS / "ca.pem"), "--cert", str(CERTS / "agent.pem"), "--key", str(CERTS / "agent-key.pem"),
          "--fingerprint", fingerprint, "--name", f"ws-agent-{RUN_ID}", "--ws"],
@@ -828,7 +828,7 @@ def check_mtls() -> int | None:
     except Exception:  # noqa: BLE001
         report("9443 无客户端证书被拒", True)
     fingerprint = (CERTS / "agent-fingerprint.txt").read_text(encoding="utf-8").strip()
-    probe = executable(ROOT / "build" / "debug" / "samples" / "edgepulse-agent")
+    probe = executable(ROOT / "build" / "debug" / "samples" / "edgepulse-agent-probe")
     result = subprocess.run(
         [str(probe), "--ca", str(CERTS / "ca.pem"), "--cert", str(CERTS / "agent.pem"), "--key", str(CERTS / "agent-key.pem"), "--fingerprint", fingerprint],
         capture_output=True, text=True, timeout=60, check=False,

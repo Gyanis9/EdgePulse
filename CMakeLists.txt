@@ -27,6 +27,7 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 option(EDGEPULSE_BUILD_TESTS "构建单元、集成与协议测试" ON)
 
 add_subdirectory(src)
+add_subdirectory(agent)
 add_subdirectory(samples)
 
 if(EDGEPULSE_BUILD_TESTS)

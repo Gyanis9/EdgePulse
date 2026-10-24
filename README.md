@@ -290,7 +290,7 @@ migrations/    SQL 迁移 V1–V18，已应用文件不可修改
 config/        非敏感配置样例；生产配置与信任键目录不入库
 deploy/        Docker、systemd、Prometheus
 scripts/       证书、开发运行、固件签名、备份恢复与验收
-samples/       DeviceAgent、FirmwareVerifier、H3Probe 样例
+samples/       DeviceAgent（协议探针 edgepulse-agent-probe）、FirmwareVerifier、H3Probe 样例
 tests/         GoogleTest 单元、集成与协议用例
 docs/          架构、API、部署、验收与覆盖率
 .github/       CI 工作流、Issue 与 PR 模板
