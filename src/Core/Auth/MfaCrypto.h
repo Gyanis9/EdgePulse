@@ -38,6 +38,8 @@ namespace EdgePulse::Auth
      * @brief 两步验证秘密的对称加密
      * @details 每次加密生成新的 12 字节随机 nonce，认证标签附在密文尾部；解密失败只返回空值，
      *          不区分密钥错误、篡改与格式损坏，避免把失败原因交给调用方或用户。
+     * @note 本阶段不把 AAD 绑定到用户或 key_version，也不实现密钥轮换。能直接改库的攻击者
+     *       可以替换密文或回退 last_used_step，这一边界在本阶段不设防，后续版本再补。
      */
     namespace MfaCrypto
     {

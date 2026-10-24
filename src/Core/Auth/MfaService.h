@@ -57,9 +57,12 @@ namespace EdgePulse::Auth
 
     /**
      * @brief 两步验证服务
-     * @details 待启用的秘密放在缓存里，启用时才加密落库；TOTP 校验用条件更新推进步号，
+     * @details 待启用的秘密加密后放在缓存里，启用时直接落库；TOTP 校验用条件更新推进步号，
      *          恢复码以 JSON 文本为乐观锁逐枚删除。未配置主密钥时只关闭设置与启用入口，
      *          状态、校验与管理员重置仍可安全执行。
+     * @note 本服务不承担尝试次数限制。登录挑战的 5 次失败门禁与挑战绑定，由登录流程统一计数；
+     *       这里每次校验都直接返回结果，另起一套计数器会与挑战口径冲突。
+     * @note 恢复码以主密钥为键做 HMAC-SHA256 后落库，只有数据库泄露不足以离线还原 40 位随机码。
      */
     class MfaService
     {
@@ -73,7 +76,7 @@ namespace EdgePulse::Auth
         MfaService(std::shared_ptr<Common::Database> database, std::shared_ptr<Cache::KeyValueStore> cache, std::string encryptionKey);
 
         /**
-         * @brief 生成新秘密并写入待启用缓存
+         * @brief 生成新秘密，加密后写入待启用缓存
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份；秘密按该用户与其租户记录
          * @return 成功返回 base32 秘密与 otpauth URI；未配置主密钥返回 503，已启用返回 409
@@ -87,15 +90,17 @@ namespace EdgePulse::Auth
          * @param session 当前身份
          * @param code 身份验证器当前的 6 位验证码
          * @return 成功返回 10 枚明文恢复码，只出现这一次；设置过期返回 400，验证码错误返回 401，已启用返回 409
+         * @note 命中步号会写成 last_used_step，setup 口令不能在启用后继续用于登录校验
          */
         AsynGyanis::Core::Task<std::expected<std::vector<std::string>, MfaError>> enable(AsynGyanis::Core::EventLoop &loop, SessionRecord session, std::string code);
 
         /**
-         * @brief 校验 TOTP 后删除记录
+         * @brief 校验 TOTP 后消费步号并删除记录
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份
          * @param code 身份验证器当前的 6 位验证码
-         * @return 成功为空；未启用返回 404，验证码错误返回 401，未配置主密钥返回 503
+         * @return 成功为空；未启用返回 404，验证码错误或已消费返回 401，未配置主密钥返回 503
+         * @note 与 verify 共用步号水位：登录时用过的口令不能再关闭两步验证
          */
         AsynGyanis::Core::Task<std::expected<void, MfaError>> disable(AsynGyanis::Core::EventLoop &loop, SessionRecord session, std::string code);
 
@@ -105,6 +110,7 @@ namespace EdgePulse::Auth
          * @param userId 用户标识，来自已确认的登录身份
          * @param code 6 位验证码
          * @return bool 验证码命中窗口内尚未消费的步号时为 true；未启用、密钥缺失、解密失败或重放均为 false
+         * @note 按主键读记录，调用方必须保证该用户已经过登录或会话认证
          */
         AsynGyanis::Core::Task<bool> verify(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string code);
 
@@ -114,6 +120,7 @@ namespace EdgePulse::Auth
          * @param userId 用户标识
          * @param code 明文恢复码，大小写不敏感
          * @return bool 命中并成功删除一枚哈希时为 true；第二次提交同一枚返回 false
+         * @note 按主键读记录，调用方必须保证该用户已经过登录或会话认证
          */
         AsynGyanis::Core::Task<bool> verifyRecovery(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string code);
 
@@ -122,6 +129,7 @@ namespace EdgePulse::Auth
          * @param loop 恢复协程用的事件循环
          * @param userId 用户标识
          * @return bool 记录存在且 enabled 为真
+         * @note 按主键读记录，调用方必须保证该用户已经过登录或会话认证
          */
         AsynGyanis::Core::Task<bool> enabled(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
@@ -130,14 +138,16 @@ namespace EdgePulse::Auth
          * @param loop 恢复协程用的事件循环
          * @param userId 用户标识
          * @return MfaStatus 未启用时两项为 false 与 0
+         * @note 按主键读记录，调用方必须保证该用户已经过登录或会话认证
          */
         AsynGyanis::Core::Task<MfaStatus> status(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
         /**
          * @brief 管理员重置：删除记录与待启用缓存
          * @param loop 恢复协程用的事件循环
-         * @param userId 目标用户标识；调用方负责确认目标在当前租户内
+         * @param userId 目标用户标识；调用方负责确认目标在当前租户内并持有 system:user:edit
          * @return bool 是否删掉一条记录
+         * @note 按主键全租户删除，管理端控制器必须完成 system:user:edit 权限与租户校验
          */
         AsynGyanis::Core::Task<bool> reset(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
@@ -157,6 +167,16 @@ namespace EdgePulse::Auth
 
         /**
          * @brief 在 ±1 步窗口内找出验证码对应的步号
+         * @param secret base32 秘密
+         * @param code 用户输入的验证码
+         * @param nowStep 当前步号
+         * @param lastUsedStep 上次消费的步号，候选必须严格更大
+         * @return std::optional<std::int64_t> 命中时返回步号
+         */
+        [[nodiscard]] std::optional<std::int64_t> matchingStepForSecret(std::string_view secret, std::string_view code, std::int64_t nowStep, std::int64_t lastUsedStep) const;
+
+        /**
+         * @brief 解密记录后找出验证码对应的步号
          * @param record 两步验证记录
          * @param code 用户输入的验证码
          * @param nowStep 当前步号

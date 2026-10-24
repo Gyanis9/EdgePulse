@@ -32,9 +32,9 @@ namespace EdgePulse::Auth
         std::int64_t             tenantId{1};      ///< 归属租户
         std::string              secretCiphertext; ///< 秘密密文与认证标签的 base64
         std::string              secretNonce;      ///< 12 字节 nonce 的 base64
-        int                      keyVersion{1};    ///< 主密钥版本，供后续轮换
+        int                      keyVersion{1};    ///< 主密钥版本，预留字段；当前解密不校验该值，也不支持轮换
         std::int64_t             lastUsedStep{0};  ///< 上次成功校验的 TOTP 步号
-        std::vector<std::string> recoveryHashes;   ///< 恢复码的 SHA-256 十六进制
+        std::vector<std::string> recoveryHashes;   ///< 恢复码的 HMAC-SHA256 十六进制，以主密钥为键
         bool                     enabled{false};   ///< 是否已启用
         std::string              createdAt;        ///< 创建时间，UTC
         std::string              updatedAt;        ///< 更新时间，UTC
@@ -85,10 +85,11 @@ namespace EdgePulse::Auth
          * @param loop 恢复协程用的事件循环
          * @param userId 用户标识
          * @param recoveryCodesJson 恢复码哈希数组的 JSON
+         * @param lastUsedStep 启用时消费的 TOTP 步号
          * @param now 更新时间，UTC
          * @return bool 是否命中一条尚未启用的记录
          */
-        AsynGyanis::Core::Task<bool> enable(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string recoveryCodesJson, std::string now);
+        AsynGyanis::Core::Task<bool> enable(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string recoveryCodesJson, std::int64_t lastUsedStep, std::string now);
 
         /**
          * @brief 删除用户的记录，供关闭与管理员重置使用
@@ -112,9 +113,10 @@ namespace EdgePulse::Auth
          * @brief 以 JSON 文本为乐观锁删除一枚恢复码哈希
          * @param loop 恢复协程用的事件循环
          * @param userId 用户标识
-         * @param hash 待删除的 SHA-256 十六进制
+         * @param hash 待删除的 HMAC-SHA256 十六进制
          * @param now 更新时间，UTC
-         * @return bool 是否删除成功；哈希不存在或并发修改导致 CAS 失败时返回 false
+         * @return bool 是否删除成功；哈希不存在、记录未启用或 CAS 失败时返回 false
+         * @note 读写都要求 enabled = 1，停用中的记录不会因为残留 JSON 被消费
          */
         AsynGyanis::Core::Task<bool> consumeRecoveryCode(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string hash, std::string now);
 

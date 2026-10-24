@@ -1,4 +1,10 @@
 #include "Base/Coding/Base64.h"
+#include "Base/Config/ConfigValue.h"
+#include "Base/Database/Database.h"
+#include "Base/Database/SqlHelpers.h"
+#include "Base/Runtime/TimeFormat.h"
+#include "Base/Security/Hmac.h"
+#include "Core/Auth/MfaCrypto.h"
 #include "Core/Auth/MfaService.h"
 #include "Core/Auth/Totp.h"
 #include "Core/Cache/MemoryKeyValueStore.h"
@@ -12,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26,7 +33,7 @@ namespace
     using EdgePulse::TestSupport::AuthTestContext;
     using EdgePulse::TestSupport::EventLoopRunner;
 
-    [[nodiscard]] std::string encodedMfaKey()
+    [[nodiscard]] std::string rawMfaKey()
     {
         std::string key;
         key.reserve(32);
@@ -34,7 +41,34 @@ namespace
         {
             key.push_back(static_cast<char>(index + 1));
         }
-        return AsynGyanis::Base::base64Encode(key);
+        return key;
+    }
+
+    [[nodiscard]] std::string encodedMfaKey()
+    {
+        return AsynGyanis::Base::base64Encode(rawMfaKey());
+    }
+
+    [[nodiscard]] std::string setupCacheKey(const std::int64_t userId)
+    {
+        return "edgepulse:mfa:setup:" + std::to_string(userId);
+    }
+
+    void executeOrFail(const AuthTestContext &context, const std::string &sql)
+    {
+        const auto connection = EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+        ASSERT_NE(nullptr, connection->execute(sql)) << connection->lastError();
+    }
+
+    [[nodiscard]] std::string readRecoveryJson(const AuthTestContext &context, const std::int64_t userId)
+    {
+        const auto connection = EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+        const auto result     = connection->execute("SELECT recovery_codes_json FROM sys_user_mfa WHERE user_id = " + std::to_string(userId));
+        if (!result || !result->next())
+        {
+            return {};
+        }
+        return EdgePulse::Sql::text(*result, "recovery_codes_json");
     }
 
     /// 一套临时库、事件循环与已注入管理员身份的两步验证服务
@@ -104,7 +138,7 @@ TEST(MfaService, EnableVerifyReplayRecoveryAndDisable)
     EXPECT_EQ(10U, status.remainingRecoveryCodes);
     EXPECT_TRUE(fixture.runner.run(fixture.service->enabled(fixture.runner.loop(), fixture.admin.userId)));
 
-    EXPECT_TRUE(fixture.runner.run(fixture.service->verify(fixture.runner.loop(), fixture.admin.userId, enableCode)));
+    // 启用时已经消费了 setup 口令，登录校验不能再用同一枚
     EXPECT_FALSE(fixture.runner.run(fixture.service->verify(fixture.runner.loop(), fixture.admin.userId, enableCode)));
     EXPECT_FALSE(fixture.runner.run(fixture.service->verify(fixture.runner.loop(), fixture.admin.userId, "abcdef")));
 
@@ -182,4 +216,111 @@ TEST(MfaService, InvalidKeyBehavesAsUnconfiguredAndResetClearsRow)
 
     const bool removed = fixture.runner.run(brokenKey.reset(fixture.runner.loop(), fixture.admin.userId));
     EXPECT_FALSE(removed);
+}
+
+// 钉住：登录校验消费过的步号不能再用于关闭两步验证
+TEST(MfaService, DisableRejectsCodeConsumedByVerify)
+{
+    MfaFixture fixture;
+
+    const auto setup = fixture.runner.run(fixture.service->beginSetup(fixture.runner.loop(), fixture.admin));
+    ASSERT_TRUE(setup.has_value()) << setup.error().message;
+    const std::int64_t setupStep = MfaFixture::nowStep();
+    const auto codes = fixture.runner.run(fixture.service->enable(fixture.runner.loop(), fixture.admin, EdgePulse::Auth::Totp::code(setup->secret, setupStep)));
+    ASSERT_TRUE(codes.has_value()) << codes.error().message;
+
+    const std::int64_t loginStep = std::max(MfaFixture::nowStep(), setupStep + 1);
+    const std::string  loginCode = EdgePulse::Auth::Totp::code(setup->secret, loginStep);
+    ASSERT_TRUE(fixture.runner.run(fixture.service->verify(fixture.runner.loop(), fixture.admin.userId, loginCode)));
+
+    const auto disabled = fixture.runner.run(fixture.service->disable(fixture.runner.loop(), fixture.admin, loginCode));
+    ASSERT_FALSE(disabled.has_value());
+    EXPECT_EQ(401, disabled.error().httpStatus);
+    EXPECT_TRUE(fixture.runner.run(fixture.service->enabled(fixture.runner.loop(), fixture.admin.userId)));
+}
+
+// 钉住：恢复码存的是以主密钥为键的 HMAC-SHA256，不是明文，也不是无键 SHA-256
+TEST(MfaService, RecoveryCodesAreHmacHashedNotPlaintext)
+{
+    MfaFixture fixture;
+
+    const auto setup = fixture.runner.run(fixture.service->beginSetup(fixture.runner.loop(), fixture.admin));
+    ASSERT_TRUE(setup.has_value()) << setup.error().message;
+    const auto recoveryCodes =
+            fixture.runner.run(fixture.service->enable(fixture.runner.loop(), fixture.admin, EdgePulse::Auth::Totp::code(setup->secret, MfaFixture::nowStep())));
+    ASSERT_TRUE(recoveryCodes.has_value()) << recoveryCodes.error().message;
+
+    const std::string json = readRecoveryJson(fixture.context, fixture.admin.userId);
+    const std::optional<AsynGyanis::Base::ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(json);
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_TRUE(parsed->is_array());
+    std::vector<std::string> hashes;
+    for (const AsynGyanis::Base::ConfigValue &item: *parsed)
+    {
+        hashes.push_back(item.get<std::string>());
+    }
+    ASSERT_EQ(recoveryCodes->size(), hashes.size());
+
+    for (const std::string &recoveryCode: *recoveryCodes)
+    {
+        const std::string expected = EdgePulse::Common::hmacSha256Hex(rawMfaKey(), recoveryCode);
+        EXPECT_EQ(64U, expected.size());
+        EXPECT_NE(hashes.end(), std::find(hashes.begin(), hashes.end(), expected)) << recoveryCode;
+        EXPECT_EQ(std::string::npos, json.find(recoveryCode));
+    }
+
+    EXPECT_TRUE(fixture.runner.run(fixture.service->verifyRecovery(fixture.runner.loop(), fixture.admin.userId, recoveryCodes->front())));
+    EXPECT_FALSE(fixture.runner.run(fixture.service->verifyRecovery(fixture.runner.loop(), fixture.admin.userId, recoveryCodes->front())));
+}
+
+// 钉住：待启用秘密在缓存里是密文，只有持有主密钥才能还原
+TEST(MfaService, PendingSetupSecretIsEncryptedInCache)
+{
+    MfaFixture fixture;
+
+    const auto setup = fixture.runner.run(fixture.service->beginSetup(fixture.runner.loop(), fixture.admin));
+    ASSERT_TRUE(setup.has_value()) << setup.error().message;
+
+    const std::optional<std::string> cached = fixture.runner.run(fixture.context.cache->get(fixture.runner.loop(), setupCacheKey(fixture.admin.userId)));
+    ASSERT_TRUE(cached.has_value());
+    EXPECT_EQ(std::string::npos, cached->find(setup->secret));
+
+    const std::optional<AsynGyanis::Base::ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(*cached);
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_TRUE(parsed->is_object());
+    const std::string nonce      = parsed->value("nonce", std::string{});
+    const std::string ciphertext = parsed->value("ciphertext", std::string{});
+    const std::optional<std::string> decrypted = EdgePulse::Auth::MfaCrypto::decrypt(ciphertext, nonce, rawMfaKey());
+    ASSERT_TRUE(decrypted.has_value());
+    EXPECT_EQ(setup->secret, *decrypted);
+}
+
+// 钉住：仓储的恢复码 CAS 只在 enabled 行上生效，停用期间不消费
+TEST(MfaService, RecoveryCasRequiresEnabledRow)
+{
+    MfaFixture fixture;
+
+    const auto setup = fixture.runner.run(fixture.service->beginSetup(fixture.runner.loop(), fixture.admin));
+    ASSERT_TRUE(setup.has_value()) << setup.error().message;
+    const auto recoveryCodes =
+            fixture.runner.run(fixture.service->enable(fixture.runner.loop(), fixture.admin, EdgePulse::Auth::Totp::code(setup->secret, MfaFixture::nowStep())));
+    ASSERT_TRUE(recoveryCodes.has_value()) << recoveryCodes.error().message;
+
+    const std::string before = readRecoveryJson(fixture.context, fixture.admin.userId);
+    const std::optional<AsynGyanis::Base::ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(before);
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_TRUE(parsed->is_array());
+    ASSERT_FALSE(parsed->empty());
+    const std::string storedHash = parsed->front().get<std::string>();
+
+    const std::string userIdText = std::to_string(fixture.admin.userId);
+    executeOrFail(fixture.context, "UPDATE sys_user_mfa SET enabled = 0 WHERE user_id = " + userIdText);
+
+    auto repository = EdgePulse::Auth::MfaRepository(fixture.context.database, TenantScope{1, false});
+    EXPECT_FALSE(fixture.runner.run(repository.consumeRecoveryCode(fixture.runner.loop(), fixture.admin.userId, storedHash, EdgePulse::Common::nowDateTimeUtc())));
+    EXPECT_EQ(before, readRecoveryJson(fixture.context, fixture.admin.userId));
+
+    executeOrFail(fixture.context, "UPDATE sys_user_mfa SET enabled = 1 WHERE user_id = " + userIdText);
+    EXPECT_TRUE(fixture.runner.run(repository.consumeRecoveryCode(fixture.runner.loop(), fixture.admin.userId, storedHash, EdgePulse::Common::nowDateTimeUtc())));
+    EXPECT_NE(before, readRecoveryJson(fixture.context, fixture.admin.userId));
 }

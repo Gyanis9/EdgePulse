@@ -4,10 +4,10 @@
 #include "Base/Coding/SecureCompare.h"
 #include "Base/Config/ConfigValue.h"
 #include "Base/Runtime/TimeFormat.h"
+#include "Base/Security/Hmac.h"
 #include "Base/Security/RandomBytes.h"
 #include "Core/Auth/MfaCrypto.h"
 #include "Core/Auth/Totp.h"
-#include "Core/Crypto/Digest.h"
 
 #include <algorithm>
 #include <cctype>
@@ -116,7 +116,7 @@ namespace EdgePulse::Auth
 
         /**
          * @brief 把恢复码哈希序列化成 JSON 数组
-         * @param hashes SHA-256 十六进制
+         * @param hashes 恢复码哈希的十六进制
          * @return std::string JSON 文本
          */
         [[nodiscard]] std::string serializeHashes(const std::vector<std::string> &hashes)
@@ -130,6 +130,17 @@ namespace EdgePulse::Auth
         }
 
         /**
+         * @brief 恢复码落库哈希：以主密钥为键的 HMAC-SHA256
+         * @param key 32 字节主密钥
+         * @param canonical 归一后的 xxxx-xxxx 文本
+         * @return std::string 64 个十六进制字符
+         */
+        [[nodiscard]] std::string recoveryHash(const std::string_view key, const std::string_view canonical)
+        {
+            return Common::hmacSha256Hex(key, canonical);
+        }
+
+        /**
          * @brief 待启用秘密的缓存键
          * @param userId 用户标识
          * @return std::string 键
@@ -137,6 +148,38 @@ namespace EdgePulse::Auth
         [[nodiscard]] std::string setupCacheKey(const std::int64_t userId)
         {
             return std::string{kSetupCachePrefix} + std::to_string(userId);
+        }
+
+        /**
+         * @brief 把待启用秘密的密文序列化成缓存值
+         * @param ciphertext 加密结果
+         * @return std::string 含 nonce 与 ciphertext 的 JSON 对象文本
+         */
+        [[nodiscard]] std::string serializeSetupCiphertext(const MfaCiphertext &ciphertext)
+        {
+            return AsynGyanis::Base::ConfigValue::object({{"nonce", ciphertext.nonce}, {"ciphertext", ciphertext.ciphertext}}).dump();
+        }
+
+        /**
+         * @brief 解析缓存里的待启用密文
+         * @param text 缓存值
+         * @return std::optional<MfaCiphertext> 两个字段都非空时返回
+         */
+        [[nodiscard]] std::optional<MfaCiphertext> parseSetupCiphertext(const std::string_view text)
+        {
+            const std::optional<AsynGyanis::Base::ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(text);
+            if (!parsed.has_value() || !parsed->is_object())
+            {
+                return std::nullopt;
+            }
+            MfaCiphertext ciphertext;
+            ciphertext.nonce      = parsed->value("nonce", std::string{});
+            ciphertext.ciphertext = parsed->value("ciphertext", std::string{});
+            if (ciphertext.nonce.empty() || ciphertext.ciphertext.empty())
+            {
+                return std::nullopt;
+            }
+            return ciphertext;
         }
 
         /**
@@ -203,14 +246,10 @@ namespace EdgePulse::Auth
         return MfaCrypto::decrypt(record.secretCiphertext, record.secretNonce, m_key);
     }
 
-    std::optional<std::int64_t> MfaService::matchingStep(const MfaRecord &record, const std::string_view code, const std::int64_t nowStep, const std::int64_t lastUsedStep) const
+    std::optional<std::int64_t> MfaService::matchingStepForSecret(const std::string_view secret, const std::string_view code, const std::int64_t nowStep,
+                                                                  const std::int64_t lastUsedStep) const
     {
         if (code.size() != static_cast<std::size_t>(Totp::kDefaultDigits))
-        {
-            return std::nullopt;
-        }
-        const std::optional<std::string> secret = decryptSecret(record);
-        if (!secret.has_value())
         {
             return std::nullopt;
         }
@@ -221,13 +260,23 @@ namespace EdgePulse::Auth
             {
                 continue;
             }
-            const std::string expected = Totp::code(*secret, candidate);
+            const std::string expected = Totp::code(secret, candidate);
             if (!expected.empty() && AsynGyanis::Base::constantTimeEquals(expected, code))
             {
                 return candidate;
             }
         }
         return std::nullopt;
+    }
+
+    std::optional<std::int64_t> MfaService::matchingStep(const MfaRecord &record, const std::string_view code, const std::int64_t nowStep, const std::int64_t lastUsedStep) const
+    {
+        const std::optional<std::string> secret = decryptSecret(record);
+        if (!secret.has_value())
+        {
+            return std::nullopt;
+        }
+        return matchingStepForSecret(*secret, code, nowStep, lastUsedStep);
     }
 
     AsynGyanis::Core::Task<std::expected<MfaSetup, MfaError>> MfaService::beginSetup(AsynGyanis::Core::EventLoop &loop, SessionRecord session)
@@ -244,9 +293,14 @@ namespace EdgePulse::Auth
         }
 
         MfaSetup setup;
-        setup.secret      = Totp::generateSecret();
-        setup.otpauthUri  = Totp::otpauthUri(kIssuer, session.username, setup.secret);
-        const bool cached = co_await m_cache->set(loop, setupCacheKey(session.userId), setup.secret, kSetupTtl);
+        setup.secret     = Totp::generateSecret();
+        setup.otpauthUri = Totp::otpauthUri(kIssuer, session.username, setup.secret);
+        const std::optional<MfaCiphertext> encrypted = MfaCrypto::encrypt(setup.secret, m_key);
+        if (!encrypted.has_value())
+        {
+            co_return std::unexpected(serviceUnavailable("两步验证密钥加密失败，请稍后重试"));
+        }
+        const bool cached = co_await m_cache->set(loop, setupCacheKey(session.userId), serializeSetupCiphertext(*encrypted), kSetupTtl);
         if (!cached)
         {
             co_return std::unexpected(serviceUnavailable("两步验证设置缓存不可用，请稍后重试"));
@@ -272,15 +326,20 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(badRequest("两步验证设置已过期，请重新开始设置"));
         }
-        if (!Totp::verify(*pending, trimCopy(code), Totp::currentStep(), 0))
+        const std::optional<MfaCiphertext> stored = parseSetupCiphertext(*pending);
+        if (!stored.has_value())
+        {
+            co_return std::unexpected(badRequest("两步验证设置已过期，请重新开始设置"));
+        }
+        const std::optional<std::string> pendingSecret = MfaCrypto::decrypt(stored->ciphertext, stored->nonce, m_key);
+        if (!pendingSecret.has_value())
+        {
+            co_return std::unexpected(badRequest("两步验证设置已过期，请重新开始设置"));
+        }
+        const std::optional<std::int64_t> matchedStep = matchingStepForSecret(*pendingSecret, trimCopy(code), Totp::currentStep(), 0);
+        if (!matchedStep.has_value())
         {
             co_return std::unexpected(unauthorized("验证码错误，请确认身份验证器时间后重试"));
-        }
-
-        const std::optional<MfaCiphertext> encrypted = MfaCrypto::encrypt(*pending, m_key);
-        if (!encrypted.has_value())
-        {
-            co_return std::unexpected(serviceUnavailable("两步验证密钥加密失败，请稍后重试"));
         }
 
         const std::vector<std::string> recoveryCodes = generateRecoveryCodes();
@@ -288,23 +347,23 @@ namespace EdgePulse::Auth
         hashes.reserve(recoveryCodes.size());
         for (const std::string &recoveryCode: recoveryCodes)
         {
-            hashes.push_back(AsynGyanis::Core::Digest::sha256Hex(recoveryCode));
+            hashes.push_back(recoveryHash(m_key, recoveryCode));
         }
 
         const std::string now = Common::nowDateTimeUtc();
         MfaRecord         record;
         record.userId           = session.userId;
         record.tenantId         = session.tenantId;
-        record.secretCiphertext = encrypted->ciphertext;
-        record.secretNonce      = encrypted->nonce;
+        record.secretCiphertext = stored->ciphertext;
+        record.secretNonce      = stored->nonce;
         record.keyVersion       = 1;
-        record.lastUsedStep     = 0;
+        record.lastUsedStep     = *matchedStep;
         record.recoveryHashes   = hashes;
         record.enabled          = false;
         record.createdAt        = now;
         record.updatedAt        = now;
         co_await repository->upsertSecret(loop, std::move(record));
-        if (!co_await repository->enable(loop, session.userId, serializeHashes(hashes), now))
+        if (!co_await repository->enable(loop, session.userId, serializeHashes(hashes), *matchedStep, now))
         {
             co_return std::unexpected(conflict("两步验证状态已被并发修改，请刷新后重试"));
         }
@@ -324,10 +383,16 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(notFound("两步验证未启用"));
         }
-        // 关闭只校验当前窗口，不推进步号：紧随登录之后的关闭请求不该被刚消费的步号拦住
-        if (!matchingStep(*existing, trimCopy(code), Totp::currentStep(), 0).has_value())
+        // 与 verify 共用步号水位：登录时刚用过的口令不能再关闭两步验证
+        const std::optional<std::int64_t> matched = matchingStep(*existing, trimCopy(code), Totp::currentStep(), existing->lastUsedStep);
+        if (!matched.has_value())
         {
-            co_return std::unexpected(unauthorized("验证码错误，请确认身份验证器时间后重试"));
+            co_return std::unexpected(unauthorized("验证码错误或已使用，请等待身份验证器刷新后重试"));
+        }
+        // 先条件消费再删除：并发 verify 抢先用掉同一步时，这里拿到 false 而不是删掉记录
+        if (!co_await repository->consumeStep(loop, session.userId, *matched, Common::nowDateTimeUtc()))
+        {
+            co_return std::unexpected(unauthorized("验证码错误或已使用，请等待身份验证器刷新后重试"));
         }
         if (!co_await repository->remove(loop, session.userId))
         {
@@ -359,6 +424,10 @@ namespace EdgePulse::Auth
 
     AsynGyanis::Core::Task<bool> MfaService::verifyRecovery(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string code)
     {
+        if (!keyConfigured())
+        {
+            co_return false;
+        }
         const std::optional<MfaRecord> record = co_await m_repository.scoped({0, true})->findByUser(loop, userId);
         if (!record.has_value() || !record->enabled)
         {
@@ -370,7 +439,7 @@ namespace EdgePulse::Auth
             co_return false;
         }
         co_return co_await m_repository.scoped({record->tenantId, false})
-                ->consumeRecoveryCode(loop, userId, AsynGyanis::Core::Digest::sha256Hex(canonical), Common::nowDateTimeUtc());
+                ->consumeRecoveryCode(loop, userId, recoveryHash(m_key, canonical), Common::nowDateTimeUtc());
     }
 
     AsynGyanis::Core::Task<bool> MfaService::enabled(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)

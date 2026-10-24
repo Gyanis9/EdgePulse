@@ -18,11 +18,11 @@ namespace EdgePulse::Auth
     {
         constexpr const char *kMfaColumns =
                 "user_id, tenant_id, secret_ciphertext, secret_nonce, key_version, last_used_step, recovery_codes_json, enabled, created_at, updated_at";
-        constexpr int kRecoveryCasAttempts = 3; ///< CAS 并发冲突时的有界重试次数
+        constexpr int kRecoveryCasAttempts = 5; ///< CAS 并发冲突时的有界重试次数
 
         /**
          * @brief 把恢复码哈希数组序列化成 JSON
-         * @param hashes SHA-256 十六进制
+         * @param hashes 恢复码哈希的十六进制
          * @return std::string JSON 数组文本
          */
         [[nodiscard]] std::string serializeRecoveryCodes(const std::vector<std::string> &hashes)
@@ -153,13 +153,15 @@ namespace EdgePulse::Auth
         co_return;
     }
 
-    AsynGyanis::Core::Task<bool> MfaRepository::enable(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string recoveryCodesJson, std::string now)
+    AsynGyanis::Core::Task<bool> MfaRepository::enable(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string recoveryCodesJson,
+                                                       const std::int64_t lastUsedStep, std::string now)
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [userId, recoveryCodesJson = std::move(recoveryCodesJson), now = std::move(now), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> bool
+                [userId, recoveryCodesJson = std::move(recoveryCodesJson), lastUsedStep, now = std::move(now), tenant = m_tenant](
+                        AsynGyanis::Database::DatabaseConnection &connection) -> bool
                 {
-                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{recoveryCodesJson, now, userId};
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{recoveryCodesJson, lastUsedStep, now, userId};
                     std::string                                      clause;
                     if (!tenant.allTenants)
                     {
@@ -168,7 +170,9 @@ namespace EdgePulse::Auth
                     }
                     // 只有未启用行可以转入启用；并发启用时后到的一方拿到 false
                     const auto result = Sql::executeOrThrow(
-                            connection, "UPDATE sys_user_mfa SET enabled = 1, recovery_codes_json = ?, updated_at = ? WHERE user_id = ? AND enabled = 0" + clause, parameters);
+                            connection,
+                            "UPDATE sys_user_mfa SET enabled = 1, recovery_codes_json = ?, last_used_step = ?, updated_at = ? WHERE user_id = ? AND enabled = 0" + clause,
+                            parameters);
                     return result->affectedRowCount() > 0;
                 });
     }
@@ -229,8 +233,8 @@ namespace EdgePulse::Auth
                     {
                         std::string previousJson;
                         {
-                            const auto rows =
-                                    Sql::executeOrThrow(connection, std::string{"SELECT recovery_codes_json FROM sys_user_mfa WHERE user_id = ?"} + clause, selectParameters);
+                            const auto rows = Sql::executeOrThrow(
+                                    connection, std::string{"SELECT recovery_codes_json FROM sys_user_mfa WHERE user_id = ? AND enabled = 1"} + clause, selectParameters);
                             if (!rows->next())
                             {
                                 return false;
@@ -255,7 +259,8 @@ namespace EdgePulse::Auth
                         }
                         // 旧 JSON 文本作为乐观锁：另一枚恢复码恰好并发消费时本轮 CAS 失败，重读后再试
                         const auto result = Sql::executeOrThrow(
-                                connection, "UPDATE sys_user_mfa SET recovery_codes_json = ?, updated_at = ? WHERE user_id = ? AND recovery_codes_json = ?" + updateClause,
+                                connection,
+                                "UPDATE sys_user_mfa SET recovery_codes_json = ?, updated_at = ? WHERE user_id = ? AND recovery_codes_json = ? AND enabled = 1" + updateClause,
                                 updateParameters);
                         if (result->affectedRowCount() > 0)
                         {
