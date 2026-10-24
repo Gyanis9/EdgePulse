@@ -34,13 +34,23 @@ die() {
     exit 1
 }
 
-normalize_path() {
-    local path="$1"
-    path="${path//\/\//\/}"
-    while [[ "${path}" == */ && "${path}" != "/" ]]; do
-        path="${path%/}"
-    done
-    printf '%s' "${path}"
+require_realpath() {
+    command -v realpath >/dev/null 2>&1 ||
+        die "未找到 realpath（GNU coreutils）：无法规范化卸载路径，请先安装 coreutils"
+}
+
+# 路径先规范化为逻辑绝对路径，再做校验与删除：realpath -m 折叠重复斜杠、. 与 ..，
+# 且不要求目标已存在。校验值与实际删除目标来自同一次规范化，避免两者不一致。
+canonical_path() {
+    local raw="$1"
+    local option="$2"
+    local canonical
+    [[ -n "${raw}" ]] || die "${option} 不能为空"
+    [[ "${raw}" != *$'\n'* && "${raw}" != *$'\r'* ]] ||
+        die "${option} 不能包含换行或回车：$(printf '%q' "${raw}")"
+    [[ "${raw}" == /* ]] || die "${option} 必须是绝对路径：${raw}"
+    canonical="$(realpath -m -- "${raw}")" || die "${option} 无法规范化路径：${raw}"
+    printf '%s' "${canonical}"
 }
 
 # 系统目录不接受为卸载目标；各选项的文档默认值除外，默认卸载仍使用 /usr/local
@@ -54,8 +64,8 @@ is_system_dir() {
     return 1
 }
 
-# 路径选项必须是绝对路径，且不能是系统目录、不能含 .. 路径段或以 . 结尾，
-# 避免删除单元、二进制或清理目录时误伤上级目录。
+# 校验的是规范化后的路径，因此这里只剩 realpath 失败时的兜底断言：
+# 结果必须绝对、无空白字符、无 .. 路径段、不以 . 结尾，且不命中系统目录。
 check_path() {
     local path="$1"
     local option="$2"
@@ -118,11 +128,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-prefix="$(normalize_path "${prefix}")"
-config_dir="$(normalize_path "${config_dir}")"
-state_dir="$(normalize_path "${state_dir}")"
-log_dir="$(normalize_path "${log_dir}")"
-unit_dir="$(normalize_path "${unit_dir}")"
+require_realpath
+
+prefix="$(canonical_path "${prefix}" "--prefix")"
+config_dir="$(canonical_path "${config_dir}" "--config-dir")"
+state_dir="$(canonical_path "${state_dir}" "--state-dir")"
+log_dir="$(canonical_path "${log_dir}" "--log-dir")"
+unit_dir="$(canonical_path "${unit_dir}" "SYSTEMD_UNIT_DIR")"
 
 check_path "${prefix}" "--prefix" "/usr/local"
 check_path "${config_dir}" "--config-dir" "/etc/edgepulse-agent"
