@@ -83,7 +83,7 @@ namespace EdgePulse::Device
     {
         TokenRejected,          ///< 注册/改绑令牌无效、过期、已用或与节点名不符
         ConcurrentRegistration, ///< 整段事务在有限次重试后仍撞上并发锁或唯一键
-        NameConflict,           ///< 同名节点已被软删除，唯一索引不允许再次使用该名称
+        NameConflict,           ///< 同名行已存在（其他租户的活节点或已删除记录），唯一索引不允许再次使用该名称
     };
 
     /**

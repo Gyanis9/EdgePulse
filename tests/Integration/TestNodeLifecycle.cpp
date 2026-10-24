@@ -240,6 +240,49 @@ TEST(NodeLifecycle, RevokedNodeGetsNoOfflineAlarm)
     EXPECT_EQ(0, published);
 }
 
+// 钉住：补告警批次处理期间节点被吊销时，复查要跳过它，不能为永远不会再心跳的节点建告警
+TEST(NodeLifecycle, SweepReconciliationSkipsNodeRevokedDuringBatch)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    auto                                    nodes  = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    auto                                    alarms = std::make_shared<EdgePulse::Alarm::AlarmRepository>(context.database);
+    EdgePulse::Alarm::AlarmService          alarmService(alarms);
+
+    const auto first  = runner.run(nodes->create(runner.loop(), "reconcile-first", "{}"));
+    const auto second = runner.run(nodes->create(runner.loop(), "reconcile-second", "{}"));
+    // 固定补告警顺序：first 先于 second
+    setLastSeen(context, first.id, "2000-01-01 00:00:00");
+    setLastSeen(context, second.id, "2000-01-02 00:00:00");
+
+    int                                     published = 0;
+    EdgePulse::Device::NodeLifecycleService lifecycle(
+            *nodes, alarmService,
+            [&published, &nodes, &runner, second](const EdgePulse::Device::NodeRecord &node) -> AsynGyanis::Core::Task<>
+            {
+                ++published;
+                if (node.id == second.id)
+                {
+                    co_return;
+                }
+                // 补 first 的告警时模拟 second 被吊销：second 的复查必须重新看到吊销时间
+                static_cast<void>(co_await nodes->revokeCertificate(runner.loop(), second.id));
+                co_return;
+            },
+            90);
+
+    runner.run(lifecycle.sweep(runner.loop(), "9999-12-31 23:59:59"));
+
+    // 只有 first 补发状态与告警；second 已吊销，不能留下无法销案的 critical 告警
+    EXPECT_EQ(1, published);
+    EXPECT_TRUE(runner.run(alarms->findOpen(runner.loop(), 0, first.id)).has_value());
+    EXPECT_FALSE(runner.run(alarms->findOpen(runner.loop(), 0, second.id)).has_value());
+    EXPECT_EQ(1, runner.run(alarms->openCount(runner.loop())));
+    const auto revoked = runner.run(nodes->findById(runner.loop(), second.id));
+    ASSERT_TRUE(revoked.has_value());
+    EXPECT_FALSE(revoked->certRevokedAt.empty());
+}
+
 // 钉住：全租户扫描能转换别家租户的节点，告警落在节点自己的租户下
 TEST(NodeLifecycle, SweepTransitionsNodeFromOtherTenant)
 {

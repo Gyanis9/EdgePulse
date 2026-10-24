@@ -111,11 +111,11 @@ namespace EdgePulse::Device
         const auto outcome         = co_await m_repository->upsertAgent(loop, std::move(upsert));
         if (!outcome.has_value())
         {
-            // 仓储拒绝分三类：同名软删除记录按名字冲突返回 409 并给出改名/清理建议；
+            // 仓储拒绝分三类：同名行（其他租户的活节点或已删除记录）按名字冲突返回 409 并给出改名/清理建议；
             // 令牌/改绑不通过按授权失败返回 403；整段事务仍撞并发返回 409 让 Agent 稍后重试
             if (outcome.error() == AgentUpsertFailure::NameConflict)
             {
-                co_return std::unexpected(AgentError{AgentError::Reason::Conflict, "节点名与已删除的节点重复，请改名后重试，或先清理该已删除记录"});
+                co_return std::unexpected(AgentError{AgentError::Reason::Conflict, "节点名已被其他租户或已删除节点占用，请改名或联系管理员清理"});
             }
             if (outcome.error() == AgentUpsertFailure::ConcurrentRegistration)
             {

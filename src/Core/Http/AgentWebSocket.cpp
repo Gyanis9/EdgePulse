@@ -136,13 +136,42 @@ namespace EdgePulse::Web
                                            }
                                        }
                                        channels.registerNode(nodeId, &peer);
-                                       // 登记后再读一次：吊销可能恰好落在读取与登记之间，必须摘表并关闭
-                                       const auto afterRegister = co_await allNodes->findById(loop, nodeId);
-                                       if (!afterRegister.has_value() || !afterRegister->certRevokedAt.empty())
+                                       bool        afterRegisterFailed = false;
+                                       std::string afterRegisterFailure;
+                                       try
                                        {
+                                           // 登记后再读一次：吊销可能恰好落在读取与登记之间，必须摘表并关闭
+                                           const auto afterRegister = co_await allNodes->findById(loop, nodeId);
+                                           if (!afterRegister.has_value() || !afterRegister->certRevokedAt.empty())
+                                           {
+                                               channels.unregisterNode(nodeId, &peer);
+                                               LOG_WARN_FMT("Agent WebSocket 登记后发现证书已吊销：node={}", nodeId);
+                                               co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "证书已吊销");
+                                               co_return;
+                                           }
+                                       } catch (const std::exception &failure)
+                                       {
+                                           // co_await 不能出现在 catch 体里：先记下原因，出了 catch 再摘表与关闭
+                                           afterRegisterFailed  = true;
+                                           afterRegisterFailure = failure.what();
+                                       } catch (...)
+                                       {
+                                           afterRegisterFailed  = true;
+                                           afterRegisterFailure = "未知异常";
+                                       }
+                                       if (afterRegisterFailed)
+                                       {
+                                           // 复查失败时通道已经指向这条连接：先摘表再关闭，不能让异常把悬空项留在注册表里
                                            channels.unregisterNode(nodeId, &peer);
-                                           LOG_WARN_FMT("Agent WebSocket 登记后发现证书已吊销：node={}", nodeId);
-                                           co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
+                                           LOG_ERROR_FMT("Agent WebSocket 登记后复查失败：node={} reason={}", nodeId, afterRegisterFailure);
+                                           try
+                                           {
+                                               // 1011 表示服务端内部错误；关闭本身再失败时通道已摘除，只记录原因
+                                               co_await peer.close(1011, "登记后复查失败，连接已关闭");
+                                           } catch (const std::exception &closeFailure)
+                                           {
+                                               LOG_ERROR_FMT("Agent WebSocket 关闭失败：node={} reason={}", nodeId, closeFailure.what());
+                                           }
                                            co_return;
                                        }
                                        static_cast<void>(co_await peer.sendText(R"({"type":"hello","ok":true})"));

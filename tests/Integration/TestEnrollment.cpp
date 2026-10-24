@@ -190,8 +190,35 @@ TEST(Enrollment, ReRegistrationAfterSoftDeleteReportsNameConflict)
     const auto rejected = runner.run(registry.registerAgent(runner.loop(), registration));
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(EdgePulse::Device::AgentError::Reason::Conflict, rejected.error().reason);
-    EXPECT_NE(std::string::npos, rejected.error().message.find("已删除"));
+    EXPECT_EQ("节点名已被其他租户或已删除节点占用，请改名或联系管理员清理", rejected.error().message);
     EXPECT_EQ(std::string::npos, rejected.error().message.find("并发"));
+}
+
+// 钉住：同名活节点落在其他租户时同样返回名字冲突，不能退化成永远重试的并发冲突
+TEST(Enrollment, LiveCrossTenantNameReportsNameConflict)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    auto                                    nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+
+    EdgePulse::Device::AgentUpsert first;
+    first.name            = "edge-cross-tenant";
+    first.agentVersion    = "1.0.0";
+    first.certFingerprint = std::string(64, 'e');
+    first.labelsJson      = "{}";
+    first.enrollmentMode  = "off";
+    first.tenantId        = 1;
+    const auto created    = runner.run(nodes->upsertAgent(runner.loop(), first));
+    ASSERT_TRUE(created.has_value());
+    EXPECT_TRUE(created->created);
+
+    // 租户 2 的注册看不到租户 1 的活节点，插入会撞全局唯一索引；必须按名字冲突返回
+    EdgePulse::Device::AgentUpsert conflicting = first;
+    conflicting.certFingerprint                = std::string(64, 'f');
+    conflicting.tenantId                       = 2;
+    const auto rejected                        = runner.run(nodes->upsertAgent(runner.loop(), conflicting));
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(EdgePulse::Device::AgentUpsertFailure::NameConflict, rejected.error());
 }
 
 // 钉住：enroll/rebind 由仓储在事务内判定；调用方给的旧快照不能当放行依据，吊销节点必须重新持令牌

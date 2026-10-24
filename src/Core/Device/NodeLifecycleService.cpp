@@ -72,7 +72,8 @@ namespace EdgePulse::Device
             try
             {
                 const std::optional<NodeRecord> current = co_await m_nodes.findById(loop, node.id);
-                if (!current.has_value() || current->status != "offline")
+                // 已吊销证书的节点不会再心跳，补告警只会留下一条无法销案的 critical 告警
+                if (!current.has_value() || current->status != "offline" || !current->certRevokedAt.empty())
                 {
                     continue;
                 }

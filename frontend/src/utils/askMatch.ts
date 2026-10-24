@@ -13,7 +13,7 @@ const VERBS: Array<[RegExp, string]> = [
   [/新增|添加|创建|新建/, 'add'],
   [/修改|编辑|更新/, 'edit'],
   [/导出/, 'list'],
-  [/重置密码/, 'resetPwd'],
+  [/重置密码/, 'reset'],
   [/查看|查询|访问|看到/, 'list'],
 ]
 const OBJECTS: Array<[RegExp, string]> = [

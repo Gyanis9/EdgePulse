@@ -111,10 +111,8 @@ namespace EdgePulse::Auth
         // 锁定已过期但失败窗口更短时，计数可能仍停在阈值上；先清零，避免下一次输错立刻把账号重新锁上
         if (!user->lockedUntil.empty())
         {
-            if (!co_await m_users.scoped({tenantId, false})->clearLoginFailures(loop, user->id))
-            {
-                LOG_WARN_FMT("过期锁定未清空失败计数：user={}", user->username);
-            }
+            // 并发成功登录可能已经清过计数，MySQL 把「值未变化」计为 0 行；返回 false 不代表清除失败
+            static_cast<void>(co_await m_users.scoped({tenantId, false})->clearLoginFailures(loop, user->id));
         }
 
         // PBKDF2 是 CPU 密集操作，放到工作线程，避免 210000 次迭代占住事件循环

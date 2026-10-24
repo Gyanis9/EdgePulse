@@ -136,18 +136,18 @@ namespace EdgePulse::Device
         }
 
         /**
-         * @brief 判断是否已有同名软删除节点占着全局唯一索引
+         * @brief 判断同名节点是否已占用全局唯一索引
          * @param connection 当前数据库连接
          * @param name 注册声明的节点名
-         * @return true 表示插入冲突来自软删除记录，重试也不会成功
+         * @return true 表示已有同名行（活节点或软删除记录），重试也不会成功
          */
-        [[nodiscard]] bool hasDeletedNodeWithName(AsynGyanis::Database::DatabaseConnection &connection, const std::string &name)
+        [[nodiscard]] bool hasNodeWithName(AsynGyanis::Database::DatabaseConnection &connection, const std::string &name)
         {
             const std::vector<AsynGyanis::Database::DatabaseValue>      parameters{name};
-            const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute("SELECT 1 FROM biz_node WHERE name = ? AND deleted = 1 LIMIT 1", parameters);
+            const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute("SELECT 1 FROM biz_node WHERE name = ? LIMIT 1", parameters);
             if (!result)
             {
-                throw Common::DatabaseException("查询已删除同名节点失败：" + connection.lastError());
+                throw Common::DatabaseException("查询同名节点失败：" + connection.lastError());
             }
             return result->next();
         }
@@ -479,19 +479,20 @@ namespace EdgePulse::Device
                             {
                                 throw;
                             }
-                            // 插入撞唯一索引且同名节点只是被软删除时，重试永远不会成功；返回可操作的名字冲突而不是并发冲突
-                            bool deletedNameConflict = false;
+                            // 插入撞唯一索引说明同名行已存在（软删除记录或别家租户的活节点），重试永远不会成功；
+                            // 返回可操作的名字冲突而不是并发冲突
+                            bool nameConflict = false;
                             if (insertingNode && Sql::isUniqueViolation(failure.what()))
                             {
                                 try
                                 {
-                                    deletedNameConflict = hasDeletedNodeWithName(connection, registration.name);
+                                    nameConflict = hasNodeWithName(connection, registration.name);
                                 } catch (const Common::DatabaseException &)
                                 {
                                     // 判断本身失败时仍按可重试的并发冲突处理，不让它盖过原始失败
                                 }
                             }
-                            if (deletedNameConflict)
+                            if (nameConflict)
                             {
                                 return std::unexpected(AgentUpsertFailure::NameConflict);
                             }
