@@ -13,7 +13,7 @@ import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { flattenDepts } from '@/composables/dept'
 import type { Dept } from '@/data'
-import { isLockActive } from '@/utils/time'
+import { formatLocalDateTime, isLockActive } from '@/utils/time'
 import { email, phone, required, validate } from '@/utils/validate'
 
 const route = useRoute()
@@ -422,7 +422,7 @@ async function batchRemove(ids: (string | number)[]) {
         <Tag v-if="isLockActive(row.lockedUntil)" tone="danger" dot>已锁定</Tag>
       </div>
     </template>
-    <template #cell-createTime="{ row }"><span class="tnum soft">{{ row.createTime }}</span></template>
+    <template #cell-createTime="{ row }"><span class="tnum soft">{{ formatLocalDateTime(row.createTime) }}</span></template>
     <template #cell-actions="{ row }">
       <div class="row-actions">
         <PermissionButton perm="system:user:edit" icon-only icon="edit" label="编辑" @click="openEdit(row)" />

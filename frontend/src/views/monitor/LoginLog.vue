@@ -12,6 +12,7 @@ import { revealCascade } from '@/composables/motion'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 
 interface LoginRow { id: number; username: string; status: number; msg?: string; ip?: string; location?: string; browser?: string; os?: string; loginTime: string }
 
@@ -169,7 +170,7 @@ async function clearAll() {
             </span>
             <span class="alert-key">{{ a.key }}</span>
             <span class="alert-figure"><b class="tnum">{{ a.failed }}</b><span>次失败 / 共 {{ a.total }} 次 · {{ a.kind === 'ip' ? `尝试 ${a.spread} 个账号` : `来自 ${a.spread} 个 IP` }}</span></span>
-            <span class="alert-meta">{{ a.firstTime }} → {{ a.lastTime }}</span>
+            <span class="alert-meta">{{ formatLocalDateTime(a.firstTime) }} → {{ formatLocalDateTime(a.lastTime) }}</span>
           </button>
         </div>
         <p v-else class="alert-calm"><Icon name="check" :size="15" />近 {{ heatDays }} 天没有达到告警阈值的失败聚集。</p>
@@ -207,6 +208,6 @@ async function clearAll() {
       </div>
     </template>
     <template #cell-client="{ row }"><span class="muted">{{ [row.browser, row.os].filter(Boolean).join(' · ') || '—' }}</span></template>
-    <template #cell-loginTime="{ row }"><span class="tnum soft">{{ row.loginTime }}</span></template>
+    <template #cell-loginTime="{ row }"><span class="tnum soft">{{ formatLocalDateTime(row.loginTime) }}</span></template>
   </ListPage>
 </template>

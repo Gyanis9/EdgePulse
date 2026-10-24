@@ -6,6 +6,7 @@ import TrendChart from '@/components/charts/TrendChart.vue'
 import { deviceApi, fleetApi, type NodeRow, type TelemetryPoint } from '@/api'
 import { toastError } from '@/composables/toast'
 import { formatMetricValue } from '@/utils/metric'
+import { formatLocalDateTime, formatLocalTime } from '@/utils/time'
 
 const route = useRoute()
 const nodes = ref<NodeRow[]>([])
@@ -28,7 +29,7 @@ const loading = ref(false)
 const latestLoading = ref(false)
 const selected = computed(() => latest.value.find(point => point.metric === metric.value) ?? null)
 const values = computed(() => points.value.map(point => point.value))
-const labels = computed(() => points.value.map(point => point.collectedAt.slice(11, 16)))
+const labels = computed(() => points.value.map(point => formatLocalTime(point.collectedAt)))
 
 function fromTime(): string {
   const now = new Date()
@@ -126,7 +127,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <div class="metric-value tnum" :title="`${point.value} ${point.unit}`">
             {{ formatMetricValue(point.value, point.unit) }}<span class="metric-unit soft">{{ point.unit }}</span>
           </div>
-          <div class="metric-time mono faint">{{ point.collectedAt }}</div>
+          <div class="metric-time mono faint">{{ formatLocalDateTime(point.collectedAt) }}</div>
         </button>
         <EmptyState v-if="!latestLoading && !latest.length" title="暂无遥测" desc="Agent 上报后会显示指标。" icon="line-chart" />
       </div>

@@ -5,6 +5,7 @@ import { deviceApi, type EnrollmentTokenCreated, type EnrollmentTokenRow } from 
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { copyText } from '@/utils/clipboard'
+import { formatLocalDateTime } from '@/utils/time'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
@@ -113,7 +114,7 @@ async function revoke(row: EnrollmentTokenRow) {
       <pre class="code-block token-value">{{ created.token }}</pre>
       <div class="token-actions">
         <Button variant="primary" size="sm" icon="copy" @click="copyToken">复制令牌</Button>
-        <Tag tone="ok" dot>有效至 {{ created.expiresAt }}</Tag>
+        <Tag tone="ok" dot>有效至 {{ formatLocalDateTime(created.expiresAt) }}</Tag>
       </div>
     </div>
 
@@ -138,8 +139,8 @@ async function revoke(row: EnrollmentTokenRow) {
         <template #cell-nodeName="{ row }"><span :class="row.nodeName ? 'mono' : 'faint'">{{ row.nodeName || '任意节点' }}</span></template>
         <template #cell-action="{ row }"><Tag tone="info">{{ ACTION_LABEL[row.action] || row.action }}</Tag></template>
         <template #cell-status="{ row }"><Tag :tone="STATUS_TONE[row.status] || 'neutral'" dot>{{ STATUS_LABEL[row.status] || row.status }}</Tag></template>
-        <template #cell-expiresAt="{ row }"><span class="mono soft">{{ row.expiresAt || '—' }}</span></template>
-        <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt || '—' }}</span></template>
+        <template #cell-expiresAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.expiresAt) }}</span></template>
+        <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
         <template #cell-actions="{ row }">
           <Button v-if="row.status === 'active'" variant="text" size="sm" danger icon="ban" @click="revoke(row)">吊销</Button>
           <span v-else class="faint">—</span>

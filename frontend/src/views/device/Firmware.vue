@@ -7,6 +7,7 @@ import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 
 const columns: Column[] = [
   { key: 'name', title: '固件', minWidth: 200 },
@@ -245,7 +246,7 @@ onMounted(async () => {
       </template>
       <template #cell-sizeBytes="{ row }"><span class="tnum soft">{{ sizeText(row.sizeBytes) }}</span></template>
       <template #cell-sha256="{ row }"><span class="mono faint" style="font-size:11px">{{ row.sha256 }}</span></template>
-      <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
+      <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
       <template #cell-actions="{ row }">
         <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="send" label="下发" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openDeploy(row)" />
         <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="refresh" label="回滚" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openRollback(row)" />
@@ -315,6 +316,7 @@ onMounted(async () => {
       <DataTable :columns="taskColumns" :data="tasks" :loading="tasksLoading" :min-width="760" empty-text="还没有下发任务">
         <template #cell-status="{ row }"><Tag :tone="row.status === 'installed' ? 'ok' : row.status === 'failed' ? 'danger' : 'info'">{{ row.status }}</Tag></template>
         <template #cell-progress="{ row }"><span class="tnum">{{ row.progress }}%</span></template>
+        <template #cell-updatedAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.updatedAt) }}</span></template>
       </DataTable>
     </Drawer>
   </div>

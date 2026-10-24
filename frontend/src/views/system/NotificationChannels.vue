@@ -7,6 +7,7 @@ import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 import { required, validate } from '@/utils/validate'
 
 const list = useListPage<NotificationChannelRow, { keyword: string }>({
@@ -232,7 +233,7 @@ async function remove(row: NotificationChannelRow) {
       <DataTable :columns="deliveryColumns" :data="deliveries" :loading="deliveriesLoading" :min-width="760" empty-text="还没有投递记录">
         <template #cell-status="{ row }"><Tag :tone="row.status === 'succeeded' ? 'success' : 'danger'">{{ row.status === 'succeeded' ? '成功' : '失败' }}</Tag></template>
         <template #cell-attempts="{ row }"><span class="tnum">{{ row.attempts }}</span></template>
-        <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
+        <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
       </DataTable>
     </Drawer>
   </ListPage>

@@ -6,6 +6,7 @@ import { systemApi, type TenantRow } from '@/api'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 import { pattern, required, validate } from '@/utils/validate'
 
 const list = useListPage<TenantRow, { keyword: string; status: string }>({
@@ -128,7 +129,7 @@ async function toggleStatus(row: TenantRow) {
     <template #cell-code="{ row }"><span class="mono">{{ row.code }}</span></template>
     <template #cell-status="{ row }"><Tag :tone="row.status === 1 ? 'success' : 'muted'">{{ row.status === 1 ? '启用' : '停用' }}</Tag></template>
     <template #cell-remark="{ row }"><span class="muted">{{ row.remark || '—' }}</span></template>
-    <template #cell-createTime="{ row }"><span class="tnum soft">{{ row.createTime }}</span></template>
+    <template #cell-createTime="{ row }"><span class="tnum soft">{{ formatLocalDateTime(row.createTime) }}</span></template>
     <template #cell-actions="{ row }">
       <div class="row-actions">
         <PermissionButton perm="system:tenant:edit" icon-only icon="edit" label="编辑" @click="openEdit(row)" />

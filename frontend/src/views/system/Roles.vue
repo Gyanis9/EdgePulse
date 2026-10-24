@@ -15,6 +15,7 @@ import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { revealCascade } from '@/composables/motion'
 import type { Menu } from '@/data'
+import { formatLocalDateTime } from '@/utils/time'
 import { pattern, required, validate } from '@/utils/validate'
 
 interface RoleRow {
@@ -334,7 +335,7 @@ async function savePermission() {
     <template #cell-userCount="{ row }"><span class="tnum">{{ row.userCount }}</span></template>
     <template #cell-sort="{ row }"><span class="tnum soft">{{ row.sort }}</span></template>
     <template #cell-status="{ row }"><StatusTag :status="row.status" /></template>
-    <template #cell-createTime="{ row }"><span class="tnum soft">{{ row.createTime }}</span></template>
+    <template #cell-createTime="{ row }"><span class="tnum soft">{{ formatLocalDateTime(row.createTime) }}</span></template>
     <template #cell-actions="{ row }">
       <div class="row-actions">
         <template v-if="!row.builtin">

@@ -10,6 +10,7 @@ import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { revealCascade } from '@/composables/motion'
+import { formatLocalDateTime } from '@/utils/time'
 
 interface OperRow {
   id: number
@@ -213,7 +214,7 @@ async function clearAll() {
     </template>
     <template #cell-result="{ row }"><Tag :tone="row.result === 1 ? 'ok' : 'danger'" dot>{{ row.result === 1 ? '成功' : '失败' }}</Tag></template>
     <template #cell-cost="{ row }"><span class="tnum soft">{{ row.cost }} ms</span></template>
-    <template #cell-operTime="{ row }"><span class="tnum soft">{{ row.operTime }}</span></template>
+    <template #cell-operTime="{ row }"><span class="tnum soft">{{ formatLocalDateTime(row.operTime) }}</span></template>
     <template #cell-actions="{ row }">
       <PermissionButton perm="monitor:operlog:list" icon-only icon="eye" label="查看详情" @click="detail = row" />
     </template>
@@ -223,7 +224,7 @@ async function clearAll() {
         <div ref="detailBody" class="drawer-stack">
         <div class="kv-grid">
           <div class="kv"><div class="kv-label">操作人</div><div class="kv-value">{{ detail.operName }}<span v-if="detail.dept" class="soft"> · {{ detail.dept }}</span></div></div>
-          <div class="kv"><div class="kv-label">操作时间</div><div class="kv-value tnum">{{ detail.operTime }}</div></div>
+          <div class="kv"><div class="kv-label">操作时间</div><div class="kv-value tnum">{{ formatLocalDateTime(detail.operTime) }}</div></div>
           <div class="kv span-2"><div class="kv-label">请求</div><div class="kv-value mono">{{ detail.method }} {{ detail.url }}</div></div>
           <div class="kv"><div class="kv-label">来源</div><div class="kv-value tnum">{{ detail.ip || '—' }} {{ detail.location || '' }}</div></div>
           <div class="kv"><div class="kv-label">结果 / 耗时</div><div class="kv-value"><Tag :tone="detail.result === 1 ? 'ok' : 'danger'" dot>{{ detail.result === 1 ? '成功' : '失败' }}</Tag> <span class="tnum soft">{{ detail.cost }} ms</span></div></div>

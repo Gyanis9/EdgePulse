@@ -10,6 +10,7 @@ import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { invalidateDict } from '@/composables/dict'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 import { pattern, required, validate } from '@/utils/validate'
 
 interface TypeRow { id: number; dictName: string; dictType: string; status: number; remark?: string; createTime: string }
@@ -233,7 +234,7 @@ async function removeData(row: DataRow) {
     <template #cell-dictType="{ row }"><span class="code-chip">{{ row.dictType }}</span></template>
     <template #cell-status="{ row }"><StatusTag :status="row.status" /></template>
     <template #cell-remark="{ row }"><span class="muted">{{ row.remark || '—' }}</span></template>
-    <template #cell-createTime="{ row }"><span class="tnum soft">{{ row.createTime }}</span></template>
+    <template #cell-createTime="{ row }"><span class="tnum soft">{{ formatLocalDateTime(row.createTime) }}</span></template>
     <template #cell-actions="{ row }">
       <div class="row-actions">
         <PermissionButton perm="system:dict:list" icon-only icon="dict" label="字典数据" @click="openData(row)" />

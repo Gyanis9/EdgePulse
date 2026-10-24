@@ -8,6 +8,7 @@ import { useListPage } from '@/composables/list'
 import { useNodeSocket } from '@/composables/nodeSocket'
 import { pushToast, toastError } from '@/composables/toast'
 import { confirm } from '@/composables/confirm'
+import { formatLocalDateTime } from '@/utils/time'
 
 const STATUSES = [
   { label: '全部状态', value: '' },
@@ -169,8 +170,8 @@ onMounted(() => {
       <template #cell-status="{ row }"><Tag :tone="STATUS_TONE[row.status] || 'neutral'" dot>{{ STATUS_LABEL[row.status] || row.status }}</Tag></template>
       <template #cell-message="{ row }"><span class="faint">{{ row.message || '—' }}</span></template>
     <template #cell-batchId="{ row }"><span class="mono faint">{{ row.batchId ? `#${row.batchId}` : '—' }}</span></template>
-      <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
-      <template #cell-finishedAt="{ row }"><span class="mono soft">{{ row.finishedAt || '—' }}</span></template>
+      <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
+      <template #cell-finishedAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.finishedAt) }}</span></template>
       <template #cell-actions="{ row }">
         <PermissionButton perm="device:command:list" variant="text" size="sm" icon="search" label="详情" @click="detail = row" />
         <PermissionButton v-if="row.status === 'pending' || row.status === 'running'" perm="device:command:send" variant="text" size="sm" danger icon="x" label="取消" @click="cancel(row)" />
@@ -199,8 +200,8 @@ onMounted(() => {
     <Drawer :open="Boolean(detail)" title="命令详情" :sub="detail ? `${detail.type} · ${detail.nodeName}` : ''" :width="560" @close="detail = null">
       <div v-if="detail" class="detail-stack">
         <div class="kv"><div class="kv-label">状态</div><div class="kv-value"><StatusTag :status="detail.status === 'succeeded'" on="已成功" off="未成功" /> {{ STATUS_LABEL[detail.status] }}</div></div>
-        <div class="kv"><div class="kv-label">创建 / 结束</div><div class="kv-value mono">{{ detail.createdAt }} → {{ detail.finishedAt || '—' }}</div></div>
-        <div v-if="detail.scheduledAt" class="kv"><div class="kv-label">计划时间</div><div class="kv-value mono">{{ detail.scheduledAt }}</div></div>
+        <div class="kv"><div class="kv-label">创建 / 结束</div><div class="kv-value mono">{{ formatLocalDateTime(detail.createdAt) }} → {{ formatLocalDateTime(detail.finishedAt) }}</div></div>
+        <div v-if="detail.scheduledAt" class="kv"><div class="kv-label">计划时间</div><div class="kv-value mono">{{ formatLocalDateTime(detail.scheduledAt) }}</div></div>
         <div v-if="detail.batchId" class="kv"><div class="kv-label">批次</div><div class="kv-value mono">#{{ detail.batchId }}</div></div>
         <div class="kv"><div class="kv-label">载荷</div><pre class="code-block">{{ pretty(detail.payload) }}</pre></div>
         <div class="kv"><div class="kv-label">结果</div><pre class="code-block">{{ pretty(detail.result) }}</pre></div>

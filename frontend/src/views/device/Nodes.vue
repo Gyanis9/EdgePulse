@@ -9,6 +9,7 @@ import { useListPage } from '@/composables/list'
 import { useNodeSocket } from '@/composables/nodeSocket'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 
 const columns: Column[] = [
   { key: 'name', title: '节点名', minWidth: 180 },
@@ -151,7 +152,7 @@ async function remove(node: NodeRow) {
         <span class="faint">{{ row.groupName || '—' }}</span>
       </template>
       <template #cell-lastSeen="{ row }">
-        <span class="mono faint">{{ row.lastSeen || '—' }}</span>
+        <span class="mono faint">{{ formatLocalDateTime(row.lastSeen) }}</span>
       </template>
       <template #cell-labels="{ row }">
         <span class="faint">{{ labelText(row) }}</span>

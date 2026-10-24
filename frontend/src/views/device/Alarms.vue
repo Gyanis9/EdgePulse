@@ -7,6 +7,7 @@ import { useListPage } from '@/composables/list'
 import { useNodeSocket } from '@/composables/nodeSocket'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 
 const LEVELS = [
   { label: '全部级别', value: '' },
@@ -182,7 +183,7 @@ onMounted(loadRules)
         <StatusTag :status="row.status !== 'open'" on="已处理" off="未恢复" />
         <span class="cell-sub">{{ STATUS_LABEL[row.status] || row.status }}</span>
       </template>
-      <template #cell-triggeredAt="{ row }"><span class="mono soft">{{ row.triggeredAt }}</span></template>
+      <template #cell-triggeredAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.triggeredAt) }}</span></template>
       <template #cell-actions="{ row }">
         <PermissionButton v-if="row.status === 'open'" perm="device:alarm:handle" variant="text" size="sm" icon="check" label="确认" @click="ack(row)" />
         <PermissionButton v-if="row.status !== 'resolved'" perm="device:alarm:handle" variant="text" size="sm" icon="power" label="恢复" @click="resolve(row)" />

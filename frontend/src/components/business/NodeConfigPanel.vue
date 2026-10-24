@@ -4,6 +4,7 @@ import { Button, DataTable, EmptyState, Field, Panel, Tag, TextInput, type Colum
 import { ApiError, deviceApi, type NodeConfigRevisionRow, type NodeConfigRow } from '@/api'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
+import { formatLocalDateTime } from '@/utils/time'
 import PermissionButton from './PermissionButton.vue'
 
 const props = defineProps<{ nodeId: number }>()
@@ -188,7 +189,7 @@ defineExpose({ reload })
       <Panel title="期望配置" :meta="config ? `v${config.desired.version}` : ''">
         <div class="panel-body config-stack">
           <div v-if="config" class="config-meta">
-            <span class="mono">{{ config.desired.updatedAt || '—' }}</span>
+            <span class="mono">{{ formatLocalDateTime(config.desired.updatedAt) }}</span>
             <span>操作人 #{{ config.desired.updatedBy || '—' }}</span>
             <code v-if="config.desired.hash">hash {{ config.desired.hash.slice(0, 16) }}</code>
           </div>
@@ -200,7 +201,7 @@ defineExpose({ reload })
         <div class="panel-body config-stack">
           <div v-if="config" class="config-meta">
             <Tag :tone="reportedTone(config.reported.status)" dot>{{ reportedLabel(config.reported.status) }}</Tag>
-            <span class="mono">{{ config.reported.at || '—' }}</span>
+            <span class="mono">{{ formatLocalDateTime(config.reported.at) }}</span>
             <code v-if="config.reported.hash">hash {{ config.reported.hash.slice(0, 16) }}</code>
           </div>
           <p v-if="config?.reported.message" class="faint" style="margin: 0">Agent 说明：{{ config.reported.message }}</p>
@@ -231,7 +232,7 @@ defineExpose({ reload })
       <DataTable :columns="revisionColumns" :data="revisions" :loading="loading" :min-width="620" empty-text="还没有配置修订">
         <template #cell-version="{ row }"><span class="mono">v{{ row.version }}</span></template>
         <template #cell-note="{ row }"><span :class="row.note ? 'muted' : 'faint'">{{ row.note || '—' }}</span></template>
-        <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
+        <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
         <template #cell-actions="{ row }">
           <PermissionButton
             perm="device:node:write"

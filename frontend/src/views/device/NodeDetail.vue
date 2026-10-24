@@ -9,6 +9,7 @@ import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { copyText } from '@/utils/clipboard'
 import { formatMetricValue } from '@/utils/metric'
+import { formatLocalDateTime } from '@/utils/time'
 
 type Tab = 'overview' | 'telemetry' | 'alarms' | 'commands' | 'firmware' | 'config'
 const TABS: Array<{ label: string; value: Tab }> = [
@@ -94,7 +95,7 @@ const labelsText = computed(() => {
 const canRevoke = computed(() => Boolean(node.value?.certFingerprint) && !node.value?.certRevokedAt)
 const firmwareCommands = computed(() => commands.value.filter(row => row.type.startsWith('firmware.')))
 const headerDesc = computed(() => node.value
-  ? `最后心跳 ${node.value.lastSeen || '—'} · Agent ${node.value.agentVersion || '—'} · 分组 ${node.value.groupName || '未分组'}`
+  ? `最后心跳 ${formatLocalDateTime(node.value.lastSeen)} · Agent ${node.value.agentVersion || '—'} · 分组 ${node.value.groupName || '未分组'}`
   : '查看证书、遥测、告警、命令、固件与配置')
 const telemetryPath = computed(() => pathOf('device/Telemetry'))
 const commandsPath = computed(() => pathOf('device/Commands'))
@@ -261,7 +262,7 @@ onMounted(load)
             </div>
             <div class="kv">
               <div class="kv-label">最后心跳</div>
-              <div class="kv-value mono">{{ node.lastSeen || '—' }}</div>
+              <div class="kv-value mono">{{ formatLocalDateTime(node.lastSeen) }}</div>
             </div>
             <div class="kv">
               <div class="kv-label">Agent 版本</div>
@@ -280,12 +281,12 @@ onMounted(load)
             </div>
             <div class="kv">
               <div class="kv-label">证书到期</div>
-              <div class="kv-value mono">{{ node.certNotAfter || '—' }}</div>
+              <div class="kv-value mono">{{ formatLocalDateTime(node.certNotAfter) }}</div>
             </div>
             <div class="kv">
               <div class="kv-label">证书状态</div>
               <div class="kv-value">
-                <Tag v-if="node.certRevokedAt" tone="danger" dot>已吊销 {{ node.certRevokedAt }}</Tag>
+                <Tag v-if="node.certRevokedAt" tone="danger" dot>已吊销 {{ formatLocalDateTime(node.certRevokedAt) }}</Tag>
                 <Tag v-else-if="node.certFingerprint" tone="ok" dot>有效</Tag>
                 <span v-else class="faint">未绑定证书</span>
               </div>
@@ -315,7 +316,7 @@ onMounted(load)
             <template #cell-metric="{ row }"><span class="mono">{{ row.metric }}</span></template>
             <template #cell-value="{ row }"><span class="tnum">{{ formatMetricValue(row.value, row.unit) }}</span></template>
             <template #cell-unit="{ row }"><span class="soft">{{ row.unit || '—' }}</span></template>
-            <template #cell-collectedAt="{ row }"><span class="mono soft">{{ row.collectedAt }}</span></template>
+            <template #cell-collectedAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.collectedAt) }}</span></template>
           </DataTable>
         </div>
       </Panel>
@@ -330,7 +331,7 @@ onMounted(load)
             <template #cell-status="{ row }">
               <Tag :tone="ALARM_STATUS_TONE[row.status] || 'neutral'" dot>{{ ALARM_STATUS_LABEL[row.status] || row.status }}</Tag>
             </template>
-            <template #cell-triggeredAt="{ row }"><span class="mono soft">{{ row.triggeredAt }}</span></template>
+            <template #cell-triggeredAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.triggeredAt) }}</span></template>
             <template #cell-actions="{ row }">
               <PermissionButton v-if="row.status === 'open'" perm="device:alarm:handle" variant="text" size="sm" icon="check" label="确认" @click="ackAlarm(row)" />
               <PermissionButton v-if="row.status !== 'resolved'" perm="device:alarm:handle" variant="text" size="sm" icon="power" label="恢复" @click="resolveAlarm(row)" />
@@ -351,8 +352,8 @@ onMounted(load)
               <Tag :tone="COMMAND_STATUS_TONE[row.status] || 'neutral'" dot>{{ COMMAND_STATUS_LABEL[row.status] || row.status }}</Tag>
             </template>
             <template #cell-message="{ row }"><span class="faint">{{ row.message || '—' }}</span></template>
-            <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
-            <template #cell-finishedAt="{ row }"><span class="mono soft">{{ row.finishedAt || '—' }}</span></template>
+            <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
+            <template #cell-finishedAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.finishedAt) }}</span></template>
           </DataTable>
         </div>
       </Panel>
@@ -370,8 +371,8 @@ onMounted(load)
               <Tag :tone="COMMAND_STATUS_TONE[row.status] || 'neutral'" dot>{{ COMMAND_STATUS_LABEL[row.status] || row.status }}</Tag>
             </template>
             <template #cell-message="{ row }"><span class="faint">{{ row.message || '—' }}</span></template>
-            <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
-            <template #cell-finishedAt="{ row }"><span class="mono soft">{{ row.finishedAt || '—' }}</span></template>
+            <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
+            <template #cell-finishedAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.finishedAt) }}</span></template>
           </DataTable>
         </div>
       </Panel>
