@@ -81,6 +81,12 @@ jobs:
         run: cmake --build --preset debug
       - name: Test
         run: ctest --preset debug --output-on-failure
+      # 环境变量门控的用例被跳过时全量 ctest 仍会绿，这里点名外部依赖用例并断言没有 Skipped
+      - name: Assert external tests ran
+        run: |
+          set -o pipefail
+          ctest --preset debug --output-on-failure --no-tests=error -R "ExternalStores|RealtimeBus" | tee /tmp/external-tests.log
+          ! grep -q "Skipped" /tmp/external-tests.log
       # 服务容器已拉取 mysql:8.4，脚本复用本地镜像，不额外等待下载
       - name: Backup and restore round trip
         run: python scripts/backup_restore_mysql_test.py
@@ -116,7 +122,9 @@ jobs:
 
   lint-workflows:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: actionlint
-        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:latest -color

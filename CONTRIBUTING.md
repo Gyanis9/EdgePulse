@@ -74,10 +74,10 @@ npm run test:e2e
 
 ```bash
 # Linux 与 CI
-docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
+docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:latest -color
 
 # Windows Git Bash 需要阻止 MSYS 改写容器内路径
-MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" -w /repo rhysd/actionlint:latest -color
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo:ro" -w /repo rhysd/actionlint:latest -color
 ```
 
 - 推送后查询 `main` 最近一次 run 的结果（换分支加 `--branch <名称>`）：
@@ -88,6 +88,8 @@ python scripts/check-actions-status.py
 ```
 
 令牌需要该仓库的 Actions 读权限（细粒度 PAT 勾 Actions: Read）。脚本只读环境变量且不打印令牌；缺令牌时打印 SKIP 并退出 77，最近一次 run 成功退出 0，失败、查询出错或没有 run 退出 1。令牌只放在当前 shell 会话，不要写进仓库文件或提交历史。
+
+`python scripts/check-actions-status.py --self-test` 用含换行的假令牌走拒绝路径，确认令牌值不出现在 stdout/stderr。
 
 ## C++ 规范
 
