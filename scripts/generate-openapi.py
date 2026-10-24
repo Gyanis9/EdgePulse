@@ -2,8 +2,12 @@
 """从源码路由字面量生成 OpenAPI 3.1 契约。
 
 只依赖 Python 标准库。路由来源是 src 下 router.get/post/put/del/patch 以及流式变体的
-字符串字面量；摘要、请求/响应 schema 与安全要求来自 docs/openapi-notes.json。生成物写入
-frontend/public/openapi.json，用 --check 与现有文件逐字节比较，供 CI 拦截漂移。
+字符串字面量；摘要、请求/响应 schema、状态码、媒体类型与安全要求来自
+docs/openapi-notes.json。生成物写入 frontend/public/openapi.json，用 --check 与现有文件
+逐字节比较，供 CI 拦截漂移。
+
+路径里的 {name} 一律生成 required 的 path 参数；非字面量路由、重复 path+method、
+notes 未知键或未知安全方案都让生成失败，只有反向代理的动态前缀在允许清单内。
 """
 
 from __future__ import annotations
@@ -21,6 +25,12 @@ OUTPUT_PATH = REPO_ROOT / "frontend" / "public" / "openapi.json"
 
 ROUTE_PATTERN = re.compile(r'router\.(get|post|put|del|patch|postStreaming|putStreaming)\(\s*"([^"]+)"')
 
+# 同一批入口的非字面量形式也要拦住：只有反向代理的动态前缀允许例外
+ROUTER_CALL_PATTERN = re.compile(r"router\.(get|post|put|del|patch|postStreaming|putStreaming|any)\s*\(")
+DYNAMIC_ROUTE_ALLOWLIST = {
+    ("src/Core/Http/ReverseProxy.cpp", "any", "configurationHandle->prefix"),
+}
+
 METHODS = {
     "get": "get",
     "post": "post",
@@ -30,6 +40,27 @@ METHODS = {
     "postStreaming": "post",
     "putStreaming": "put",
 }
+
+PATH_PARAMETER_PATTERN = re.compile(r"\{([^{}]+)\}")
+PATH_PARAMETER_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+INTEGER_PATH_PARAMETERS = {"id", "batchId"}
+
+# notes 只接受这些键；写错键名会让契约悄悄缺字段，因此直接失败
+NOTE_ROOT_KEYS = {"_comment", "paths"}
+NOTE_KEYS = {
+    "summary",
+    "description",
+    "requestSchema",
+    "responseSchema",
+    "security",
+    "envelope",
+    "responseStatus",
+    "responseContentType",
+    "responseDescription",
+}
+SECURITY_SCHEMES = {"bearerAuth"}
+RESPONSE_CONTENT_TYPES = {"application/json", "text/csv"}
+
 
 # 浏览器与自动化 API 的契约不含 Agent 通道、WebSocket、SSE 与探针；通配路由没有可枚举的路径
 SKIP_PREFIXES = ("/api/agent", "/api/ws", "/api/events", "/api/proxy")
@@ -544,41 +575,126 @@ def tag_for(path: str) -> str:
     raise GeneratorError(f"路由 {path} 没有对应的 tag，请在 TAG_RULES 中补前缀")
 
 
+def path_parameters(path: str) -> list[dict[str, object]]:
+    """把路径里的每个 {name} 都声明为必填的 path 参数。"""
+    names = PATH_PARAMETER_PATTERN.findall(path)
+    if len(names) != len(set(names)):
+        raise GeneratorError(f"路由 {path} 重复出现同名路径参数")
+    parameters: list[dict[str, object]] = []
+    for name in names:
+        if not PATH_PARAMETER_NAME_PATTERN.fullmatch(name):
+            raise GeneratorError(f"路由 {path} 的路径参数 {name} 不是合法标识符")
+        schema: dict[str, object] = {"type": "string"}
+        if name in INTEGER_PATH_PARAMETERS:
+            schema = {"type": "integer", "format": "int64"}
+        parameters.append({"name": name, "in": "path", "required": True, "schema": schema})
+    return parameters
+
+
+def validate_path_parameters(path: str, parameters: list[dict[str, object]]) -> None:
+    """生成期自检：{...} 与 required path 参数必须一一对应。"""
+    placeholders = set(PATH_PARAMETER_PATTERN.findall(path))
+    declared = {str(parameter["name"]) for parameter in parameters if parameter.get("in") == "path" and parameter.get("required") is True}
+    if placeholders != declared:
+        missing = sorted(placeholders - declared)
+        extra = sorted(declared - placeholders)
+        raise GeneratorError(f"路由 {path} 的路径参数声明不完整：缺少 {missing}，多出 {extra}")
+
+
+def reject_non_literal_router_calls(source: Path, text: str) -> None:
+    """非字面量路由会让契约漏项；只有反向代理前缀在允许清单里。"""
+    source_name = source.relative_to(REPO_ROOT).as_posix()
+    for match in ROUTER_CALL_PATTERN.finditer(text):
+        argument_start = match.end()
+        while argument_start < len(text) and text[argument_start].isspace():
+            argument_start += 1
+        if argument_start < len(text) and text[argument_start] == '"':
+            continue
+        argument_end = text.find(",", argument_start)
+        if argument_end < 0:
+            argument_end = len(text)
+        argument = " ".join(text[argument_start:argument_end].split())
+        method = match.group(1)
+        allowed = next(
+            (prefix for file_name, allowed_method, prefix in DYNAMIC_ROUTE_ALLOWLIST if file_name == source_name and allowed_method == method and argument.startswith(prefix)),
+            None,
+        )
+        if allowed is not None:
+            continue
+        line = text.count("\n", 0, match.start()) + 1
+        raise GeneratorError(
+            f"{source_name}:{line} 的 router.{method} 路径不是字符串字面量（{argument[:80]}）；"
+            "生成器无法静态枚举动态路由，只有反向代理的 configurationHandle->prefix 允许例外"
+        )
+
+
 def scan_routes() -> dict[str, dict[str, dict]]:
     """扫描源码，返回 path -> method -> note 的骨架。"""
     routes: dict[str, dict[str, dict]] = {}
     for source in sorted(SOURCE_DIR.rglob("*.cpp")):
         text = strip_comments(source.read_text(encoding="utf-8"))
+        reject_non_literal_router_calls(source, text)
+        source_name = source.relative_to(REPO_ROOT).as_posix()
         for match in ROUTE_PATTERN.finditer(text):
             method = METHODS[match.group(1)]
             path = normalize_path(match.group(2).split("?", 1)[0])
             if should_skip(path):
                 continue
             if not path.startswith("/api/"):
-                raise GeneratorError(f"{source.relative_to(REPO_ROOT)} 的路由 {path} 不在 /api 下")
-            routes.setdefault(path, {}).setdefault(method, {"source": source.relative_to(REPO_ROOT).as_posix()})
+                raise GeneratorError(f"{source_name} 的路由 {path} 不在 /api 下")
+            existing = routes.setdefault(path, {}).get(method)
+            if existing is not None:
+                raise GeneratorError(f"{method.upper()} {path} 在 {existing['source']} 与 {source_name} 重复注册；同一 path+method 只能有一条字面量路由")
+            routes[path][method] = {"source": source_name}
     if not routes:
         raise GeneratorError(f"{SOURCE_DIR} 下没有扫描到任何路由字面量")
     return routes
 
 
 def load_notes() -> dict[str, dict[str, dict]]:
-    """读取并校验手写摘要；notes 里出现未注册的方法说明文件已过期。"""
+    """读取并校验手写摘要；未知键、未知方法与未知安全方案都让生成失败。"""
     try:
         data = json.loads(NOTES_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
         raise GeneratorError(f"缺少 {NOTES_PATH.relative_to(REPO_ROOT)}") from error
     except json.JSONDecodeError as error:
         raise GeneratorError(f"{NOTES_PATH.relative_to(REPO_ROOT)} 不是合法 JSON：{error}") from error
-    paths = data.get("paths") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        raise GeneratorError(f"{NOTES_PATH.relative_to(REPO_ROOT)} 的顶层必须是对象")
+    unknown_root = set(data) - NOTE_ROOT_KEYS
+    if unknown_root:
+        raise GeneratorError(f"openapi-notes 含未知顶层键：{sorted(unknown_root)}")
+    paths = data.get("paths")
     if not isinstance(paths, dict):
         raise GeneratorError(f"{NOTES_PATH.relative_to(REPO_ROOT)} 的顶层必须是包含 paths 的对象")
     for path, methods in paths.items():
         if not isinstance(methods, dict):
             raise GeneratorError(f"openapi-notes 的 {path} 必须是方法到摘要的对象")
-        for method in methods:
+        for method, note in methods.items():
+            location = f"openapi-notes 的 {method.upper()} {path}"
             if method not in {"get", "post", "put", "delete", "patch"}:
-                raise GeneratorError(f"openapi-notes 的 {path} 含未知方法 {method}")
+                raise GeneratorError(f"{location} 含未知方法")
+            if not isinstance(note, dict):
+                raise GeneratorError(f"{location} 必须是对象")
+            unknown_keys = set(note) - NOTE_KEYS
+            if unknown_keys:
+                raise GeneratorError(f"{location} 含未知键：{sorted(unknown_keys)}")
+            for key in ("summary", "description", "responseContentType", "responseDescription"):
+                if key in note and not isinstance(note[key], str):
+                    raise GeneratorError(f"{location} 的 {key} 必须是字符串")
+            for key in ("requestSchema", "responseSchema"):
+                if key in note and not isinstance(note[key], str):
+                    raise GeneratorError(f"{location} 的 {key} 必须是字符串")
+            if "envelope" in note and not isinstance(note["envelope"], bool):
+                raise GeneratorError(f"{location} 的 envelope 必须是布尔值")
+            status = note.get("responseStatus", 200)
+            if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
+                raise GeneratorError(f"{location} 的 responseStatus 必须是 100 到 599 的整数")
+            content_type = note.get("responseContentType")
+            if content_type is not None and content_type not in RESPONSE_CONTENT_TYPES:
+                raise GeneratorError(f"{location} 的 responseContentType 必须是 {sorted(RESPONSE_CONTENT_TYPES)} 之一")
+            if content_type is not None and content_type != "application/json" and "responseSchema" in note:
+                raise GeneratorError(f"{location} 的 responseSchema 只适用于 application/json；{content_type} 不能套用 JSON schema")
     return paths
 
 
@@ -592,8 +708,15 @@ def operation_security(note: dict, location: str) -> list[dict]:
     requirements: list[dict] = []
     for item in configured:
         if isinstance(item, str):
+            if item not in SECURITY_SCHEMES:
+                raise GeneratorError(f"{location} 引用了未知安全方案 {item}；可选值：{sorted(SECURITY_SCHEMES)}")
             requirements.append({item: []})
         elif isinstance(item, dict):
+            for name, scopes in item.items():
+                if name not in SECURITY_SCHEMES:
+                    raise GeneratorError(f"{location} 引用了未知安全方案 {name}；可选值：{sorted(SECURITY_SCHEMES)}")
+                if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+                    raise GeneratorError(f"{location} 的安全方案 {name} 的 scopes 必须是字符串数组")
             requirements.append(item)
         else:
             raise GeneratorError(f"{location} 的 security 元素必须是方案名或安全要求对象")
@@ -601,7 +724,7 @@ def operation_security(note: dict, location: str) -> list[dict]:
 
 
 def response_body_schema(response_schema: str | None, note: dict) -> dict:
-    """合成 200 响应体。
+    """合成 JSON 响应体。
 
     responseSchema 描述的是包络里的 data；省略或写 Envelope 时直接复用统一包络。
     envelope 为 false 表示整个响应体就是该 schema，例如 /api/openapi.json 返回的原始文档。
@@ -619,36 +742,65 @@ def response_body_schema(response_schema: str | None, note: dict) -> dict:
     }
 
 
+def success_response(note: dict, response_schema: str | None, location: str) -> tuple[str, dict]:
+    """按 notes 合成成功响应；状态与媒体类型缺省为 200 application/json。"""
+    status = int(note.get("responseStatus", 200))
+    content_type = note.get("responseContentType")
+    if content_type is None:
+        if 300 <= status < 400 or status in (204, 304):
+            content_type = None
+        else:
+            content_type = "application/json"
+    if 300 <= status < 400:
+        response: dict[str, object] = {
+            "description": note.get("responseDescription") or "重定向",
+            "headers": {"Location": {"required": True, "schema": {"type": "string"}, "description": "重定向目标"}},
+        }
+    else:
+        response = {"description": note.get("responseDescription") or "成功"}
+    if content_type == "application/json":
+        response["content"] = {"application/json": {"schema": response_body_schema(response_schema, note)}}
+    elif content_type == "text/csv":
+        response["content"] = {"text/csv": {"schema": {"type": "string", "description": "CSV 文本，UTF-8 BOM"}}}
+    elif content_type is not None:
+        raise GeneratorError(f"{location} 的 responseContentType {content_type} 不受支持")
+    elif response_schema is not None:
+        raise GeneratorError(f"{location} 无响应正文时不能声明 responseSchema")
+    return str(status), response
+
+
 def build_paths(routes: dict[str, dict[str, dict]], notes: dict[str, dict[str, dict]]) -> dict[str, dict[str, dict]]:
     """合成按 path、method 排序的 paths 对象。"""
     paths: dict[str, dict[str, dict]] = {}
     for path in sorted(routes):
         tag = tag_for(path)
+        parameters = path_parameters(path)
+        validate_path_parameters(path, parameters)
         for method in sorted(routes[path]):
             note = notes.get(path, {}).get(method, {})
+            location = f"{method.upper()} {path}"
             request_schema = note.get("requestSchema")
             response_schema = note.get("responseSchema")
             if request_schema is not None and request_schema not in SCHEMAS:
-                raise GeneratorError(f"{method.upper()} {path} 引用了未知请求 schema {request_schema}")
+                raise GeneratorError(f"{location} 引用了未知请求 schema {request_schema}")
             if response_schema is not None and response_schema not in SCHEMAS:
-                raise GeneratorError(f"{method.upper()} {path} 引用了未知响应 schema {response_schema}")
+                raise GeneratorError(f"{location} 引用了未知响应 schema {response_schema}")
             operation: dict[str, object] = {
                 "tags": [tag],
                 "summary": note.get("summary") or f"{tag} {method.upper()} {path}",
-                "security": operation_security(note, f"{method.upper()} {path}"),
+                "security": operation_security(note, location),
             }
             if note.get("description"):
                 operation["description"] = note["description"]
+            operation["parameters"] = parameters
             if request_schema is not None:
                 operation["requestBody"] = {
                     "required": True,
                     "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{request_schema}"}}},
                 }
+            status, response = success_response(note, response_schema, location)
             operation["responses"] = {
-                "200": {
-                    "description": "成功",
-                    "content": {"application/json": {"schema": response_body_schema(response_schema, note)}},
-                },
+                status: response,
                 "default": {
                     "description": "统一错误包络",
                     "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}},
@@ -656,6 +808,22 @@ def build_paths(routes: dict[str, dict[str, dict]], notes: dict[str, dict[str, d
             }
             paths.setdefault(path, {})[method] = operation
     return paths
+
+
+def validate_generated_paths(paths: dict[str, dict[str, dict]]) -> None:
+    """成品自检：每个 {name} 段都必须有对应的 required path 参数。"""
+    for path, methods in paths.items():
+        placeholders = set(PATH_PARAMETER_PATTERN.findall(path))
+        for method, operation in methods.items():
+            parameters = operation.get("parameters")
+            if not isinstance(parameters, list):
+                raise GeneratorError(f"{method.upper()} {path} 缺少 parameters 数组")
+            validate_path_parameters(path, parameters)
+            if not placeholders:
+                continue
+            declared = {parameter.get("name") for parameter in parameters if isinstance(parameter, dict)}
+            if not placeholders.issubset(declared):
+                raise GeneratorError(f"{method.upper()} {path} 的路径参数声明不完整")
 
 
 def validate_notes(routes: dict[str, dict[str, dict]], notes: dict[str, dict[str, dict]]) -> None:
@@ -672,6 +840,7 @@ def render() -> str:
     notes = load_notes()
     validate_notes(routes, notes)
     paths = build_paths(routes, notes)
+    validate_generated_paths(paths)
     document = {
         "openapi": "3.1.0",
         "info": {

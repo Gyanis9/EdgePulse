@@ -19,6 +19,30 @@
 
 namespace EdgePulse::App
 {
+    namespace
+    {
+        constexpr std::string_view kOpenApiErrorHeader    = "x-openapi-error";
+        constexpr std::string_view kOpenApiMissingValue   = "missing";
+        constexpr std::string_view kOpenApiMissingMessage = "openapi spec not found";
+
+        /**
+         * @brief 判断读入的生成物是否像一份 JSON 对象
+         * @param content 文件内容
+         * @return 跳过 UTF-8 BOM 与空白后首字符是 { 时为 true
+         */
+        [[nodiscard]] bool looksLikeJsonObject(const std::string &content)
+        {
+            std::string_view           view{content};
+            constexpr std::string_view utf8Bom{"\xEF\xBB\xBF"};
+            if (view.starts_with(utf8Bom))
+            {
+                view.remove_prefix(utf8Bom.size());
+            }
+            const std::size_t first = view.find_first_not_of(" \t\r\n");
+            return first != std::string_view::npos && view[first] == '{';
+        }
+    } // namespace
+
     void registerHealthRoutes(AsynGyanis::Net::Router &router)
     {
         router.get("/api/health",
@@ -39,7 +63,12 @@ namespace EdgePulse::App
         {
             std::ostringstream buffer;
             buffer << stream.rdbuf();
-            document = std::make_shared<const std::string>(buffer.str());
+            const std::string content = buffer.str();
+            // 空文件或被截断成非对象的生成物按缺失处理，避免把畸形内容当 200 发出去
+            if (looksLikeJsonObject(content))
+            {
+                document = std::make_shared<const std::string>(content);
+            }
         }
 
         router.get("/api/openapi.json",
@@ -48,7 +77,9 @@ namespace EdgePulse::App
                        const std::string traceId = Web::resolveRequestId(request);
                        if (!document)
                        {
-                           Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "openapi spec not found", traceId);
+                           // 与 SPA 兜底的普通 404 区分：调用方据此判断契约文件本身缺失或不可读
+                           static_cast<void>(response.setHeader(kOpenApiErrorHeader, kOpenApiMissingValue));
+                           Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, kOpenApiMissingMessage, traceId);
                            co_return;
                        }
                        response.setStatus(200);

@@ -1,5 +1,5 @@
 {
-  "_comment": "OpenAPI 摘要与 schema 覆盖表。paths[path][method] 支持 summary、description、requestSchema、responseSchema、security、envelope。responseSchema 描述包络里的 data，省略或写 Envelope 表示整个响应就是统一包络；envelope=false 表示响应体就是该 schema。security 省略时默认 Bearer，写 [] 表示匿名。未列出的端点由生成器给通用摘要与 Envelope。",
+  "_comment": "OpenAPI 摘要与 schema 覆盖表。paths[path][method] 支持 summary、description、requestSchema、responseSchema、security、envelope、responseStatus、responseContentType、responseDescription。responseSchema 描述包络里的 data，省略或写 Envelope 表示整个响应就是统一包络；envelope=false 表示响应体就是该 schema。responseStatus 缺省 200；responseContentType 缺省 application/json，text/csv 不得同时声明 responseSchema。security 省略时默认 Bearer，写 [] 表示匿名；方案名只能是 bearerAuth。未列出的端点由生成器给通用摘要与 Envelope；未知键或未知方案会让生成失败。",
   "paths": {
     "/api/alarm-rules": {
       "get": {
@@ -117,7 +117,7 @@
       "get": {
         "summary": "OIDC 回调；重定向回前端并附带一次性 oidcCode",
         "description": "成功与失败都以 302 回到前端，失败时带 oidcError。",
-        "responseSchema": "Envelope",
+        "responseStatus": 302,
         "security": []
       }
     },
@@ -139,7 +139,7 @@
       "get": {
         "summary": "开始 OIDC 登录；重定向到身份提供方",
         "description": "成功时返回 302 到 IdP；return 只接受本站绝对路径。",
-        "responseSchema": "Envelope",
+        "responseStatus": 302,
         "security": []
       }
     },
@@ -265,6 +265,12 @@
         "responseSchema": "Envelope"
       }
     },
+    "/api/monitor/login-logs/export": {
+      "get": {
+        "summary": "导出登录日志为 CSV",
+        "responseContentType": "text/csv"
+      }
+    },
     "/api/monitor/login-logs/heatmap": {
       "get": {
         "summary": "登录时间热力图与失败聚合",
@@ -291,6 +297,12 @@
       "delete": {
         "summary": "清空操作日志",
         "responseSchema": "Envelope"
+      }
+    },
+    "/api/monitor/oper-logs/export": {
+      "get": {
+        "summary": "导出操作日志为 CSV",
+        "responseContentType": "text/csv"
       }
     },
     "/api/monitor/oper-logs/stats": {
@@ -426,6 +438,48 @@
       "post": {
         "summary": "轮换 API 令牌；旧明文在一个重叠窗口内仍有效",
         "responseSchema": "ApiToken"
+      }
+    },
+    "/api/system/configs/export": {
+      "get": {
+        "summary": "导出参数配置为 CSV",
+        "responseContentType": "text/csv"
+      }
+    },
+    "/api/system/depts/export": {
+      "get": {
+        "summary": "导出部门为 CSV",
+        "responseContentType": "text/csv"
+      }
+    },
+    "/api/system/dict/types/export": {
+      "get": {
+        "summary": "导出字典类型为 CSV",
+        "responseContentType": "text/csv"
+      }
+    },
+    "/api/system/menus/export": {
+      "get": {
+        "summary": "导出菜单为 CSV",
+        "responseContentType": "text/csv"
+      }
+    },
+    "/api/system/posts/export": {
+      "get": {
+        "summary": "导出岗位为 CSV",
+        "responseContentType": "text/csv"
+      }
+    },
+    "/api/system/roles/export": {
+      "get": {
+        "summary": "导出角色为 CSV",
+        "responseContentType": "text/csv"
+      }
+    },
+    "/api/system/users/export": {
+      "get": {
+        "summary": "导出用户为 CSV",
+        "responseContentType": "text/csv"
       }
     },
     "/api/telemetry/latest": {

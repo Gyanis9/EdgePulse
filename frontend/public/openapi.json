@@ -52,6 +52,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -97,6 +98,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -144,6 +146,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -175,6 +188,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -224,6 +248,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -269,6 +294,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -318,6 +354,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -365,6 +412,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -408,6 +466,7 @@
         ],
         "summary": "签发一次性图形验证码",
         "security": [],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -451,6 +510,7 @@
         ],
         "summary": "登录；启用两步验证时先返回挑战",
         "security": [],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -508,6 +568,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -543,6 +604,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -578,6 +640,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -625,6 +688,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -670,6 +734,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -727,6 +792,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -774,6 +840,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -827,6 +894,7 @@
         ],
         "summary": "完成两步验证挑战并签发会话令牌",
         "security": [],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -881,14 +949,17 @@
         "summary": "OIDC 回调；重定向回前端并附带一次性 oidcCode",
         "security": [],
         "description": "成功与失败都以 302 回到前端，失败时带 oidcError。",
+        "parameters": [],
         "responses": {
-          "200": {
-            "description": "成功",
-            "content": {
-              "application/json": {
+          "302": {
+            "description": "重定向",
+            "headers": {
+              "Location": {
+                "required": true,
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
-                }
+                  "type": "string"
+                },
+                "description": "重定向目标"
               }
             }
           },
@@ -912,6 +983,7 @@
         ],
         "summary": "查询是否启用 OIDC 登录",
         "security": [],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -943,6 +1015,7 @@
         ],
         "summary": "用一次性 oidcCode 换取会话令牌",
         "security": [],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -975,14 +1048,17 @@
         "summary": "开始 OIDC 登录；重定向到身份提供方",
         "security": [],
         "description": "成功时返回 302 到 IdP；return 只接受本站绝对路径。",
+        "parameters": [],
         "responses": {
-          "200": {
-            "description": "成功",
-            "content": {
-              "application/json": {
+          "302": {
+            "description": "重定向",
+            "headers": {
+              "Location": {
+                "required": true,
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
-                }
+                  "type": "string"
+                },
+                "description": "重定向目标"
               }
             }
           },
@@ -1010,6 +1086,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -1055,6 +1132,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1090,6 +1168,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1135,6 +1214,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -1192,6 +1272,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -1249,6 +1330,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "batchId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -1282,6 +1374,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -1331,6 +1434,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1366,6 +1470,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1399,6 +1504,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1432,6 +1538,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -1469,6 +1586,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1514,6 +1632,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1561,6 +1680,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1608,6 +1728,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -1641,6 +1772,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -1678,6 +1820,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -1713,6 +1866,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -1744,6 +1908,7 @@
         ],
         "summary": "存活检查，返回服务器时间",
         "security": [],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1779,6 +1944,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1812,6 +1978,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1853,19 +2020,21 @@
         "tags": [
           "monitor"
         ],
-        "summary": "monitor GET /api/monitor/login-logs/export",
+        "summary": "导出登录日志为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -1894,6 +2063,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1929,6 +2099,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -1962,6 +2133,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -1999,6 +2181,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2032,6 +2215,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2073,19 +2257,21 @@
         "tags": [
           "monitor"
         ],
-        "summary": "monitor GET /api/monitor/oper-logs/export",
+        "summary": "导出操作日志为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -2114,6 +2300,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2149,6 +2336,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2182,6 +2370,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -2219,6 +2418,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2252,6 +2452,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2287,6 +2488,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -2318,6 +2530,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -2355,6 +2578,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2400,6 +2624,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -2457,6 +2682,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -2488,6 +2724,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -2533,6 +2780,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "requestBody": {
@@ -2592,6 +2850,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -2639,6 +2908,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -2670,6 +2950,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -2705,6 +2996,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -2754,6 +3056,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -2785,6 +3098,7 @@
         ],
         "summary": "读取本 OpenAPI 3.1 契约",
         "security": [],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2820,6 +3134,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2855,6 +3170,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2890,6 +3206,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -2935,6 +3252,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -2992,6 +3310,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -3025,6 +3354,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3074,6 +3414,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3107,6 +3448,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3136,19 +3478,21 @@
         "tags": [
           "system"
         ],
-        "summary": "system GET /api/system/configs/export",
+        "summary": "导出参数配置为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -3175,6 +3519,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3208,6 +3563,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3245,6 +3611,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3274,19 +3641,21 @@
         "tags": [
           "system"
         ],
-        "summary": "system GET /api/system/depts/export",
+        "summary": "导出部门为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -3315,6 +3684,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3350,6 +3720,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -3381,6 +3762,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3418,6 +3810,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3451,6 +3844,16 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "dictType",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -3488,6 +3891,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -3519,6 +3933,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3556,6 +3981,16 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "dictType",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -3591,6 +4026,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3624,6 +4060,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3653,19 +4090,21 @@
         "tags": [
           "system"
         ],
-        "summary": "system GET /api/system/dict/types/export",
+        "summary": "导出字典类型为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -3692,6 +4131,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3725,6 +4175,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3762,6 +4223,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3791,19 +4253,21 @@
         "tags": [
           "system"
         ],
-        "summary": "system GET /api/system/menus/export",
+        "summary": "导出菜单为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -3832,6 +4296,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3867,6 +4332,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -3898,6 +4374,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -3935,6 +4422,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -3968,6 +4456,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4003,6 +4492,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4038,6 +4528,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -4069,6 +4570,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4106,6 +4618,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4141,6 +4654,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4174,6 +4688,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4203,19 +4718,21 @@
         "tags": [
           "system"
         ],
-        "summary": "system GET /api/system/posts/export",
+        "summary": "导出岗位为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -4242,6 +4759,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4275,6 +4803,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4312,6 +4851,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4345,6 +4885,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4374,19 +4915,21 @@
         "tags": [
           "system"
         ],
-        "summary": "system GET /api/system/roles/export",
+        "summary": "导出角色为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -4413,6 +4956,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4446,6 +5000,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4483,6 +5048,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -4516,6 +5092,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4553,6 +5140,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4586,6 +5174,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4619,6 +5208,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4656,6 +5256,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4689,6 +5290,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4718,19 +5320,21 @@
         "tags": [
           "system"
         ],
-        "summary": "system GET /api/system/users/export",
+        "summary": "导出用户为 CSV",
         "security": [
           {
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
             "content": {
-              "application/json": {
+              "text/csv": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "string",
+                  "description": "CSV 文本，UTF-8 BOM"
                 }
               }
             }
@@ -4759,6 +5363,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -4794,6 +5399,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -4825,6 +5441,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4862,6 +5489,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -4895,6 +5533,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -4932,6 +5581,17 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "成功",
@@ -4967,6 +5627,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",
@@ -5014,6 +5675,7 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [],
         "responses": {
           "200": {
             "description": "成功",

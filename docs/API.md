@@ -30,7 +30,7 @@
 
 ## 2. 系统管理
 
-所有写接口要求对应权限码；列表支持 `keyword`、`pageNum`、`pageSize`，导出返回 UTF-8 BOM 的 CSV。
+所有写接口要求对应权限码；列表支持 `keyword`、`pageNum`、`pageSize`，导出返回 UTF-8 BOM 的 CSV（`content-type: text/csv; charset=utf-8`，契约里是 `text/csv` 200，不是 JSON 包络）。
 
 | 方法 | 路径 | 权限 |
 |---|---|---|
@@ -262,9 +262,15 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 
 ## 9. OpenAPI 契约
 
-`GET /api/openapi.json` 返回当前控制面的 OpenAPI 3.1 文档，响应头为 `content-type: application/json` 与 `cache-control: no-cache`。该接口匿名可读；生成物缺失时返回统一包络的 JSON 404。
+`GET /api/openapi.json` 返回当前控制面的 OpenAPI 3.1 文档，响应头为 `content-type: application/json` 与 `cache-control: no-cache`。该接口匿名可读；生成物缺失、为空或不是以 `{` 开头的 JSON 对象时返回统一包络的 JSON 404，并带 `x-openapi-error: missing`，不会返回空 200。
 
-契约的事实来源是 `src/**/*.cpp` 里的 `router.get/post/put/del/patch` 与流式变体字面量，摘要、请求/响应 schema 与安全要求由 `docs/openapi-notes.json` 补齐；`frontend/public/openapi.json` 是生成物，不要手工编辑。
+生产部署必须先执行 `scripts/build-web.sh`（或等价的前端构建），它会把 `frontend/public/openapi.json` 随前端产物复制进后端的 `web/`；只部署后端二进制时该接口会按缺失返回 404。
+
+契约的事实来源是 `src/**/*.cpp` 里的 `router.get/post/put/del/patch` 与流式变体字面量，摘要、请求/响应 schema、状态码与安全要求由 `docs/openapi-notes.json` 补齐；`frontend/public/openapi.json` 是生成物，不要手工编辑。
+
+- 路径里的每个 `{name}` 都会生成一条 `in: path`、`required: true` 的参数；`id` 与 `batchId` 为 `integer/int64`，其余为 `string`。
+- 响应默认是 `200 application/json`；导出端点在 notes 里标为 `200 text/csv`，OIDC 的 `/api/auth/oidc/start` 与 `/api/auth/oidc/callback` 标为 `302` 并声明 `Location` 响应头。
+- 生成器只接受字面量路由路径；唯一例外是反向代理的 `configurationHandle->prefix` 动态前缀。同一 path+method 重复注册、notes 出现未知键或未知安全方案都会让生成失败。
 
 ```bash
 # 重新生成（Python 3，仅标准库）
