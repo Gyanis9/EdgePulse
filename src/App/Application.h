@@ -126,6 +126,7 @@ namespace EdgePulse::Ops
 namespace EdgePulse::Web
 {
     class BrowserWebSocket;
+    class IdempotencyRepository;
     class RealtimeBus;
     class SseBroadcaster;
 } // namespace EdgePulse::Web
@@ -190,7 +191,7 @@ namespace EdgePulse::App
         AsynGyanis::Core::Task<> runCommandScheduler(AsynGyanis::Core::EventLoop &loop);
 
         /**
-         * @brief 周期按保留天数清理遥测、日志与投递记录
+         * @brief 周期按保留天数清理遥测、日志与投递记录，并扫掉到期的幂等记录
          * @param loop 服务器所属事件循环
          * @return AsynGyanis::Core::Task<> 周期协程，活到应用析构
          */
@@ -268,6 +269,7 @@ namespace EdgePulse::App
         std::shared_ptr<Ops::OpsRepository>                       m_opsRepository;          ///< 运维总览
         std::shared_ptr<Web::SseBroadcaster>                      m_sseBroadcaster;         ///< 告警 SSE
         std::unique_ptr<Web::RealtimeBus>                         m_realtimeBus;            ///< 实时事件跨实例总线
+        std::shared_ptr<Web::IdempotencyRepository>               m_idempotencyRepository;  ///< 幂等记录仓储；中间件与保留期清理共用
         std::unique_ptr<AsynGyanis::Net::Router>                  m_h3Router;               ///< h3 专属路由器
         std::shared_ptr<AsynGyanis::Net::TokenBucket>             m_rateLimitBucket;        ///< 所有公开监听器共享的令牌桶
         std::unique_ptr<AsynGyanis::Net::HttpServer>              m_httpServer;             ///< 8080 开发口

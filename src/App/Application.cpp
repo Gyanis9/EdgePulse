@@ -299,6 +299,8 @@ namespace EdgePulse::App
             m_orgRepository        = std::make_shared<System::OrgRepository>(m_database);
             m_dictionaryRepository = std::make_shared<System::DictionaryRepository>(m_database);
             m_logRepository        = std::make_shared<System::LogRepository>(m_database);
+            // 中间件与保留期清理共用同一个仓储，过期幂等行才能被周期扫描物理删掉
+            m_idempotencyRepository = std::make_shared<Web::IdempotencyRepository>(m_database);
             m_dataScopeService     = std::make_shared<Auth::DataScopeService>(m_database);
             m_nodeGroupRepository  = std::make_shared<Device::NodeGroupRepository>(m_database);
             m_telemetryRepository  = std::make_shared<Telemetry::TelemetryRepository>(m_database);
@@ -606,13 +608,12 @@ namespace EdgePulse::App
         loop.scheduler().schedule(m_commandScheduler->handle());
         m_fleetLifecycle = runFleetLifecycle(loop);
         loop.scheduler().schedule(m_fleetLifecycle->handle());
-        if (m_configuration.telemetryRetentionDays > 0 || m_configuration.logRetentionDays > 0 || m_configuration.deliveryRetentionDays > 0)
+        // 幂等记录固定 24 小时 TTL，清理协程总要跑；遥测、日志与投递记录仍按各自保留天数决定是否删除
+        m_dataRetention = runDataRetention(loop);
+        loop.scheduler().schedule(m_dataRetention->handle());
+        if (m_configuration.telemetryRetentionDays <= 0 && m_configuration.logRetentionDays <= 0 && m_configuration.deliveryRetentionDays <= 0)
         {
-            m_dataRetention = runDataRetention(loop);
-            loop.scheduler().schedule(m_dataRetention->handle());
-        } else
-        {
-            LOG_WARN("遥测、日志与投递记录的保留天数都不是正数，不启用过期清理");
+            LOG_WARN("遥测、日志与投递记录的保留天数都不是正数，三类记录不做过期清理；幂等记录仍按 TTL 清理");
         }
         m_ready.store(true, std::memory_order_release);
         return true;
@@ -707,6 +708,17 @@ namespace EdgePulse::App
             {
                 LOG_WARN_FMT("投递记录清理失败：{}", failure.what());
             }
+            try
+            {
+                const std::size_t pruned = co_await m_idempotencyRepository->pruneExpired(loop);
+                if (pruned > 0)
+                {
+                    LOG_INFO_FMT("幂等记录清理完成：删除 {} 条到期记录", pruned);
+                }
+            } catch (const std::exception &failure)
+            {
+                LOG_WARN_FMT("幂等记录清理失败：{}", failure.what());
+            }
             LOG_INFO_FMT("数据清理完成（保留天数，0 表示关闭）：遥测 {}、日志 {}、投递记录 {}", m_configuration.telemetryRetentionDays, m_configuration.logRetentionDays,
                          m_configuration.deliveryRetentionDays);
         }
@@ -767,8 +779,9 @@ namespace EdgePulse::App
         Web::applySecurityHeaders(router);
         Web::applyRateLimit(router, m_rateLimitBucket);
         Web::registerAuditMiddleware(router, loop, *m_authService, *m_logRepository);
-        // 幂等键紧贴业务处理器：审计在外，重放请求也照常留下操作记录
-        Web::applyIdempotency(router, loop, std::make_shared<Web::IdempotencyRepository>(m_database));
+        // 幂等键紧贴业务处理器：审计在外，重放请求也照常留下操作记录；令牌校验在中间件前置，
+        // 吊销后的会话既拿不到重放响应也写不出占位行
+        Web::applyIdempotency(router, loop, m_idempotencyRepository, *m_authService, m_configuration.reverseProxyPrefix);
         registerHealthRoutes(router);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
         Auth::registerMfaRoutes(router, loop, *m_authService, *m_mfaService, *m_logRepository);

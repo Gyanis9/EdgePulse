@@ -77,12 +77,13 @@ namespace EdgePulse::Web
         };
     }
 
-    void applyIdempotency(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, std::shared_ptr<IdempotencyRepository> repository)
+    void applyIdempotency(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, std::shared_ptr<IdempotencyRepository> repository, Auth::AuthService &auth,
+                          std::string excludedPrefix)
     {
         // 空仓储代表调用方显式关闭：不注册比注册一个恒放行的中间件更容易从路由表上确认
         if (repository != nullptr)
         {
-            router.addMiddleware(idempotencyMiddleware(loop, std::move(repository)));
+            router.addMiddleware(idempotencyMiddleware(loop, std::move(repository), auth, std::move(excludedPrefix)));
         }
     }
 

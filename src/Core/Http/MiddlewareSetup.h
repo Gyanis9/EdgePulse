@@ -12,6 +12,7 @@
 #include "Net/Http/Routing/Middleware.h"
 
 #include <memory>
+#include <string>
 
 namespace AsynGyanis::Core
 {
@@ -22,6 +23,11 @@ namespace AsynGyanis::Net
     class Router;
     class TokenBucket;
 } // namespace AsynGyanis::Net
+
+namespace EdgePulse::Auth
+{
+    class AuthService;
+}
 
 namespace EdgePulse::Web
 {
@@ -47,9 +53,12 @@ namespace EdgePulse::Web
      * @param router 目标路由器，必须在 start() 之前调用
      * @param loop 服务器所属事件循环
      * @param repository 幂等记录仓储；空指针表示不注册中间件
+     * @param auth 认证服务，必须先于占位与重放验明令牌
+     * @param excludedPrefix 反向代理前缀；非空时该前缀下的写请求不参与幂等
      * @note 必须排在 registerAuditMiddleware() 之后，让审计仍能记录被重放的请求
      */
-    void applyIdempotency(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, std::shared_ptr<IdempotencyRepository> repository);
+    void applyIdempotency(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, std::shared_ptr<IdempotencyRepository> repository, Auth::AuthService &auth,
+                          std::string excludedPrefix = {});
 
     /**
      * @brief 给路由器挂上共享令牌桶限流
