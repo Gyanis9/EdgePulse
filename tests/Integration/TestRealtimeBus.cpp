@@ -37,6 +37,19 @@ namespace
         return std::string{value};
 #endif
     }
+
+    /**
+     * @brief 读端口环境变量，缺省时退回给定值
+     */
+    [[nodiscard]] std::uint16_t environmentPort(const char *name, const std::uint16_t fallback)
+    {
+        const std::optional<std::string> text = environmentText(name);
+        if (!text.has_value())
+        {
+            return fallback;
+        }
+        return static_cast<std::uint16_t>(std::stoul(*text));
+    }
 } // namespace
 
 // 钉住：两个实例共享 Redis 时，一个实例发布的事件能在另一个实例本地扇出（真实 Redis，缺环境变量即跳过）
@@ -62,7 +75,7 @@ TEST(RealtimeBus, RedisFanoutReachesSecondInstance)
     EdgePulse::Web::RealtimeBusOptions optionsA;
     optionsA.enabled       = true;
     optionsA.host          = *host;
-    optionsA.port          = 6379;
+    optionsA.port          = environmentPort("EDGEPULSE_TEST_REDIS_PORT", 6379);
     optionsA.password      = password;
     optionsA.database      = 15;
     optionsA.channel       = channel;

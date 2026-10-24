@@ -34,7 +34,15 @@ ctest --preset debug -R "Enrollment|NodeConfig|NodeLifecycle" --output-on-failur
 ctest --preset debug -R "SystemEndpoints|RateLimit|StrictSystemEndpoints" --output-on-failure
 ```
 
-- 真机 MySQL/Redis 用例：
+- 真机 MySQL/Redis 用例（需要 Docker）：
+
+```bash
+python scripts/run-external-tests.py
+```
+
+脚本启动一次性 MySQL 8.4 与 Redis 7 容器、在随机宿主端口上设置 `EDGEPULSE_TEST_*`，跑完 `ExternalStores|RealtimeBus` 后删除容器；失败时加 `--keep` 保留现场，用 `docker logs <容器名>` 接着排查。镜像名可用 `--mysql-image`/`--redis-image` 覆盖，离线环境先用 `docker pull` 备好本地镜像，或指到本机已有的等价标签（如 `redis:7-alpine`）。
+
+- 也可以自己准备实例，按下面的变量接线（端口不是固定的 6379/3306 时必须显式传）：
 
 ```bash
 EDGEPULSE_TEST_MYSQL_HOST=127.0.0.1 EDGEPULSE_TEST_MYSQL_PORT=3306 \
@@ -42,7 +50,7 @@ EDGEPULSE_TEST_MYSQL_USER=root EDGEPULSE_TEST_MYSQL_PASSWORD=... \
 EDGEPULSE_TEST_MYSQL_DATABASE=edgepulse_test \
 EDGEPULSE_TEST_REDIS_HOST=127.0.0.1 EDGEPULSE_TEST_REDIS_PORT=6379 \
 EDGEPULSE_TEST_REDIS_PASSWORD=... \
-ctest --preset debug -R ExternalStores --output-on-failure
+ctest --preset debug -R "ExternalStores|RealtimeBus" --output-on-failure
 ```
 
 ## 前端测试
