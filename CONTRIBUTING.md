@@ -68,6 +68,27 @@ npm run test:e2e
 - E2E 使用本机已安装的 Edge（`channel: 'msedge'`），不下载浏览器；Playwright 会通过 `webServer` 启动后端与 Vite，运行前先准备开发证书，并确保 8080、5173 未被不相关进程占用。
 - CI 不跑 Playwright；E2E 在具备 Edge 的机器上本地执行。
 
+## CI
+
+- 流水线定义在 `.github/workflows/ci.yml`。`backend-linux` 用 MySQL 8.4 与 Redis 7 服务容器承载真机用例，并在 `ctest` 之后跑一次 MySQL 备份/恢复往返；改完工作流先在本机过 actionlint：
+
+```bash
+# Linux 与 CI
+docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
+
+# Windows Git Bash 需要阻止 MSYS 改写容器内路径
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" -w /repo rhysd/actionlint:latest -color
+```
+
+- 推送后查询 `main` 最近一次 run 的结果（换分支加 `--branch <名称>`）：
+
+```bash
+export GITHUB_TOKEN=...        # PowerShell：$env:GITHUB_TOKEN = "..."
+python scripts/check-actions-status.py
+```
+
+令牌需要该仓库的 Actions 读权限（细粒度 PAT 勾 Actions: Read）。脚本只读环境变量且不打印令牌；缺令牌时打印 SKIP 并退出 77，最近一次 run 成功退出 0，失败、查询出错或没有 run 退出 1。令牌只放在当前 shell 会话，不要写进仓库文件或提交历史。
+
 ## C++ 规范
 
 - C++23；类/文件 PascalCase，函数/成员 camelCase；非静态成员 `m_` 前缀，静态成员 `s_` 前缀；全局常量 `kPascalCase`。

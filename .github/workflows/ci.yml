@@ -33,6 +33,31 @@ jobs:
 
   backend-linux:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: edgepulse_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ptest"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    env:
+      EDGEPULSE_TEST_MYSQL_HOST: 127.0.0.1
+      EDGEPULSE_TEST_MYSQL_PORT: "3306"
+      EDGEPULSE_TEST_MYSQL_USER: root
+      EDGEPULSE_TEST_MYSQL_PASSWORD: test
+      EDGEPULSE_TEST_MYSQL_DATABASE: edgepulse_test
+      EDGEPULSE_TEST_REDIS_HOST: 127.0.0.1
+      EDGEPULSE_TEST_REDIS_PORT: "6379"
+      EDGEPULSE_TEST_REDIS_PASSWORD: ""
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,6 +81,9 @@ jobs:
         run: cmake --build --preset debug
       - name: Test
         run: ctest --preset debug --output-on-failure
+      # 服务容器已拉取 mysql:8.4，脚本复用本地镜像，不额外等待下载
+      - name: Backup and restore round trip
+        run: python scripts/backup_restore_mysql_test.py
 
   frontend:
     runs-on: ubuntu-latest
@@ -85,3 +113,10 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  lint-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
