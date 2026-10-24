@@ -6,8 +6,8 @@ EDGEPULSE_TEST_MYSQL_* 与 EDGEPULSE_TEST_REDIS_* 再交给 ctest。口令通过
 写入容器，因此会出现在宿主进程参数与 docker inspect 的输出里；容器与口令都是一次性的，
 这是仅用于测试的取舍，不要照搬到部署。
 
-ctest 以 --no-tests=error 运行，并核对输出确实报告三个门控用例，正则零命中或目标缺失
-都会让脚本以非零退出。加 --keep 在失败时保留容器，脚本会打印容器名与映射端口，便于用
+ctest 以 --no-tests=error 运行，并核对输出确实报告三个门控用例；正则零命中、目标缺失或
+出现跳过标记都会让脚本以非零退出。加 --keep 在失败时保留容器，脚本会打印容器名与映射端口，便于用
 docker logs 或客户端接着排查；正常日志不打印口令。
 """
 
@@ -34,6 +34,7 @@ EXPECTED_TESTS = (
     "ExternalStores.RedisKeyValueStoreRoundTrip",
     "RealtimeBus.RedisFanoutReachesSecondInstance",
 )
+SKIP_MARKERS = ("***Skipped", "The following tests did not run")
 
 
 def run(args: list[str], *, env: dict[str, str] | None = None, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -58,7 +59,7 @@ def kept_container(name: str, container_port: str) -> str:
 
 
 def assert_expected_tests(output: str) -> None:
-    """确认 ctest 真的执行了三个门控用例，而不是正则零命中或目标未构建。"""
+    """确认 ctest 真的执行了三个门控用例，而不是正则零命中、目标未构建或环境缺失被跳过。"""
     match = re.search(r"tests passed, \d+ tests failed out of (\d+)", output)
     if match is None:
         raise RuntimeError("ctest 输出没有用例计数，无法确认三个门控用例已执行")
@@ -70,6 +71,12 @@ def assert_expected_tests(output: str) -> None:
     missing = [name for name in EXPECTED_TESTS if name not in output]
     if missing:
         raise RuntimeError(f"ctest 输出缺少用例：{'、'.join(missing)}")
+    skipped = [marker for marker in SKIP_MARKERS if marker in output]
+    if skipped:
+        raise RuntimeError(
+            f"ctest 输出包含跳过标记（{'、'.join(skipped)}）：三个门控用例必须真实执行，"
+            "请检查 EDGEPULSE_TEST_MYSQL_* 与 EDGEPULSE_TEST_REDIS_* 是否已注入"
+        )
 
 
 def run_ctest(env: dict[str, str]) -> None:
