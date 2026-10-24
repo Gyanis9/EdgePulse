@@ -32,8 +32,11 @@ namespace EdgePulse::Agent
          */
         struct DiagnosticsInputs
         {
-            std::string metricsJson; ///< 指标提供者返回的 JSON 文本
-            std::string logTail;     ///< 日志尾文本
+            std::string  metricsJson;            ///< 指标提供者返回的 JSON 文本
+            std::string  logTail;                ///< 日志尾文本
+            std::int64_t configVersion{0};       ///< 状态库里的期望配置版本
+            std::size_t  telemetryQueueDepth{0}; ///< 遥测离线队列条数
+            std::size_t  resultQueueDepth{0};    ///< 命令结果队列条数
         };
 
         /**
@@ -165,7 +168,7 @@ namespace EdgePulse::Agent
         {
             inputs = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<DiagnosticsInputs>(
                     loop,
-                    [provider = m_metricsProvider, logFile = m_configuration.logFile, tailBytes = m_configuration.diagnosticsLogTailBytes]()
+                    [state = &m_state, provider = m_metricsProvider, logFile = m_configuration.logFile, tailBytes = m_configuration.diagnosticsLogTailBytes]()
                     {
                         DiagnosticsInputs collected;
                         if (!provider)
@@ -193,6 +196,11 @@ namespace EdgePulse::Agent
                         {
                             collected.logTail = *tail;
                         }
+
+                        // 状态库调用是阻塞式 SQLite，和日志读取一样留在工作线程，事件循环线程不碰连接
+                        collected.configVersion       = desiredConfigVersion(*state);
+                        collected.telemetryQueueDepth = state->telemetryQueueDepth();
+                        collected.resultQueueDepth    = state->resultQueueDepth();
                         return collected;
                     });
         } catch (const std::exception &failure)
@@ -216,8 +224,8 @@ namespace EdgePulse::Agent
         AsynGyanis::Base::ConfigValue diagnostics = AsynGyanis::Base::ConfigValue::object({
                 {"agentVersion", m_agentVersion},
                 {"nodeName", m_configuration.name},
-                {"configVersion", desiredConfigVersion(m_state)},
-                {"queueDepth", AsynGyanis::Base::ConfigValue::object({{"telemetry", m_state.telemetryQueueDepth()}, {"results", m_state.resultQueueDepth()}})},
+                {"configVersion", inputs.configVersion},
+                {"queueDepth", AsynGyanis::Base::ConfigValue::object({{"telemetry", inputs.telemetryQueueDepth}, {"results", inputs.resultQueueDepth}})},
                 {"metrics", metrics},
                 {"logTail", inputs.logTail},
         });

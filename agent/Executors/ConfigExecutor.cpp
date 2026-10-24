@@ -126,11 +126,15 @@ namespace EdgePulse::Agent
                 if (!hook.succeeded())
                 {
                     std::string restoreError;
+                    bool        restoreSucceeded = true;
                     if (hadOldFile)
                     {
-                        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(target, oldBytes, std::nullopt, &restoreError))
+                        std::string writeBackError;
+                        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(target, oldBytes, std::nullopt, &writeBackError))
                         {
-                            restoreError = "；此外恢复旧配置失败：" + restoreError;
+                            restoreSucceeded = false;
+                            restoreError     = "；此外恢复旧配置失败：" + writeBackError + "，旧配置备份保留在 " + AsynGyanis::Platform::FileSystem::utf8FromPath(backup);
+                            LOG_WARN_FMT("恢复旧配置失败，旧配置备份保留在 {}", AsynGyanis::Platform::FileSystem::utf8FromPath(backup));
                         }
                     } else
                     {
@@ -141,7 +145,10 @@ namespace EdgePulse::Agent
                             restoreError = "；此外删除未生效的新配置失败：" + error.message();
                         }
                     }
-                    removeBackup();
+                    if (restoreSucceeded)
+                    {
+                        removeBackup();
+                    }
                     return ApplyOutcome{false, "配置应用钩子失败：" + hook.failure + restoreError};
                 }
             }

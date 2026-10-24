@@ -49,6 +49,8 @@ namespace EdgePulse::Agent
      * @note 本函数阻塞调用线程，必须经 AsyncExecutor 在事件循环之外调用
      * @note 标准输出与标准错误共用一条管道，合计最多保留 64 KiB；超出部分读取后丢弃，
      *       避免子进程写满管道而卡死
+     * @note Windows 上 .cmd/.bat 的脚本路径与参数中出现双引号、CR、LF 或百分号时直接拒绝执行：
+     *       cmd.exe 在引号内仍会展开 %NAME%，没有可靠的字面量转义
      */
     [[nodiscard]] ProcessRunResult runProcess(const std::filesystem::path &executable, const std::vector<std::string> &arguments, std::chrono::milliseconds timeout);
 } // namespace EdgePulse::Agent

@@ -23,7 +23,7 @@ namespace EdgePulse::Agent
 
     /**
      * @brief 处理 diagnostics.collect 命令
-     * @details 指标由外部提供者采集，日志尾与指标读取都在阻塞执行器上完成；
+     * @details 指标由外部提供者采集，指标、日志尾与状态库里的配置版本和队列深度都在阻塞执行器上读取；
      *          任一提供者缺失或读取失败只降级为空并记录 WARN，命令仍按成功返回。
      *          序列化结果不超过 256 KiB。
      */

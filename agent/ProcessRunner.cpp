@@ -181,8 +181,9 @@ namespace EdgePulse::Agent
             parts.insert(parts.end(), arguments.begin(), arguments.end());
             for (const std::wstring &part: parts)
             {
-                // cmd 没有可靠的转义规则：含引号或换行的成分直接拒绝，不猜
-                if (part.find_first_of(L"\"\r\n") != std::wstring::npos)
+                // cmd 没有可靠的转义规则：百分号在引号内仍会被展开成环境变量，
+                // 含引号、换行或百分号的成分直接拒绝，不猜
+                if (part.find_first_of(L"\"\r\n%") != std::wstring::npos)
                 {
                     return false;
                 }
@@ -233,7 +234,7 @@ namespace EdgePulse::Agent
             std::wstring command;
             if (!buildCmdCommand(executableWide, wideArguments, command))
             {
-                result.failure = "配置的脚本路径或参数含有 cmd 无法安全引用的字符，已拒绝执行";
+                result.failure = "配置的脚本路径或参数含有 cmd 无法安全引用的字符（双引号、换行或百分号），已拒绝执行";
                 return result;
             }
             program     = commandInterpreter();

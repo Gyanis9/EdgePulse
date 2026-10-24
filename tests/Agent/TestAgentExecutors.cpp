@@ -219,6 +219,15 @@ namespace EdgePulse::Agent
             return std::string{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
         }
 
+        [[nodiscard]] std::string trimmedTrailingNewlines(std::string text)
+        {
+            while (!text.empty() && (text.back() == '\r' || text.back() == '\n'))
+            {
+                text.pop_back();
+            }
+            return text;
+        }
+
         struct ConfigCapture
         {
             std::mutex               mutex;
@@ -441,6 +450,46 @@ namespace EdgePulse::Agent
         EXPECT_EQ(3, report->value("version", 0));
     }
 
+    TEST(AgentExecutors, ConfigApplyHookFailureKeepsBackupWhenRestoreFails)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            capture = std::make_shared<ConfigCapture>();
+        TestSupport::ServerHarness      server([capture](AsynGyanis::Net::Router &router, EventLoop &) { installConfigRoutes(router, capture, 3, ConfigValue::object({{"new", true}})); });
+
+        AgentConfiguration configuration = plaintextConfiguration(server.port());
+        configuration.configPath          = directory.path() / "node.json";
+        configuration.configApplyHook     = std::filesystem::path{EDGEPULSE_AGENT_TEST_HOOK_PATH};
+        const std::string oldContent      = "old\r\ncontent\x01";
+        static_cast<void>(directory.write("node.json", oldContent));
+        const auto markerPath = directory.path() / "hook-marker.txt";
+        const ScopedEnvironmentVariable marker("EDGEPULSE_AGENT_TEST_HOOK_MARKER", markerPath.string());
+        const ScopedEnvironmentVariable exitCode("EDGEPULSE_AGENT_TEST_HOOK_EXIT", "1");
+        const ScopedEnvironmentVariable occupy("EDGEPULSE_AGENT_TEST_HOOK_REPLACE_WITH_DIRECTORY", "1");
+
+        AgentLoop     loop;
+        AgentClient   client(loop.loop(), configuration, testIdentity());
+        ConfigExecutor executor(client, configuration, 77);
+        LoopStopGuard stopGuard{loop};
+
+        const auto outcome = loop.run(executor.execute(loop.loop(), AgentCommand{1, "config.apply", R"({"version":3})", 30}), std::chrono::seconds{20}, "恢复失败");
+        ASSERT_TRUE(outcome.has_value());
+        EXPECT_FALSE(outcome->succeeded);
+        EXPECT_NE(std::string::npos, outcome->message.find("钩子"));
+
+        std::filesystem::path backupPath = configuration.configPath;
+        backupPath += ".backup";
+        ASSERT_TRUE(std::filesystem::exists(backupPath)) << "恢复旧配置失败时不能删除唯一副本";
+        EXPECT_EQ(oldContent, readTextFile(backupPath));
+        EXPECT_NE(std::string::npos, outcome->message.find(AsynGyanis::Platform::FileSystem::utf8FromPath(backupPath)))
+                << "失败原因要给出备份路径：" << outcome->message;
+
+        const auto bodies = reportBodies(capture);
+        ASSERT_EQ(1U, bodies.size());
+        const auto report = AsynGyanis::Base::parseConfigValue(bodies.front());
+        ASSERT_TRUE(report.has_value());
+        EXPECT_EQ("failed", report->value("status", std::string{}));
+    }
+
     TEST(AgentExecutors, DiagnosticsReportsBoundedStateMetricsAndLogTail)
     {
         TestSupport::TemporaryDirectory directory;
@@ -484,6 +533,17 @@ namespace EdgePulse::Agent
         EXPECT_LE(tail.size(), 64U);
         EXPECT_NE(std::string::npos, tail.find("TAIL-END"));
         EXPECT_LE(outcome->result.size(), 256U * 1024U);
+
+        state->enqueueTelemetry(R"({"m":3})");
+        const auto refreshedOutcome = loop.run(executor.execute(loop.loop(), AgentCommand{2, "diagnostics.collect", "{}", 30}), std::chrono::seconds{20}, "再次诊断");
+        ASSERT_TRUE(refreshedOutcome.has_value());
+        ASSERT_TRUE(refreshedOutcome->succeeded) << refreshedOutcome->message;
+        EXPECT_EQ(2, calls.load(std::memory_order_acquire));
+        const auto refreshed = AsynGyanis::Base::parseConfigValue(refreshedOutcome->result);
+        ASSERT_TRUE(refreshed.has_value()) << refreshedOutcome->result;
+        EXPECT_EQ(5, refreshed->value("configVersion", 0));
+        EXPECT_EQ(3, refreshed->at("queueDepth").value("telemetry", 0)) << "队列深度必须在每次采集时从状态库重新读取";
+        EXPECT_EQ(1, refreshed->at("queueDepth").value("results", 0));
     }
 
     TEST(AgentExecutors, DiagnosticsDegradesWhenProvidersAndLogAreMissing)
@@ -584,5 +644,70 @@ namespace EdgePulse::Agent
         EXPECT_TRUE(result.succeeded()) << result.failure;
         EXPECT_TRUE(result.outputTruncated);
         EXPECT_EQ(64U * 1024U, result.output.size());
+    }
+
+    TEST(AgentExecutors, ProcessRunnerRunsCmdScriptWithArgumentAndExitCode)
+    {
+#if !defined(_WIN32)
+        GTEST_SKIP() << "cmd.exe 仅在 Windows 上可用";
+#else
+        TestSupport::TemporaryDirectory directory;
+        const auto                      marker = directory.path() / "cmd-marker.txt";
+        const ScopedEnvironmentVariable markerEnv("EDGEPULSE_AGENT_TEST_SCRIPT_MARKER", marker.string());
+        const auto                      script = directory.write("echo-argument.cmd",
+                                                                  "@echo off\r\n"
+                                                                  "> \"%EDGEPULSE_AGENT_TEST_SCRIPT_MARKER%\" echo %~1\r\n"
+                                                                  "exit /b 7\r\n");
+
+        const ProcessRunResult result = runProcess(script, {"script-argument"}, std::chrono::seconds{20});
+        EXPECT_TRUE(result.started) << result.failure;
+        EXPECT_FALSE(result.succeeded());
+        EXPECT_FALSE(result.timedOut);
+        EXPECT_EQ(7, result.exitCode);
+        EXPECT_EQ("script-argument", trimmedTrailingNewlines(readTextFile(marker)));
+#endif
+    }
+
+    TEST(AgentExecutors, ProcessRunnerRunsPowerShellScript)
+    {
+#if !defined(_WIN32)
+        GTEST_SKIP() << "powershell.exe 仅在 Windows 上可用";
+#else
+        TestSupport::TemporaryDirectory directory;
+        const auto marker = directory.path() / "ps-marker.txt";
+        const auto script = directory.write("write-marker.ps1",
+                                            "[System.IO.File]::WriteAllText($args[0], 'powershell-ok')\r\n"
+                                            "exit 0\r\n");
+
+        const ProcessRunResult result = runProcess(script, {marker.string()}, std::chrono::seconds{30});
+        if (!result.started)
+        {
+            GTEST_SKIP() << "powershell.exe 不可用：" << result.failure;
+        }
+        EXPECT_TRUE(result.succeeded()) << result.failure;
+        EXPECT_EQ(0, result.exitCode);
+        EXPECT_EQ("powershell-ok", readTextFile(marker));
+#endif
+    }
+
+    TEST(AgentExecutors, ProcessRunnerRejectsPercentArgumentForCmdScript)
+    {
+#if !defined(_WIN32)
+        GTEST_SKIP() << "cmd.exe 仅在 Windows 上可用";
+#else
+        TestSupport::TemporaryDirectory directory;
+        const auto                      marker = directory.path() / "cmd-marker.txt";
+        const ScopedEnvironmentVariable markerEnv("EDGEPULSE_AGENT_TEST_SCRIPT_MARKER", marker.string());
+        const auto                      script = directory.write("echo-argument.cmd",
+                                                                  "@echo off\r\n"
+                                                                  "> \"%EDGEPULSE_AGENT_TEST_SCRIPT_MARKER%\" echo %~1\r\n"
+                                                                  "exit /b 0\r\n");
+
+        const ProcessRunResult result = runProcess(script, {"%PATH%"}, std::chrono::seconds{20});
+        EXPECT_FALSE(result.started);
+        EXPECT_FALSE(result.succeeded());
+        EXPECT_NE(std::string::npos, result.failure.find("拒绝")) << result.failure;
+        EXPECT_FALSE(std::filesystem::exists(marker)) << "参数在启动子进程之前就必须被拒绝";
+#endif
     }
 } // namespace EdgePulse::Agent

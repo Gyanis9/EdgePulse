@@ -10,9 +10,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -67,6 +69,23 @@ int main(const int argc, char **argv)
     {
         std::cerr << "无法写入标记文件\n";
         return 2;
+    }
+
+    if (environmentValue("EDGEPULSE_AGENT_TEST_HOOK_REPLACE_WITH_DIRECTORY") == "1" && !arguments.empty())
+    {
+        std::error_code error;
+        std::filesystem::remove(arguments.front(), error);
+        if (error)
+        {
+            std::cerr << "无法删除钩子收到的路径：" << error.message() << '\n';
+            return 2;
+        }
+        std::filesystem::create_directories(std::filesystem::path{arguments.front()} / "occupied", error);
+        if (error)
+        {
+            std::cerr << "无法用目录占用钩子收到的路径：" << error.message() << '\n';
+            return 2;
+        }
     }
 
     int exitCode = 0;

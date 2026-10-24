@@ -24,7 +24,8 @@ namespace EdgePulse::Agent
     /**
      * @brief 处理 config.apply 命令
      * @details 从服务端拉取当前配置，校验版本与正文大小，原子写入配置路径；
-     *          配置了应用钩子时以配置文件路径为唯一参数运行，失败则恢复旧文件。
+     *          配置了应用钩子时以配置文件路径为唯一参数运行，失败则恢复旧文件；
+     *          恢复失败时保留备份并把备份路径写进失败原因。
      *          文件读写与钩子运行都在阻塞执行器上完成，事件循环线程只处理网络与协程调度。
      */
     class ConfigExecutor final : public CommandExecutor
