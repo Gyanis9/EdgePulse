@@ -145,7 +145,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `EDGEPULSE_REDIS_PASSWORD` | Redis 口令 |
 | `EDGEPULSE_OPS_BEARER_TOKEN` | 运维口 Bearer |
 | `EDGEPULSE_AGENT_FINGERPRINT` | 可选的单个 Agent 证书固定指纹；为空时只校验证书链 |
-| `EDGEPULSE_INITIAL_PASSWORD` | 用户表单的初始口令提示，不落库、不写日志 |
+| `EDGEPULSE_INITIAL_PASSWORD` | 新建用户与重置密码表单的默认初始口令（预填、可改；不落库、不写日志） |
 | `EDGEPULSE_UDP_TELEMETRY_SECRET` | UDP 遥测 HMAC 密钥；启用时至少 16 字节 |
 | `EDGEPULSE_OIDC_CLIENT_SECRET` | OIDC 客户端密钥；公共客户端可留空 |
 

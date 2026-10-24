@@ -248,7 +248,7 @@ onMounted(async () => {
       <template #cell-createdAt="{ row }"><span class="mono soft">{{ row.createdAt }}</span></template>
       <template #cell-actions="{ row }">
         <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="send" label="下发" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openDeploy(row)" />
-        <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="refresh" label="回滚" @click="openRollback(row)" />
+        <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="refresh" label="回滚" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openRollback(row)" />
         <PermissionButton perm="device:firmware:list" variant="text" size="sm" icon="activity" label="任务" @click="openTasks(row)" />
         <PermissionButton perm="device:firmware:remove" variant="text" size="sm" danger icon="trash" label="删除" @click="remove(row)" />
       </template>

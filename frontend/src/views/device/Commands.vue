@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { Button, Checkbox, Drawer, Field, Select, StatusTag, Tag, TextInput, type Column } from '@/components/ui'
 import { FormDialog, ListPage, PermissionButton } from '@/components/business'
 import { deviceApi, fleetApi, type CommandRow, type NodeRow } from '@/api'
@@ -22,6 +22,7 @@ const STATUS_LABEL: Record<string, string> = { pending: '待执行', running: '�
 const STATUS_TONE: Record<string, string> = { pending: 'neutral', running: 'info', succeeded: 'ok', failed: 'danger', timeout: 'danger', canceled: 'neutral' }
 
 const route = useRoute()
+const router = useRouter()
 const queryNodeId = Number(route.query.nodeId)
 const list = useListPage<CommandRow, { status: string; nodeId: number | null }>({
   query: { status: '', nodeId: Number.isInteger(queryNodeId) && queryNodeId > 0 ? queryNodeId : null },
@@ -135,6 +136,10 @@ async function cancel(row: CommandRow) {
 function clearNodeFilter() {
   list.query.nodeId = null
   list.search()
+  // 节点筛选来自 URL；只清内存状态会让刷新或再次进入时重新套用旧条件
+  const query = { ...route.query }
+  delete query.nodeId
+  void router.replace({ query })
 }
 
 function pretty(value: string) {

@@ -25,7 +25,7 @@
 | GET | `/api/auth/oidc/callback?code=&state=` | 匿名 | 302 回前端，带一次性 `oidcCode` 或 `oidcError` |
 | POST | `/api/auth/oidc/exchange` | 匿名 | `{code}` → `{token,expiresIn,returnPath}`；code 一次性 |
 
-登录失败按 IP 计数，超过 10 次/分钟返回 429；账号在窗口内连续失败达到阈值后锁定，锁定期间返回 423 并提示等待分钟数，成功登录或管理员重置会清空失败计数。验证码一次性、2 分钟过期。新建、重置与改密共用口令策略（最小长度 8–64，可要求大小写、数字与符号）。
+登录失败按 IP 计数，超过 10 次/分钟返回 429；账号在窗口内连续失败达到阈值后锁定，锁定期间返回 423，文案给出配置的锁定时长（分钟，向上取整），不是剩余时间，成功登录或管理员重置会清空失败计数与锁定。验证码一次性、2 分钟过期。新建、重置与改密共用口令策略（最小长度 8–64，可要求大小写、数字与符号）。
 
 ## 2. 系统管理
 
@@ -66,7 +66,7 @@
 | GET/POST | `/api/system/tenants` | `system:tenant:list` / `system:tenant:add`，仅平台管理员 |
 | PUT | `/api/system/tenants/{id}` | `system:tenant:edit`，仅平台管理员；停用用 `{status:0}`，默认租户不可停用 |
 
-用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`；平台管理员创建时可用 `tenantId` 指定归属，租户管理员固定落在本租户。用户列表项带 `tenantId/tenantCode/tenantName/platformAdmin`。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds,deptIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`；取 `CUSTOM` 时必须给出非空 `deptIds`。
+用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`；平台管理员创建时可用 `tenantId` 指定归属，租户管理员固定落在本租户。用户列表项带 `tenantId/tenantCode/tenantName/platformAdmin` 与 `lockedUntil`；`lockedUntil` 为 UTC 的 `YYYY-MM-DD HH:MM:SS`，数据库会保留过期的截止时刻，只有大于当前 UTC 时间才表示账号仍处于锁定中，成功登录或管理员重置后清空。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds,deptIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`；取 `CUSTOM` 时必须给出非空 `deptIds`。
 
 租户写入字段：创建 `{code,name,remark?,adminUsername,adminNickname?,adminPassword}`，同时创建租户根部门、租户管理员角色与管理员账号；更新 `{name?,status?,remark?}`。租户编码为小写字母开头、仅含小写字母/数字/下划线，最长 32 位且全局唯一。
 
@@ -254,7 +254,7 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 | 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；节点或配置 `expectedVersion` 乐观锁冲突；并发注册冲突；仍被占用的删除 |
 | 413 | 固件超过上传上限 |
 | 416 | Range 越界 |
-| 423 | 账号因窗口内连续登录失败被锁定 |
+| 423 | 账号因窗口内连续登录失败被锁定；提示中的分钟数为配置的锁定时长 |
 | 429 | 验证码签发过频、登录失败过频、公开 API 全局限流 |
 | 500 | 数据库/文件/未知内部故障 |
 | 503 | 服务未就绪或停机排空 |

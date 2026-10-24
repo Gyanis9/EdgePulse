@@ -13,6 +13,7 @@ import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { flattenDepts } from '@/composables/dept'
 import type { Dept } from '@/data'
+import { isLockActive } from '@/utils/time'
 import { email, phone, required, validate } from '@/utils/validate'
 
 const route = useRoute()
@@ -418,7 +419,7 @@ async function batchRemove(ids: (string | number)[]) {
     <template #cell-status="{ row }">
       <div class="flag-row">
         <StatusTag :status="row.status" />
-        <Tag v-if="row.lockedUntil" tone="danger" dot>已锁定</Tag>
+        <Tag v-if="isLockActive(row.lockedUntil)" tone="danger" dot>已锁定</Tag>
       </div>
     </template>
     <template #cell-createTime="{ row }"><span class="tnum soft">{{ row.createTime }}</span></template>
@@ -426,7 +427,7 @@ async function batchRemove(ids: (string | number)[]) {
       <div class="row-actions">
         <PermissionButton perm="system:user:edit" icon-only icon="edit" label="编辑" @click="openEdit(row)" />
         <PermissionButton v-if="tracePath" perm="system:role:list" icon-only icon="shield" label="权限溯源" @click="openTrace(row)" />
-        <PermissionButton perm="system:user:resetPwd" icon-only icon="key" label="重置密码" @click="openReset(row)" />
+        <PermissionButton perm="system:user:reset" icon-only icon="key" label="重置密码" @click="openReset(row)" />
         <PermissionButton perm="system:user:remove" icon-only icon="trash" label="删除" danger @click="remove(row)" />
       </div>
     </template>

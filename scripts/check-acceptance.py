@@ -227,6 +227,25 @@ def request_json(method: str, url: str, payload: dict | None = None, token: str 
         return failure.code, parsed, dict(failure.headers)
 
 
+def cleanup_acceptance_nodes(token: str, node_ids: list[int]) -> None:
+    """删除本次验收创建的节点，并先恢复这些节点上仍未恢复的告警，避免夹具逐次累积。"""
+    for node_id in dict.fromkeys(node_ids):
+        try:
+            status, alarms, _ = request_json("GET", HTTP_BASE + f"/api/alarms?pageNum=1&pageSize=100&nodeId={node_id}", token=token)
+            if status == 200:
+                for row in (alarms.get("data") or {}).get("rows", []):
+                    if row.get("status") != "resolved":
+                        resolved, _, _ = request_json("PUT", HTTP_BASE + f"/api/alarms/{row['id']}/resolve", token=token)
+                        if resolved != 200:
+                            print(f"WARN 恢复验收节点 {node_id} 的告警 {row.get('id')} 失败：HTTP {resolved}")
+            removed, _, _ = request_json("DELETE", HTTP_BASE + f"/api/nodes/{node_id}", token=token)
+            if removed != 200:
+                print(f"WARN 删除验收节点 {node_id} 失败：HTTP {removed}，请手工清理")
+        except Exception as failure:  # noqa: BLE001
+            # 清理失败不能覆盖验收结论，也不能阻止停止脚本自己启动的服务
+            print(f"WARN 清理验收节点 {node_id} 失败：{failure}，请手工清理")
+
+
 def client_context(client_cert: Path | None = None, client_key: Path | None = None) -> ssl.SSLContext:
     context = ssl.create_default_context(cafile=str(CERTS / "ca.pem"))
     if client_cert is not None and client_key is not None:
@@ -493,8 +512,8 @@ def check_sse_alarm(token: str, node_id: int) -> None:
         connection.close()
 
 
-def check_agent_websocket(token: str) -> None:
-    """启动带 --ws 的 Agent 示例，断言命令经长连接推送并由示例回写结果。"""
+def check_agent_websocket(token: str) -> int | None:
+    """启动带 --ws 的 Agent 示例，断言命令经长连接推送并由示例回写结果；返回示例注册的节点标识。"""
     fingerprint = (CERTS / "agent-fingerprint.txt").read_text(encoding="utf-8").strip()
     agent = executable(ROOT / "build" / "debug" / "samples" / "edgepulse-agent")
     process = subprocess.Popen(
@@ -532,7 +551,7 @@ def check_agent_websocket(token: str) -> None:
     report("Agent WebSocket 完成 hello", node_id > 0, f"nodeId={node_id}")
     if node_id <= 0:
         stop_process(process)
-        return
+        return None
 
     status, command, _ = request_json("POST", HTTP_BASE + "/api/commands",
                                       {"nodeId": node_id, "type": "ws.echo", "payload": "{}", "timeoutSeconds": 30}, token=token)
@@ -562,6 +581,7 @@ def check_agent_websocket(token: str) -> None:
             break
         time.sleep(0.1)
     report("WS 命令状态为 succeeded", status_text == "succeeded", status_text or f"HTTP {status}")
+    return node_id
 
 
 def check_commands(token: str, node_id: int) -> None:
@@ -895,6 +915,8 @@ def main() -> int:
     signing: FirmwareSigning | None = None
     signing_detail = ""
     already_running = False
+    token: str | None = None
+    fixture_node_ids: list[int] = []
     try:
         try:
             request_json("GET", HTTP_BASE + "/api/health", timeout=1.0)
@@ -911,6 +933,8 @@ def main() -> int:
         token = check_authentication()
         check_h3()
         agent_node_id = check_mtls()
+        if agent_node_id:
+            fixture_node_ids.append(agent_node_id)
         check_ops()
         check_otlp()
         check_udp_telemetry()
@@ -918,7 +942,9 @@ def main() -> int:
         if token:
             check_system(token)
             check_tenancy(token)
-            check_nodes(token)
+            manual_node_id = check_nodes(token)
+            if manual_node_id:
+                fixture_node_ids.append(manual_node_id)
             check_websocket(token)
             check_enrollment_tokens(token)
             check_webhook_ssrf(token)
@@ -928,7 +954,9 @@ def main() -> int:
                 verify_notification(token, notification_state)
                 check_sse_alarm(token, agent_node_id)
                 check_commands(token, agent_node_id)
-                check_agent_websocket(token)
+                ws_node_id = check_agent_websocket(token)
+                if ws_node_id:
+                    fixture_node_ids.append(ws_node_id)
                 check_firmware(token, agent_node_id)
                 check_signed_firmware(token, agent_node_id, signing, "服务已在运行，信任键目录只在启动时加载" if already_running else signing_detail)
                 check_agent_identity(agent_node_id)
@@ -940,6 +968,9 @@ def main() -> int:
         else:
             report("系统、节点与设备域检查", False, "登录失败，无法继续")
     finally:
+        # 清理必须在停止服务之前完成；节点删除会关闭在线通道并销案系统离线告警
+        if token is not None:
+            cleanup_acceptance_nodes(token, fixture_node_ids)
         if process is not None and not already_running:
             stop_process(process)
         cleanup_firmware_signing(signing)

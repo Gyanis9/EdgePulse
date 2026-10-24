@@ -71,9 +71,14 @@ const latest = ref<TelemetryPoint[]>([])
 const alarms = ref<AlarmRow[]>([])
 const commands = ref<CommandRow[]>([])
 const loading = ref(false)
+const configKey = ref(0)
 const telemetryError = ref('')
 const alarmsError = ref('')
 const commandsError = ref('')
+
+// 节点详情面板只读取最近一页；页签标题必须写出窗口，不能当成全量计数
+const ALARM_WINDOW = 20
+const COMMAND_WINDOW = 20
 
 const fingerprintText = computed(() => {
   const value = node.value?.certFingerprint ?? ''
@@ -116,8 +121,8 @@ async function load() {
   }
   const [latestResult, alarmResult, commandResult] = await Promise.allSettled([
     fleetApi.telemetry.latest(nodeId),
-    fleetApi.alarms.list({ pageNum: 1, pageSize: 20, nodeId }),
-    fleetApi.commands.list({ pageNum: 1, pageSize: 20, nodeId }),
+    fleetApi.alarms.list({ pageNum: 1, pageSize: ALARM_WINDOW, nodeId }),
+    fleetApi.commands.list({ pageNum: 1, pageSize: COMMAND_WINDOW, nodeId }),
   ])
   if (latestResult.status === 'fulfilled') latest.value = latestResult.value
   else {
@@ -139,7 +144,7 @@ async function load() {
 
 async function loadAlarms() {
   try {
-    alarms.value = (await fleetApi.alarms.list({ pageNum: 1, pageSize: 20, nodeId })).rows
+    alarms.value = (await fleetApi.alarms.list({ pageNum: 1, pageSize: ALARM_WINDOW, nodeId })).rows
     alarmsError.value = ''
   } catch (error) {
     alarmsError.value = reasonOf(error, '节点告警加载失败')
@@ -193,6 +198,12 @@ async function revokeCertificate() {
   }
 }
 
+async function refreshAll() {
+  // 配置面板自己持有草稿与修订列表，页面刷新时一并重建，避免概览与配置页签读数分叉
+  configKey.value += 1
+  await load()
+}
+
 function backToList() {
   router.push(pathOf('device/Nodes') ?? '/device/nodes')
 }
@@ -212,7 +223,7 @@ onMounted(load)
 <template>
   <div class="page">
     <PageHeader :title="node?.name || '节点详情'" :desc="headerDesc">
-      <Button icon="refresh" :loading="loading" @click="load">刷新</Button>
+      <Button icon="refresh" :loading="loading" @click="refreshAll">刷新</Button>
       <Button icon="chevronLeft" @click="backToList">返回列表</Button>
     </PageHeader>
 
@@ -309,7 +320,7 @@ onMounted(load)
         </div>
       </Panel>
 
-      <Panel v-show="tab === 'alarms'" title="节点告警" :meta="`${alarms.length} 条`">
+      <Panel v-show="tab === 'alarms'" title="节点告警" :meta="`最近 ${ALARM_WINDOW} 条`">
         <div class="panel-body config-stack">
           <p v-if="alarmsError" class="form-error" style="margin: 0">{{ alarmsError }}</p>
           <DataTable :columns="alarmColumns" :data="alarms" :min-width="820" empty-text="该节点暂无告警">
@@ -328,7 +339,7 @@ onMounted(load)
         </div>
       </Panel>
 
-      <Panel v-show="tab === 'commands'" title="节点命令" :meta="`${commands.length} 条`">
+      <Panel v-show="tab === 'commands'" title="节点命令" :meta="`最近 ${COMMAND_WINDOW} 条`">
         <template #tools>
           <Button v-if="commandsPath" variant="secondary" size="sm" icon="command" @click="openNodePage(commandsPath)">打开命令中心</Button>
         </template>
@@ -346,12 +357,12 @@ onMounted(load)
         </div>
       </Panel>
 
-      <Panel v-show="tab === 'firmware'" title="固件命令" :meta="`${firmwareCommands.length} 条`">
+      <Panel v-show="tab === 'firmware'" title="固件命令" :meta="`最近 ${COMMAND_WINDOW} 条命令中的 ${firmwareCommands.length} 条`">
         <template #tools>
           <Button v-if="firmwarePath" variant="secondary" size="sm" icon="layers" @click="openPage(firmwarePath)">打开固件页</Button>
         </template>
         <div class="panel-body config-stack">
-          <p class="faint" style="margin: 0">这里只列出命令类型以 firmware. 开头的记录；固件任务由命令承载。</p>
+          <p class="faint" style="margin: 0">这里只列出最近 {{ COMMAND_WINDOW }} 条命令中类型以 firmware. 开头的记录；更早的固件任务请到固件页查看。</p>
           <p v-if="commandsError" class="form-error" style="margin: 0">{{ commandsError }}</p>
           <DataTable :columns="commandColumns" :data="firmwareCommands" :min-width="760" empty-text="该节点还没有固件升级记录">
             <template #cell-type="{ row }"><span class="mono">{{ row.type }}</span></template>
@@ -365,7 +376,7 @@ onMounted(load)
         </div>
       </Panel>
 
-      <NodeConfigPanel v-show="tab === 'config'" :node-id="nodeId" @updated="load" />
+      <NodeConfigPanel v-show="tab === 'config'" :key="configKey" :node-id="nodeId" @updated="load" />
     </template>
   </div>
 </template>

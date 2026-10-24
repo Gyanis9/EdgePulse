@@ -24,6 +24,8 @@ const error = ref('')
 const conflict = ref(false)
 
 const hasConfig = computed(() => Boolean(config.value && config.value.desired.version > 0))
+// 面板不分页，只展示最近一页修订；标题同时给出真实总数与已加载条数
+const REVISION_WINDOW = 50
 const revisionColumns: Column[] = [
   { key: 'version', title: '版本', width: 90 },
   { key: 'note', title: '备注', minWidth: 220 },
@@ -44,7 +46,7 @@ function reportedTone(status: string) {
 }
 
 async function loadRevisions() {
-  const page = await deviceApi.nodes.config.revisions(props.nodeId, { pageNum: 1, pageSize: 50 })
+  const page = await deviceApi.nodes.config.revisions(props.nodeId, { pageNum: 1, pageSize: REVISION_WINDOW })
   revisions.value = page.rows
   revisionsTotal.value = page.total
 }
@@ -194,7 +196,7 @@ onMounted(load)
       </div>
     </Panel>
 
-    <Panel title="历史版本" :meta="`${revisionsTotal} 条`">
+    <Panel title="历史版本" :meta="revisionsTotal > revisions.length ? `共 ${revisionsTotal} 条，显示最近 ${revisions.length} 条` : `${revisionsTotal} 条`">
       <DataTable :columns="revisionColumns" :data="revisions" :loading="loading" :min-width="620" empty-text="还没有配置修订">
         <template #cell-version="{ row }"><span class="mono">v{{ row.version }}</span></template>
         <template #cell-note="{ row }"><span :class="row.note ? 'muted' : 'faint'">{{ row.note || '—' }}</span></template>
