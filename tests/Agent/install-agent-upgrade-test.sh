@@ -171,6 +171,7 @@ normal_stage="${work}/normal-package"
 normal_root="${work}/normal"
 mkdir -p "${normal_stage}" "${normal_root}"
 cp "${installer}" "${normal_stage}/install-agent.sh"
+cp "${repo_root}/agent/packaging/linux/uninstall-agent.sh" "${normal_stage}/uninstall-agent.sh"
 cp "${repo_root}/agent/packaging/linux/edgepulse-agent.service" "${normal_stage}/edgepulse-agent.service"
 cp "${repo_root}/agent/packaging/config/agent.yaml.example" "${normal_stage}/agent.yaml.example"
 install -m 0755 "${old_source}/edgepulse-agent" "${normal_stage}/edgepulse-agent"
@@ -194,6 +195,21 @@ if grep -q '/usr/local/lib/edgepulse' "${normal_root}/config/agent.yaml"; then
     fail "配置里仍残留默认安装器路径"
 fi
 say "PASS: 普通安装复制安装器并替换配置里的前缀"
+
+SYSTEMD_UNIT_DIR="${normal_root}/unit" bash "${normal_stage}/uninstall-agent.sh" \
+    --prefix "${normal_root}/prefix" \
+    --config-dir "${normal_root}/config" \
+    --state-dir "${normal_root}/state" \
+    --log-dir "${normal_root}/log" \
+    --no-start \
+    >"${normal_root}/uninstall.log" 2>&1 || {
+    cat "${normal_root}/uninstall.log" >&2 || true
+    fail "卸载失败"
+}
+[[ ! -e "${normal_root}/prefix/bin/edgepulse-agent" ]] || fail "卸载后二进制仍存在"
+[[ ! -e "${normal_root}/prefix/lib/edgepulse/install-agent.sh" ]] || fail "卸载后安装器副本仍存在"
+[[ -f "${normal_root}/config/agent.yaml" ]] || fail "卸载默认应保留配置"
+say "PASS: 卸载删除二进制与安装器副本并保留配置"
 
 if [[ -n "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS:-}" ]]; then
     mkdir -p "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}"

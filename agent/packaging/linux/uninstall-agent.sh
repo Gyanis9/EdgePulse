@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 卸载 EdgePulse Agent：停止并禁用服务，删除单元与二进制；配置/状态/日志默认保留，--purge 才删除。
+# 卸载 EdgePulse Agent：停止并禁用服务，删除单元、二进制与安装器副本；配置/状态/日志默认保留，--purge 才删除。
 set -euo pipefail
 
 usage() {
@@ -183,6 +183,14 @@ if [[ -e "${prefix}/bin/edgepulse-agent" ]]; then
     echo "已删除二进制：${prefix}/bin/edgepulse-agent"
 else
     echo "二进制不存在，跳过：${prefix}/bin/edgepulse-agent"
+fi
+
+# 安装器副本由普通安装写入；同目录下的固件钩子属于管理员配置，不在这里删除
+if [[ -e "${prefix}/lib/edgepulse/install-agent.sh" ]]; then
+    rm -f "${prefix}/lib/edgepulse/install-agent.sh"
+    echo "已删除安装器副本：${prefix}/lib/edgepulse/install-agent.sh"
+else
+    echo "安装器副本不存在，跳过：${prefix}/lib/edgepulse/install-agent.sh"
 fi
 
 if [[ "${no_start}" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
