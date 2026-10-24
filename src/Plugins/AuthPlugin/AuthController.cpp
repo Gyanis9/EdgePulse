@@ -8,6 +8,7 @@
 #include "Net/Http/Message/HttpResponse.h"
 #include "Net/Http/Routing/Router.h"
 #include "Core/Http/Authorization.h"
+#include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 
 #include <Core/EventLoop/EventLoop.h>
@@ -161,9 +162,14 @@ namespace EdgePulse::Auth
                     {
                         const std::string                traceId = Web::resolveRequestId(request);
                         const std::optional<std::string> token   = Web::bearerToken(request);
-                        if (!token.has_value() || !(co_await authService.authenticate(loop, *token)).has_value())
+                        if (!token.has_value())
                         {
                             writeUnauthorized(response, traceId);
+                            co_return;
+                        }
+                        // 注销只接受浏览器会话：令牌没有可删除的会话行，用令牌调用既不生效也不该回成功
+                        if (!(co_await Web::requireBrowserSession(authService, loop, request, response, traceId)).has_value())
+                        {
                             co_return;
                         }
                         static_cast<void>(co_await authService.logout(loop, *token));
@@ -205,16 +211,11 @@ namespace EdgePulse::Auth
         router.get("/api/auth/routes",
                    [&authService, &loop](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
-                       const std::string                traceId = Web::resolveRequestId(request);
-                       const std::optional<std::string> token   = Web::bearerToken(request);
-                       std::optional<SessionRecord>     session;
-                       if (token.has_value())
-                       {
-                           session = co_await authService.authenticate(loop, *token);
-                       }
+                       const std::string traceId = Web::resolveRequestId(request);
+                       // 菜单树会暴露 owner 的完整菜单与权限，只接受浏览器会话，令牌不能借此枚举权限
+                       const auto session = co_await Web::requireBrowserSession(authService, loop, request, response, traceId);
                        if (!session.has_value())
                        {
-                           writeUnauthorized(response, traceId);
                            co_return;
                        }
                        const std::vector<System::MenuNode> tree   = co_await authService.routes(loop, *session);

@@ -493,6 +493,35 @@ TEST_F(ApiTokenEndpointsTest, TokenSessionCannotUsePermissionlessEndpoint)
     EXPECT_NE(std::string::npos, (*tokenJson)["message"].get<std::string>().find("API 令牌"));
 }
 
+TEST_F(ApiTokenEndpointsTest, TokenSessionCannotUseBrowserOnlyAuthEndpoints)
+{
+    const std::string session = login();
+    ASSERT_FALSE(session.empty());
+    const CreatedToken created = createToken(session, "browser-only", {"system:token:list"});
+
+    // 浏览器会话可读菜单树
+    const HttpResult browserRoutes = m_server->get("/api/auth/routes", bearer(session));
+    ASSERT_EQ(200, browserRoutes.status) << browserRoutes.body;
+
+    // 令牌既不能枚举 owner 的菜单与权限，也不能注销会话
+    const HttpResult tokenRoutes = m_server->get("/api/auth/routes", bearer(created.plaintext));
+    ASSERT_EQ(403, tokenRoutes.status) << tokenRoutes.body;
+    const auto routesJson = tokenRoutes.json();
+    ASSERT_TRUE(routesJson.has_value());
+    EXPECT_NE(std::string::npos, (*routesJson)["message"].get<std::string>().find("API 令牌"));
+
+    const HttpResult tokenLogout = m_server->post("/api/auth/logout", "{}", "application/json", bearer(created.plaintext));
+    ASSERT_EQ(403, tokenLogout.status) << tokenLogout.body;
+    const auto logoutJson = tokenLogout.json();
+    ASSERT_TRUE(logoutJson.has_value());
+    EXPECT_NE(std::string::npos, (*logoutJson)["message"].get<std::string>().find("API 令牌"));
+
+    // 被拒的注销没有吊销令牌，也没有影响浏览器会话
+    EXPECT_EQ(200, m_server->get("/api/auth/me", bearer(created.plaintext)).status);
+    EXPECT_EQ(200, m_server->get("/api/auth/me", bearer(session)).status);
+    EXPECT_EQ(200, m_server->post("/api/auth/logout", "{}", "application/json", bearer(session)).status);
+}
+
 TEST_F(ApiTokenEndpointsTest, TokenSessionCannotOpenBrowserWebSocket)
 {
     const std::string session = login();
