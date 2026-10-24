@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -53,4 +54,22 @@ namespace EdgePulse::Agent
      *       cmd.exe 在引号内仍会展开 %NAME%，没有可靠的字面量转义
      */
     [[nodiscard]] ProcessRunResult runProcess(const std::filesystem::path &executable, const std::vector<std::string> &arguments, std::chrono::milliseconds timeout);
+
+    /**
+     * @brief 取当前进程的可执行文件路径
+     * @return 成功返回绝对路径；读取系统信息失败时返回中文原因
+     * @note Linux 读 /proc/self/exe，Windows 取 GetModuleFileNameW
+     */
+    [[nodiscard]] std::expected<std::filesystem::path, std::string> currentExecutablePath();
+
+    /**
+     * @brief 启动一个脱离当前进程生命周期与终端的子进程，不等待它结束
+     * @param executable 可执行文件路径或 PATH 中的裸名字
+     * @param arguments 参数表，逐项传递，不拼接成 shell 命令
+     * @return 成功表示子进程已经创建；失败返回中文原因
+     * @note Windows 用 DETACHED_PROCESS 与 CREATE_NEW_PROCESS_GROUP 创建进程；Linux 依赖
+     *       systemd-run 把安装器托管给独立 transient 单元，因此这里等待 systemd-run 启动结束，
+     *       非零退出按启动失败处理
+     */
+    [[nodiscard]] std::expected<void, std::string> launchDetached(const std::filesystem::path &executable, const std::vector<std::string> &arguments);
 } // namespace EdgePulse::Agent

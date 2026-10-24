@@ -483,6 +483,36 @@ namespace EdgePulse::Agent
         }
     }
 
+    std::expected<UpdateStateRecord, std::string> AgentState::updateState()
+    {
+        std::lock_guard lock(*m_mutex);
+        const auto      rows = queryStatement(*m_connection, "SELECT version, previous_binary, healthy_at, pending_result FROM update_state WHERE id = 1");
+        if (!rows)
+        {
+            return std::unexpected("读取升级状态失败：" + rows.error());
+        }
+        if (!(*rows)->next())
+        {
+            return UpdateStateRecord{};
+        }
+        return UpdateStateRecord{Sql::text(**rows, "version"), Sql::text(**rows, "previous_binary"), Sql::text(**rows, "healthy_at"), Sql::text(**rows, "pending_result")};
+    }
+
+    std::expected<void, std::string> AgentState::setUpdateState(const UpdateStateRecord &record)
+    {
+        std::lock_guard                    lock(*m_mutex);
+        const std::array<DatabaseValue, 4> parameters{record.version, record.previousBinary, record.healthyAt, record.pendingResult};
+        return runWriteTransaction(*m_connection,
+                                   [&parameters](DatabaseConnection &connection) -> std::expected<void, std::string>
+                                   {
+                                       return executeStatement(connection,
+                                                               "INSERT INTO update_state (id, version, previous_binary, healthy_at, pending_result) VALUES (1, ?, ?, ?, ?) "
+                                                               "ON CONFLICT(id) DO UPDATE SET version = excluded.version, previous_binary = excluded.previous_binary, "
+                                                               "healthy_at = excluded.healthy_at, pending_result = excluded.pending_result",
+                                                               parameters);
+                                   });
+    }
+
     std::optional<std::string> AgentState::pendingUpdateResult()
     {
         std::lock_guard lock(*m_mutex);

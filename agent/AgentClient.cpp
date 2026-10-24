@@ -20,7 +20,7 @@ namespace EdgePulse::Agent
 {
     namespace
     {
-        constexpr std::chrono::seconds kFirmwareDownloadTimeout{300}; ///< 固件正文的下载时限
+        constexpr std::chrono::seconds kDownloadTimeout{300}; ///< 下载正文的整体时限
 
         /**
          * @brief 从失败响应里取出统一包络的中文 message
@@ -148,7 +148,7 @@ namespace EdgePulse::Agent
         {
             if (downloadPath.empty())
             {
-                return std::unexpected("固件下载地址为空");
+                return std::unexpected("下载地址为空");
             }
             if (downloadPath.front() == '/')
             {
@@ -157,7 +157,7 @@ namespace EdgePulse::Agent
             const std::size_t schemeEnd = downloadPath.find("://");
             if (schemeEnd == std::string_view::npos)
             {
-                return std::unexpected("固件下载地址必须以 / 开头或为绝对 http(s) 地址");
+                return std::unexpected("下载地址必须以 / 开头或为绝对 http(s) 地址");
             }
             const std::string scheme = asciiLower(downloadPath.substr(0, schemeEnd));
             if (scheme == "https")
@@ -168,11 +168,11 @@ namespace EdgePulse::Agent
             {
                 if (!allowPlaintext)
                 {
-                    return std::unexpected("固件下载地址是明文 http，只有显式开启明文测试配置时才允许");
+                    return std::unexpected("下载地址是明文 http，只有显式开启明文测试配置时才允许");
                 }
                 return std::string{downloadPath};
             }
-            return std::unexpected("固件下载地址的协议 " + scheme + " 不受支持，只允许 https 或相对路径");
+            return std::unexpected("下载地址的协议 " + scheme + " 不受支持，只允许 https 或相对路径");
         }
     } // namespace
 
@@ -630,8 +630,8 @@ namespace EdgePulse::Agent
         co_return std::expected<void, std::string>{};
     }
 
-    AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> AgentClient::downloadFirmware(std::string downloadPath,
-                                                                                                    AsynGyanis::Net::HttpResponseBodyReceiver receiver)
+    AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> AgentClient::downloadFile(std::string downloadPath,
+                                                                                                AsynGyanis::Net::HttpResponseBodyReceiver receiver)
     {
         if (!m_initializationError.empty() || m_client == nullptr)
         {
@@ -639,7 +639,7 @@ namespace EdgePulse::Agent
         }
         if (!receiver)
         {
-            co_return std::unexpected("固件下载缺少正文接收口");
+            co_return std::unexpected("下载缺少正文接收口");
         }
 
         auto resolved = resolveDownloadUrl(downloadPath, m_baseUrl, m_configuration.allowPlaintextForTests);
@@ -655,14 +655,14 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(*resolved, request, kFirmwareDownloadTimeout);
+            response = co_await m_client->send(*resolved, request, kDownloadTimeout);
         } catch (const std::exception &failure)
         {
-            co_return std::unexpected("固件下载请求异常：" + std::string{failure.what()});
+            co_return std::unexpected("下载请求异常：" + std::string{failure.what()});
         }
         if (response == nullptr)
         {
-            co_return std::unexpected("固件下载请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志");
+            co_return std::unexpected("下载请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志");
         }
 
         DownloadResult result;

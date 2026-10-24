@@ -49,6 +49,17 @@ namespace EdgePulse::Agent
     };
 
     /**
+     * @brief 单行升级状态
+     */
+    struct UpdateStateRecord
+    {
+        std::string version;        ///< 目标版本，空表示没有进行中的升级
+        std::string previousBinary; ///< 升级前二进制路径
+        std::string healthyAt;      ///< 新版本写出健康标记的时刻，空表示尚未确认
+        std::string pendingResult;  ///< 升级待上报结果，空表示没有
+    };
+
+    /**
      * @brief 进程内的 SQLite 状态库
      * @details 单条连接由内部互斥量串行化；写操作包在立即取写锁的事务里，
      *          遇到锁竞争按有界次数重试，普通 SQL 与约束错误只记录日志，不向调用方抛出。
@@ -145,6 +156,21 @@ namespace EdgePulse::Agent
          * @param id 队列内自增标识
          */
         void ackResult(std::int64_t id);
+
+        /**
+         * @brief 读取整行升级状态
+         * @return 成功返回四个字段；读取失败时返回中文原因
+         * @note 表里始终有一行，空串表示该字段没有内容
+         */
+        [[nodiscard]] std::expected<UpdateStateRecord, std::string> updateState();
+
+        /**
+         * @brief 覆盖整行升级状态
+         * @param record 目标版本、上一版二进制、健康时刻与待上报结果
+         * @return 成功为空；写入失败时返回中文原因
+         * @note 与逐字段写入不同，本方法把失败交回调用方：升级前写不进状态就不能启动安装器
+         */
+        [[nodiscard]] std::expected<void, std::string> setUpdateState(const UpdateStateRecord &record);
 
         /**
          * @brief 读取上次升级遗留的待上报结果

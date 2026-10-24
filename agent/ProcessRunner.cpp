@@ -6,17 +6,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <expected>
 #include <string>
 #include <thread>
 #include <utility>
-
-#if ASYN_PLATFORM_WIN32
 #include <vector>
-#else
+
+#if !ASYN_PLATFORM_WIN32
 #include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -516,6 +517,99 @@ namespace EdgePulse::Agent
             fillFailure(result, timeout);
         }
         return result;
+#endif
+    }
+
+    std::expected<std::filesystem::path, std::string> currentExecutablePath()
+    {
+#if ASYN_PLATFORM_WIN32
+        std::vector<wchar_t> buffer(32768);
+        for (;;)
+        {
+            const DWORD length = ::GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (length == 0)
+            {
+                return std::unexpected("无法读取当前进程的可执行文件路径：Windows 错误 " + std::to_string(static_cast<int>(::GetLastError())));
+            }
+            if (static_cast<std::size_t>(length) < buffer.size())
+            {
+                const std::string utf8Path = AsynGyanis::Platform::TextEncoding::toUtf8String(std::wstring{buffer.data(), length});
+                if (utf8Path.empty())
+                {
+                    return std::unexpected("当前进程的可执行文件路径无法转换为 UTF-8");
+                }
+                return AsynGyanis::Platform::FileSystem::pathFromUtf8(utf8Path);
+            }
+            buffer.resize(buffer.size() * 2);
+        }
+#else
+        std::vector<char> buffer(4096);
+        for (;;)
+        {
+            const ssize_t length = ::readlink("/proc/self/exe", buffer.data(), buffer.size());
+            if (length < 0)
+            {
+                return std::unexpected("无法读取当前进程的可执行文件路径：" + std::string{std::strerror(errno)});
+            }
+            if (static_cast<std::size_t>(length) < buffer.size())
+            {
+                return std::filesystem::path{std::string{buffer.data(), static_cast<std::size_t>(length)}};
+            }
+            buffer.resize(buffer.size() * 2);
+        }
+#endif
+    }
+
+    std::expected<void, std::string> launchDetached(const std::filesystem::path &executable, const std::vector<std::string> &arguments)
+    {
+        if (executable.empty())
+        {
+            return std::unexpected("启动器路径为空，无法创建子进程");
+        }
+
+#if ASYN_PLATFORM_WIN32
+        const std::wstring executableWide = AsynGyanis::Platform::TextEncoding::toWideString(AsynGyanis::Platform::FileSystem::utf8FromPath(executable));
+        if (executableWide.empty())
+        {
+            return std::unexpected("启动器路径无法转换为 Windows 路径：" + AsynGyanis::Platform::FileSystem::utf8FromPath(executable));
+        }
+        std::vector<std::wstring> wideArguments;
+        wideArguments.reserve(arguments.size());
+        for (const std::string &argument: arguments)
+        {
+            wideArguments.push_back(AsynGyanis::Platform::TextEncoding::toWideString(argument));
+        }
+
+        std::wstring commandLine = buildCommandLine(executableWide, wideArguments);
+        STARTUPINFOW        startupInfo{};
+        startupInfo.cb        = sizeof(startupInfo);
+        PROCESS_INFORMATION processInformation{};
+        const BOOL          created = ::CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr,
+                                                       &startupInfo, &processInformation);
+        if (created == 0)
+        {
+            return std::unexpected("无法创建升级安装器进程 " + AsynGyanis::Platform::FileSystem::utf8FromPath(executable) + "：Windows 错误 " +
+                                   std::to_string(static_cast<int>(::GetLastError())));
+        }
+        ::CloseHandle(processInformation.hThread);
+        ::CloseHandle(processInformation.hProcess);
+        return {};
+#else
+        const ProcessRunResult started = runProcess(executable, arguments, std::chrono::seconds{30});
+        if (!started.started)
+        {
+            return std::unexpected(started.failure);
+        }
+        if (started.timedOut)
+        {
+            return std::unexpected("启动器在 30 秒内没有返回，无法确认安装器已经托管给 systemd");
+        }
+        if (!started.succeeded())
+        {
+            return std::unexpected("启动器以退出码 " + std::to_string(started.exitCode) + " 结束" +
+                                   (started.output.empty() ? std::string{} : "：" + started.output.substr(0, std::min<std::size_t>(started.output.size(), 512))));
+        }
+        return {};
 #endif
     }
 } // namespace EdgePulse::Agent

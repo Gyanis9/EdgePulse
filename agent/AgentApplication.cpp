@@ -11,6 +11,7 @@
 #include "Executors/FirmwareExecutor.h"
 #include "Executors/RestartExecutor.h"
 #include "Executors/TelemetryPublisher.h"
+#include "Executors/UpdateExecutor.h"
 #include "TelemetryCollector.h"
 
 #include "Platform/Platform.h"
@@ -516,6 +517,8 @@ namespace EdgePulse::Agent
             std::vector<std::shared_ptr<CommandExecutor>> executors;
             executors.push_back(std::make_shared<ConfigExecutor>(client, m_configuration, *nodeId));
             executors.push_back(std::make_shared<FirmwareExecutor>(client, *state, m_configuration, *nodeId));
+            // 安装器在另一个进程里替换二进制并等待健康标记，本进程确认它已启动后立即退出
+            executors.push_back(std::make_shared<UpdateExecutor>(client, *state, m_configuration, UpdateExecutor::Launcher{}, [this] { requestStop(); }));
             // 诊断指标由遥测采集器提供，提供者本身在诊断工作线程上执行
             executors.push_back(std::make_shared<DiagnosticsExecutor>(*state, m_configuration, agentVersion, [telemetryCollector] { return telemetryCollector->metricsJson(); }));
             // 服务托管接入后，回调必须在命令结果入队并上报完成之后再重启进程，否则结果会随进程退出丢失；

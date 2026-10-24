@@ -194,15 +194,15 @@ namespace EdgePulse::Agent
                                                                               std::string_view status, std::string_view message);
 
         /**
-         * @brief 下载固件正文，按到达批次交给接收口
+         * @brief 下载一份正文，按到达批次交给接收口
          * @param downloadPath 服务端给出的下载地址：以 / 开头时相对 base_url，否则必须是绝对地址
          * @param receiver 正文接收口，只在事件循环线程上调用
          * @return 成功返回状态码与服务端说明；传输失败或地址不合法时返回中文原因
          * @note 绝对地址只接受 https；明文 http 仅在配置开启 allow_plaintext_for_tests 时放行
          * @note 非 200 响应同样按成功返回并带上状态码，由调用方决定是否继续；接收口应自行拒绝非 200 正文
          */
-        AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> downloadFirmware(std::string downloadPath,
-                                                                                             AsynGyanis::Net::HttpResponseBodyReceiver receiver);
+        AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> downloadFile(std::string downloadPath,
+                                                                                        AsynGyanis::Net::HttpResponseBodyReceiver receiver);
 
         /**
          * @brief 上报一次固件任务状态

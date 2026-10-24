@@ -11,6 +11,7 @@ add_library(edgepulse-agent-core STATIC
         Executors/FirmwareExecutor.cpp
         Executors/RestartExecutor.cpp
         Executors/TelemetryPublisher.cpp
+        Executors/UpdateExecutor.cpp
         ProcessRunner.cpp
         TelemetryCollector.cpp)
 target_include_directories(edgepulse-agent-core PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})

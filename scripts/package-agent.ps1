@@ -1,9 +1,12 @@
 ﻿# 打包 Windows Agent：收集二进制、安装/卸载脚本与配置模板，生成带 SHA-256 清单的 zip。
+# 提供签名私钥时同时生成 manifest.sig；checksums.sha256 只列 manifest.files 里的数据文件。
 [CmdletBinding()]
 param(
     [string]$Binary,
     [string]$Version,
-    [string]$Output
+    [string]$Output,
+    [string]$SigningKey,
+    [string]$SigningKeyId
 )
 
 Set-StrictMode -Version Latest
@@ -67,12 +70,17 @@ function New-ManifestText {
     param(
         [Parameter(Mandatory = $true)][string]$ManifestVersion,
         [Parameter(Mandatory = $true)][string]$ManifestPlatform,
-        [Parameter(Mandatory = $true)][object[]]$Files
+        [Parameter(Mandatory = $true)][object[]]$Files,
+        [string]$KeyId
     )
     $builder = New-Object System.Text.StringBuilder
     $null = $builder.Append("{`n")
     $null = $builder.Append('  "version": "' + $ManifestVersion + '",' + "`n")
     $null = $builder.Append('  "platform": "' + $ManifestPlatform + '",' + "`n")
+    if (-not [string]::IsNullOrWhiteSpace($KeyId)) {
+        $null = $builder.Append('  "signingKeyId": "' + $KeyId + '",' + "`n")
+        $null = $builder.Append('  "signatureAlgorithm": "ed25519-sha256",' + "`n")
+    }
     $null = $builder.Append('  "files": [' + "`n")
     for ($index = 0; $index -lt $Files.Count; $index++) {
         $file = $Files[$index]
@@ -96,6 +104,24 @@ function Build-Package {
         throw "版本号不合法：$Version"
     }
     $platform = Get-PlatformName
+
+    $hasSigningKey   = -not [string]::IsNullOrWhiteSpace($SigningKey)
+    $hasSigningKeyId = -not [string]::IsNullOrWhiteSpace($SigningKeyId)
+    if ($hasSigningKey -ne $hasSigningKeyId) {
+        throw '-SigningKey 与 -SigningKeyId 必须同时给出'
+    }
+    if ($hasSigningKey) {
+        if (-not (Test-Path -LiteralPath $SigningKey -PathType Leaf)) {
+            throw "找不到签名私钥：$SigningKey"
+        }
+        if ($SigningKeyId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $SigningKeyId.Contains('..')) {
+            throw "key id 只能由字母、数字、点、下划线与连字符组成，且不能包含 ..：$SigningKeyId"
+        }
+        if ($null -eq (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            throw '缺少 openssl：签名需要 OpenSSL 3 的 pkeyutl'
+        }
+        $SigningKey = (Resolve-Path -LiteralPath $SigningKey).ProviderPath
+    }
 
     if ([string]::IsNullOrWhiteSpace($Binary)) {
         $Binary = Invoke-ReleaseBuild
@@ -131,16 +157,60 @@ function Build-Package {
         }
 
         $manifestFiles = @($packageInputs | ForEach-Object { Get-Item -LiteralPath (Join-Path $stageDirectory $_.Name) } | Sort-Object -Property Name)
-        $manifestText = New-ManifestText -ManifestVersion $Version -ManifestPlatform $platform -Files $manifestFiles
+        $manifestText = New-ManifestText -ManifestVersion $Version -ManifestPlatform $platform -Files $manifestFiles -KeyId $(if ($hasSigningKey) { $SigningKeyId } else { '' })
         $encoding = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText((Join-Path $stageDirectory 'manifest.json'), $manifestText, $encoding)
+        $manifestPath = Join-Path $stageDirectory 'manifest.json'
+        [System.IO.File]::WriteAllText($manifestPath, $manifestText, $encoding)
+
+        # 校验文件与 manifest 覆盖同一批数据文件：清单自身、签名与校验文件不列进去，避免互相引用
+        $checksumBuilder = New-Object System.Text.StringBuilder
+        foreach ($file in $manifestFiles) {
+            $digest = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $null = $checksumBuilder.Append($digest + '  ' + $file.Name + "`n")
+        }
+        $checksumsPath = Join-Path $stageDirectory 'checksums.sha256'
+        [System.IO.File]::WriteAllText($checksumsPath, $checksumBuilder.ToString(), $encoding)
+
+        $signaturePath = Join-Path $stageDirectory 'manifest.sig'
+        if ($hasSigningKey) {
+            $digestFile = [System.IO.Path]::GetTempFileName()
+            $rawSignatureFile = [System.IO.Path]::GetTempFileName()
+            try {
+                & openssl dgst -sha256 -binary -out $digestFile $manifestPath
+                if ($LASTEXITCODE -ne 0) {
+                    throw "openssl 计算 manifest 摘要失败（退出码 $LASTEXITCODE）"
+                }
+                & openssl pkeyutl -sign -inkey $SigningKey -rawin -in $digestFile -out $rawSignatureFile
+                if ($LASTEXITCODE -ne 0) {
+                    throw "openssl 签名失败（退出码 $LASTEXITCODE）"
+                }
+                & openssl base64 -A -in $rawSignatureFile -out $signaturePath
+                if ($LASTEXITCODE -ne 0) {
+                    throw "openssl Base64 编码失败（退出码 $LASTEXITCODE）"
+                }
+            } finally {
+                Remove-Item -LiteralPath $digestFile -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $rawSignatureFile -Force -ErrorAction SilentlyContinue
+            }
+        }
 
         $archiveName = 'edgepulse-agent-' + $Version + '-' + $platform + '.zip'
         $archivePath = Join-Path $Output $archiveName
         Compress-Archive -Path (Join-Path $stageDirectory '*') -DestinationPath $archivePath -Force
 
+        $baseName = 'edgepulse-agent-' + $Version + '-' + $platform
+        Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $Output ($baseName + '.manifest.json')) -Force
+        Copy-Item -LiteralPath $checksumsPath -Destination (Join-Path $Output ($baseName + '.checksums.sha256')) -Force
+
         Write-Host "安装包：$archivePath"
         Write-Host "清单：$($manifestFiles.Count) 个文件，逐项记录 size 与 sha256"
+        Write-Host "校验：$baseName.checksums.sha256"
+        if ($hasSigningKey) {
+            Copy-Item -LiteralPath $signaturePath -Destination (Join-Path $Output ($baseName + '.manifest.sig')) -Force
+            Write-Host "签名：$baseName.manifest.sig（key id $SigningKeyId）"
+        } else {
+            Write-Host '未提供签名私钥：本次生成的是未签名安装包，不能用于需要验签的升级'
+        }
     } finally {
         if (Test-Path -LiteralPath $stageDirectory) {
             Remove-Item -LiteralPath $stageDirectory -Recurse -Force

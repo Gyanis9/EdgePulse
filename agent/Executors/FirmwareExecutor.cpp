@@ -2,6 +2,8 @@
 
 #include "AgentClient.h"
 #include "AgentState.h"
+#include "Executors/DownloadSink.h"
+#include "Executors/Sha256Text.h"
 #include "ProcessRunner.h"
 
 #include "Base/Config/ConfigValue.h"
@@ -12,15 +14,11 @@
 #include "Core/Coroutine/AsyncExecutor.h"
 #include "Core/EventLoop/EventLoop.h"
 
-#include <openssl/evp.h>
-
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,48 +31,6 @@ namespace EdgePulse::Agent
     namespace
     {
         constexpr std::chrono::seconds kInstallHookTimeout{300}; ///< 安装钩子的执行时限
-        constexpr std::size_t          kSha256HexLength = 64;    ///< SHA-256 十六进制文本的长度
-
-        /**
-         * @brief 判断文本是否恰好 64 个十六进制字符
-         * @param text 待判断文本
-         * @return true 表示长度与字符集都符合 SHA-256 十六进制写法
-         */
-        [[nodiscard]] bool isSha256Hex(const std::string_view text)
-        {
-            if (text.size() != kSha256HexLength)
-            {
-                return false;
-            }
-            for (const char character: text)
-            {
-                const bool isDigit = character >= '0' && character <= '9';
-                const bool isLower = character >= 'a' && character <= 'f';
-                const bool isUpper = character >= 'A' && character <= 'F';
-                if (!isDigit && !isLower && !isUpper)
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        /**
-         * @brief 把十六进制文本折成小写
-         * @param text 十六进制文本
-         * @return std::string 小写副本
-         */
-        [[nodiscard]] std::string lowerHex(const std::string_view text)
-        {
-            std::string lowered;
-            lowered.reserve(text.size());
-            for (const char character: text)
-            {
-                lowered.push_back(character >= 'A' && character <= 'F' ? static_cast<char>(character - 'A' + 'a') : character);
-            }
-            return lowered;
-        }
-
         /**
          * @brief 取对象里的必填非空字符串字段
          * @param object JSON 对象
@@ -121,186 +77,6 @@ namespace EdgePulse::Agent
             return value;
         }
 
-        /**
-         * @brief 计算 SHA-256 的十六进制文本
-         * @param digest 32 字节摘要
-         * @return std::string 小写十六进制文本
-         */
-        [[nodiscard]] std::string digestHexText(const std::array<unsigned char, 32> &digest)
-        {
-            static constexpr char kHexDigits[] = "0123456789abcdef";
-            std::string           text;
-            text.reserve(64);
-            for (const unsigned char byte: digest)
-            {
-                text.push_back(kHexDigits[byte >> 4]);
-                text.push_back(kHexDigits[byte & 0x0F]);
-            }
-            return text;
-        }
-
-        /**
-         * @brief 固件下载的落盘与摘要状态
-         * @details 每次写入都经阻塞执行器调用，因此文件流与 EVP 上下文只会被一个工作线程依次碰到；
-         *          接收口只负责把批次交进来，不在事件循环上做文件读写或摘要计算。
-         */
-        struct DownloadSink
-        {
-            std::filesystem::path path;                        ///< 暂存文件路径
-            std::ofstream         file;                        ///< 暂存文件，首次写入时打开
-            EVP_MD_CTX           *digest{nullptr};             ///< SHA-256 上下文
-            std::uint64_t         expectedBytes{0};            ///< 命令给出的固件字节数
-            std::uint64_t         receivedBytes{0};            ///< 已写入的字节数
-            bool                  opened{false};               ///< 暂存文件是否已打开
-            bool                  failed{false};               ///< 是否已判定失败
-            std::string           failure;                     ///< 中文失败原因
-
-            DownloadSink() = default;
-
-            ~DownloadSink()
-            {
-                if (digest != nullptr)
-                {
-                    EVP_MD_CTX_free(digest);
-                }
-            }
-
-            DownloadSink(const DownloadSink &)            = delete;
-            DownloadSink &operator=(const DownloadSink &) = delete;
-
-            /**
-             * @brief 创建暂存目录、打开文件并初始化摘要
-             * @return true 表示已就绪
-             */
-            bool open()
-            {
-                std::error_code filesystemError;
-                std::filesystem::create_directories(path.parent_path(), filesystemError);
-                if (filesystemError)
-                {
-                    failure = "无法创建固件暂存目录 " + AsynGyanis::Platform::FileSystem::utf8FromPath(path.parent_path()) + "：" + filesystemError.message();
-                    return false;
-                }
-                file.open(path, std::ios::binary | std::ios::trunc);
-                if (!file.is_open())
-                {
-                    failure = "无法创建固件暂存文件 " + AsynGyanis::Platform::FileSystem::utf8FromPath(path);
-                    return false;
-                }
-                digest = EVP_MD_CTX_new();
-                if (digest == nullptr || EVP_DigestInit_ex(digest, EVP_sha256(), nullptr) != 1)
-                {
-                    failure = "无法初始化固件 SHA-256 计算";
-                    return false;
-                }
-                opened = true;
-                return true;
-            }
-
-            /**
-             * @brief 关闭暂存文件
-             * @return true 表示文件已关闭或本来就没打开
-             * @note Windows 上删除仍被打开的文件会失败，任何结局在删除前都要先关闭
-             */
-            bool close()
-            {
-                if (!file.is_open())
-                {
-                    return true;
-                }
-                file.close();
-                if (!file)
-                {
-                    failed = true;
-                    if (failure.empty())
-                    {
-                        failure = "关闭固件暂存文件失败";
-                    }
-                    return false;
-                }
-                return true;
-            }
-
-            /**
-             * @brief 写入一批正文并更新摘要
-             * @param batch 本批字节
-             * @return true 表示已完整写入；失败时 failed 与 failure 已置位
-             */
-            bool append(const std::string_view batch)
-            {
-                if (failed)
-                {
-                    return false;
-                }
-                if (!opened && !open())
-                {
-                    failed = true;
-                    return false;
-                }
-                if (batch.empty())
-                {
-                    return true;
-                }
-                if (receivedBytes + batch.size() > expectedBytes)
-                {
-                    failed  = true;
-                    failure = "固件正文超过命令给出的 " + std::to_string(expectedBytes) + " 字节，已中止下载";
-                    return false;
-                }
-                file.write(batch.data(), static_cast<std::streamsize>(batch.size()));
-                if (!file)
-                {
-                    failed  = true;
-                    failure = "写入固件暂存文件失败，可用磁盘空间可能不足";
-                    return false;
-                }
-                if (EVP_DigestUpdate(digest, batch.data(), batch.size()) != 1)
-                {
-                    failed  = true;
-                    failure = "更新固件 SHA-256 失败";
-                    return false;
-                }
-                receivedBytes += batch.size();
-                return true;
-            }
-
-            /**
-             * @brief 收尾文件与摘要
-             * @return 成功返回已收字节数与十六进制摘要；失败返回中文原因
-             */
-            std::expected<std::pair<std::uint64_t, std::string>, std::string> finish()
-            {
-                const bool closed = close();
-                if (failed)
-                {
-                    return std::unexpected(failure);
-                }
-                if (!closed)
-                {
-                    return std::unexpected(failure);
-                }
-                if (!opened)
-                {
-                    // 零字节正文不会触发写入，摘要仍要按空文件算完
-                    if (!open() || !close())
-                    {
-                        return std::unexpected(failure);
-                    }
-                }
-                std::array<unsigned char, EVP_MAX_MD_SIZE> digestValue{};
-                unsigned int                               digestLength = 0;
-                if (EVP_DigestFinal_ex(digest, digestValue.data(), &digestLength) != 1 || digestLength != 32)
-                {
-                    return std::unexpected("计算固件 SHA-256 失败");
-                }
-                std::array<unsigned char, 32> sha256{};
-                for (std::size_t index = 0; index < sha256.size(); ++index)
-                {
-                    sha256[index] = digestValue[index];
-                }
-                return std::pair<std::uint64_t, std::string>{receivedBytes, digestHexText(sha256)};
-            }
-        };
 
         /**
          * @brief 在阻塞执行器上删除暂存文件
@@ -373,11 +149,11 @@ namespace EdgePulse::Agent
         {
             return std::unexpected(PayloadFailure{firmware.firmwareId, sha256.error()});
         }
-        if (!isSha256Hex(*sha256))
+        if (!isSha256HexText(*sha256))
         {
             return std::unexpected(PayloadFailure{firmware.firmwareId, "firmware.update 的 sha256 不是 64 个十六进制字符"});
         }
-        firmware.sha256 = lowerHex(*sha256);
+        firmware.sha256 = lowercaseHexText(*sha256);
 
         const auto sizeBytes = requiredPositiveInteger(*parsed, "sizeBytes", "sizeBytes");
         if (!sizeBytes.has_value())
@@ -511,6 +287,7 @@ namespace EdgePulse::Agent
         const std::shared_ptr<DownloadSink> sink = std::make_shared<DownloadSink>();
         sink->path                          = staging;
         sink->expectedBytes                 = payload.sizeBytes;
+        sink->purpose                       = "固件";
 
         const auto receiver = [loopPointer = &loop, sink](const AsynGyanis::Net::HttpResponseInfo &head, const std::string_view batch, bool) -> AsynGyanis::Core::Task<bool>
         {
@@ -535,7 +312,7 @@ namespace EdgePulse::Agent
             }
         };
 
-        const auto downloaded = co_await m_client.downloadFirmware(payload.downloadPath, receiver);
+        const auto downloaded = co_await m_client.downloadFile(payload.downloadPath, receiver);
 
         // 无论下载如何收场都先关闭文件：Windows 上删除仍被打开的文件会失败
         try
