@@ -7,6 +7,7 @@ import base64
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -38,17 +39,35 @@ AGENT_NAME = f"e2e-agent-{RUN_ID}"
 ENROLLMENT_ENV = "EDGEPULSE_AGENT_E2E_ENROLLMENT_TOKEN"
 REBIND_ENV = "EDGEPULSE_AGENT_E2E_REBIND_TOKEN"
 HOOK_MARKER_ENV = "EDGEPULSE_AGENT_TEST_HOOK_MARKER"
+# 开发 shell 可能留下这些 hook 覆盖变量，注入验收环境前必须清掉
+SCRUBBED_AGENT_ENV = (ENROLLMENT_ENV, REBIND_ENV, "EDGEPULSE_AGENT_TEST_HOOK_EXIT", "EDGEPULSE_AGENT_TEST_HOOK_OUTPUT",
+                      "EDGEPULSE_AGENT_TEST_HOOK_REPLACE_WITH_DIRECTORY")
 AGENT_CONFIG_CONTENT = {"mode": "e2e", "sample_interval": 17}
 TELEMETRY_METRICS = ("cpu.usage", "memory.usage", "disk.usage")
 
 failures: list[str] = []
 skips: list[str] = []
 passed = 0
+known_secrets: set[str] = set()
+admin_tokens: list[str] = []
+
+
+def remember_secret(value: str) -> None:
+    if value:
+        known_secrets.add(value)
+
+
+def redact_secrets(text: str) -> str:
+    """把脚本持有的令牌明文从任何输出里抹掉，避免失败诊断回显凭据。"""
+    for secret in sorted(known_secrets, key=len, reverse=True):
+        if len(secret) >= 12:
+            text = text.replace(secret, "***")
+    return text
 
 
 def report(name: str, ok: bool, detail: str = "") -> None:
     global passed
-    print(("PASS " if ok else "FAIL ") + name + (("：" + detail) if detail else ""))
+    print(("PASS " if ok else "FAIL ") + name + (("：" + redact_secrets(detail)) if detail else ""))
     if ok:
         passed += 1
     else:
@@ -57,7 +76,7 @@ def report(name: str, ok: bool, detail: str = "") -> None:
 
 def skip(name: str, detail: str = "") -> None:
     """记录本次无法构造的检查；跳过不是通过，也不让退出码变成失败。"""
-    print("SKIP " + name + (("：" + detail) if detail else ""))
+    print("SKIP " + name + (("：" + redact_secrets(detail)) if detail else ""))
     skips.append(name)
 
 
@@ -107,7 +126,7 @@ def read_log_tail(path: Path, maximum_bytes: int = 4000) -> str:
         data = path.read_bytes()
     except OSError:
         return "无日志"
-    return data[-maximum_bytes:].decode("utf-8", "replace").strip() or "无日志"
+    return redact_secrets(data[-maximum_bytes:].decode("utf-8", "replace").strip()) or "无日志"
 
 
 def stop_process(process: subprocess.Popen | None) -> None:
@@ -129,11 +148,35 @@ def stop_process(process: subprocess.Popen | None) -> None:
 
 
 def start_logged_process(command: list[str], cwd: Path, env: dict, log_path: Path) -> tuple[subprocess.Popen, object]:
-    stream = open(log_path, "wb")
+    # 追加写入：服务端与 Agent 都会重启，截断会让首轮输出（可能含令牌泄漏）逃过扫描
+    stream = open(log_path, "ab")
     creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(command, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
                                creationflags=creation_flags, start_new_session=os.name != "nt")
     return process, stream
+
+
+def process_alive(pid: int) -> bool:
+    """只查询进程是否还在，不发送任何信号；Windows 上不能用 os.kill(pid, 0)。"""
+    if os.name == "nt":
+        result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", check=False)
+        return str(pid) in (result.stdout or "")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def build_agent_environment(extra: dict[str, str]) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in SCRUBBED_AGENT_ENV:
+        environment.pop(name, None)
+    environment.update(extra)
+    return environment
 
 
 def port_is_free(port: int) -> bool:
@@ -260,6 +303,77 @@ def server_telemetry_duplicate_groups(database: Path, node_id: int) -> int:
     return -1
 
 
+def queued_telemetry_samples(database: Path) -> list[tuple[str, str, float]]:
+    """读取离线队列每一行的 metric、collectedAt 与数值，作为补报必须逐条落库的精确身份。"""
+    if not database.exists():
+        return []
+    for _ in range(5):
+        try:
+            connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            time.sleep(0.2)
+            continue
+        try:
+            rows = connection.execute("SELECT payload FROM telemetry_queue ORDER BY id").fetchall()
+        except sqlite3.Error:
+            time.sleep(0.2)
+            continue
+        finally:
+            connection.close()
+        samples: list[tuple[str, str, float]] = []
+        for (payload,) in rows:
+            try:
+                sample = json.loads(str(payload))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(sample, dict):
+                continue
+            metric = sample.get("metric")
+            collected_at = sample.get("collectedAt")
+            value = sample.get("value")
+            if isinstance(metric, str) and isinstance(collected_at, str) and isinstance(value, (int, float)):
+                samples.append((metric, collected_at, float(value)))
+        return samples
+    return []
+
+
+def server_telemetry_samples(database: Path, node_id: int) -> list[tuple[str, str, float]]:
+    if not database.exists():
+        return []
+    for _ in range(5):
+        try:
+            connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            time.sleep(0.2)
+            continue
+        try:
+            rows = connection.execute("SELECT metric, collected_at, value FROM biz_telemetry WHERE node_id = ?", (node_id,)).fetchall()
+        except sqlite3.Error:
+            time.sleep(0.2)
+            continue
+        finally:
+            connection.close()
+        return [(str(metric), str(collected_at), float(value)) for metric, collected_at, value in rows]
+    return []
+
+
+def missing_telemetry_samples(expected: list[tuple[str, str, float]], actual: list[tuple[str, str, float]]) -> list[tuple[str, str, float]]:
+    """按 metric + collectedAt + 数值比对；数值用容差比较，其余两项必须精确相等。"""
+    by_key: dict[tuple[str, str], list[float]] = {}
+    for metric, collected_at, value in actual:
+        by_key.setdefault((metric, collected_at), []).append(value)
+    missing: list[tuple[str, str, float]] = []
+    for metric, collected_at, value in expected:
+        candidates = by_key.get((metric, collected_at), [])
+        if not any(math.isclose(candidate, value, rel_tol=1e-9, abs_tol=1e-9) for candidate in candidates):
+            missing.append((metric, collected_at, value))
+    return missing
+
+
+def format_telemetry_samples(samples: list[tuple[str, str, float]]) -> str:
+    return "、".join(f"{metric}@{collected_at}={value}" for metric, collected_at, value in samples)
+
+
 def patch_lines(text: str, replacements: list[tuple[str, str, str]]) -> str:
     for pattern, replacement, label in replacements:
         updated, count = re.subn(pattern, replacement, text, flags=re.MULTILINE)
@@ -292,10 +406,13 @@ class Session:
         self.server_config = temp_root / "server.yaml"
         self.agent_config = temp_root / "agent.yaml"
         self.ops_token = secrets.token_hex(32)
+        remember_secret(self.ops_token)
         self.server_process: subprocess.Popen | None = None
         self.server_stream = None
         self.agent_process: subprocess.Popen | None = None
         self.agent_stream = None
+        self.started_pids: list[int] = []
+        self.server_ports_released = True
         self.node_id = 0
         self.agent_version = ""
         self.agent_fingerprint = ""
@@ -385,19 +502,24 @@ class Session:
         self.server_stream = None
         self.server_process, self.server_stream = start_logged_process([str(binary), "--config", str(self.server_config)], self.temp_root,
                                                                       self.server_environment(), self.server_log)
+        self.started_pids.append(self.server_process.pid)
         if not wait_for_health(self.server_process):
             report(label, False, "服务端未在 60 秒内就绪：" + read_log_tail(self.server_log))
             return False
         report(label, True, "8080 健康检查 UP")
         return True
 
-    def stop_server(self) -> None:
+    def stop_server(self) -> bool:
         stop_process(self.server_process)
         self.server_process = None
         close_stream(self.server_stream)
         self.server_stream = None
+        released = True
         for port in SERVER_PORTS:
-            wait_port_free(port)
+            if not wait_port_free(port):
+                released = False
+        self.server_ports_released = released
+        return released
 
     def start_agent(self, environment: dict) -> bool:
         binary = executable(ROOT / "build" / "debug" / "bin" / "edgepulse-agent")
@@ -408,6 +530,7 @@ class Session:
         self.agent_stream = None
         self.agent_process, self.agent_stream = start_logged_process([str(binary), "--config", str(self.agent_config), "--console"], self.temp_root,
                                                                      environment, self.agent_stdout)
+        self.started_pids.append(self.agent_process.pid)
         return True
 
     def stop_agent(self) -> None:
@@ -416,10 +539,22 @@ class Session:
         close_stream(self.agent_stream)
         self.agent_stream = None
 
+    def log_offsets(self) -> tuple[int, int]:
+        def size(path: Path) -> int:
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
+        return size(self.agent_log), size(self.agent_stdout)
+
     def close(self) -> None:
         self.stop_agent()
         self.stop_server()
-        shutil.rmtree(self.temp_root, ignore_errors=True)
+        for _ in range(10):
+            shutil.rmtree(self.temp_root, ignore_errors=True)
+            if not self.temp_root.exists():
+                return
+            time.sleep(0.5)
 
 
 def close_stream(stream: object) -> None:
@@ -481,6 +616,9 @@ def login(label: str = "管理员登录") -> str | None:
             "POST", HTTP_BASE + "/api/auth/login",
             {"username": "admin", "password": "admin123", "captcha": code, "captchaUuid": captcha["data"]["uuid"]})
     token = (login_payload.get("data") or {}).get("token", "")
+    if token:
+        remember_secret(token)
+        admin_tokens.append(token)
     report(label, status == 200 and len(token) == 64, f"HTTP {status}")
     return token or None
 
@@ -491,6 +629,7 @@ def create_enrollment_token(token: str, action: str) -> tuple[int | None, str]:
     data = created.get("data") or {}
     token_id = data.get("id")
     plaintext = str(data.get("token", ""))
+    remember_secret(plaintext)
     return (token_id if status == 200 else None), plaintext
 
 
@@ -575,6 +714,25 @@ def wait_queue_drained(session: Session, timeout: float) -> bool:
     return False
 
 
+def wait_heartbeat_rejection(session: Session, offsets: tuple[int, int], timeout: float) -> str:
+    """只看吊销之后新增的日志，并要求同一行同时出现心跳动作与 HTTP 403，避免把别的 403 当证据。"""
+    pattern = re.compile(r"心跳[^\r\n]*HTTP 403")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for path, offset in zip((session.agent_log, session.agent_stdout), offsets):
+            try:
+                with open(path, "rb") as stream:
+                    stream.seek(offset)
+                    appended = stream.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            match = pattern.search(appended)
+            if match:
+                return match.group(0)
+        time.sleep(0.5)
+    return ""
+
+
 def upload_signed_firmware(token: str, signing: FirmwareSigning, version: str) -> dict | None:
     query = urllib.parse.urlencode({"name": "EdgePulse Agent E2E", "version": version, "fileName": "agent-e2e.bin"})
     connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=60)
@@ -637,27 +795,50 @@ def generate_rebind_certificate(session: Session) -> tuple[Path, Path] | None:
 
 
 def check_tokens_not_leaked(session: Session, enrollment_token: str, rebind_token: str) -> None:
-    needles = [enrollment_token.encode(), rebind_token.encode(), b"BEGIN EC PRIVATE KEY", b"BEGIN PRIVATE KEY"]
-    findings: list[str] = []
-    for path in (session.agent_log, session.agent_stdout, session.server_log):
+    needles = [("管理员令牌", token.encode()) for token in admin_tokens if token]
+    needles += [("注册令牌", enrollment_token.encode()), ("改绑令牌", rebind_token.encode()), ("运维令牌", session.ops_token.encode())]
+    needles += [("PEM 私钥", marker) for marker in (b"BEGIN PRIVATE KEY", b"BEGIN OPENSSH PRIVATE KEY", b"BEGIN EC PRIVATE KEY")]
+    logs = sorted(path for path in (session.temp_root / "logs").glob("*") if path.is_file())
+    databases = [session.agent_database, session.server_database]
+    missing = [path.name for path in (session.agent_log, session.agent_stdout, session.server_log, *databases) if not path.exists()]
+    scanned = logs + [path for database in databases for path in database_family(database) if path.exists()]
+    findings: list[str] = ["缺失文件：" + "、".join(missing)] if missing else []
+    for path in scanned:
         try:
             content = path.read_bytes()
-        except OSError:
+        except OSError as failure:
+            findings.append(f"{path.name}（无法读取：{failure}）")
             continue
-        for needle in needles:
+        for label, needle in needles:
             if needle and needle in content:
-                findings.append(path.name)
+                findings.append(f"{path.name}（{label}）")
                 break
-    for path in (session.agent_database, session.server_database):
-        try:
-            content = path.read_bytes()
-        except OSError:
-            continue
-        for needle in needles:
-            if needle and needle in content:
-                findings.append(path.name)
-                break
-    report("令牌与私钥未出现在日志或状态库", not findings, "命中：" + "、".join(sorted(set(findings))) if findings else "已检查 3 份日志与 2 个状态库")
+    report("令牌与私钥未出现在日志或状态库", not findings,
+           "命中：" + "、".join(findings) if findings else "已扫描 " + "、".join(path.name for path in scanned))
+
+
+def database_family(database: Path) -> list[Path]:
+    """主库必须存在；WAL/SHM 与数据一样可能残留令牌，存在就要一起扫。"""
+    paths = [database]
+    for suffix in ("-wal", "-shm"):
+        sidecar = database.with_name(database.name + suffix)
+        if sidecar.exists():
+            paths.append(sidecar)
+    return paths
+
+
+def verify_cleanup(session: Session) -> None:
+    leftovers: list[str] = []
+    busy = [str(port) for port in SERVER_PORTS if not port_is_free(port)]
+    if busy:
+        leftovers.append("端口仍被占用 " + ", ".join(busy))
+    alive = [str(pid) for pid in session.started_pids if process_alive(pid)]
+    if alive:
+        leftovers.append("进程仍在运行 " + ", ".join(alive))
+    if session.temp_root.exists():
+        leftovers.append("临时目录未删除 " + str(session.temp_root))
+    report("清理后无残留进程、端口与临时目录", not leftovers,
+           "；".join(leftovers) if leftovers else f"{len(session.started_pids)} 个进程已退出，端口全部空闲，临时目录已删除")
 
 
 def run(session: Session) -> None:
@@ -707,15 +888,18 @@ def run(session: Session) -> None:
     if token is None:
         return
 
+    status, _ = request_json("POST", AGENT_BASE + "/api/agent/register",
+                             {"name": AGENT_NAME + "-no-token", "agentVersion": session.agent_version, "certFingerprint": session.agent_fingerprint,
+                              "tenantCode": "default", "labels": "{}"},
+                             context=client_context(CERTS / "agent.pem", CERTS / "agent-key.pem"))
+    report("缺少注册令牌的注册被拒", status == 403, f"HTTP {status}")
+
     enrollment_token_id, enrollment_token = create_enrollment_token(token, "enroll")
     report("创建注册令牌", enrollment_token_id is not None and enrollment_token.startswith("ep_enroll_"), f"id={enrollment_token_id}")
     if not enrollment_token:
         return
 
-    agent_environment = os.environ.copy()
-    agent_environment.pop(REBIND_ENV, None)
-    agent_environment[ENROLLMENT_ENV] = enrollment_token
-    agent_environment[HOOK_MARKER_ENV] = str(session.hook_marker)
+    agent_environment = build_agent_environment({ENROLLMENT_ENV: enrollment_token, HOOK_MARKER_ENV: str(session.hook_marker)})
     if not session.start_agent(agent_environment):
         return
     if not wait_registration(session):
@@ -819,8 +1003,10 @@ def run(session: Session) -> None:
     telemetry_before = server_telemetry_total(session.server_database, session.node_id)
     last_seen_before_outage = str(node_detail(token, session.node_id).get("lastSeen", ""))
     node_id_before_restart = read_agent_state(session.agent_database, "node_id") or str(session.node_id)
-    session.stop_server()
-    report("服务端已停止", all(port_is_free(port) for port in SERVER_PORTS), "用于构造离线遥测")
+    ports_released = session.stop_server()
+    busy_ports = [str(port) for port in SERVER_PORTS if not port_is_free(port)]
+    report("服务端已停止", ports_released and not busy_ports,
+           "用于构造离线遥测" if not busy_ports else "停止后端口仍被占用：" + ", ".join(busy_ports))
     queued = wait_queue_depth(session, 3, 60)
     report("离线期间遥测写入本地队列", queued is not None and queued[0] >= 3,
            f"telemetry_queue={(queued or (None, None))[0]}" if queued else "60 秒内没有队列行")
@@ -828,10 +1014,10 @@ def run(session: Session) -> None:
 
     # 服务端离线时重启 Agent：注册会按退避重试，本地队列必须跨进程保留并在恢复后补报
     session.stop_agent()
-    restart_environment = os.environ.copy()
-    restart_environment.pop(ENROLLMENT_ENV, None)
-    restart_environment.pop(REBIND_ENV, None)
-    restart_environment[HOOK_MARKER_ENV] = str(session.hook_marker)
+    queued_samples = queued_telemetry_samples(session.agent_database)
+    report("离线队列样本逐条取样", bool(queued_samples),
+           f"{len(queued_samples)} 条：" + format_telemetry_samples(queued_samples) if queued_samples else "队列里读不到可解析样本")
+    restart_environment = build_agent_environment({HOOK_MARKER_ENV: str(session.hook_marker)})
     if not session.start_agent(restart_environment):
         return
     report("服务端离线期间重启 Agent", session.agent_process is not None and session.agent_process.poll() is None, "Agent 进程已启动并在等待注册")
@@ -853,6 +1039,19 @@ def run(session: Session) -> None:
         time.sleep(0.5)
     report("服务端收到补报遥测", drained and recovered_total >= telemetry_before + queued_rows,
            f"before={telemetry_before}，queued={queued_rows}，after={recovered_total}")
+    missing_samples = queued_samples
+    deadline = time.time() + 30
+    while time.time() < deadline and missing_samples:
+        missing_samples = missing_telemetry_samples(queued_samples, server_telemetry_samples(session.server_database, session.node_id))
+        if missing_samples:
+            time.sleep(0.5)
+    if not queued_samples:
+        exact_detail = "离线队列没有可核对的样本"
+    elif missing_samples:
+        exact_detail = "缺失 " + format_telemetry_samples(missing_samples)
+    else:
+        exact_detail = f"队列 {len(queued_samples)} 条按 metric+collectedAt+value 全部命中"
+    report("离线队列样本逐条落在服务端遥测", bool(queued_samples) and not missing_samples, exact_detail)
     recovered_node = wait_node_detail(token, session.node_id,
                                       lambda node: node.get("status") == "online" and node.get("lastSeen") != last_seen_before_outage, 60)
     state_after_restart = wait_agent_state(session.agent_database, "node_id", node_id_before_restart, 10)
@@ -881,6 +1080,7 @@ def run(session: Session) -> None:
 
     rebind_id, rebind_token = create_enrollment_token(token, "rebind")
     report("创建改绑令牌", rebind_id is not None and rebind_token.startswith("ep_enroll_"), f"id={rebind_id}")
+    agent_log_offsets = session.log_offsets()
     revoke_status, revoked = request_json("POST", HTTP_BASE + f"/api/nodes/{session.node_id}/certificate/revoke", {}, token=token)
     revoked_data = revoked.get("data") or {}
     report("吊销节点证书", revoke_status == 200 and not revoked_data.get("certFingerprint") and bool(revoked_data.get("certRevokedAt")),
@@ -889,17 +1089,8 @@ def run(session: Session) -> None:
     status, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat", {"nodeId": session.node_id, "agentVersion": session.agent_version},
                              context=old_context)
     report("吊销后旧证书心跳被拒", status == 403, f"HTTP {status}")
-    heartbeat_rejected = False
-    deadline = time.time() + 25
-    while time.time() < deadline:
-        try:
-            if b"HTTP 403" in session.agent_stdout.read_bytes():
-                heartbeat_rejected = True
-                break
-        except OSError:
-            pass
-        time.sleep(0.5)
-    report("运行中的 Agent 收到吊销拒绝", heartbeat_rejected, "Agent 日志出现 HTTP 403" if heartbeat_rejected else "Agent 日志未出现 HTTP 403")
+    rejection_line = wait_heartbeat_rejection(session, agent_log_offsets, 25)
+    report("运行中的 Agent 收到吊销拒绝", bool(rejection_line), ("Agent 日志：" + rejection_line) if rejection_line else "新增日志未出现心跳 HTTP 403")
     offline = wait_node_detail(token, session.node_id, lambda node: node.get("status") == "offline", 30)
     report("吊销后节点离线", offline is not None, f"status={(offline or {}).get('status')}")
 
@@ -910,10 +1101,7 @@ def run(session: Session) -> None:
         report("新客户端证书签发", new_fingerprint != session.agent_fingerprint, f"指纹 {new_fingerprint}")
         session.stop_agent()
         session.write_agent_config(new_certificate_path, new_key_path)
-        rebind_environment = os.environ.copy()
-        rebind_environment.pop(ENROLLMENT_ENV, None)
-        rebind_environment[REBIND_ENV] = rebind_token
-        rebind_environment[HOOK_MARKER_ENV] = str(session.hook_marker)
+        rebind_environment = build_agent_environment({REBIND_ENV: rebind_token, HOOK_MARKER_ENV: str(session.hook_marker)})
         if session.start_agent(rebind_environment):
             rebound = wait_node_detail(token, session.node_id,
                                        lambda node: node.get("status") == "online" and node.get("certFingerprint") == new_fingerprint
@@ -951,7 +1139,13 @@ def main() -> int:
             traceback.print_exc()
             report("端到端执行未抛出异常", False, f"{type(failure).__name__}: {failure}")
     finally:
-        session.close()
+        try:
+            session.close()
+        finally:
+            try:
+                verify_cleanup(session)
+            except Exception as failure:  # noqa: BLE001
+                report("清理后无残留进程、端口与临时目录", False, f"清理检查异常：{type(failure).__name__}: {failure}")
     print()
     print(f"Agent 端到端验收：通过 {passed} 项，失败 {len(failures)} 项，跳过 {len(skips)} 项")
     if failures:
