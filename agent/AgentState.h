@@ -110,6 +110,14 @@ namespace EdgePulse::Agent
         void ackTelemetry(std::int64_t id);
 
         /**
+         * @brief 在一个事务里删除多条已确认投递的遥测
+         * @param ids 队列内自增标识列表
+         * @return 成功为空；列表超过单批上限或删除失败时返回中文原因
+         * @note 空列表直接成功，不打开写事务；单批上限 500 条，低于 SQLite 单语句绑定参数上限
+         */
+        [[nodiscard]] std::expected<void, std::string> ackTelemetryBatch(const std::vector<std::int64_t> &ids);
+
+        /**
          * @brief 追加一条命令结果
          * @param commandId 服务端命令标识
          * @param payload 结果正文

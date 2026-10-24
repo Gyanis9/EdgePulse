@@ -402,7 +402,7 @@ namespace EdgePulse::Agent
                 {
                     co_return;
                 }
-                co_await publisher.flush(nodeId);
+                co_await publisher.flush(loop, nodeId);
                 if (stopRequested.load(std::memory_order_acquire))
                 {
                     co_return;

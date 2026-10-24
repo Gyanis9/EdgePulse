@@ -128,6 +128,39 @@ namespace EdgePulse::Agent
         EXPECT_TRUE(state->takeTelemetry(10).empty());
     }
 
+    TEST(AgentState, AckTelemetryBatchDeletesGivenRowsAndKeepsFifo)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = AgentState::open(directory.path() / "agent.db");
+        ASSERT_TRUE(state.has_value()) << state.error();
+
+        state->enqueueTelemetry("first");
+        state->enqueueTelemetry("second");
+        state->enqueueTelemetry("third");
+        state->enqueueTelemetry("fourth");
+
+        const std::vector<QueuedItem> rows = state->takeTelemetry(10);
+        ASSERT_EQ(4U, rows.size());
+
+        const auto emptied = state->ackTelemetryBatch({});
+        EXPECT_TRUE(emptied.has_value()) << emptied.error();
+        EXPECT_EQ(4U, state->telemetryQueueDepth()) << "空列表必须直接成功且不动队列";
+
+        const auto deleted = state->ackTelemetryBatch({rows[0].id, rows[2].id});
+        ASSERT_TRUE(deleted.has_value()) << deleted.error();
+        EXPECT_EQ(2U, state->telemetryQueueDepth());
+
+        const std::vector<QueuedItem> remaining = state->takeTelemetry(10);
+        ASSERT_EQ(2U, remaining.size());
+        EXPECT_EQ("second", remaining[0].payload);
+        EXPECT_EQ("fourth", remaining[1].payload);
+
+        const std::vector<std::int64_t> tooMany(501, 1);
+        const auto                      rejected = state->ackTelemetryBatch(tooMany);
+        EXPECT_FALSE(rejected.has_value()) << "超过单批上限必须拒绝，不能拼出一条超长语句";
+        EXPECT_EQ(2U, state->telemetryQueueDepth());
+    }
+
     TEST(AgentState, TelemetryQueueDropsOldestAtLimit)
     {
         TestSupport::TemporaryDirectory directory;

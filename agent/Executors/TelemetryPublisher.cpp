@@ -6,8 +6,14 @@
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogMacros.h"
 
+#include "Core/Coroutine/AsyncExecutor.h"
+#include "Core/EventLoop/EventLoop.h"
+
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <expected>
 #include <optional>
 #include <string>
 #include <utility>
@@ -62,6 +68,86 @@ namespace EdgePulse::Agent
             for (const AsynGyanis::Base::ConfigValue &sample: samples)
             {
                 state.enqueueTelemetry(sample.dump());
+            }
+        }
+
+        /**
+         * @brief 一个已分拣好的补报批次
+         */
+        struct FlushBatch
+        {
+            AsynGyanis::Base::ConfigValue payloads = AsynGyanis::Base::ConfigValue::array(); ///< 可上报的样本数组
+            std::vector<std::int64_t>     ids;                                               ///< 与 payloads 一一对应的队列行
+            std::size_t                   takenRows{0};                                      ///< 本次从队列取出的行数
+            bool                          corruptCleanupFailed{false};                       ///< 损坏行删除失败，本轮补报必须停止
+        };
+
+        /**
+         * @brief 从队列取一批行并按可上报性分拣，损坏行当场批量删除
+         * @param state 本地状态库
+         * @return FlushBatch 可上报样本、对应行标识与损坏行清理结论
+         * @note 只应在阻塞执行器的工作线程上调用
+         */
+        [[nodiscard]] FlushBatch takeFlushBatch(AgentState &state)
+        {
+            const std::vector<QueuedItem> rows = state.takeTelemetry(kTelemetryBatchLimit);
+            FlushBatch                    taken;
+            taken.takenRows = rows.size();
+
+            std::vector<QueuedItem>   corruptRows;
+            std::vector<std::int64_t> corruptIds;
+            corruptRows.reserve(rows.size());
+            corruptIds.reserve(rows.size());
+            for (const QueuedItem &row: rows)
+            {
+                auto parsed = AsynGyanis::Base::parseConfigValue(row.payload);
+                if (!parsed.has_value() || !isValidQueuedSample(*parsed))
+                {
+                    corruptRows.push_back(row);
+                    corruptIds.push_back(row.id);
+                    continue;
+                }
+                taken.payloads.push_back(std::move(*parsed));
+                taken.ids.push_back(row.id);
+            }
+
+            if (!corruptIds.empty())
+            {
+                const auto dropped = state.ackTelemetryBatch(corruptIds);
+                if (!dropped)
+                {
+                    LOG_ERROR_FMT("遥测队列中 {} 条损坏行删除失败，本轮补报停止：{}", corruptIds.size(), dropped.error());
+                    taken.corruptCleanupFailed = true;
+                    return taken;
+                }
+                for (const QueuedItem &row: corruptRows)
+                {
+                    LOG_ERROR_FMT("遥测队列第 {} 条正文已损坏，已从队列删除：{}", row.id, row.payload);
+                }
+            }
+            return taken;
+        }
+
+        /**
+         * @brief 在一个阻塞任务里批量确认已送达的队列行
+         * @param state 本地状态库
+         * @param loop 恢复协程用的事件循环
+         * @param ids 待删除的队列行
+         * @return 成功为空；任务提交失败或删除失败时返回中文原因
+         */
+        [[nodiscard]] AsynGyanis::Core::Task<std::expected<void, std::string>> ackTelemetryRows(AgentState &state, AsynGyanis::Core::EventLoop &loop, std::vector<std::int64_t> ids)
+        {
+            try
+            {
+                std::expected<void, std::string> acknowledged = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                        loop, [state = &state, ids = std::move(ids)]() { return state->ackTelemetryBatch(ids); });
+                co_return acknowledged;
+            } catch (const std::exception &failure)
+            {
+                co_return std::unexpected("遥测确认任务失败：" + std::string{failure.what()});
+            } catch (...)
+            {
+                co_return std::unexpected("遥测确认任务失败：未知异常");
             }
         }
     } // namespace
@@ -120,7 +206,7 @@ namespace EdgePulse::Agent
         LOG_WARN_FMT("遥测上报失败，已把 {} 条样本写入离线队列等待补报：{}", count, failure.message);
     }
 
-    AsynGyanis::Core::Task<> TelemetryPublisher::flush(const std::int64_t nodeId)
+    AsynGyanis::Core::Task<> TelemetryPublisher::flush(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
     {
         if (nodeId <= 0)
         {
@@ -130,38 +216,42 @@ namespace EdgePulse::Agent
 
         for (;;)
         {
-            const std::vector<QueuedItem> rows = m_state.takeTelemetry(kTelemetryBatchLimit);
-            if (rows.empty())
+            FlushBatch taken;
+            try
+            {
+                taken = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<FlushBatch>(loop, [state = &m_state] { return takeFlushBatch(*state); });
+            } catch (const std::exception &failure)
+            {
+                LOG_ERROR_FMT("遥测补报的队列读取任务失败，本轮停止：{}", failure.what());
+                co_return;
+            } catch (...)
+            {
+                LOG_ERROR("遥测补报的队列读取任务失败：未知异常，本轮停止");
+                co_return;
+            }
+            if (taken.corruptCleanupFailed)
             {
                 co_return;
             }
-
-            AsynGyanis::Base::ConfigValue batch = AsynGyanis::Base::ConfigValue::array();
-            std::vector<QueuedItem>       deliverable;
-            deliverable.reserve(rows.size());
-            for (const QueuedItem &row: rows)
+            if (taken.takenRows == 0)
             {
-                const auto parsed = AsynGyanis::Base::parseConfigValue(row.payload);
-                if (!parsed.has_value() || !isValidQueuedSample(*parsed))
-                {
-                    LOG_ERROR_FMT("遥测队列第 {} 条正文已损坏，已从队列删除：{}", row.id, row.payload);
-                    m_state.ackTelemetry(row.id);
-                    continue;
-                }
-                batch.push_back(*parsed);
-                deliverable.push_back(row);
+                co_return;
             }
-            if (deliverable.empty())
+            if (taken.ids.empty())
             {
+                // 整批都是损坏行且已删除，接着取下一批
                 continue;
             }
 
-            const auto sent = co_await m_client.sendTelemetry(nodeId, batch);
+            const std::size_t batchSize = taken.ids.size();
+            const auto        sent      = co_await m_client.sendTelemetry(nodeId, taken.payloads);
             if (sent.has_value())
             {
-                for (const QueuedItem &row: deliverable)
+                const auto acknowledged = co_await ackTelemetryRows(m_state, loop, std::move(taken.ids));
+                if (!acknowledged)
                 {
-                    m_state.ackTelemetry(row.id);
+                    LOG_ERROR_FMT("遥测补报已送达，但 {} 条队列行确认失败，下一轮会重复上报：{}", batchSize, acknowledged.error());
+                    co_return;
                 }
                 continue;
             }
@@ -169,13 +259,15 @@ namespace EdgePulse::Agent
             const TelemetryFailure &failure = sent.error();
             if (failure.retryable)
             {
-                LOG_WARN_FMT("遥测补报失败，{} 条样本保留在离线队列等待重试：{}", deliverable.size(), failure.message);
+                LOG_WARN_FMT("遥测补报失败，{} 条样本保留在离线队列等待重试：{}", batchSize, failure.message);
                 co_return;
             }
-            LOG_ERROR_FMT("遥测补报被服务端以 HTTP {} 拒绝，重试不会改变结论，已删除 {} 条队列样本：{}", failure.httpStatus, deliverable.size(), failure.message);
-            for (const QueuedItem &row: deliverable)
+            LOG_ERROR_FMT("遥测补报被服务端以 HTTP {} 拒绝，重试不会改变结论，已删除 {} 条队列样本：{}", failure.httpStatus, batchSize, failure.message);
+            const auto acknowledged = co_await ackTelemetryRows(m_state, loop, std::move(taken.ids));
+            if (!acknowledged)
             {
-                m_state.ackTelemetry(row.id);
+                LOG_ERROR_FMT("被终态拒绝的 {} 条队列行删除失败，下一轮会再次补报：{}", batchSize, acknowledged.error());
+                co_return;
             }
         }
     }

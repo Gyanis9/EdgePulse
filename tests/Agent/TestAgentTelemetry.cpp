@@ -189,6 +189,35 @@ namespace EdgePulse::Agent
         {
             return std::format("{:%Y-%m-%dT%H:%M:%S}Z", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
         }
+
+        /**
+         * @brief 用独立连接一次性写入按序编号的遥测种子
+         * @param databasePath 状态库路径
+         * @param count 写入条数，指标值从 0 递增
+         * @return bool 提交成功返回 true
+         */
+        [[nodiscard]] bool seedTelemetryRows(const std::filesystem::path &databasePath, const int count)
+        {
+            const std::string                                               createdAt  = utcNow();
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirectSqlite(databasePath.string());
+            if (connection == nullptr || connection->execute("BEGIN IMMEDIATE") == nullptr)
+            {
+                return false;
+            }
+            for (int index = 0; index < count; ++index)
+            {
+                const auto payload = serializeTelemetrySample(makeSample("cpu.usage", static_cast<double>(index)));
+                if (!payload.has_value())
+                {
+                    return false;
+                }
+                if (connection->execute("INSERT INTO telemetry_queue(payload, created_at) VALUES(?, ?)", std::vector<DatabaseValue>{*payload, createdAt}) == nullptr)
+                {
+                    return false;
+                }
+            }
+            return connection->execute("COMMIT") != nullptr;
+        }
     } // namespace
 
     TEST(AgentTelemetry, ComputesLinuxCpuPercentFromProcStat)
@@ -335,7 +364,7 @@ namespace EdgePulse::Agent
         EXPECT_EQ(77, firstRequest->value("nodeId", 0));
         ASSERT_EQ(3U, firstRequest->at("samples").size());
 
-        ASSERT_TRUE(loop.run(publisher.flush(77), std::chrono::seconds{10}, "离线补报"));
+        ASSERT_TRUE(loop.run(publisher.flush(loop.loop(), 77), std::chrono::seconds{10}, "离线补报"));
         EXPECT_EQ(0U, state->telemetryQueueDepth()) << "HTTP 200 后必须删掉已确认的队列行";
 
         const auto bodies = capturedBodies(capture);
@@ -375,11 +404,11 @@ namespace EdgePulse::Agent
         state->enqueueTelemetry(serializeTelemetrySample(makeSample("memory.usage", 2.0)).value_or(""));
         state->enqueueTelemetry(serializeTelemetrySample(makeSample("disk.usage", 3.0)).value_or(""));
         ASSERT_EQ(2U, state->telemetryQueueDepth());
-        ASSERT_TRUE(loop.run(publisher.flush(77), std::chrono::seconds{10}, "终态拒绝补报"));
+        ASSERT_TRUE(loop.run(publisher.flush(loop.loop(), 77), std::chrono::seconds{10}, "终态拒绝补报"));
         EXPECT_EQ(0U, state->telemetryQueueDepth()) << "补报被终态 4xx 拒绝后必须删除该批行，不能永久堵塞队列";
 
         state->enqueueTelemetry(serializeTelemetrySample(makeSample("cpu.usage", 4.0)).value_or(""));
-        ASSERT_TRUE(loop.run(publisher.flush(77), std::chrono::seconds{10}, "拒绝后再次补报"));
+        ASSERT_TRUE(loop.run(publisher.flush(loop.loop(), 77), std::chrono::seconds{10}, "拒绝后再次补报"));
         EXPECT_EQ(0U, state->telemetryQueueDepth());
 
         const auto bodies = capturedBodies(capture);
@@ -409,7 +438,7 @@ namespace EdgePulse::Agent
         state->enqueueTelemetry(R"({"metric":"","value":1,"unit":"%","collectedAt":"2026-10-24 12:00:00"})");
         ASSERT_EQ(3U, state->telemetryQueueDepth());
 
-        ASSERT_TRUE(loop.run(publisher.flush(77), std::chrono::seconds{10}, "损坏行补报"));
+        ASSERT_TRUE(loop.run(publisher.flush(loop.loop(), 77), std::chrono::seconds{10}, "损坏行补报"));
         EXPECT_EQ(0U, state->telemetryQueueDepth()) << "损坏行与已确认行都必须从队列删除";
 
         const auto bodies = capturedBodies(capture);
@@ -430,21 +459,7 @@ namespace EdgePulse::Agent
             ASSERT_TRUE(state.has_value()) << state.error();
         }
 
-        const std::string createdAt = utcNow();
-        {
-            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirectSqlite(databasePath.string());
-            ASSERT_NE(nullptr, connection);
-            ASSERT_NE(nullptr, connection->execute("BEGIN IMMEDIATE")) << connection->lastError();
-            for (int index = 0; index < 501; ++index)
-            {
-                const auto payload = serializeTelemetrySample(makeSample("cpu.usage", static_cast<double>(index)));
-                ASSERT_TRUE(payload.has_value());
-                const auto inserted = connection->execute("INSERT INTO telemetry_queue(payload, created_at) VALUES(?, ?)", std::vector<DatabaseValue>{*payload, createdAt});
-                ASSERT_NE(nullptr, inserted) << connection->lastError();
-            }
-            ASSERT_NE(nullptr, connection->execute("COMMIT")) << connection->lastError();
-        }
-
+        ASSERT_TRUE(seedTelemetryRows(databasePath, 501)) << "遥测种子写入失败";
         auto state = AgentState::open(databasePath);
         ASSERT_TRUE(state.has_value()) << state.error();
         ASSERT_EQ(501U, state->telemetryQueueDepth());
@@ -458,7 +473,7 @@ namespace EdgePulse::Agent
         TelemetryPublisher publisher(client, *state);
         LoopStopGuard      stopGuard{loop};
 
-        ASSERT_TRUE(loop.run(publisher.flush(77), std::chrono::seconds{20}, "分批补报"));
+        ASSERT_TRUE(loop.run(publisher.flush(loop.loop(), 77), std::chrono::seconds{20}, "分批补报"));
         EXPECT_EQ(0U, state->telemetryQueueDepth());
 
         const auto bodies = capturedBodies(capture);
@@ -469,7 +484,86 @@ namespace EdgePulse::Agent
         ASSERT_TRUE(second.has_value());
         ASSERT_EQ(500U, first->at("samples").size());
         ASSERT_EQ(1U, second->at("samples").size());
-        EXPECT_DOUBLE_EQ(0.0, first->at("samples")[0].value("value", -1.0));
-        EXPECT_DOUBLE_EQ(500.0, second->at("samples")[0].value("value", -1.0));
+        for (std::size_t index = 0; index < 500; ++index)
+        {
+            const auto &sample = first->at("samples")[index];
+            EXPECT_EQ("cpu.usage", sample.value("metric", std::string{}));
+            EXPECT_DOUBLE_EQ(static_cast<double>(index), sample.value("value", -1.0)) << "第 " << index << " 条必须按入队顺序发送";
+        }
+        EXPECT_DOUBLE_EQ(500.0, second->at("samples")[0].value("value", -1.0)) << "第二批必须接着第一批的入队顺序";
+    }
+
+    TEST(AgentTelemetry, CorruptRowInBatchIsDroppedAndValidRowsShareOneRequest)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = AgentState::open(directory.path() / "agent.db");
+        ASSERT_TRUE(state.has_value()) << state.error();
+
+        auto                       capture = std::make_shared<TelemetryCapture>();
+        TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { installTelemetryRoute(router, capture); });
+
+        AgentLoop          loop;
+        AgentClient        client(loop.loop(), plaintextConfiguration(server.port()), testIdentity());
+        TelemetryPublisher publisher(client, *state);
+        LoopStopGuard      stopGuard{loop};
+
+        state->enqueueTelemetry(serializeTelemetrySample(makeSample("cpu.usage", 0.0)).value_or(""));
+        state->enqueueTelemetry(R"({"metric":"","value":1,"unit":"%","collectedAt":"2026-10-24 12:00:00"})");
+        state->enqueueTelemetry(serializeTelemetrySample(makeSample("memory.usage", 1.0)).value_or(""));
+        state->enqueueTelemetry(serializeTelemetrySample(makeSample("disk.usage", 2.0)).value_or(""));
+        ASSERT_EQ(4U, state->telemetryQueueDepth());
+
+        ASSERT_TRUE(loop.run(publisher.flush(loop.loop(), 77), std::chrono::seconds{10}, "损坏行同批补报"));
+        EXPECT_EQ(0U, state->telemetryQueueDepth()) << "损坏行与其余有效行都必须从队列删除";
+
+        const auto bodies = capturedBodies(capture);
+        ASSERT_EQ(1U, bodies.size()) << "同一批里的有效行必须在同一次请求里补报";
+        const auto request = parseTelemetryRequest(bodies.front());
+        ASSERT_TRUE(request.has_value());
+        ASSERT_EQ(3U, request->at("samples").size());
+        const std::vector<std::string> expected{"cpu.usage", "memory.usage", "disk.usage"};
+        for (std::size_t index = 0; index < expected.size(); ++index)
+        {
+            EXPECT_EQ(expected[index], request->at("samples")[index].value("metric", std::string{}));
+            EXPECT_DOUBLE_EQ(static_cast<double>(index), request->at("samples")[index].value("value", -1.0));
+        }
+    }
+
+    TEST(AgentTelemetry, TerminalRejectionDropsFullBatchAndLaterRowIsDelivered)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const std::filesystem::path     databasePath = directory.path() / "agent.db";
+        {
+            auto state = AgentState::open(databasePath);
+            ASSERT_TRUE(state.has_value()) << state.error();
+        }
+        ASSERT_TRUE(seedTelemetryRows(databasePath, 501)) << "遥测种子写入失败";
+
+        auto state = AgentState::open(databasePath);
+        ASSERT_TRUE(state.has_value()) << state.error();
+        ASSERT_EQ(501U, state->telemetryQueueDepth());
+
+        auto capture      = std::make_shared<TelemetryCapture>();
+        capture->statuses = {400, 200};
+        TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { installTelemetryRoute(router, capture); });
+
+        AgentLoop          loop;
+        AgentClient        client(loop.loop(), plaintextConfiguration(server.port()), testIdentity());
+        TelemetryPublisher publisher(client, *state);
+        LoopStopGuard      stopGuard{loop};
+
+        ASSERT_TRUE(loop.run(publisher.flush(loop.loop(), 77), std::chrono::seconds{20}, "终态拒绝整批补报"));
+        EXPECT_EQ(0U, state->telemetryQueueDepth()) << "整批 500 条被终态拒绝后必须删除，且不能堵塞后续行";
+
+        const auto bodies = capturedBodies(capture);
+        ASSERT_EQ(2U, bodies.size()) << "500 条被拒后剩余 1 条必须单独补报";
+        const auto rejected  = parseTelemetryRequest(bodies[0]);
+        const auto delivered = parseTelemetryRequest(bodies[1]);
+        ASSERT_TRUE(rejected.has_value());
+        ASSERT_TRUE(delivered.has_value());
+        ASSERT_EQ(500U, rejected->at("samples").size());
+        ASSERT_EQ(1U, delivered->at("samples").size());
+        EXPECT_DOUBLE_EQ(499.0, rejected->at("samples")[499].value("value", -1.0));
+        EXPECT_DOUBLE_EQ(500.0, delivered->at("samples")[0].value("value", -1.0)) << "终态拒绝后剩余行仍按入队顺序送达";
     }
 } // namespace EdgePulse::Agent

@@ -34,6 +34,7 @@ namespace EdgePulse::Agent
         constexpr std::int64_t kResultQueueLimit       = 1000;  ///< 命令结果队列上限
         constexpr int          kWriteAttemptCount      = 3;     ///< 锁竞争时的写事务尝试次数
         constexpr int          kTelemetryRetentionDays = 7;     ///< 遥测离线保留天数
+        constexpr std::size_t  kTelemetryAckBatchLimit = 500;   ///< 单次批量确认上限，低于 SQLite 单语句 999 个绑定参数
 
         /**
          * @brief 执行一条语句，失败时把驱动原文收进返回值
@@ -374,6 +375,36 @@ namespace EdgePulse::Agent
         {
             LOG_ERROR_FMT("确认遥测 {} 失败：{}", id, deleted.error());
         }
+    }
+
+    std::expected<void, std::string> AgentState::ackTelemetryBatch(const std::vector<std::int64_t> &ids)
+    {
+        if (ids.empty())
+        {
+            return {};
+        }
+        if (ids.size() > kTelemetryAckBatchLimit)
+        {
+            return std::unexpected("一次确认的遥测条数 " + std::to_string(ids.size()) + " 超过单批上限 " + std::to_string(kTelemetryAckBatchLimit));
+        }
+
+        std::string                sql = "DELETE FROM telemetry_queue WHERE id IN (";
+        std::vector<DatabaseValue> parameters;
+        parameters.reserve(ids.size());
+        for (const std::int64_t id: ids)
+        {
+            if (!parameters.empty())
+            {
+                sql += ", ";
+            }
+            sql += "?";
+            parameters.emplace_back(id);
+        }
+        sql += ")";
+
+        std::lock_guard lock(*m_mutex);
+        return runWriteTransaction(*m_connection, [&sql, &parameters](DatabaseConnection &connection) -> std::expected<void, std::string>
+                                   { return executeStatement(connection, sql, parameters); });
     }
 
     void AgentState::enqueueResult(const std::int64_t commandId, std::string payload)

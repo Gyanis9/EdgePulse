@@ -16,6 +16,11 @@
 #include <cstdint>
 #include <vector>
 
+namespace AsynGyanis::Core
+{
+    class EventLoop;
+} // namespace AsynGyanis::Core
+
 namespace EdgePulse::Agent
 {
     class AgentClient;
@@ -25,6 +30,7 @@ namespace EdgePulse::Agent
      * @brief 把采集到的样本直接上报，失败时落入本地队列
      * @details 直报遇可重试失败时逐条入队，遇终态 4xx 时丢弃本批并记 ERROR；
      *          补报按入队顺序每批最多 500 条，只有 HTTP 200 才确认并删除对应行。
+     *          队列读取、损坏行判定与批量确认都投到阻塞执行器的工作线程，事件循环只做批次编排与 HTTP。
      *          损坏的队列正文会被删除并记 ERROR，避免永久堵塞队列。
      *          同一时刻只由遥测循环的一条协程调用，不额外加锁。
      */
@@ -48,10 +54,13 @@ namespace EdgePulse::Agent
 
         /**
          * @brief 按 FIFO 补报离线队列，直到队列为空或遇到可重试失败
+         * @param loop 提交阻塞任务与恢复协程用的事件循环
          * @param nodeId 节点标识
-         * @note 每批最多 500 条；损坏行先删除再发送其余行；终态 4xx 删除该批后继续下一批
+         * @return 协程任务
+         * @note 每批最多 500 条；队列读取与批量确认在阻塞执行器上执行；
+         *       损坏行先删除再发送其余行；终态 4xx 删除该批后继续下一批
          */
-        AsynGyanis::Core::Task<> flush(std::int64_t nodeId);
+        AsynGyanis::Core::Task<> flush(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
 
     private:
         AgentClient &m_client; ///< 服务端客户端
