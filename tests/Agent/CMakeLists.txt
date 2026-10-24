@@ -6,12 +6,15 @@ edgepulse_enable_warnings(edgepulse-agent-test-hook)
 set_target_properties(edgepulse-agent-test-hook PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 add_executable(edgepulse-agent-tests
+        AgentLoop.h
         CertificateFixture.cpp
+        FirmwareKeyFixture.cpp
         TestAgentApplication.cpp
         TestAgentClient.cpp
         TestAgentCommand.cpp
         TestAgentConfiguration.cpp
         TestAgentExecutors.cpp
+        TestAgentFirmware.cpp
         TestAgentIdentity.cpp
         TestAgentState.cpp)
 target_compile_definitions(edgepulse-agent-tests PRIVATE EDGEPULSE_AGENT_TEST_HOOK_PATH="$<TARGET_FILE:edgepulse-agent-test-hook>")

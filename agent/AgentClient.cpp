@@ -18,6 +18,8 @@ namespace EdgePulse::Agent
 {
     namespace
     {
+        constexpr std::chrono::seconds kFirmwareDownloadTimeout{300}; ///< 固件正文的下载时限
+
         /**
          * @brief 从失败响应里取出统一包络的中文 message
          * @param body 响应正文
@@ -115,6 +117,61 @@ namespace EdgePulse::Agent
         {
             return std::string{action} + "返回 HTTP " + std::to_string(status) + "：" + envelopeMessage(body);
         }
+
+        /**
+         * @brief 取 ASCII 小写副本
+         * @param text 原文本
+         * @return std::string 小写副本，非 ASCII 字节原样保留
+         */
+        [[nodiscard]] std::string asciiLower(const std::string_view text)
+        {
+            std::string lowered;
+            lowered.reserve(text.size());
+            for (const char character: text)
+            {
+                lowered.push_back(character >= 'A' && character <= 'Z' ? static_cast<char>(character - 'A' + 'a') : character);
+            }
+            return lowered;
+        }
+
+        /**
+         * @brief 把命令给出的下载地址解析成绝对地址
+         * @param downloadPath 服务端给出的下载地址
+         * @param baseUrl 去掉结尾斜杠的服务端基地址
+         * @param allowPlaintext 是否允许明文 http 绝对地址
+         * @return 成功返回绝对地址；失败返回中文原因
+         * @details 以 / 开头时相对 base_url 拼接；带协议的绝对地址只接受 https，http 仅在显式允许明文时放行
+         */
+        [[nodiscard]] std::expected<std::string, std::string> resolveDownloadUrl(const std::string_view downloadPath, const std::string &baseUrl, const bool allowPlaintext)
+        {
+            if (downloadPath.empty())
+            {
+                return std::unexpected("固件下载地址为空");
+            }
+            if (downloadPath.front() == '/')
+            {
+                return std::string{baseUrl} + std::string{downloadPath};
+            }
+            const std::size_t schemeEnd = downloadPath.find("://");
+            if (schemeEnd == std::string_view::npos)
+            {
+                return std::unexpected("固件下载地址必须以 / 开头或为绝对 http(s) 地址");
+            }
+            const std::string scheme = asciiLower(downloadPath.substr(0, schemeEnd));
+            if (scheme == "https")
+            {
+                return std::string{downloadPath};
+            }
+            if (scheme == "http")
+            {
+                if (!allowPlaintext)
+                {
+                    return std::unexpected("固件下载地址是明文 http，只有显式开启明文测试配置时才允许");
+                }
+                return std::string{downloadPath};
+            }
+            return std::unexpected("固件下载地址的协议 " + scheme + " 不受支持，只允许 https 或相对路径");
+        }
     } // namespace
 
     AgentClient::AgentClient(AsynGyanis::Core::EventLoop &loop, const AgentConfiguration &configuration, AgentIdentity identity) :
@@ -130,6 +187,7 @@ namespace EdgePulse::Agent
         m_heartbeatUrl = m_baseUrl + "/api/agent/heartbeat";
         m_commandsUrl  = m_baseUrl + "/api/agent/commands";
         m_agentNodesUrl = m_baseUrl + "/api/agent/nodes";
+        m_firmwareUrl   = m_baseUrl + "/api/agent/firmware";
 
         try
         {
@@ -514,6 +572,109 @@ namespace EdgePulse::Agent
         if (!checked)
         {
             co_return std::unexpected("上报配置结果" + checked.error());
+        }
+        co_return std::expected<void, std::string>{};
+    }
+
+    AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> AgentClient::downloadFirmware(std::string downloadPath,
+                                                                                                    AsynGyanis::Net::HttpResponseBodyReceiver receiver)
+    {
+        if (!m_initializationError.empty() || m_client == nullptr)
+        {
+            co_return std::unexpected(m_initializationError);
+        }
+        if (!receiver)
+        {
+            co_return std::unexpected("固件下载缺少正文接收口");
+        }
+
+        auto resolved = resolveDownloadUrl(downloadPath, m_baseUrl, m_configuration.allowPlaintextForTests);
+        if (!resolved.has_value())
+        {
+            co_return std::unexpected(resolved.error());
+        }
+
+        AsynGyanis::Net::HttpClientRequest request;
+        request.method               = "GET";
+        request.responseBodyReceiver = std::move(receiver);
+
+        std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
+        try
+        {
+            response = co_await m_client->send(*resolved, request, kFirmwareDownloadTimeout);
+        } catch (const std::exception &failure)
+        {
+            co_return std::unexpected("固件下载请求异常：" + std::string{failure.what()});
+        }
+        if (response == nullptr)
+        {
+            co_return std::unexpected("固件下载请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志");
+        }
+
+        DownloadResult result;
+        result.httpStatus = response->statusCode;
+        if (result.httpStatus < 200 || result.httpStatus >= 300)
+        {
+            // 正文已交给接收口，这里的 body 为空；失败原因取统一包络或固定文案
+            result.message = envelopeMessage(response->body);
+        }
+        co_return result;
+    }
+
+    AsynGyanis::Core::Task<std::expected<void, std::string>> AgentClient::reportFirmwareStatus(const std::int64_t firmwareId, const std::int64_t nodeId,
+                                                                                               const std::string_view status, const int progress, const std::string_view message)
+    {
+        if (!m_initializationError.empty() || m_client == nullptr)
+        {
+            co_return std::unexpected(m_initializationError);
+        }
+        if (firmwareId <= 0)
+        {
+            co_return std::unexpected("固件标识无效，无法上报状态");
+        }
+        if (nodeId <= 0)
+        {
+            co_return std::unexpected("节点标识无效，无法上报固件状态");
+        }
+        if (status != "pending" && status != "downloading" && status != "installing" && status != "installed" && status != "failed")
+        {
+            co_return std::unexpected("固件状态只允许 pending、downloading、installing、installed 或 failed");
+        }
+        if (progress < 0 || progress > 100)
+        {
+            co_return std::unexpected("固件进度必须在 0 到 100 之间");
+        }
+
+        const AsynGyanis::Base::ConfigValue requestBody =
+                AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", std::string{status}}, {"progress", progress}, {"message", std::string{message}}});
+        // HttpClientRequest::body 是 string_view：序列化结果必须落在协程帧里的具名局部量
+        const std::string bodyText = requestBody.dump();
+
+        AsynGyanis::Net::HttpClientRequest request;
+        request.method      = "POST";
+        request.body        = bodyText;
+        request.contentType = "application/json";
+
+        std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
+        try
+        {
+            response = co_await m_client->send(m_firmwareUrl + "/" + std::to_string(firmwareId) + "/status", request, m_requestTimeout);
+        } catch (const std::exception &failure)
+        {
+            co_return std::unexpected("上报固件状态请求异常：" + std::string{failure.what()});
+        }
+        if (response == nullptr)
+        {
+            co_return std::unexpected("上报固件状态请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志");
+        }
+        if (response->statusCode < 200 || response->statusCode >= 300)
+        {
+            co_return std::unexpected(httpFailure("上报固件状态", response->statusCode, response->body));
+        }
+        const auto checked = checkSuccessEnvelope(response->body);
+        if (!checked)
+        {
+            co_return std::unexpected("上报固件状态" + checked.error());
         }
         co_return std::expected<void, std::string>{};
     }

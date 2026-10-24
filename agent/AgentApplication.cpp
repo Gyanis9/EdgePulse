@@ -8,6 +8,7 @@
 #include "CommandDispatcher.h"
 #include "Executors/ConfigExecutor.h"
 #include "Executors/DiagnosticsExecutor.h"
+#include "Executors/FirmwareExecutor.h"
 #include "Executors/RestartExecutor.h"
 
 #include "Platform/Platform.h"
@@ -457,6 +458,7 @@ namespace EdgePulse::Agent
             AgentClient                 client(loop, m_configuration, *identity);
             std::vector<std::shared_ptr<CommandExecutor>> executors;
             executors.push_back(std::make_shared<ConfigExecutor>(client, m_configuration, *nodeId));
+            executors.push_back(std::make_shared<FirmwareExecutor>(client, *state, m_configuration, *nodeId));
             // 指标采集由后续的遥测任务接入；当前没有来源时诊断按空数组降级
             executors.push_back(std::make_shared<DiagnosticsExecutor>(*state, m_configuration, agentVersion, DiagnosticsExecutor::MetricsProvider{}));
             // 服务托管接入后，回调必须在命令结果入队并上报完成之后再重启进程，否则结果会随进程退出丢失；

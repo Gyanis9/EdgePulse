@@ -8,6 +8,7 @@ add_library(edgepulse-agent-core STATIC
         CommandDispatcher.cpp
         Executors/ConfigExecutor.cpp
         Executors/DiagnosticsExecutor.cpp
+        Executors/FirmwareExecutor.cpp
         Executors/RestartExecutor.cpp
         ProcessRunner.cpp)
 target_include_directories(edgepulse-agent-core PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})

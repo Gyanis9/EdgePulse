@@ -1,6 +1,7 @@
 #include "AgentClient.h"
 #include "AgentConfiguration.h"
 #include "AgentIdentity.h"
+#include "AgentLoop.h"
 #include "AgentState.h"
 #include "Executors/CommandExecutor.h"
 #include "Executors/ConfigExecutor.h"
@@ -48,103 +49,6 @@ namespace EdgePulse::Agent
         using AsynGyanis::Base::ConfigValue;
         using AsynGyanis::Core::EventLoop;
         using AsynGyanis::Core::Task;
-
-        /**
-         * @brief 自持事件循环与协程帧的执行器
-         */
-        class AgentLoop
-        {
-        public:
-            AgentLoop() : m_thread([this] { m_loop.run(); })
-            {
-            }
-
-            ~AgentLoop()
-            {
-                stop();
-            }
-
-            AgentLoop(const AgentLoop &)            = delete;
-            AgentLoop &operator=(const AgentLoop &) = delete;
-
-            void stop()
-            {
-                m_loop.stop();
-                if (m_thread.joinable())
-                {
-                    m_thread.join();
-                }
-            }
-
-            [[nodiscard]] EventLoop &loop() noexcept
-            {
-                return m_loop;
-            }
-
-            template<typename T>
-            std::optional<T> run(Task<T> operation, const std::chrono::seconds timeout, const char *what)
-            {
-                auto promise = std::make_shared<std::promise<T>>();
-                auto future  = promise->get_future();
-                auto frame   = forward(std::move(operation), promise);
-                m_loop.scheduler().scheduleRemote(frame.handle());
-                m_frames.push_back(std::move(frame));
-
-                if (future.wait_for(timeout) != std::future_status::ready)
-                {
-                    ADD_FAILURE() << what << " 未在时限内完成";
-                    return std::nullopt;
-                }
-                try
-                {
-                    return future.get();
-                } catch (const std::exception &failure)
-                {
-                    ADD_FAILURE() << what << " 抛出异常：" << failure.what();
-                    return std::nullopt;
-                }
-            }
-
-        private:
-            template<typename T>
-            static Task<> forward(Task<T> operation, std::shared_ptr<std::promise<T>> promise)
-            {
-                try
-                {
-                    promise->set_value(co_await std::move(operation));
-                } catch (...)
-                {
-                    promise->set_exception(std::current_exception());
-                }
-                co_return;
-            }
-
-            EventLoop           m_loop;
-            std::jthread        m_thread;
-            std::vector<Task<>> m_frames;
-        };
-
-        /**
-         * @brief 在用例离开作用域时先停掉 Agent 循环
-         */
-        class LoopStopGuard
-        {
-        public:
-            explicit LoopStopGuard(AgentLoop &loop) : m_loop(loop)
-            {
-            }
-
-            ~LoopStopGuard()
-            {
-                m_loop.stop();
-            }
-
-            LoopStopGuard(const LoopStopGuard &)            = delete;
-            LoopStopGuard &operator=(const LoopStopGuard &) = delete;
-
-        private:
-            AgentLoop &m_loop;
-        };
 
         /**
          * @brief 在用例存续期间设置环境变量，析构时恢复原值

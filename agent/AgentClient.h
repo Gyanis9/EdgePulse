@@ -13,7 +13,9 @@
 #include "AgentIdentity.h"
 
 #include "Base/Config/ConfigValue.h"
+
 #include "Core/Coroutine/Task.h"
+#include "Net/Http/Client/HttpClient.h"
 
 #include <chrono>
 #include <cstdint>
@@ -73,6 +75,15 @@ namespace EdgePulse::Agent
         ResultPostDisposition disposition{ResultPostDisposition::Retryable}; ///< 处置分类
         int                   httpStatus{0};                                ///< HTTP 状态码；0 表示没有拿到响应
         std::string           message;                                      ///< 中文原因，供日志使用
+    };
+
+    /**
+     * @brief 一次固件下载的结论
+     */
+    struct DownloadResult
+    {
+        int         httpStatus{0}; ///< 响应状态码；只有 200 表示正文已完整交出
+        std::string message;       ///< 服务端说明或固定的中文文案
     };
 
     /**
@@ -163,6 +174,30 @@ namespace EdgePulse::Agent
         AsynGyanis::Core::Task<std::expected<void, std::string>> reportConfig(std::int64_t nodeId, std::int64_t version, const AsynGyanis::Base::ConfigValue &content,
                                                                               std::string_view status, std::string_view message);
 
+        /**
+         * @brief 下载固件正文，按到达批次交给接收口
+         * @param downloadPath 服务端给出的下载地址：以 / 开头时相对 base_url，否则必须是绝对地址
+         * @param receiver 正文接收口，只在事件循环线程上调用
+         * @return 成功返回状态码与服务端说明；传输失败或地址不合法时返回中文原因
+         * @note 绝对地址只接受 https；明文 http 仅在配置开启 allow_plaintext_for_tests 时放行
+         * @note 非 200 响应同样按成功返回并带上状态码，由调用方决定是否继续；接收口应自行拒绝非 200 正文
+         */
+        AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> downloadFirmware(std::string downloadPath,
+                                                                                             AsynGyanis::Net::HttpResponseBodyReceiver receiver);
+
+        /**
+         * @brief 上报一次固件任务状态
+         * @param firmwareId 固件标识
+         * @param nodeId 节点标识
+         * @param status 状态文本，取 pending、downloading、installing、installed 或 failed
+         * @param progress 进度百分比，0 到 100
+         * @param message 中文说明
+         * @return 成功为空；失败返回中文原因
+         * @note 调用方按尽力而为处理：上报失败不影响下载与安装的结论
+         */
+        AsynGyanis::Core::Task<std::expected<void, std::string>> reportFirmwareStatus(std::int64_t firmwareId, std::int64_t nodeId, std::string_view status, int progress,
+                                                                                      std::string_view message);
+
     private:
         AsynGyanis::Core::EventLoop                 &m_loop;                ///< 请求所属事件循环
         AgentConfiguration                           m_configuration;       ///< 本次进程使用的配置副本
@@ -173,6 +208,7 @@ namespace EdgePulse::Agent
         std::string                                  m_heartbeatUrl;        ///< 心跳接口的绝对地址
         std::string                                  m_commandsUrl;         ///< 命令接口的绝对地址前缀
         std::string                                  m_agentNodesUrl;       ///< Agent 节点接口的绝对地址前缀
+        std::string                                  m_firmwareUrl;         ///< 固件任务接口的绝对地址前缀
         std::string                                  m_initializationError; ///< 客户端装配失败原因，空表示可用
         std::chrono::milliseconds                    m_requestTimeout;      ///< 单次注册请求的整体时限
     };
