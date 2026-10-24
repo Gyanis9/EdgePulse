@@ -145,6 +145,16 @@ curl -X POST http://127.0.0.1:8080/api/system/api-tokens \
 }
 ```
 
+```bash
+# 轮换：响应带新 token 与 previousValidUntil；到期时间不变
+curl -X POST http://127.0.0.1:8080/api/system/api-tokens/1900000000000001/rotate \
+  -H "Authorization: Bearer <浏览器会话令牌>"
+
+# 吊销：只标记 revokedAt，记录保留
+curl -X DELETE http://127.0.0.1:8080/api/system/api-tokens/1900000000000001 \
+  -H "Authorization: Bearer <浏览器会话令牌>"
+```
+
 - `name` 为 1–64 个字符；`scopes` 必须是非空字符串数组、去重后全部落在 owner 当前权限内；有效期省略或为 0 时取 30 天，其余限制在 300 到 31536000 秒。
 - 列表行只有 `id,name,prefix,scopes,expiresAt,lastUsedAt,revokedAt,createdAt`。创建与轮换响应带 `Cache-Control: no-store`。
 - 使用令牌时走与浏览器会话相同的 `Authorization: Bearer <token>`；每次请求重新读取 owner 与租户状态，并把令牌 `scopes` 与 owner 当前权限取交集。owner 或租户停用、令牌吊销或过期、权限被收回后立即失效。
