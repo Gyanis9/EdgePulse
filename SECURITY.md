@@ -31,6 +31,10 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 ## 安全模型
 
 - 浏览器会话：登录成功后签发 32 字节不透明 Bearer token，服务端只保存会话记录；默认 TTL 7200 秒并滑动续期。浏览器不使用 Cookie 承载会话，跨站请求不能自动携带凭据。会话存储可落在 Redis，供多实例共享。
+- API Token：明文以 `ep_api_` 开头，由 32 字节随机数编码；响应只在创建或轮换时返回一次，数据库只存 SHA-256 与前 12 个字符。令牌身份继承 owner 的用户与租户，但 `platformAdmin` 恒为 false；每次请求按 owner 当前权限与令牌 scope 的交集授权，owner/租户停用、令牌吊销或过期立即失效。令牌身份不能访问只要求登录的浏览器接口、浏览器 WebSocket，也不能修改账户口令；只能管理本人且 scope 不宽于自身的令牌，浏览器会话可按租户管理。轮换保留一个 1 小时旧哈希重叠窗口，吊销只写 `revoked_at`，不物理删除。
+- 两步验证：TOTP 按 RFC 6238 校验，秘密用 `EDGEPULSE_MFA_KEY`（base64 32 字节）做 AES-256-GCM 加密后落库，nonce 随机，密钥缺失或认证失败只返回空值。恢复码是 10 枚 `xxxx-xxxx`，以同一主密钥做 HMAC-SHA256 后存 JSON，逐枚 CAS 删除，一枚只能用一次。登录挑战在缓存中原子消费，300 秒过期、最多 5 次失败、绑定来源 IP；设置、启用、关闭与换发恢复码另有每用户 5 次/300 秒的失败上限。管理员重置需要 `system:user:edit` 并按会话租户校验目标。MFA 是用户自助启用，没有租户级强制策略。
+- 写请求幂等：只对带有效 Bearer 与 `Idempotency-Key` 的写请求生效，按令牌哈希与键哈希分区，请求指纹覆盖方法、完整 URI、表示头、权限摘要与正文。完成态保留 24 小时；同键不同内容或权限降级返回 409，处理中返回 409，已吊销会话不能重放旧响应。401、403、5xx 与超过 256 KiB 的响应不缓存；认证、Agent、令牌、注册令牌、用户/租户写入与流式上传路径整段排除，避免一次性明文或口令进入幂等表。处理中占位有 90 秒租约，崩溃接管按至少一次语义执行。
+- OpenAPI 契约：`GET /api/openapi.json` 匿名返回生成物，内容来自源码路由字面量与 `docs/openapi-notes.json`，CI 用 `--check` 阻止漂移。契约不含凭据；缺失或损坏时返回带 `x-openapi-error: missing` 的 JSON 404，不会回退到 HTML 或 SPA。
 - Agent 身份：Agent 只通过 9443 的 mTLS 通道通信。TLS 层要求客户端证书由配置的 CA 签发；注册时自报的 SHA-256 叶证书指纹必须与这条连接出示的叶证书一致；心跳、遥测、命令结果、固件状态与固件下载都复核同一份叶证书，防止已注册节点被其他证书冒充。证书被吊销后指纹清空、节点置离线，已建立的 Agent WebSocket 以 1008 关闭。
 - 生产 Agent 守护进程：`agent/` 随仓库交付，Linux 与 Windows 都由安装器注册为系统服务。命令执行不经过 shell，只接受 `config.apply`、`diagnostics.collect`、`firmware.update`、`agent.restart`、`agent.update` 等白名单类型，未知类型按失败上报；配置应用与固件安装钩子只运行配置里显式给出的程序，统一限时并限制输出。`agent.restart` 的结果先入队并尝试上报，之后才通过 systemd 或 SCM 重启服务；重启启动器失败只记 ERROR，不谎报成功。固件与升级包都用 Ed25519 对 SHA-256 摘要验签（`ed25519-sha256`）。升级包的签名对象是归档本身的 SHA-256：Agent 按命令摘要验签通过后才下载，并要求下载文件的摘要一致；归档内的 manifest 版本、平台、文件哈希与安装器脚本因此处于已认证范围，安装器继续校验它们。命令里的 `manifest` 字段不参与信任判断。升级后新版本在首次成功心跳写出 `update-health`；安装器在启动服务前写 `<状态目录>/update-expected`，手工升级没有待上报命令时也靠它确认健康。超时或启动失败时安装器恢复旧二进制并写 `update-rollback`，旧版本补报失败；版本不符时 `update-expected` 保留给安装器回滚。
 - Agent 凭据与服务权限：注册与改绑令牌只从环境变量读取，Linux 写在 0600 的 `agent.env`，Windows 写在服务注册表项的 `Environment` 值；令牌不写 YAML、日志或状态库，注册成功后清空。Linux 以 systemd 单元运行，配置文件 0600、配置/状态/日志目录 0750，单元启用 `NoNewPrivileges`、`ProtectSystem=strict`、`PrivateTmp` 并只放开必要目录；Windows 以 SCM 服务运行，默认 LocalSystem，数据目录 ACL 只授予 Administrators 与 SYSTEM，安装目录给 Users 读取/执行，并配置失败自动重启。
@@ -43,6 +47,9 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 ## 已知边界
 
 - DNS 重绑定窗口：Webhook 地址校验与实际连接之间存在时间差，引擎客户端会再次解析域名，可能拿到与校验时不同的地址。高安全环境不能只依赖 `allow_private_webhooks`，应在主机、容器或出口网关配置出站防火墙与域名白名单。
+- 两步验证的边界：MFA 是每用户自助启用，没有租户级强制开关，管理员只能查看 `mfaEnabled` 并逐个重置。`EDGEPULSE_MFA_KEY` 丢失或更换后，已启用账号的 TOTP 与恢复码都不可用；本阶段没有密钥轮换、`key_version` 迁移或 AAD 绑定。能直接写数据库的攻击者可以替换加密秘密、回退 `last_used_step` 或替换恢复码哈希，这类数据库写权限失守不在本阶段防护范围内。
+- 反向代理与来源 IP：服务端没有可信代理头处理，`request.remoteIp()` 取直接对端地址，不信任 `X-Forwarded-For`。在负载均衡或反向代理之后，MFA 挑战绑定、登录限频与审计看到的是代理地址，同一代理后的用户会共享这些计数；需要真实来源时应在受信代理层解析并在应用支持可信代理之前谨慎启用，不能把客户端自报的头当作身份依据。
+- 幂等键的边界：身份在中间件与处理器各校验一次，吊销后的重试不能重放，但处理中途崩溃后由新请求接管时，业务可能执行第二次（至少一次语义）。幂等表会保存最多 256 KiB 的响应正文与 24 小时历史，不要把敏感正文写进可缓存的写接口响应。API 令牌由令牌会话签发后是独立记录，父令牌轮换或吊销不会级联；令牌也还没有独立的速率限制，仍受 owner 权限与全局限流约束。
 - 生产 Agent 的边界：控制面不提供 CA 或 CSR 服务，节点证书由外部 CA 或 `scripts/gen-agent-certs.sh` 签发；证书轮换依靠 `rebind` 令牌重新注册，不是自动轮转。调度、离线扫描与保留期清理仍是单实例进程内定时器。Agent 安装包由外部托管，控制面只在 `agent.update` 命令里给出下载地址。Windows 升级模式固定服务名 `EdgePulseAgent`，自定义 SCM 服务名不支持自动升级。
 - 手工 Agent 升级：`install-agent.sh --upgrade` 与 `install-agent.ps1 -Upgrade` 只校验包内 `checksums.sha256`，不验证归档的 Ed25519 签名。自动路径的归档认证由 Agent 在下载前后完成；手工升级必须由操作者确认归档来源。
 - 单实例调度：离线扫描、生命周期处理与保留期清理依赖进程内定时器，没有 HA 选主或分布式租约；计划命令的到点判断在查询侧，也没有跨实例协调。多实例部署时不要假设只有一个实例在扫描，需要明确的活动实例或外部协调。
@@ -54,7 +61,7 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 ## 密钥与证书管理
 
 - 不提交私钥、证书、令牌、`.env`、日志或任何明文凭据。`.gitignore` 只覆盖开发证书所在的 `var/`（含 `var/certs/`）、`config/prod.yaml`、`config/firmware-keys/` 与部署令牌；生产 `cert_dir`（如 `/etc/edgepulse/tls`）在仓库之外，不受仓库忽略规则保护，必须由主机文件权限与备份策略单独保护。`var/`、`config/prod.yaml` 与 `deploy/prometheus/ops-token` 同时在 `.dockerignore` 中。
-- 数据库、Redis、运维口、UDP 遥测、OIDC 与初始口令提示只从环境变量读取：`EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`、`EDGEPULSE_INITIAL_PASSWORD`。
+- 数据库、Redis、运维口、UDP 遥测、OIDC、两步验证与初始口令提示只从环境变量读取：`EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`、`EDGEPULSE_MFA_KEY`、`EDGEPULSE_INITIAL_PASSWORD`。`EDGEPULSE_MFA_KEY` 用 `openssl rand -base64 32` 生成，同一数据库的所有实例共用同一值，与数据库备份分开保管。
 - 固件签名私钥留在签名工作站或密钥管理系统，只把公钥分发到各实例的 `trusted_keys_dir`；不要复用历史 key id 覆盖公钥，轮换时使用新文件名并在确认旧固件不再需要后移除旧公钥。
 - 服务器证书与私钥放在 `cert_dir` 指向的目录，Agent 客户端证书的信任锚是同一目录的 `ca.pem`。证书文件权限只给服务账号读取。
 

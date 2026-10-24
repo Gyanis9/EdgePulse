@@ -16,7 +16,7 @@
 |---|---|---|---|
 | GET | `/api/health` | 匿名 | `{status:"UP",time}` |
 | GET | `/api/auth/captcha` | 匿名 | `{uuid,imageSvg,code?}`；开发档带 code |
-| POST | `/api/auth/login` | 匿名 | `{username,password,captcha,captchaUuid,tenantCode?}` → `{token,expiresIn}`；tenantCode 缺省 `default` |
+| POST | `/api/auth/login` | 匿名 | `{username,password,captcha,captchaUuid,tenantCode?}` → `{token,expiresIn}`；启用两步验证时改为 `{mfaRequired:true,challengeToken,expiresIn}`；tenantCode 缺省 `default` |
 | POST | `/api/auth/logout` | 登录 | 删除当前会话 |
 | GET | `/api/auth/me` | 登录 | `{id,userId,username,nickname,deptId,deptName,tenantId,tenantCode,tenantName,platformAdmin,roles,permissions}` |
 | GET | `/api/auth/routes` | 登录 | 动态菜单树；节点形状 `{id,parentId,name,type,path,component,icon,permission,children}` |
@@ -24,9 +24,29 @@
 | GET | `/api/auth/oidc/enabled` | 匿名 | `{enabled,label}` |
 | GET | `/api/auth/oidc/start?return=/path` | 匿名 | 302 到 IdP；return 只接受本站绝对路径 |
 | GET | `/api/auth/oidc/callback?code=&state=` | 匿名 | 302 回前端，带一次性 `oidcCode` 或 `oidcError` |
-| POST | `/api/auth/oidc/exchange` | 匿名 | `{code}` → `{token,expiresIn,returnPath}`；code 一次性 |
+| POST | `/api/auth/oidc/exchange` | 匿名 | `{code}` → `{token,expiresIn,returnPath}`；code 一次性；启用两步验证时改为 `{mfaRequired:true,challengeToken,expiresIn,returnPath}` |
 
 登录失败按 IP 计数，超过 10 次/分钟返回 429；账号在窗口内连续失败达到阈值后锁定，锁定期间返回 423，文案给出配置的锁定时长（分钟，向上取整），不是剩余时间，成功登录或管理员重置会清空失败计数与锁定。验证码一次性、2 分钟过期。新建、重置与改密共用口令策略（最小长度 8–64，可要求大小写、数字与符号）。
+
+### 1.1 两步验证
+
+启用 MFA 的账号在口令校验通过后不再直接拿到会话，登录响应变为 `{mfaRequired:true, challengeToken, expiresIn}`（`expiresIn` 为 300 秒），并带 `Cache-Control: no-store`；客户端用挑战令牌和动态码调用 `/api/auth/mfa/verify` 换取 `{token,expiresIn}`。OIDC 的 `/api/auth/oidc/exchange` 在需要第二步时返回同一形状，并附带 `returnPath`。挑战一次性消费、绑定发起口令登录的来源 IP，最多允许 5 次失败；失效、来源不符、次数用尽与验证码错误统一返回 401 和同一条文案。
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| GET | `/api/auth/mfa` | 登录 | `{enabled,recoveryCodesRemaining}` |
+| POST | `/api/auth/mfa/setup` | 登录 | `{password}` → `{secret,otpauthUri}`；复核当前口令后签发待启用秘密，秘密只在本次响应出现 |
+| POST | `/api/auth/mfa/enable` | 登录 | `{password,code}` → `{recoveryCodes:[10 枚]}`；恢复码只出现这一次 |
+| POST | `/api/auth/mfa/disable` | 登录 | `{password,code}` → `data:null`；口令与未消费的动态码都要正确 |
+| POST | `/api/auth/mfa/verify` | 匿名 | `{challengeToken,code}` → `{token,expiresIn}`；动态码或恢复码均可 |
+| POST | `/api/auth/mfa/recovery-codes` | 登录 | `{code}` → `{recoveryCodes:[10 枚]}`；整组替换旧恢复码 |
+| POST | `/api/system/users/{id}/mfa/reset` | `system:user:edit` | 删除目标用户的两步验证记录与待启用缓存；越界目标与不存在都返回 404，未启用账号也返回成功 |
+
+- 恢复码格式为 `xxxx-xxxx`，大小写不敏感、每枚只能使用一次；使用 TOTP 登录或换发恢复码都会消费当前步号，刚用过的动态码需要等身份验证器刷新到下一步。
+- 上表的设置、启用、关闭、状态与换发恢复码只接受浏览器会话；API 令牌调用会返回 403。`/api/auth/mfa/verify` 与 OIDC 兑换属于匿名入口，不需要会话。
+- 设置、启用、关闭与换发恢复码共用每用户 5 次/300 秒的失败上限，超过后返回 429；登录挑战的 5 次上限独立计算。
+- `EDGEPULSE_MFA_KEY`（base64 编码的 32 字节）是秘密加密与恢复码 HMAC 的主密钥，非空但不是 32 字节时启动直接失败。未配置时设置、启用与关闭返回 503；已启用账号的登录校验也会失败，管理员重置与状态查询仍可用，恢复访问需要恢复同一密钥或重置该账号。
+- 本版本是用户自助启用，没有租户级强制策略；管理员可在用户列表看到 `mfaEnabled` 并重置单个账号。
 
 ## 2. 系统管理
 
@@ -66,6 +86,9 @@
 | GET | `/api/system/configs/export` | `system:config:export` |
 | GET/POST | `/api/system/tenants` | `system:tenant:list` / `system:tenant:add`，仅平台管理员 |
 | PUT | `/api/system/tenants/{id}` | `system:tenant:edit`，仅平台管理员；停用用 `{status:0}`，默认租户不可停用 |
+| GET/POST | `/api/system/api-tokens` | `system:token:list` / `system:token:add`，见 2.1 |
+| POST/DELETE | `/api/system/api-tokens/{id}/rotate`、`/api/system/api-tokens/{id}` | `system:token:edit` / `system:token:remove` |
+| POST | `/api/system/users/{id}/mfa/reset` | `system:user:edit`；重置目标用户的两步验证，见 1.1 |
 
 用户写入字段：`username,nickname,password(创建时),phone,email,deptId,status,roleIds,postIds`；平台管理员创建时可用 `tenantId` 指定归属，租户管理员固定落在本租户。用户列表项带 `tenantId/tenantCode/tenantName/platformAdmin` 与 `lockedUntil`；`lockedUntil` 为 UTC 的 `YYYY-MM-DD HH:MM:SS`，数据库会保留过期的截止时刻，只有大于当前 UTC 时间才表示账号仍处于锁定中，成功登录或管理员重置后清空。角色写入字段：`name,code,dataScope,sort,status,remark,menuIds,deptIds`。数据范围取 `ALL/DEPT_AND_CHILD/DEPT/SELF/CUSTOM`；取 `CUSTOM` 时必须给出非空 `deptIds`。
 
@@ -83,7 +106,53 @@ Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、
 
 固件灰度与回滚：`POST /api/firmware/{id}/deploy` 的正文可带 `batchSize`，返回 `{deployed,deferredNodeIds}`；不带 `batchSize` 时仍返回旧的数组形状。`POST /api/firmware/{id}/rollback` 正文 `{nodeIds}`，按任务记录的上一版本重新下发。
 
-## 2.1 边缘反向代理
+### 2.1 API 令牌
+
+API 令牌用于自动化客户端，替代把浏览器会话令牌写进脚本。明文形如 `ep_api_` 加 64 位小写十六进制，只在创建或轮换响应出现一次；服务端只存 SHA-256 与前 12 个字符，列表、审计与日志都不回显完整令牌或哈希。
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| GET | `/api/system/api-tokens` | `system:token:list` | 返回当前身份可见范围内的令牌摘要（含已吊销、已过期），数组不分页 |
+| POST | `/api/system/api-tokens` | `system:token:add` | `{name,scopes,expiresInSeconds?}` → 摘要加一次性 `token` |
+| POST | `/api/system/api-tokens/{id}/rotate` | `system:token:edit` | 返回新 `token` 与 `previousValidUntil`，保留原到期时间 |
+| DELETE | `/api/system/api-tokens/{id}` | `system:token:remove` | 只写 `revokedAt`，不物理删除；不存在、已吊销或越权统一 404 |
+
+创建示例：
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/system/api-tokens \
+  -H "Authorization: Bearer <浏览器会话令牌>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"ci-deploy","scopes":["device:node:list","device:firmware:upload"],"expiresInSeconds":2592000}'
+```
+
+```json
+{
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "id": 1900000000000001,
+    "name": "ci-deploy",
+    "prefix": "ep_api_1a2b3",
+    "scopes": ["device:node:list", "device:firmware:upload"],
+    "expiresAt": "2026-11-24 08:00:00",
+    "lastUsedAt": "",
+    "revokedAt": "",
+    "createdAt": "2026-10-25 08:00:00",
+    "token": "ep_api_<64 位十六进制>"
+  },
+  "traceId": "..."
+}
+```
+
+- `name` 为 1–64 个字符；`scopes` 必须是非空字符串数组、去重后全部落在 owner 当前权限内；有效期省略或为 0 时取 30 天，其余限制在 300 到 31536000 秒。
+- 列表行只有 `id,name,prefix,scopes,expiresAt,lastUsedAt,revokedAt,createdAt`。创建与轮换响应带 `Cache-Control: no-store`。
+- 使用令牌时走与浏览器会话相同的 `Authorization: Bearer <token>`；每次请求重新读取 owner 与租户状态，并把令牌 `scopes` 与 owner 当前权限取交集。owner 或租户停用、令牌吊销或过期、权限被收回后立即失效。
+- 令牌身份不是平台管理员（`platformAdmin=false`）；除 `/api/auth/me` 自省外，只应访问要求具体权限码的接口。只要求登录的浏览器接口、浏览器 `/api/ws`、`PUT /api/auth/password` 以及无权限的 dashboard/字典/告警 SSE 等入口会拒绝令牌身份。
+- 令牌会话可以为同一用户签发 scope 不宽于自身的子令牌，也能轮换/吊销本人且 scope 不宽于自身的令牌；浏览器会话按租户管理。轮换后旧明文在 `previousValidUntil`（当前时间加 1 小时）之前仍可用，新明文立即生效。
+- 建议按最小权限拆分令牌，并在过期前轮换；怀疑泄露时直接吊销，相关行会保留供审计。
+
+### 2.2 边缘反向代理
 
 配置 `edgepulse.reverse_proxy.enabled=true` 后，`prefix`（默认 `/edge`）与 `prefix/*` 转发到 `upstream`。默认剥离前缀，例如 `GET /edge/api/status?a=1` 转发为 `GET <upstream>/api/status?a=1`。
 
@@ -91,6 +160,27 @@ Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、
 - 只转发白名单请求头，不透传 Authorization/Cookie；响应状态、白名单响应头与正文原样返回。
 - `maximum_request_bytes` / `maximum_response_bytes` / `timeout_ms` 限制单次转发；超过请求上限返回 413，上游失败返回 502。
 - 不代理 WebSocket 升级与流式大响应。
+
+### 2.3 写请求幂等键
+
+`POST`、`PUT`、`PATCH`、`DELETE` 请求可带 `Idempotency-Key`（8–128 个字符，按 UTF-8 码点计数）。只有同时带有效 `Authorization: Bearer` 与幂等键时才进入缓存；未登录、免登录或排除路径上的请求照常执行，不产生幂等记录。
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/commands \
+  -H "Authorization: Bearer <令牌>" \
+  -H "Idempotency-Key: deploy-node-42-20261025-01" \
+  -H "Content-Type: application/json" \
+  -d '{"nodeId":42,"type":"config.apply","payload":{},"timeoutSeconds":60}'
+```
+
+- 首次请求结束（状态码小于 500，且不是 401/403、正文不超过 256 KiB）后保存状态码、`content-type`、正文与 `x-request-id`，保留 24 小时。
+- 同键同内容重试返回首次响应，并加 `Idempotent-Replayed: true`；重放的 `x-request-id` 是首次请求的链路标识。
+- 同键但请求指纹不同返回 409「幂等键已被不同的请求内容使用」。指纹覆盖方法、完整 URI（含查询串）、`Content-Type`、`Content-Encoding`、身份权限码摘要与正文；权限降级后同键重试也会 409，防止交回旧的已授权响应。
+- 同键首次请求仍在处理时返回 409「相同幂等键的请求正在处理中」。处理中占位有 90 秒租约；超过租约的残留行可被后续同键请求接管，接管按至少一次语义执行。
+- 401、403、5xx 与超大响应会删除占位，客户端可用同一键真正重试；处理中途崩溃留下的占位最多保留 24 小时，正常请求不会被误判为完成。
+- 24 小时到期行由后台保留期任务定期物理删除；同键请求到来时也会先删除自己的过期行。
+- 不参与幂等的路径：`/api/auth/`、`/api/agent/`、`/api/ws`、`/api/events/`、精确 `/api/firmware`（流式上传）、`/api/system/api-tokens` 前缀、`/api/enrollment-tokens` 前缀、`/api/system/users` 前缀、`/api/system/tenants` 前缀，以及配置的反向代理前缀。认证、令牌与注册令牌路径可能产生一次性明文，用户/租户写入可能带明文口令，流式上传拿不到完整正文，Agent 与消息通道不适用，因此整段排除。
+- 幂等键不是业务唯一约束：不同令牌使用同一键互不影响；同一业务实体的重复创建仍应由业务字段与数据库约束兜底。
 
 ## 3. 监控与工作台
 
@@ -248,17 +338,17 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 
 | HTTP | 场景 |
 |---|---|
-| 400 | 参数缺失、JSON 不合法、配置正文不合法；Webhook 地址被 SSRF 校验拒绝；缺固件签名头、验签失败；固件下载缺 `nodeId` |
-| 401 | 未登录、会话过期、Redis/数据库不可用导致的认证失败 |
-| 403 | 已登录但缺权限；Agent 连接证书与节点登记指纹不一致或证书已吊销；`required` 模式缺注册/改绑令牌；命令或固件不属于该节点/租户；租户管理员跨租户签发令牌 |
-| 404 | 资源不存在；注册令牌不存在、已使用或已吊销；配置修订或节点不存在；固件文件缺失；`/api/*` 未命中 |
-| 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；节点或配置 `expectedVersion` 乐观锁冲突；并发注册冲突；仍被占用的删除 |
+| 400 | 参数缺失、JSON 不合法、配置正文不合法；Webhook 地址被 SSRF 校验拒绝；缺固件签名头、验签失败；固件下载缺 `nodeId`；幂等键长度越界；两步验证设置过期或请求体缺字段 |
+| 401 | 未登录、会话过期、Redis/数据库不可用导致的认证失败；两步验证挑战失效、来源不符、验证码错误或次数用尽；两步验证口令复核失败 |
+| 403 | 已登录但缺权限；Agent 连接证书与节点登记指纹不一致或证书已吊销；`required` 模式缺注册/改绑令牌；命令或固件不属于该节点/租户；租户管理员跨租户签发令牌；API 令牌访问只要求登录的浏览器入口 |
+| 404 | 资源不存在；注册令牌不存在、已使用或已吊销；配置修订或节点不存在；固件文件缺失；`/api/*` 未命中；API 令牌不存在、已吊销或越权；关闭未启用的两步验证 |
+| 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；节点或配置 `expectedVersion` 乐观锁冲突；并发注册冲突；仍被占用的删除；幂等键内容冲突或同键请求处理中；重复启用两步验证或轮换已吊销/已过期/并发冲突的令牌 |
 | 413 | 固件超过上传上限 |
 | 416 | Range 越界 |
 | 423 | 账号因窗口内连续登录失败被锁定；提示中的分钟数为配置的锁定时长 |
-| 429 | 验证码签发过频、登录失败过频、公开 API 全局限流 |
+| 429 | 验证码签发过频、登录失败过频、公开 API 全局限流；两步验证尝试次数达到上限 |
 | 500 | 数据库/文件/未知内部故障 |
-| 503 | 服务未就绪或停机排空 |
+| 503 | 服务未就绪或停机排空；未配置 `EDGEPULSE_MFA_KEY` 时的两步验证设置、启用与关闭；幂等占位写入失败 |
 
 ## 9. OpenAPI 契约
 
@@ -266,7 +356,7 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 
 生产部署必须先执行 `scripts/build-web.sh`（或等价的前端构建），它会把 `frontend/public/openapi.json` 随前端产物复制进后端的 `web/`；只部署后端二进制时该接口会按缺失返回 404。
 
-契约的事实来源是 `src/**/*.cpp` 里的 `router.get/post/put/del/patch` 与流式变体字面量，摘要、请求/响应 schema、状态码与安全要求由 `docs/openapi-notes.json` 补齐；`frontend/public/openapi.json` 是生成物，不要手工编辑。
+契约的事实来源是 `src/**/*.cpp` 里的 `router.get/post/put/del/patch` 与流式变体字面量，摘要、请求/响应 schema、状态码与安全要求由 `docs/openapi-notes.json` 补齐；`frontend/public/openapi.json` 是生成物，不要手工编辑。P7 的 `/api/auth/mfa/*` 与 `/api/system/api-tokens/*` 已包含在契约中；`/api/ws`、SSE 与 Agent 通道不在其中。
 
 - 路径里的每个 `{name}` 都会生成一条 `in: path`、`required: true` 的参数；`id` 与 `batchId` 为 `integer/int64`，其余为 `string`。
 - 响应默认是 `200 application/json`；导出端点在 notes 里标为 `200 text/csv`，OIDC 的 `/api/auth/oidc/start` 与 `/api/auth/oidc/callback` 标为 `302` 并声明 `Location` 响应头。
