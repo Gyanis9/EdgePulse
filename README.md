@@ -248,6 +248,9 @@ cd ..
 # 全量协议与安全验收
 python scripts/check-acceptance.py
 
+# Agent 端到端：真实 server/agent 二进制，临时 SQLite 库
+python scripts/check-agent-e2e.py
+
 # SQLite 备份与恢复：往返、边车清理、路径与私钥过滤
 python scripts/backup_restore_test.py
 
@@ -261,10 +264,10 @@ python scripts/backup_restore_mysql_test.py
 python scripts/check-docker-stack.py --build
 ```
 
-- 2026-10-24 全量回归（`feat/p5-residual-closure` @ `0e4f508`）：`ctest --preset debug` 注册 205 项，通过 202，跳过 3，失败 0，耗时 66.47 秒；`npm run test:unit` 13 个文件 30 项、`npm run test:e2e` 9 项全部通过，`npm run build` 类型检查与构建通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/backup_restore_test.py` 6 项中 5 项通过，1 项 Windows 文件权限位用例按平台跳过；`python scripts/run-external-tests.py --redis-image redis:7-alpine` 三项门控用例全部通过、无跳过；`python scripts/backup_restore_mysql_test.py` 完成 MySQL 备份与恢复往返。
+- 2026-10-24 全量回归（`feat/p6-production-agent` @ `cca00c9`）：`ctest --preset debug` 注册 298 项，通过 294，跳过 4，失败 0，耗时 94.38 秒；`npm run test:unit` 30 项、`npm run test:e2e` 9 项全部通过，`npm run build` 类型检查与构建通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0；`python scripts/backup_restore_test.py` 6 项中 5 项通过，1 项 Windows 文件权限位用例按平台跳过；`python scripts/run-external-tests.py` 三项门控用例全部通过、无跳过；`python scripts/backup_restore_mysql_test.py` 完成 MySQL 备份与恢复往返。
 - `ExternalStores.*` 与 `RealtimeBus.*` 需要真实 MySQL/Redis：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性容器并注入 `EDGEPULSE_TEST_MYSQL_*`、`EDGEPULSE_TEST_REDIS_*`，随后断言三项用例确实执行且输出不含 Skipped；镜像可用 `--mysql-image`/`--redis-image` 覆盖。直接跑 `ctest` 缺变量时仍 SKIP，不伪造通过。
 - 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
-- CI 跑 Windows/Linux 后端构建与 ctest、Linux 后端 MySQL 8.4/Redis 7 service 与 MySQL 备份往返、前端单测/构建、密钥扫描与 actionlint；Linux 后端任务单独断言外部用例没有被 Skip。Playwright 在本地用系统 Edge 运行。
+- CI 跑 Windows/Linux 后端构建与 ctest、Linux 后端 MySQL 8.4/Redis 7 service 与 MySQL 备份往返、Agent 端到端、前端单测/构建、密钥扫描与 actionlint；Linux 后端任务单独断言外部用例没有被 Skip。Playwright 在本地用系统 Edge 运行。
 - 验收证据与逐项输出见 [docs/验收.md](docs/验收.md)。
 
 ## 部署

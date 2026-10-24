@@ -32,6 +32,8 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 
 - 浏览器会话：登录成功后签发 32 字节不透明 Bearer token，服务端只保存会话记录；默认 TTL 7200 秒并滑动续期。浏览器不使用 Cookie 承载会话，跨站请求不能自动携带凭据。会话存储可落在 Redis，供多实例共享。
 - Agent 身份：Agent 只通过 9443 的 mTLS 通道通信。TLS 层要求客户端证书由配置的 CA 签发；注册时自报的 SHA-256 叶证书指纹必须与这条连接出示的叶证书一致；心跳、遥测、命令结果、固件状态与固件下载都复核同一份叶证书，防止已注册节点被其他证书冒充。证书被吊销后指纹清空、节点置离线，已建立的 Agent WebSocket 以 1008 关闭。
+- 生产 Agent 守护进程：`agent/` 随仓库交付，Linux 与 Windows 都由安装器注册为系统服务。命令执行不经过 shell，只接受 `config.apply`、`diagnostics.collect`、`firmware.update`、`agent.restart`、`agent.update` 等白名单类型，未知类型按失败上报；配置应用与固件安装钩子只运行配置里显式给出的程序，统一限时并限制输出。固件与升级包都用 Ed25519 对 SHA-256 摘要验签（`ed25519-sha256`），升级包另校验 manifest 版本、平台、文件哈希与安装器脚本。升级后新版本在首次成功心跳写出 `update-health`；超时或启动失败时安装器恢复旧二进制并写 `update-rollback`，旧版本补报失败。
+- Agent 凭据与服务权限：注册与改绑令牌只从环境变量读取，Linux 写在 0600 的 `agent.env`，Windows 写在服务注册表项的 `Environment` 值；令牌不写 YAML、日志或状态库，注册成功后清空。Linux 以 systemd 单元运行，配置文件 0600、配置/状态/日志目录 0750，单元启用 `NoNewPrivileges`、`ProtectSystem=strict`、`PrivateTmp` 并只放开必要目录；Windows 以 SCM 服务运行，默认 LocalSystem，数据目录 ACL 只授予 Administrators 与 SYSTEM，安装目录给 Users 读取/执行，并配置失败自动重启。
 - 注册令牌：`enroll` 用于新节点，`rebind` 用于已有节点换证；令牌一次性消费，数据库只存 SHA-256，明文只在签发响应出现一次。有效期限制在 300 到 2592000 秒。生产使用 `enrollment_mode=required`，新注册与换证都必须持对应令牌。
 - 固件签名：固件签名覆盖文件 SHA-256 的 32 字节原始摘要，算法为 Ed25519，传输标识 `ed25519-sha256`。服务端只从 `trusted_keys_dir` 加载 Ed25519 公钥；`require_signature=true` 时缺签名、未知 key id、摘要不符或签名格式错误的固件不能上传、部署或回滚。公钥变更后重启加载，`GET /api/firmware/policy` 可确认已加载的 key id。
 - 运维口：`/metrics`、`/debug/loops`、`/debug/connections` 与 `/debug/log-level` 需要 Bearer；`/healthz` 与 `/readyz` 只暴露进程与就绪状态。代码默认监听回环；生产样例与 Compose 为容器抓取绑 `0.0.0.0`，必须用主机防火墙或容器网络策略限制来源。
@@ -41,7 +43,7 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 ## 已知边界
 
 - DNS 重绑定窗口：Webhook 地址校验与实际连接之间存在时间差，引擎客户端会再次解析域名，可能拿到与校验时不同的地址。高安全环境不能只依赖 `allow_private_webhooks`，应在主机、容器或出口网关配置出站防火墙与域名白名单。
-- 生产 Agent 仍是样例：仓库里的 `samples/DeviceAgent` 是验证协议与命令通道的探针，不是可直接部署的守护进程。它没有守护进程安装包、系统服务托管、凭据安全存储、长期断线重连与自动升级，生产接入需要自行实现或等待正式的 `edgepulse-agent`。
+- 生产 Agent 的边界：控制面不提供 CA 或 CSR 服务，节点证书由外部 CA 或 `scripts/gen-agent-certs.sh` 签发；证书轮换依靠 `rebind` 令牌重新注册，不是自动轮转。调度、离线扫描与保留期清理仍是单实例进程内定时器。Agent 安装包由外部托管，控制面只在 `agent.update` 命令里给出下载地址。Windows 升级模式固定服务名 `EdgePulseAgent`，自定义 SCM 服务名不支持自动升级。
 - 单实例调度：离线扫描、生命周期处理与保留期清理依赖进程内定时器，没有 HA 选主或分布式租约；计划命令的到点判断在查询侧，也没有跨实例协调。多实例部署时不要假设只有一个实例在扫描，需要明确的活动实例或外部协调。
 - h3 空闲超时：HTTP/3 的空闲计时由 QUIC 传输层决定，取 `server.quic.idle_timeout_seconds`（默认 30 秒，允许 1 到 3600，启动时生效）。`server.limits.idle_timeout_ms` 不作用于 h3 连接，调大它不会延长 h3 连接。
 - 备份与恢复：恢复必须停止服务，运行中的进程会持有数据库、WAL 或固件文件句柄；SQLite 备份支持在线快照，但一致性归档仍建议放在维护窗口。证书、运维令牌与固件签名私钥不要和数据库备份放在同一份未加密介质里。
