@@ -22,6 +22,7 @@ namespace EdgePulse::Auth
 {
     class AuthService;
     class DataScopeService;
+    class MfaService;
 } // namespace EdgePulse::Auth
 namespace EdgePulse::System
 {
@@ -43,6 +44,7 @@ namespace EdgePulse::System
     {
         Auth::AuthService      *auth{nullptr};         ///< 认证服务
         Auth::DataScopeService *dataScopes{nullptr};   ///< 数据范围
+        Auth::MfaService       *mfa{nullptr};          ///< 两步验证，用于管理员重置
         UserRepository         *users{nullptr};        ///< 用户
         RoleRepository         *roles{nullptr};        ///< 角色
         MenuRepository         *menus{nullptr};        ///< 菜单

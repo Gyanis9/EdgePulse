@@ -13,6 +13,7 @@
 #include "Base/Security/PasswordHash.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Auth/DataScopeService.h"
+#include "Core/Auth/MfaService.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 #include "Core/System/DictionaryRepository.h"
@@ -130,6 +131,7 @@ namespace EdgePulse::System
                                         {"postName", user.postNames},
                                         {"roleName", user.roleNames},
                                         {"status", user.status},
+                                        {"mfaEnabled", user.mfaEnabled},
                                         {"lockedUntil", user.lockedUntil},
                                         {"createTime", user.createTime},
                                         {"lastLogin", user.lastLoginTime},
@@ -775,6 +777,39 @@ namespace EdgePulse::System
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;
                    });
+
+        router.post("/api/system/users/:id/mfa/reset",
+                    [&loop, deps, authOf](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string traceId = Web::resolveRequestId(request);
+                        const auto        session = co_await Web::requireSession(authOf(), loop, request, response, "system:user:edit", traceId);
+                        if (!session.has_value())
+                        {
+                            co_return;
+                        }
+                        const auto userId = Common::parsePositiveIdentifier(request.param("id"));
+                        if (!userId.has_value())
+                        {
+                            fail(response, Common::kCodeBadRequest, "用户标识不合法", traceId);
+                            co_return;
+                        }
+                        if (deps->mfa == nullptr)
+                        {
+                            fail(response, Common::kCodeServiceUnavailable, "两步验证服务未装配", traceId);
+                            co_return;
+                        }
+                        // 租户边界先于重置：越界目标与不存在同样回 404，不暴露其他租户的账号
+                        const auto target = co_await deps->users->scoped(session->tenantScope())->findById(loop, *userId);
+                        if (!target.has_value())
+                        {
+                            fail(response, Common::kCodeNotFound, "用户不存在或已删除", traceId);
+                            co_return;
+                        }
+                        // 已启用与未启用的账号都按成功处理，管理员重复重置是幂等的
+                        static_cast<void>(co_await deps->mfa->reset(loop, *userId));
+                        Common::writeSuccess(response, nullptr, traceId);
+                        co_return;
+                    });
 
         router.del("/api/system/users/:id",
                    [&loop, deps, authOf](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>

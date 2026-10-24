@@ -3,9 +3,11 @@
 #include "Base/Coding/Base64.h"
 #include "Base/Coding/SecureCompare.h"
 #include "Base/Config/ConfigValue.h"
+#include "Base/Json/JsonFields.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/Hmac.h"
 #include "Base/Security/RandomBytes.h"
+#include "Base/Security/RandomToken.h"
 #include "Core/Auth/MfaCrypto.h"
 #include "Core/Auth/Totp.h"
 
@@ -14,6 +16,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <optional>
 #include <string>
@@ -28,10 +31,13 @@ namespace EdgePulse::Auth
     {
         constexpr std::string_view     kSetupCachePrefix = "edgepulse:mfa:setup:";
         constexpr std::chrono::seconds kSetupTtl{600};
-        constexpr std::size_t          kRecoveryCodeCount     = 10;
-        constexpr std::size_t          kRecoveryCodeGroupSize = 4;
-        constexpr std::string_view     kRecoveryAlphabet      = "123456789abcdefghjkmnpqrstuvwxyz";
-        constexpr std::string_view     kIssuer                = "EdgePulse";
+        constexpr std::string_view     kChallengeCachePrefix        = "edgepulse:mfa:challenge:";
+        constexpr std::size_t          kChallengeTokenBytes         = 24;
+        constexpr std::size_t          kMaximumChallengeTokenLength = 128;
+        constexpr std::size_t          kRecoveryCodeCount           = 10;
+        constexpr std::size_t          kRecoveryCodeGroupSize       = 4;
+        constexpr std::string_view     kRecoveryAlphabet            = "123456789abcdefghjkmnpqrstuvwxyz";
+        constexpr std::string_view     kIssuer                      = "EdgePulse";
 
         /**
          * @brief 去掉首尾空白
@@ -151,6 +157,57 @@ namespace EdgePulse::Auth
         }
 
         /**
+         * @brief 登录挑战的缓存键
+         * @param token 一次性令牌
+         * @return std::string 键
+         */
+        [[nodiscard]] std::string challengeCacheKey(const std::string_view token)
+        {
+            return std::string{kChallengeCachePrefix} + std::string{token};
+        }
+
+        /**
+         * @brief 把挑战序列化成缓存值
+         * @param challenge 挑战内容
+         * @return std::string JSON 对象文本
+         */
+        [[nodiscard]] std::string serializeChallenge(const MfaChallenge &challenge)
+        {
+            return AsynGyanis::Base::ConfigValue::object(
+                           {{"userId", challenge.userId}, {"tenantId", challenge.tenantId}, {"clientIp", challenge.clientIp}, {"attempts", challenge.attempts}})
+                    .dump();
+        }
+
+        /**
+         * @brief 解析缓存里的挑战
+         * @param token 令牌
+         * @param text 缓存值
+         * @return std::optional<MfaChallenge> 字段齐全且用户与租户为正时返回
+         */
+        [[nodiscard]] std::optional<MfaChallenge> parseChallenge(const std::string_view token, const std::string_view text)
+        {
+            const std::optional<AsynGyanis::Base::ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(text);
+            if (!parsed.has_value() || !parsed->is_object())
+            {
+                return std::nullopt;
+            }
+            const std::optional<std::int64_t> userId   = Json::optionalInteger(*parsed, "userId");
+            const std::optional<std::int64_t> tenantId = Json::optionalInteger(*parsed, "tenantId");
+            if (!userId.has_value() || !tenantId.has_value() || *userId <= 0 || *tenantId <= 0)
+            {
+                return std::nullopt;
+            }
+            MfaChallenge challenge;
+            challenge.token                            = std::string{token};
+            challenge.userId                           = *userId;
+            challenge.tenantId                         = *tenantId;
+            challenge.clientIp                         = Json::stringField(*parsed, "clientIp");
+            const std::optional<std::int64_t> attempts = Json::optionalInteger(*parsed, "attempts");
+            challenge.attempts                         = attempts.has_value() ? std::max(0, static_cast<int>(*attempts)) : 0;
+            return challenge;
+        }
+
+        /**
          * @brief 把待启用秘密的密文序列化成缓存值
          * @param ciphertext 加密结果
          * @return std::string 含 nonce 与 ciphertext 的 JSON 对象文本
@@ -232,6 +289,61 @@ namespace EdgePulse::Auth
     {
     }
 
+    AsynGyanis::Core::Task<std::optional<std::string>> MfaService::createChallenge(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, const std::int64_t tenantId,
+                                                                                   std::string clientIp)
+    {
+        if (userId <= 0 || tenantId <= 0)
+        {
+            co_return std::nullopt;
+        }
+        try
+        {
+            MfaChallenge challenge;
+            challenge.token    = Common::randomTokenHex(kChallengeTokenBytes);
+            challenge.userId   = userId;
+            challenge.tenantId = tenantId;
+            challenge.clientIp = std::move(clientIp);
+            if (!co_await m_cache->set(loop, challengeCacheKey(challenge.token), serializeChallenge(challenge), std::chrono::seconds{kChallengeTtlSeconds}))
+            {
+                co_return std::nullopt;
+            }
+            co_return challenge.token;
+        } catch (const std::exception &)
+        {
+            // 随机源不可用时不签发挑战，由调用方转成可恢复的服务不可用
+            co_return std::nullopt;
+        }
+    }
+
+    AsynGyanis::Core::Task<std::optional<MfaChallenge>> MfaService::takeChallenge(AsynGyanis::Core::EventLoop &loop, const std::string_view token)
+    {
+        if (token.empty() || token.size() > kMaximumChallengeTokenLength)
+        {
+            co_return std::nullopt;
+        }
+        const std::optional<std::string> stored = co_await m_cache->take(loop, challengeCacheKey(token));
+        if (!stored.has_value())
+        {
+            co_return std::nullopt;
+        }
+        co_return parseChallenge(token, *stored);
+    }
+
+    AsynGyanis::Core::Task<bool> MfaService::recordChallengeFailure(AsynGyanis::Core::EventLoop &loop, MfaChallenge challenge)
+    {
+        if (challenge.token.empty())
+        {
+            co_return false;
+        }
+        ++challenge.attempts;
+        if (challenge.attempts >= kChallengeMaxAttempts)
+        {
+            // 第 5 次失败不再写回，令牌在上一次 take 时已经删除
+            co_return false;
+        }
+        co_return co_await m_cache->set(loop, challengeCacheKey(challenge.token), serializeChallenge(challenge), std::chrono::seconds{kChallengeTtlSeconds});
+    }
+
     bool MfaService::keyConfigured() const noexcept
     {
         return m_key.size() == kMfaKeyBytes;
@@ -293,8 +405,8 @@ namespace EdgePulse::Auth
         }
 
         MfaSetup setup;
-        setup.secret     = Totp::generateSecret();
-        setup.otpauthUri = Totp::otpauthUri(kIssuer, session.username, setup.secret);
+        setup.secret                                 = Totp::generateSecret();
+        setup.otpauthUri                             = Totp::otpauthUri(kIssuer, session.username, setup.secret);
         const std::optional<MfaCiphertext> encrypted = MfaCrypto::encrypt(setup.secret, m_key);
         if (!encrypted.has_value())
         {
@@ -402,6 +514,40 @@ namespace EdgePulse::Auth
         co_return std::expected<void, MfaError>{};
     }
 
+    AsynGyanis::Core::Task<std::expected<std::vector<std::string>, MfaError>> MfaService::regenerateRecoveryCodes(AsynGyanis::Core::EventLoop &loop, SessionRecord session,
+                                                                                                                  std::string code)
+    {
+        if (!keyConfigured())
+        {
+            co_return std::unexpected(serviceUnavailable("未配置两步验证加密密钥，请联系管理员配置 EDGEPULSE_MFA_KEY 后重试"));
+        }
+        const std::shared_ptr<MfaRepository> repository = m_repository.scoped({session.tenantId, false});
+        const std::optional<MfaRecord>       existing   = co_await repository->findByUser(loop, session.userId);
+        if (!existing.has_value() || !existing->enabled)
+        {
+            co_return std::unexpected(notFound("两步验证未启用"));
+        }
+        // 与登录共用步号水位：刚用于登录或关闭的验证码不能再签发恢复码
+        const std::optional<std::int64_t> matched = matchingStep(*existing, trimCopy(code), Totp::currentStep(), existing->lastUsedStep);
+        if (!matched.has_value() || !co_await repository->consumeStep(loop, session.userId, *matched, Common::nowDateTimeUtc()))
+        {
+            co_return std::unexpected(unauthorized("验证码错误或已使用，请等待身份验证器刷新后重试"));
+        }
+
+        const std::vector<std::string> recoveryCodes = generateRecoveryCodes();
+        std::vector<std::string>       hashes;
+        hashes.reserve(recoveryCodes.size());
+        for (const std::string &recoveryCode: recoveryCodes)
+        {
+            hashes.push_back(recoveryHash(m_key, recoveryCode));
+        }
+        if (!co_await repository->updateRecoveryCodes(loop, session.userId, serializeHashes(hashes), Common::nowDateTimeUtc()))
+        {
+            co_return std::unexpected(conflict("两步验证记录已被并发修改，请刷新后重试"));
+        }
+        co_return recoveryCodes;
+    }
+
     AsynGyanis::Core::Task<bool> MfaService::verify(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string code)
     {
         if (!keyConfigured())
@@ -438,8 +584,7 @@ namespace EdgePulse::Auth
         {
             co_return false;
         }
-        co_return co_await m_repository.scoped({record->tenantId, false})
-                ->consumeRecoveryCode(loop, userId, recoveryHash(m_key, canonical), Common::nowDateTimeUtc());
+        co_return co_await m_repository.scoped({record->tenantId, false})->consumeRecoveryCode(loop, userId, recoveryHash(m_key, canonical), Common::nowDateTimeUtc());
     }
 
     AsynGyanis::Core::Task<bool> MfaService::enabled(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId)

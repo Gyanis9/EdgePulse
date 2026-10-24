@@ -43,6 +43,7 @@ namespace EdgePulse::System
         std::int64_t              departmentId{0};      ///< 部门标识
         std::string               departmentName;       ///< 部门名
         int                       status{0};            ///< 1 启用、0 停用
+        bool                      mfaEnabled{false};    ///< 是否已启用两步验证
         int                       failedLoginCount{0};  ///< 当前失败窗口内的连续失败次数
         std::string               lockedUntil;          ///< 锁定截止时刻，空表示未锁定
         std::string               lastLoginTime;        ///< 最近登录时间

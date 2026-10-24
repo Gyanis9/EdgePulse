@@ -3,6 +3,7 @@
 #include "App/ListenerAssembly.h"
 #include "Base/Config/ConfigValue.h"
 #include "Plugins/AuthPlugin/AuthController.h"
+#include "Plugins/AuthPlugin/MfaController.h"
 #include "Plugins/AuthPlugin/OidcController.h"
 #include "Core/Auth/ApiTokenService.h"
 #include "Core/Auth/AuthService.h"
@@ -210,6 +211,8 @@ namespace EdgePulse::App
             authOptions.loginLockSeconds          = m_configuration.loginLockSeconds;
             m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache, m_tenantRepository, authOptions);
             m_mfaService       = std::make_shared<Auth::MfaService>(m_database, m_cache, m_configuration.mfaEncryptionKey);
+            // 登录与外部身份签发共用同一个两步验证服务，装配阶段绑定一次
+            m_authService->setMfaService(m_mfaService);
             // 只报告是否配置；密钥内容与长度都不进日志
             LOG_INFO_FMT("两步验证加密密钥：{}", m_configuration.mfaEncryptionKey.empty() ? "未配置" : "已配置");
             m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>();
@@ -765,6 +768,7 @@ namespace EdgePulse::App
         Web::registerAuditMiddleware(router, loop, *m_authService, *m_logRepository);
         registerHealthRoutes(router);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
+        Auth::registerMfaRoutes(router, loop, *m_authService, *m_mfaService);
         if (m_oidcService)
         {
             Auth::registerOidcRoutes(router, loop, *m_oidcService);
@@ -772,6 +776,7 @@ namespace EdgePulse::App
         System::SystemDependencies systemDependencies;
         systemDependencies.auth         = m_authService.get();
         systemDependencies.dataScopes   = m_dataScopeService.get();
+        systemDependencies.mfa          = m_mfaService.get();
         systemDependencies.users        = m_userRepository.get();
         systemDependencies.roles        = m_roleRepository.get();
         systemDependencies.menus        = m_menuRepository.get();

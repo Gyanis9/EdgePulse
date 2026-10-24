@@ -36,6 +36,7 @@ namespace EdgePulse::System
 namespace EdgePulse::Auth
 {
     class ApiTokenService;
+    class MfaService;
 
     /**
      * @brief 认证失败的可恢复错误
@@ -66,8 +67,11 @@ namespace EdgePulse::Auth
      */
     struct LoginResult
     {
-        std::string token;        ///< 不透明会话令牌
-        int         expiresIn{0}; ///< 有效期，单位秒
+        std::string token;                 ///< 不透明会话令牌
+        int         expiresIn{0};          ///< 有效期，单位秒
+        bool        mfaRequired{false};    ///< 是否需要先完成两步验证
+        std::string challengeToken;        ///< 两步验证挑战令牌；mfaRequired 为真时有效
+        int         challengeExpiresIn{0}; ///< 挑战有效期，单位秒
     };
 
     /**
@@ -111,12 +115,42 @@ namespace EdgePulse::Auth
         void setApiTokenService(std::shared_ptr<ApiTokenService> apiTokens);
 
         /**
+         * @brief 挂接两步验证服务，使口令登录与外部身份签发复用同一套 MFA 分支
+         * @param mfa 两步验证服务；空表示不启用第二因素
+         * @note 只在启动装配阶段调用一次，不做运行期替换；空指针时登录与外部签发都保持单因素
+         */
+        void setMfaService(std::shared_ptr<MfaService> mfa);
+
+        /**
          * @brief 验证码 + 口令登录
          * @param loop 恢复协程用的事件循环
          * @param credentials 登录输入
-         * @return 成功返回 token 与有效期；失败返回可恢复错误
+         * @return 成功返回 token 与有效期；启用两步验证时返回挑战令牌而不签发会话；失败返回可恢复错误
          */
         AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> login(AsynGyanis::Core::EventLoop &loop, LoginCredentials credentials);
+
+        /**
+         * @brief 用挑战令牌与验证码完成两步验证并签发会话
+         * @param loop 恢复协程用的事件循环
+         * @param challengeToken 登录响应里的挑战令牌
+         * @param code TOTP 或恢复码
+         * @param clientIp 本次请求的来源 IP，必须与发起登录时一致
+         * @param traceId 请求标识
+         * @return 成功返回 token 与有效期；挑战失效、来源不符、次数用尽或验证码错误返回 401
+         * @note 挑战在取出时即从缓存删除；失败会按次数写回，第 5 次失败后不再保留
+         */
+        AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> verifyMfa(AsynGyanis::Core::EventLoop &loop, std::string challengeToken, std::string code,
+                                                                                std::string clientIp, std::string traceId);
+
+        /**
+         * @brief 校验指定用户的口令，不写登录失败计数
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识，来自已认证会话
+         * @param password 待校验明文
+         * @return bool 用户存在且口令匹配时为 true
+         * @note 供关闭两步验证等敏感操作二次确认，不改变登录锁定状态
+         */
+        AsynGyanis::Core::Task<bool> verifyPassword(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string password);
 
         /**
          * @brief 为已确认的外部身份签发会话
@@ -130,6 +164,19 @@ namespace EdgePulse::Auth
          */
         AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> issueSessionForUser(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string clientIp,
                                                                                           std::string traceId, std::string auditMessage);
+
+        /**
+         * @brief 为外部身份签发会话；已启用两步验证时只签发挑战
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         * @param clientIp 来源 IP
+         * @param traceId 请求标识
+         * @param auditMessage 无 MFA 时的登录审计文案；进入挑战时固定写等待两步验证
+         * @return 成功返回 token 与有效期，或 mfaRequired 的挑战；账号不存在或停用时返回 401
+         * @note 供 OIDC 等已完成外部身份校验的调用方使用；已通过 MFA 的路径继续用 issueSessionForUser
+         */
+        AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> issueSessionOrChallengeForUser(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string clientIp,
+                                                                                                     std::string traceId, std::string auditMessage);
 
         /**
          * @brief 校验令牌并滑动续期
@@ -227,6 +274,7 @@ namespace EdgePulse::Auth
         std::shared_ptr<Cache::KeyValueStore>     m_cache;          ///< 登录失败计数
         std::shared_ptr<System::TenantRepository> m_tenants;        ///< 租户注册表
         std::shared_ptr<ApiTokenService>          m_apiTokens;      ///< API 令牌；空表示未启用
+        std::shared_ptr<MfaService>               m_mfa;            ///< 两步验证；空表示不启用
         System::UserRepository                    m_users;          ///< 用户仓储
         System::MenuRepository                    m_menus;          ///< 菜单仓储
         AuthOptions                               m_options;        ///< 口令与锁定策略

@@ -282,10 +282,18 @@ namespace EdgePulse::Auth
             co_return result;
         }
         result.returnPath = Json::stringField(*value, "returnPath");
-        const auto issued = co_await m_auth.issueSessionForUser(loop, *userId, std::move(clientIp), std::move(traceId), "OIDC 登录成功");
+        const auto issued = co_await m_auth.issueSessionOrChallengeForUser(loop, *userId, std::move(clientIp), std::move(traceId), "OIDC 登录成功");
         if (!issued.has_value())
         {
             result.error = issued.error().message;
+            co_return result;
+        }
+        if (issued->mfaRequired)
+        {
+            result.ok                 = true;
+            result.mfaRequired        = true;
+            result.challengeToken     = issued->challengeToken;
+            result.challengeExpiresIn = issued->challengeExpiresIn;
             co_return result;
         }
         result.ok        = true;

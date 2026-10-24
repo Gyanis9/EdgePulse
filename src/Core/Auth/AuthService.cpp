@@ -5,6 +5,7 @@
 #include "Base/Security/PasswordHash.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/ApiTokenService.h"
+#include "Core/Auth/MfaService.h"
 #include "Core/Coroutine/AsyncExecutor.h"
 #include "Core/System/TenantRepository.h"
 
@@ -47,6 +48,11 @@ namespace EdgePulse::Auth
     void AuthService::setApiTokenService(std::shared_ptr<ApiTokenService> apiTokens)
     {
         m_apiTokens = std::move(apiTokens);
+    }
+
+    void AuthService::setMfaService(std::shared_ptr<MfaService> mfa)
+    {
+        m_mfa = std::move(mfa);
     }
 
     AsynGyanis::Core::Task<> AuthService::recordAudit(AsynGyanis::Core::EventLoop &loop, LoginAuditEntry entry)
@@ -139,6 +145,21 @@ namespace EdgePulse::Auth
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "用户名或密码错误"});
         }
 
+        // 口令成立后先看第二因素：启用 MFA 的账号在完成挑战前不签发任何会话
+        if (m_mfa != nullptr && co_await m_mfa->enabled(loop, user->id))
+        {
+            const std::optional<std::string> challenge = co_await m_mfa->createChallenge(loop, user->id, user->tenantId, credentials.clientIp);
+            if (!challenge.has_value())
+            {
+                co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "两步验证挑战签发失败", credentials.traceId, user->id,
+                                                           user->departmentId, tenantId});
+                co_return std::unexpected(AuthError{Common::kCodeServiceUnavailable, Common::kCodeServiceUnavailable, "两步验证服务暂不可用，请稍后重试"});
+            }
+            co_await recordAudit(
+                    loop, LoginAuditEntry{credentials.username, credentials.clientIp, true, "登录成功，等待两步验证", credentials.traceId, user->id, user->departmentId, tenantId});
+            co_return LoginResult{.mfaRequired = true, .challengeToken = *challenge, .challengeExpiresIn = MfaService::kChallengeTtlSeconds};
+        }
+
         auto issued = co_await createSessionForUser(loop, *user, credentials.clientIp, credentials.traceId, "登录成功");
         if (issued.has_value())
         {
@@ -153,6 +174,71 @@ namespace EdgePulse::Auth
         co_return issued;
     }
 
+    AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> AuthService::verifyMfa(AsynGyanis::Core::EventLoop &loop, std::string challengeToken, std::string code,
+                                                                                         std::string clientIp, std::string traceId)
+    {
+        // 挑战失效、来源不符与验证码错误对客户端用同一条文案，避免帮助攻击者区分失败阶段
+        const auto invalidChallenge = []() -> AuthError { return AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "两步验证失败：验证码错误或已过期，请重新登录"}; };
+        if (m_mfa == nullptr || challengeToken.empty())
+        {
+            co_return std::unexpected(invalidChallenge());
+        }
+        // 取值即删除：同一挑战只允许一次校验，失败次数由写回的挑战承担
+        std::optional<MfaChallenge> challenge = co_await m_mfa->takeChallenge(loop, challengeToken);
+        if (!challenge.has_value() || challenge->attempts >= MfaService::kChallengeMaxAttempts)
+        {
+            co_return std::unexpected(invalidChallenge());
+        }
+        if (challenge->clientIp != clientIp)
+        {
+            co_await recordAudit(loop, LoginAuditEntry{std::string{}, clientIp, false, "两步验证来源与登录请求不一致", traceId, challenge->userId, 0, challenge->tenantId});
+            co_return std::unexpected(invalidChallenge());
+        }
+
+        const std::optional<System::UserRecord> user = co_await m_users.scoped({challenge->tenantId, false})->findById(loop, challenge->userId);
+        if (!user.has_value() || user->status != 1)
+        {
+            co_return std::unexpected(invalidChallenge());
+        }
+
+        // TOTP 与恢复码共用同一失败计数：TOTP 未命中后再尝试恢复码，两者都失败才记一次
+        bool verified = co_await m_mfa->verify(loop, user->id, code);
+        if (!verified)
+        {
+            verified = co_await m_mfa->verifyRecovery(loop, user->id, code);
+        }
+        if (!verified)
+        {
+            const bool retained = co_await m_mfa->recordChallengeFailure(loop, *challenge);
+            co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, retained ? "两步验证失败" : "两步验证失败次数已达上限", traceId, user->id,
+                                                       user->departmentId, user->tenantId});
+            co_return std::unexpected(invalidChallenge());
+        }
+
+        auto issued = co_await createSessionForUser(loop, *user, clientIp, traceId, "登录成功（两步验证）");
+        if (issued.has_value())
+        {
+            if (!co_await m_users.scoped({user->tenantId, false})->clearLoginFailures(loop, user->id))
+            {
+                LOG_WARN_FMT("两步验证登录后清零失败计数未命中用户：user={} id={}", user->username, user->id);
+            }
+            static_cast<void>(co_await m_cache->erase(loop, ipFailureKey(clientIp)));
+        }
+        co_return issued;
+    }
+
+    AsynGyanis::Core::Task<bool> AuthService::verifyPassword(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string password)
+    {
+        const std::optional<System::UserRecord> user = co_await m_users.scoped({1, true})->findById(loop, userId);
+        if (!user.has_value() || user->status != 1)
+        {
+            co_return false;
+        }
+        const std::string storedHash = user->passwordHash;
+        co_return co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop, [storedHash, password = std::move(password)]
+                                                                                  { return Common::verifyPassword(storedHash, password); });
+    }
+
     AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> AuthService::issueSessionForUser(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId,
                                                                                                    std::string clientIp, std::string traceId, std::string auditMessage)
     {
@@ -160,6 +246,28 @@ namespace EdgePulse::Auth
         if (!user.has_value() || user->status != 1)
         {
             co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "账号不存在或已停用"});
+        }
+        co_return co_await createSessionForUser(loop, *user, clientIp, traceId, auditMessage);
+    }
+
+    AsynGyanis::Core::Task<std::expected<LoginResult, AuthError>> AuthService::issueSessionOrChallengeForUser(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId,
+                                                                                                              std::string clientIp, std::string traceId, std::string auditMessage)
+    {
+        const std::optional<System::UserRecord> user = co_await m_users.scoped({1, true})->findById(loop, userId);
+        if (!user.has_value() || user->status != 1)
+        {
+            co_return std::unexpected(AuthError{Common::kCodeUnauthorized, Common::kCodeUnauthorized, "账号不存在或已停用"});
+        }
+        if (m_mfa != nullptr && co_await m_mfa->enabled(loop, user->id))
+        {
+            const std::optional<std::string> challenge = co_await m_mfa->createChallenge(loop, user->id, user->tenantId, clientIp);
+            if (!challenge.has_value())
+            {
+                co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, "两步验证挑战签发失败", traceId, user->id, user->departmentId, user->tenantId});
+                co_return std::unexpected(AuthError{Common::kCodeServiceUnavailable, Common::kCodeServiceUnavailable, "两步验证服务暂不可用，请稍后重试"});
+            }
+            co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, true, "登录成功，等待两步验证", traceId, user->id, user->departmentId, user->tenantId});
+            co_return LoginResult{.mfaRequired = true, .challengeToken = *challenge, .challengeExpiresIn = MfaService::kChallengeTtlSeconds};
         }
         co_return co_await createSessionForUser(loop, *user, clientIp, traceId, auditMessage);
     }

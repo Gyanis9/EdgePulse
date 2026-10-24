@@ -80,11 +80,14 @@ namespace EdgePulse::Auth
      */
     struct OidcExchangeResult
     {
-        bool        ok{false};    ///< 是否签发成功
-        std::string token;        ///< 会话令牌
-        int         expiresIn{0}; ///< 有效期
-        std::string returnPath;   ///< 登录前想去的路径
-        std::string error;        ///< 中文失败原因
+        bool        ok{false};             ///< 是否完成兑换；需要两步验证时也为真，但只返回挑战
+        std::string token;                 ///< 会话令牌；mfaRequired 时为空
+        int         expiresIn{0};          ///< 会话有效期
+        std::string returnPath;            ///< 登录前想去的路径
+        std::string error;                 ///< 中文失败原因
+        bool        mfaRequired{false};    ///< 本地账号已启用两步验证
+        std::string challengeToken;        ///< 两步验证挑战令牌
+        int         challengeExpiresIn{0}; ///< 挑战有效期，单位秒
     };
 
     /**

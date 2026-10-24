@@ -142,6 +142,15 @@ namespace EdgePulse::Auth
                             writeAuthError(response, result.error(), traceId);
                             co_return;
                         }
+                        if (result->mfaRequired)
+                        {
+                            // 第二因素未完成前只回挑战，不签发会话；挑战令牌同样不能被缓存
+                            AsynGyanis::Base::ConfigValue challenge = AsynGyanis::Base::ConfigValue::object(
+                                    {{"mfaRequired", true}, {"challengeToken", result->challengeToken}, {"expiresIn", result->challengeExpiresIn}});
+                            response.setHeader("Cache-Control", "no-store");
+                            Common::writeSuccess(response, std::move(challenge), traceId);
+                            co_return;
+                        }
                         AsynGyanis::Base::ConfigValue data = AsynGyanis::Base::ConfigValue::object({{"token", result->token}, {"expiresIn", result->expiresIn}});
                         Common::writeSuccess(response, std::move(data), traceId);
                         co_return;

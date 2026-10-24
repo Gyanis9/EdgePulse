@@ -85,6 +85,18 @@ namespace EdgePulse::Auth
                             Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, result.error, traceId);
                             co_return;
                         }
+                        if (result.mfaRequired)
+                        {
+                            // 外部身份已确认，但本地账号还差第二因素；只回挑战，不下发会话
+                            response.setHeader("Cache-Control", "no-store");
+                            Common::writeSuccess(response,
+                                                 ConfigValue::object({{"mfaRequired", true},
+                                                                      {"challengeToken", result.challengeToken},
+                                                                      {"expiresIn", result.challengeExpiresIn},
+                                                                      {"returnPath", result.returnPath}}),
+                                                 traceId);
+                            co_return;
+                        }
                         Common::writeSuccess(response, ConfigValue::object({{"token", result.token}, {"expiresIn", result.expiresIn}, {"returnPath", result.returnPath}}), traceId);
                         co_return;
                     });

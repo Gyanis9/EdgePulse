@@ -39,7 +39,8 @@ namespace EdgePulse::System
                                                  "COALESCE((SELECT GROUP_CONCAT(DISTINCT r.role_name) FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id "
                                                  "WHERE ur.user_id = u.id AND r.deleted = 0), '') AS role_names, "
                                                  "COALESCE((SELECT GROUP_CONCAT(DISTINCT p.post_name) FROM sys_user_post up JOIN sys_post p ON p.id = up.post_id "
-                                                 "WHERE up.user_id = u.id AND p.deleted = 0), '') AS post_names "
+                                                 "WHERE up.user_id = u.id AND p.deleted = 0), '') AS post_names, "
+                                                 "EXISTS (SELECT 1 FROM sys_user_mfa m WHERE m.user_id = u.id AND m.enabled = 1) AS mfa_enabled "
                                                  "FROM sys_user u LEFT JOIN sys_tenant t ON t.id = u.tenant_id LEFT JOIN sys_dept d ON d.id = u.dept_id ";
 
         [[nodiscard]] std::unique_ptr<DatabaseResult> execute(DatabaseConnection &connection, const std::string &sql, std::span<const DatabaseValue> parameters)
@@ -98,6 +99,7 @@ namespace EdgePulse::System
             user.departmentId     = Sql::integer(result, "dept_id");
             user.departmentName   = Sql::text(result, "dept_name");
             user.status           = static_cast<int>(Sql::integer(result, "status"));
+            user.mfaEnabled       = Sql::boolean(result, "mfa_enabled");
             user.failedLoginCount = static_cast<int>(Sql::integer(result, "failed_login_count"));
             user.lockedUntil      = Sql::dateTimeText(result, "locked_until");
             user.lastLoginTime    = Sql::dateTimeText(result, "last_login_time");
