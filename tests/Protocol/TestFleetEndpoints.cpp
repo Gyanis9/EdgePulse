@@ -207,11 +207,13 @@ namespace
             }
             result.connected = true;
 
-            AsynGyanis::Net::HttpClientRequest request;
+            // body 是 string_view：序列化结果要活到 co_await 返回，直接绑定 dump() 的临时串会在 send 读取前释放
+            const std::string                   bodyText = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"type", "ws-echo"}, {"payload", "{}"}, {"timeoutSeconds", 30}}).dump();
+            AsynGyanis::Net::HttpClientRequest  request;
             request.method      = "POST";
             request.contentType = "application/json";
             request.headers     = bearer(token);
-            request.body        = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"type", "ws-echo"}, {"payload", "{}"}, {"timeoutSeconds", 30}}).dump();
+            request.body        = bodyText;
             const auto created  = co_await AsynGyanis::Net::HttpClient::send(loop, "http://127.0.0.1:" + std::to_string(port) + "/api/commands", request, std::chrono::seconds{5});
             if (!created || created->statusCode != 200)
             {
