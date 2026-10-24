@@ -16,6 +16,10 @@
 - 口令策略、账号登录锁定与公开入口共享令牌桶限流。
 - 备份与恢复工具：数据库、固件与非敏感配置打包，逐文件 SHA-256 校验，支持 SQLite 与 MySQL。
 - Apache-2.0 许可证、安全策略、变更日志、行为准则、Roadmap、Issue/PR 模板与 Windows/Linux/前端/密钥扫描 CI。
+- 真机外部依赖用例可复现：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性 MySQL 8.4 与 Redis 7 容器并注入测试变量，断言 `ExternalStores.*` 与 `RealtimeBus.RedisFanoutReachesSecondInstance` 三项执行且无跳过。
+- MySQL 备份与恢复往返测试 `scripts/backup_restore_mysql_test.py`：在一次性容器内执行 `mysqldump`/`mysql`，校验归档 manifest 与导入后的迁移版本。
+- `server.quic.idle_timeout_seconds`：单独控制 h3 传输层空闲超时（1 到 3600 秒），`server.limits.idle_timeout_ms` 仍只管 HTTP/1.1、h2 与 Agent/运维口。
+- 审计脱敏与 Agent WebSocket 失败分支补直测：断言操作日志移除 `enrollmentToken`/`signature`，并通过测试注入钩子稳定命中 hello 后心跳被拒的关闭路径。
 
 ### Changed
 
@@ -24,6 +28,8 @@
 - 固件上传在开启签名门禁时要求 `X-Firmware-Signature` 与 `X-Firmware-Key-Id`，缺签名在写入正文前拒绝。
 - 生产配置样例收紧默认值：注册令牌必需、固件签名必需、强口令与登录锁定开启、私网 Webhook 默认关闭。
 - 备份归档排除 `prod.yaml`、`*.env`、私钥、Git 元数据与日志，避免把秘密带入备份介质。
+- 节点详情配置面板在页面刷新与配置加载在途时保留未保存草稿，刷新只重载未修改的面板；验收脚本收尾删除本次创建的手工与 Agent 节点。
+- CI 的 Linux 后端任务挂 MySQL 8.4/Redis 7 service、跑 MySQL 备份往返并断言外部用例无跳过；新增 actionlint 工作流校验。
 
 ### Security
 
@@ -39,6 +45,7 @@
 - 限流参数同时接受整数与小数写法，非数字、NaN 与无穷在启动时报错。
 - 登录失败计数与租户开通共用事务，避免失败记录丢失或半开通租户。
 - 节点配置并发写入按版本收口，Agent 上报的失败说明正确落库。
+- 配置上报与期望配置写入共用可重试 SQL 失败分类器与重试预算（最多三次），并发上报不再把 SQLite busy 抛成 500。
 - 注册事务在并发下重试并保持一次性令牌语义，吊销证书会关闭该节点已建立的 Agent WebSocket。
 
 ### Migration
