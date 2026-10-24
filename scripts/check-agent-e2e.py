@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import sqlite3
 import ssl
@@ -135,12 +136,20 @@ def stop_process(process: subprocess.Popen | None) -> None:
     if os.name == "nt":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, check=False)
     else:
-        process.terminate()
+        # start_logged_process 用 start_new_session 建了独立会话：按进程组发信号，
+        # 服务端若在收尾期间还有子进程，单杀主 PID 会把监听套接字留在子进程里
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=8)
             return
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     try:
         process.wait(timeout=8)
     except subprocess.TimeoutExpired:
