@@ -87,3 +87,53 @@ test('node detail keeps an unsaved config draft when the page refreshes', async 
   await page.getByRole('dialog').getByRole('button', { name: '删除', exact: true }).click()
   await expect(page.getByText('节点已删除')).toBeVisible({ timeout: 10_000 })
 })
+
+test('node detail keeps edits typed while a config refresh is in flight', async ({ page }) => {
+  const nodeName = `race-${Date.now()}`
+  await login(page)
+  await page.goto('/device/nodes')
+
+  await page.getByRole('button', { name: '新增节点' }).click()
+  const createDialog = page.getByRole('dialog')
+  await createDialog.getByPlaceholder('例如 edge-sh-01').fill(nodeName)
+  await createDialog.getByRole('button', { name: '保存' }).click()
+  await expect(page.getByText('节点已创建')).toBeVisible({ timeout: 10_000 })
+
+  const row = page.getByRole('row', { name: new RegExp(nodeName) })
+  await row.getByRole('button', { name: '详情' }).click()
+  await expect(page).toHaveURL(/\/device\/nodes\/\d+$/)
+  await page.getByRole('radio', { name: '配置', exact: true }).click()
+  await expect(page.getByText('尚未下发配置')).toBeVisible()
+
+  // 扣住下一次配置读取，保证草稿写入发生在响应返回之前
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let held = 0
+  await page.route(/\/api\/nodes\/\d+\/config$/, async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue()
+      return
+    }
+    held += 1
+    await gate
+    await route.continue()
+  })
+
+  await page.getByRole('button', { name: '刷新' }).first().click()
+  await expect.poll(() => held).toBe(1)
+
+  const editor = page.getByPlaceholder('{"interval":30}')
+  const draft = '{"race":true}'
+  await editor.fill(draft)
+  release()
+
+  await expect(page.getByText('加载期间检测到编辑，已保留草稿；保存或回滚后再刷新')).toBeVisible()
+  await expect(editor).toHaveValue(draft)
+
+  await page.getByRole('button', { name: '返回列表' }).click()
+  await expect(page).toHaveURL(/\/device\/nodes$/)
+  const cleanupRow = page.getByRole('row', { name: new RegExp(nodeName) })
+  await cleanupRow.getByRole('button', { name: '删除' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: '删除', exact: true }).click()
+  await expect(page.getByText('节点已删除')).toBeVisible({ timeout: 10_000 })
+})

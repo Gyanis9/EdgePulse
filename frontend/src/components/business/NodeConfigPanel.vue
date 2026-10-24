@@ -23,6 +23,8 @@ const rollingBack = ref<number | null>(null)
 const error = ref('')
 const conflict = ref(false)
 const dirty = ref(false)
+// 本地状态代数：编辑、保存与回滚回填都会推进；在途加载据此判断响应是否已被本地更新超越
+const localEpoch = ref(0)
 
 const hasConfig = computed(() => Boolean(config.value && config.value.desired.version > 0))
 // 面板不分页，只展示最近一页修订；标题同时给出真实总数与已加载条数
@@ -56,8 +58,16 @@ async function load(): Promise<boolean> {
   loading.value = true
   error.value = ''
   conflict.value = false
+  // 发请求前记下代数；回来时若已变化，说明加载结果已被本地编辑或保存结果超越，不能回填
+  const startedEpoch = localEpoch.value
   try {
     const [current] = await Promise.all([deviceApi.nodes.config.get(props.nodeId), loadRevisions()])
+    if (localEpoch.value !== startedEpoch) {
+      // 首次加载时草稿还没有服务端基准，仍需补上配置版本供保存使用；已有配置时保持原版本，让并发更新走 409
+      if (!config.value) config.value = current
+      if (dirty.value) pushToast('加载期间检测到编辑，已保留草稿；保存或回滚后再刷新', 'info')
+      return false
+    }
     config.value = current
     editor.value = pretty(current.desired.content)
     dirty.value = false
@@ -71,6 +81,7 @@ async function load(): Promise<boolean> {
 }
 
 function markDirty() {
+  localEpoch.value += 1
   dirty.value = true
 }
 
@@ -111,6 +122,7 @@ async function save() {
     editor.value = pretty(saved.desired.content)
     note.value = ''
     dirty.value = false
+    localEpoch.value += 1
     pushToast('期望配置已下发，等待 Agent 上报')
     emit('updated')
     await loadRevisions()
@@ -146,6 +158,7 @@ async function rollback(revision: NodeConfigRevisionRow) {
     config.value = rolled
     editor.value = pretty(rolled.desired.content)
     dirty.value = false
+    localEpoch.value += 1
     pushToast(`已回滚到 v${revision.version}，等待 Agent 上报`)
     emit('updated')
     await loadRevisions()
