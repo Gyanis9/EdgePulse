@@ -36,6 +36,8 @@ add_library(edgepulse-core STATIC
         Http/AlarmEventStream.cpp
         Http/AuditMiddleware.cpp
         Http/Authorization.cpp
+        Http/IdempotencyMiddleware.cpp
+        Http/IdempotencyRepository.cpp
         Http/MiddlewareSetup.cpp
         Http/RealtimeBus.cpp
         Http/ReverseProxy.cpp

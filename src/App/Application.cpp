@@ -16,6 +16,7 @@
 #include "Core/Cache/MemoryKeyValueStore.h"
 #include "Core/Cache/RedisKeyValueStore.h"
 #include "Core/Http/AuditMiddleware.h"
+#include "Core/Http/IdempotencyRepository.h"
 #include "Base/Api/ApiResponse.h"
 #include "Base/Config/ConfigManager.h"
 #include "Base/Log/LogMacros.h"
@@ -766,6 +767,8 @@ namespace EdgePulse::App
         Web::applySecurityHeaders(router);
         Web::applyRateLimit(router, m_rateLimitBucket);
         Web::registerAuditMiddleware(router, loop, *m_authService, *m_logRepository);
+        // 幂等键紧贴业务处理器：审计在外，重放请求也照常留下操作记录
+        Web::applyIdempotency(router, loop, std::make_shared<Web::IdempotencyRepository>(m_database));
         registerHealthRoutes(router);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
         Auth::registerMfaRoutes(router, loop, *m_authService, *m_mfaService, *m_logRepository);

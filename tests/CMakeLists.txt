@@ -73,6 +73,7 @@ add_executable(edgepulse-protocol-tests
         Protocol/TestEnrollmentEndpoints.cpp
         Protocol/TestHealthServer.cpp
         Protocol/TestFleetEndpoints.cpp
+        Protocol/TestIdempotency.cpp
         Protocol/TestMfaEndpoints.cpp
         Protocol/TestNodeConfigEndpoints.cpp
         Protocol/TestNodeEndpoints.cpp

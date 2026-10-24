@@ -13,6 +13,10 @@
 
 #include <memory>
 
+namespace AsynGyanis::Core
+{
+    class EventLoop;
+}
 namespace AsynGyanis::Net
 {
     class Router;
@@ -21,6 +25,8 @@ namespace AsynGyanis::Net
 
 namespace EdgePulse::Web
 {
+    class IdempotencyRepository;
+
     /**
      * @brief 给路由器挂上统一的安全响应头与请求级异常兜底
      * @param router 目标路由器，必须在 start() 之前调用
@@ -35,6 +41,15 @@ namespace EdgePulse::Web
      * @note 探针被 429 会让编排器把进程误判为不健康，因此 /healthz、/readyz、/api/health 与 /api/probe/ 一律放行
      */
     [[nodiscard]] AsynGyanis::Net::MiddlewareFunc rateLimitExceptProbes(std::shared_ptr<AsynGyanis::Net::TokenBucket> bucket);
+
+    /**
+     * @brief 给路由器挂上写请求幂等键处理
+     * @param router 目标路由器，必须在 start() 之前调用
+     * @param loop 服务器所属事件循环
+     * @param repository 幂等记录仓储；空指针表示不注册中间件
+     * @note 必须排在 registerAuditMiddleware() 之后，让审计仍能记录被重放的请求
+     */
+    void applyIdempotency(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, std::shared_ptr<IdempotencyRepository> repository);
 
     /**
      * @brief 给路由器挂上共享令牌桶限流

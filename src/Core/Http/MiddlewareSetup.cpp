@@ -7,6 +7,7 @@
 #include "Net/Http/Message/HttpResponse.h"
 #include "Net/Http/Routing/Middleware.h"
 #include "Net/Http/Routing/Router.h"
+#include "Core/Http/IdempotencyMiddleware.h"
 #include "Core/Http/RequestId.h"
 
 #include <exception>
@@ -74,6 +75,15 @@ namespace EdgePulse::Web
             }
             co_await limited(request, response, std::move(next));
         };
+    }
+
+    void applyIdempotency(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, std::shared_ptr<IdempotencyRepository> repository)
+    {
+        // 空仓储代表调用方显式关闭：不注册比注册一个恒放行的中间件更容易从路由表上确认
+        if (repository != nullptr)
+        {
+            router.addMiddleware(idempotencyMiddleware(loop, std::move(repository)));
+        }
     }
 
     void applyRateLimit(AsynGyanis::Net::Router &router, const std::shared_ptr<AsynGyanis::Net::TokenBucket> &bucket)
