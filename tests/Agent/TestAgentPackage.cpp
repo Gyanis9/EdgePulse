@@ -181,8 +181,29 @@ namespace EdgePulse::Agent
                 m_configuration.stateDirectory               = m_directory.path() / "state";
                 m_configuration.packageTrustedKeysDirectory  = m_directory.path() / "package-keys";
                 m_configuration.updateStagingDirectory       = m_directory.path() / "update-staging";
-                m_configuration.updateInstallerScript        = m_directory.path() / "install-agent";
                 m_configuration.updateHealthTimeoutSeconds   = 30;
+
+                // 执行器启动前会检查安装器存在且可执行，用例统一放一个真实的临时脚本
+                const std::filesystem::path installer = m_directory.path() / "install-agent";
+                std::ofstream               installerStream(installer, std::ios::binary | std::ios::trunc);
+                installerStream << "#!/bin/sh\nexit 0\n";
+                installerStream.close();
+                if (!installerStream)
+                {
+                    ADD_FAILURE() << "无法创建升级安装器测试脚本 " << installer;
+                }
+#if !defined(_WIN32)
+                std::error_code error;
+                std::filesystem::permissions(installer,
+                                             std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec |
+                                                     std::filesystem::perms::others_read | std::filesystem::perms::others_exec,
+                                             error);
+                if (error)
+                {
+                    ADD_FAILURE() << "无法设置升级安装器测试脚本的可执行位：" << error.message();
+                }
+#endif
+                m_configuration.updateInstallerScript = installer;
             }
 
             PackageHarness(const PackageHarness &)            = delete;
@@ -206,6 +227,19 @@ namespace EdgePulse::Agent
             [[nodiscard]] std::filesystem::path installerPath() const
             {
                 return m_configuration.updateInstallerScript;
+            }
+
+            /**
+             * @brief 删除安装器测试脚本，模拟安装器缺失
+             */
+            void removeInstaller() const
+            {
+                std::error_code filesystemError;
+                std::filesystem::remove(m_configuration.updateInstallerScript, filesystemError);
+                if (filesystemError)
+                {
+                    ADD_FAILURE() << "无法删除升级安装器测试脚本：" << filesystemError.message();
+                }
             }
 
             void setDownloadStatus(const int status) const
@@ -471,6 +505,7 @@ namespace EdgePulse::Agent
         EXPECT_TRUE(containsArgument(AsynGyanis::Platform::FileSystem::utf8FromPath(executable->parent_path())));
 #else
         EXPECT_EQ("systemd-run", harness.launchExecutable().string());
+        EXPECT_TRUE(containsArgument("--property=Type=exec")) << "启动结果必须能看见安装器 exec 失败";
         EXPECT_TRUE(containsArgument("--upgrade"));
         EXPECT_TRUE(containsArgument(AsynGyanis::Platform::FileSystem::utf8FromPath(staged.front())));
         EXPECT_TRUE(containsArgument(AsynGyanis::Platform::FileSystem::utf8FromPath(harness.installerPath())));
@@ -651,10 +686,41 @@ namespace EdgePulse::Agent
         const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
         const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
 
+        std::error_code error;
+        std::filesystem::create_directories(harness.healthMarkerPath().parent_path(), error);
+        std::ofstream(harness.healthMarkerPath()) << "stale";
+        ASSERT_TRUE(std::filesystem::exists(harness.healthMarkerPath()));
+
         const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
         EXPECT_FALSE(result.succeeded);
         EXPECT_NE(std::string::npos, result.message.find("安装器")) << result.message;
         expectNoUpgradeLeftBehind(harness, 1);
+        EXPECT_TRUE(std::filesystem::exists(harness.healthMarkerPath())) << "启动安装器失败必须恢复旧健康标记";
+        EXPECT_EQ("stale", readTextFile(harness.healthMarkerPath()));
+    }
+
+    TEST(AgentPackage, RejectsMissingInstallerBeforeWritingState)
+    {
+        const std::string archive = "EDGEPULSE-AGENT-ARCHIVE-" + std::string(1024, 'm');
+        PackageHarness    harness(archive);
+        const auto        key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "pkg-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+        const std::string manifest  = manifestText("2.0.0", std::string{kAgentPlatform});
+        const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(archive);
+        const std::string signature = key->signDigest(AsynGyanis::Core::Digest::sha256Hex(manifest));
+
+        std::error_code error;
+        std::filesystem::create_directories(harness.healthMarkerPath().parent_path(), error);
+        std::ofstream(harness.healthMarkerPath()) << "stale";
+        ASSERT_TRUE(std::filesystem::exists(harness.healthMarkerPath()));
+        harness.removeInstaller();
+
+        const CommandResult result = harness.execute(packagePayload("2.0.0", digest, signature, manifest).dump());
+        EXPECT_FALSE(result.succeeded);
+        EXPECT_NE(std::string::npos, result.message.find("安装器")) << result.message;
+        expectNoUpgradeLeftBehind(harness);
+        EXPECT_TRUE(std::filesystem::exists(harness.healthMarkerPath())) << "安装器缺失不得删除健康标记";
+        EXPECT_EQ("stale", readTextFile(harness.healthMarkerPath()));
     }
 
     TEST(AgentPackage, StateStoresUpdateFieldsAndPendingResult)

@@ -17,10 +17,14 @@
 #include "Core/Coroutine/AsyncExecutor.h"
 #include "Core/EventLoop/EventLoop.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -128,6 +132,38 @@ namespace EdgePulse::Agent
         }
 
         /**
+         * @brief 确认安装器存在且可执行
+         * @param installer 安装脚本路径
+         * @return 成功为空；失败返回中文原因
+         * @note 在阻塞执行器上调用。脱离启动只能证明启动器进程已经创建，安装器缺失时安装不会发生，
+         *       必须在写升级状态之前拒绝
+         */
+        [[nodiscard]] std::expected<void, std::string> checkInstaller(const std::filesystem::path &installer)
+        {
+            if (installer.empty())
+            {
+                return std::unexpected("未配置 agent.update.installer_script，拒绝执行升级");
+            }
+            const std::string installerText = AsynGyanis::Platform::FileSystem::utf8FromPath(installer);
+            std::error_code   filesystemError;
+            if (!std::filesystem::is_regular_file(installer, filesystemError))
+            {
+                if (filesystemError)
+                {
+                    return std::unexpected("检查升级安装器 " + installerText + " 失败：" + filesystemError.message());
+                }
+                return std::unexpected("升级安装器 " + installerText + " 不存在或不是普通文件");
+            }
+#if !ASYN_PLATFORM_WIN32
+            if (::access(installer.c_str(), X_OK) != 0)
+            {
+                return std::unexpected("升级安装器 " + installerText + " 不可执行：" + std::string{std::strerror(errno)});
+            }
+#endif
+            return {};
+        }
+
+        /**
          * @brief 一次待执行的安装器启动
          */
         struct LaunchCommand
@@ -162,7 +198,10 @@ namespace EdgePulse::Agent
 #else
             LaunchCommand command;
             command.executable = "systemd-run";
+            // Type=exec 让 systemd-run 等主进程 exec 成功后才报告启动完成；默认的 Type=simple 在单元
+            // 入队时就算成功，安装器无法执行时这里仍会拿到成功并留下待上报状态
             command.arguments  = {"--collect",
+                                  "--property=Type=exec",
                                   "--unit=edgepulse-agent-update-" + std::to_string(currentProcessId()) + "-" +
                                           std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
                                   installerText,
@@ -390,6 +429,94 @@ namespace EdgePulse::Agent
         co_return CommandResult{false, "{}", std::move(message)};
     }
 
+    AsynGyanis::Core::Task<std::expected<UpdateExecutor::HealthMarkerSnapshot, std::string>> UpdateExecutor::takeHealthMarker(AsynGyanis::Core::EventLoop &loop,
+                                                                                                                              const std::filesystem::path &path)
+    {
+        std::expected<HealthMarkerSnapshot, std::string> snapshot;
+        try
+        {
+            snapshot = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<HealthMarkerSnapshot, std::string>>(
+                    loop,
+                    [path]() -> std::expected<HealthMarkerSnapshot, std::string>
+                    {
+                        const std::string pathText = AsynGyanis::Platform::FileSystem::utf8FromPath(path);
+                        HealthMarkerSnapshot result;
+                        std::error_code      filesystemError;
+                        if (!std::filesystem::exists(path, filesystemError))
+                        {
+                            if (filesystemError)
+                            {
+                                return std::unexpected("检查旧健康标记 " + pathText + " 失败：" + filesystemError.message());
+                            }
+                            return result;
+                        }
+
+                        std::ifstream stream(path, std::ios::binary);
+                        if (!stream)
+                        {
+                            return std::unexpected("读取旧健康标记 " + pathText + " 失败");
+                        }
+                        result.content.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+                        // Windows 上删除仍被打开的文件会失败，先关闭再删
+                        const bool readFailed = stream.bad();
+                        stream.close();
+                        if (readFailed || !stream)
+                        {
+                            return std::unexpected("读取旧健康标记 " + pathText + " 失败");
+                        }
+                        result.existed = true;
+
+                        std::filesystem::remove(path, filesystemError);
+                        if (filesystemError)
+                        {
+                            return std::unexpected("删除旧健康标记 " + pathText + " 失败：" + filesystemError.message());
+                        }
+                        return result;
+                    });
+        } catch (const std::exception &failure)
+        {
+            snapshot = std::unexpected("提交旧健康标记清理任务失败：" + std::string{failure.what()});
+        }
+        co_return snapshot;
+    }
+
+    AsynGyanis::Core::Task<> UpdateExecutor::restoreHealthMarker(AsynGyanis::Core::EventLoop &loop, const std::filesystem::path &path, HealthMarkerSnapshot snapshot)
+    {
+        if (!snapshot.existed)
+        {
+            co_return;
+        }
+        std::expected<void, std::string> restored;
+        try
+        {
+            restored = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                    loop,
+                    [path, content = std::move(snapshot.content)]() -> std::expected<void, std::string>
+                    {
+                        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+                        if (!stream)
+                        {
+                            return std::unexpected("写入旧健康标记 " + AsynGyanis::Platform::FileSystem::utf8FromPath(path) + " 失败");
+                        }
+                        stream.write(content.data(), static_cast<std::streamsize>(content.size()));
+                        stream.close();
+                        if (!stream)
+                        {
+                            return std::unexpected("写入旧健康标记 " + AsynGyanis::Platform::FileSystem::utf8FromPath(path) + " 失败");
+                        }
+                        return {};
+                    });
+        } catch (const std::exception &failure)
+        {
+            restored = std::unexpected("提交健康标记恢复任务失败：" + std::string{failure.what()});
+        }
+        if (!restored.has_value())
+        {
+            LOG_ERROR_FMT("恢复旧健康标记 {} 失败：{}", AsynGyanis::Platform::FileSystem::utf8FromPath(path), restored.error());
+        }
+        co_return;
+    }
+
     AsynGyanis::Core::Task<CommandResult> UpdateExecutor::execute(AsynGyanis::Core::EventLoop &loop, const AgentCommand &command)
     {
         const auto parsed = parsePayload(command.payload);
@@ -520,6 +647,20 @@ namespace EdgePulse::Agent
             co_return co_await fail(loop, staging, "升级包 SHA-256 与命令不符：收到 " + receivedDigest);
         }
 
+        std::expected<void, std::string> installerReady;
+        try
+        {
+            installerReady = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                    loop, [installer = m_configuration.updateInstallerScript]() { return checkInstaller(installer); });
+        } catch (const std::exception &failure)
+        {
+            installerReady = std::unexpected("提交升级安装器检查任务失败：" + std::string{failure.what()});
+        }
+        if (!installerReady.has_value())
+        {
+            co_return co_await fail(loop, staging, installerReady.error());
+        }
+
         const auto executable = currentExecutablePath();
         if (!executable.has_value())
         {
@@ -542,13 +683,13 @@ namespace EdgePulse::Agent
             co_return co_await fail(loop, staging, "读取升级状态失败：" + previousState.error());
         }
 
-        // 健康标记属于上一版进程的确认；旧标记不清掉，安装器会把未验证的新版本当成功
-        const std::filesystem::path healthMarker = m_configuration.stateDirectory / "update-health";
-        std::error_code             filesystemError;
-        std::filesystem::remove(healthMarker, filesystemError);
-        if (filesystemError)
+        // 健康标记属于上一版进程的确认；旧标记不清掉，安装器会把未验证的新版本当成功。
+        // 删除前留下快照，启动失败时按原样恢复
+        const std::filesystem::path healthMarker   = m_configuration.stateDirectory / "update-health";
+        const auto                  healthSnapshot = co_await takeHealthMarker(loop, healthMarker);
+        if (!healthSnapshot.has_value())
         {
-            co_return co_await fail(loop, staging, "删除旧健康标记 " + AsynGyanis::Platform::FileSystem::utf8FromPath(healthMarker) + " 失败：" + filesystemError.message());
+            co_return co_await fail(loop, staging, healthSnapshot.error());
         }
 
         const AsynGyanis::Base::ConfigValue pending = AsynGyanis::Base::ConfigValue::object({{"commandId", command.id}, {"version", payload.version}, {"status", "pending"}});
@@ -559,19 +700,32 @@ namespace EdgePulse::Agent
         const auto written    = m_state.setUpdateState(record);
         if (!written.has_value())
         {
+            co_await restoreHealthMarker(loop, healthMarker, *healthSnapshot);
             co_return co_await fail(loop, staging, "写入升级状态失败：" + written.error());
         }
 
+        // 启动器可能等待子进程或 systemd 启动结果（Linux 最长 30 秒），不能占住事件循环
         std::expected<void, std::string> launched;
         try
         {
-            launched = m_launcher(launchCommand->executable, launchCommand->arguments);
+            launched = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                    loop,
+                    [launcher = m_launcher, executable = launchCommand->executable, arguments = launchCommand->arguments]() -> std::expected<void, std::string>
+                    {
+                        try
+                        {
+                            return launcher(executable, arguments);
+                        } catch (const std::exception &failure)
+                        {
+                            return std::unexpected("启动升级安装器时发生异常：" + std::string{failure.what()});
+                        } catch (...)
+                        {
+                            return std::unexpected("启动升级安装器时发生未知异常");
+                        }
+                    });
         } catch (const std::exception &failure)
         {
-            launched = std::unexpected("启动升级安装器时发生异常：" + std::string{failure.what()});
-        } catch (...)
-        {
-            launched = std::unexpected("启动升级安装器时发生未知异常");
+            launched = std::unexpected("提交安装器启动任务失败：" + std::string{failure.what()});
         }
         if (!launched.has_value())
         {
@@ -580,6 +734,7 @@ namespace EdgePulse::Agent
             {
                 LOG_ERROR_FMT("启动安装器失败后恢复升级状态失败：{}", reverted.error());
             }
+            co_await restoreHealthMarker(loop, healthMarker, *healthSnapshot);
             co_return co_await fail(loop, staging, "启动升级安装器失败：" + launched.error());
         }
 

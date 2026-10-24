@@ -30,9 +30,10 @@ namespace EdgePulse::Agent
      * @brief 处理 agent.update 命令
      * @details 命令给出升级包的下载地址、归档摘要、manifest 原文与 Ed25519 签名。执行器先校验
      *          manifest 的版本、平台与文件清单，再用升级包信任键目录验签，然后下载归档并核对
-     *          SHA-256。全部通过后清掉旧健康标记、写入升级状态与待上报结果，最后把安装器作为
-     *          脱离进程启动并请求当前进程停止。任何启动前失败都不改升级状态、不启动安装器，
-     *          并删除暂存包；安装器需要消费暂存包，成功路径不删除。
+     *          SHA-256。全部通过后确认安装器存在且可执行、清掉旧健康标记（先留快照）、写入升级
+     *          状态与待上报结果，最后在阻塞执行器上把安装器作为脱离进程启动并请求当前进程停止。
+     *          任何启动前失败都不改升级状态、不启动安装器，并删除暂存包；启动失败时回滚升级状态
+     *          并恢复旧健康标记。安装器需要消费暂存包，成功路径不删除。
      *          文件读写与摘要计算在阻塞执行器上完成，事件循环线程只做网络与协程调度。
      */
     class UpdateExecutor final : public CommandExecutor
@@ -73,6 +74,15 @@ namespace EdgePulse::Agent
         AsynGyanis::Core::Task<CommandResult> execute(AsynGyanis::Core::EventLoop &loop, const AgentCommand &command) override;
 
     private:
+        /**
+         * @brief 升级前的健康标记快照
+         */
+        struct HealthMarkerSnapshot
+        {
+            bool        existed{false}; ///< 升级前是否存在健康标记
+            std::string content;        ///< 标记原文；不存在时为空
+        };
+
         /**
          * @brief 已校验的升级命令正文
          */
@@ -124,6 +134,24 @@ namespace EdgePulse::Agent
          * @return 失败的命令结果
          */
         AsynGyanis::Core::Task<CommandResult> fail(AsynGyanis::Core::EventLoop &loop, const std::filesystem::path &staging, std::string message);
+
+        /**
+         * @brief 在阻塞执行器上读取并删除旧健康标记
+         * @param loop 命令所属事件循环
+         * @param path 健康标记路径
+         * @return 成功返回标记快照；读取或删除失败返回中文原因
+         * @note 只有拿到快照才允许删除；启动失败时按快照恢复
+         */
+        AsynGyanis::Core::Task<std::expected<HealthMarkerSnapshot, std::string>> takeHealthMarker(AsynGyanis::Core::EventLoop &loop, const std::filesystem::path &path);
+
+        /**
+         * @brief 在阻塞执行器上把健康标记恢复到升级前的状态
+         * @param loop 命令所属事件循环
+         * @param path 健康标记路径
+         * @param snapshot 升级前的快照；原本不存在时不做任何事
+         * @note 恢复失败只记 ERROR，不覆盖调用方正在返回的失败原因
+         */
+        AsynGyanis::Core::Task<> restoreHealthMarker(AsynGyanis::Core::EventLoop &loop, const std::filesystem::path &path, HealthMarkerSnapshot snapshot);
 
         AgentClient       &m_client;        ///< 服务端客户端
         AgentState        &m_state;         ///< 本地状态库
