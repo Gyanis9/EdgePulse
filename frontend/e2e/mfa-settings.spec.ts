@@ -122,6 +122,51 @@ test('enable flow reveals one-time recovery codes and blocks closing until saved
   await expect(dialog).toHaveCount(0)
 })
 
+test('closing is blocked while enable is in flight so recovery codes are not lost', async ({ page }) => {
+  await page.route('**/api/auth/mfa/setup', route => route.fulfill({ json: ok({ secret: SECRET, otpauthUri: OTPAUTH_URI }) }))
+  await page.route('**/api/auth/mfa/enable', async (route) => {
+    await new Promise(resolve => setTimeout(resolve, 700))
+    await route.fulfill({ json: ok({ recoveryCodes: RECOVERY_CODES }) })
+  })
+
+  const dialog = await openSettings(page, { enabled: false, recoveryCodesRemaining: 0 })
+  await dialog.getByRole('button', { name: '开始设置' }).click()
+  await dialog.locator('input[type="password"]').fill('admin123')
+  await dialog.getByRole('button', { name: '生成密钥' }).click()
+  await expect(dialog.locator('.mfa-secret')).toHaveText(SECRET)
+  await dialog.getByPlaceholder('6 位数字').fill('123456')
+  await dialog.getByRole('button', { name: '启用两步验证' }).click()
+
+  // 启用请求在途：标题栏关闭与 Escape 都必须无效，否则响应里的恢复码会被丢弃
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeVisible()
+  await expect(dialog.locator('.modal-head').getByRole('button', { name: '关闭' })).toHaveCount(0)
+  await expect(dialog.getByRole('button', { name: '返回', exact: true })).toBeDisabled()
+
+  await expect(dialog.getByText('恢复码只显示这一次')).toBeVisible()
+  await expect(dialog.getByText(RECOVERY_CODES[0], { exact: true })).toBeVisible()
+})
+
+test('closing is blocked while regenerating recovery codes', async ({ page }) => {
+  await page.route('**/api/auth/mfa/recovery-codes', async (route) => {
+    await new Promise(resolve => setTimeout(resolve, 700))
+    await route.fulfill({ json: ok({ recoveryCodes: REGENERATED_CODES }) })
+  })
+
+  const dialog = await openSettings(page, { enabled: true, recoveryCodesRemaining: 2 })
+  await dialog.getByRole('button', { name: '重新生成恢复码' }).click()
+  await dialog.getByPlaceholder('6 位数字').fill('112233')
+  await dialog.getByRole('button', { name: '生成新恢复码' }).click()
+
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeVisible()
+  await expect(dialog.locator('.modal-head').getByRole('button', { name: '关闭' })).toHaveCount(0)
+  await expect(dialog.getByRole('button', { name: '返回', exact: true })).toBeDisabled()
+
+  await expect(dialog.getByText('恢复码只显示这一次')).toBeVisible()
+  await expect(dialog.getByText(REGENERATED_CODES[0], { exact: true })).toBeVisible()
+})
+
 test('disable flow submits password and TOTP code', async ({ page }) => {
   let disableBody: unknown
   await page.route('**/api/auth/mfa/disable', async (route) => {

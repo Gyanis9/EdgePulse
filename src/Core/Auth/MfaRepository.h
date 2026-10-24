@@ -74,22 +74,27 @@ namespace EdgePulse::Auth
          * @brief 写入待启用的秘密；已启用行不会被覆盖
          * @param loop 恢复协程用的事件循环
          * @param record 除恢复码与启用状态外的字段
-         * @throws Common::DatabaseException 归属租户越界、写入失败或并发启用导致主键冲突
-         * @note 同一用户重复开始设置时覆盖上一条未启用记录；并发启用后的覆盖会以主键冲突失败，
-         *       而不是把已启用账号静默降级
+         * @return bool 是否写入成功；并发启用已经占住主键时返回 false
+         * @throws Common::DatabaseException 归属租户越界或非唯一键冲突的写入失败
+         * @note 同一用户重复开始设置时覆盖上一条未启用记录；并发启用后的覆盖会以唯一键冲突收口，
+         *       由调用方转成 409，而不是把已启用账号静默降级或把冲突暴露成 500
          */
-        AsynGyanis::Core::Task<> upsertSecret(AsynGyanis::Core::EventLoop &loop, MfaRecord record);
+        AsynGyanis::Core::Task<bool> upsertSecret(AsynGyanis::Core::EventLoop &loop, MfaRecord record);
 
         /**
-         * @brief 把未启用行标记为启用并写入恢复码哈希
+         * @brief 用一次条件更新把待启用行转入启用并写入恢复码哈希
          * @param loop 恢复协程用的事件循环
-         * @param userId 用户标识
+         * @param record 待启用记录；密文、nonce 与 key_version 同时写入
          * @param recoveryCodesJson 恢复码哈希数组的 JSON
          * @param lastUsedStep 启用时消费的 TOTP 步号
          * @param now 更新时间，UTC
-         * @return bool 是否命中一条尚未启用的记录
+         * @return bool 是否命中一条密文一致且尚未启用的记录；已启用或密文已被并发设置替换时返回 false
+         * @throws Common::DatabaseException 归属租户越界或写入失败
+         * @note 一次 UPDATE 同时写入密文、恢复码、步号与启用位，避免两次写的中间态被并发启用交错；
+         *       条件里的密文是期望值，另一个设置流程替换过待启用秘密时本次启用失败而不是覆盖它
          */
-        AsynGyanis::Core::Task<bool> enable(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string recoveryCodesJson, std::int64_t lastUsedStep, std::string now);
+        AsynGyanis::Core::Task<bool> enable(AsynGyanis::Core::EventLoop &loop, const MfaRecord &record, std::string recoveryCodesJson, std::int64_t lastUsedStep,
+                                            std::string now);
 
         /**
          * @brief 删除用户的记录，供关闭与管理员重置使用

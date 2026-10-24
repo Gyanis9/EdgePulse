@@ -332,6 +332,11 @@ namespace EdgePulse::Auth
         {
             co_return std::nullopt;
         }
+        // 挑战是第二因素的入口，失败计数到上限后不再签发，避免换一枚令牌重新拿 5 次机会
+        if (co_await attemptLimitReached(loop, userId))
+        {
+            co_return std::nullopt;
+        }
         try
         {
             MfaChallenge challenge;
@@ -464,6 +469,10 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(serviceUnavailable("未配置两步验证加密密钥，请联系管理员配置 EDGEPULSE_MFA_KEY 后重试"));
         }
+        if (co_await attemptLimitReached(loop, session.userId))
+        {
+            co_return std::unexpected(tooManyRequests("两步验证尝试过于频繁：请 5 分钟后再试"));
+        }
         const std::shared_ptr<MfaRepository> repository = m_repository.scoped({session.tenantId, false});
         const std::optional<MfaRecord>       existing   = co_await repository->findByUser(loop, session.userId);
         if (existing.has_value() && existing->enabled)
@@ -479,6 +488,22 @@ namespace EdgePulse::Auth
         {
             co_return std::unexpected(serviceUnavailable("两步验证密钥加密失败，请稍后重试"));
         }
+
+        // 先写一条停用行：启用时只需要一次条件 UPDATE，不再依赖“先 upsert 再 enable”的两次写
+        const std::string now = Common::nowDateTimeUtc();
+        MfaRecord         record;
+        record.userId           = session.userId;
+        record.tenantId         = session.tenantId;
+        record.secretCiphertext = encrypted->ciphertext;
+        record.secretNonce      = encrypted->nonce;
+        record.keyVersion       = 1;
+        record.createdAt        = now;
+        record.updatedAt        = now;
+        if (!co_await repository->upsertSecret(loop, std::move(record)))
+        {
+            co_return std::unexpected(conflict("两步验证状态已被并发修改，请刷新后重试"));
+        }
+
         const bool cached = co_await m_cache->set(loop, setupCacheKey(session.userId), serializeSetupCiphertext(*encrypted), kSetupTtl);
         if (!cached)
         {
@@ -546,8 +571,8 @@ namespace EdgePulse::Auth
         record.enabled          = false;
         record.createdAt        = now;
         record.updatedAt        = now;
-        co_await repository->upsertSecret(loop, std::move(record));
-        if (!co_await repository->enable(loop, session.userId, serializeHashes(hashes), *matchedStep, now))
+        // 启用行在 beginSetup 时已经建好；这里只用一次条件 UPDATE 同时写入密文、恢复码与启用位
+        if (!co_await repository->enable(loop, record, serializeHashes(hashes), *matchedStep, now))
         {
             co_return std::unexpected(conflict("两步验证状态已被并发修改，请刷新后重试"));
         }

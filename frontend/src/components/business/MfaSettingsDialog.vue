@@ -20,6 +20,8 @@ const stage = ref<Stage>('overview')
 const status = ref<MfaStatusResponse | null>(null)
 const loading = ref(false)
 const saving = ref(false)
+/* 启用或换发恢复码的响应携带一次性恢复码；请求在途时关闭会永久丢失它们 */
+const issuingCodes = ref(false)
 const statusError = ref('')
 const formError = ref('')
 const password = ref('')
@@ -60,6 +62,7 @@ function reset() {
   status.value = null
   loading.value = false
   saving.value = false
+  issuingCodes.value = false
   statusError.value = ''
   formError.value = ''
   password.value = ''
@@ -181,6 +184,7 @@ async function enable() {
   if (Object.keys(errors.value).length) return
   const token = nextOperation()
   saving.value = true
+  issuingCodes.value = true
   try {
     const result = await authApi.enableMfa({ password: password.value, code: code.value.trim() })
     if (!isCurrent(token)) return
@@ -196,7 +200,10 @@ async function enable() {
     formError.value = messageOf(error, '两步验证启用失败')
     toastError(error, '两步验证启用失败')
   } finally {
-    if (isCurrent(token)) saving.value = false
+    if (isCurrent(token)) {
+      saving.value = false
+      issuingCodes.value = false
+    }
   }
 }
 
@@ -234,6 +241,7 @@ async function regenerate() {
   if (Object.keys(errors.value).length) return
   const token = nextOperation()
   saving.value = true
+  issuingCodes.value = true
   try {
     const result = await authApi.recoveryCodes({ code: code.value.trim() })
     if (!isCurrent(token)) return
@@ -247,7 +255,10 @@ async function regenerate() {
     formError.value = messageOf(error, '恢复码生成失败')
     toastError(error, '恢复码生成失败')
   } finally {
-    if (isCurrent(token)) saving.value = false
+    if (isCurrent(token)) {
+      saving.value = false
+      issuingCodes.value = false
+    }
   }
 }
 
@@ -257,9 +268,11 @@ function finishCodes() {
   stage.value = 'overview'
 }
 
-/* 恢复码只显示一次，保存确认前不接受标题栏、Escape 与返回操作 */
+/* 恢复码只显示一次，保存确认前不接受标题栏、Escape 与返回操作；
+   启用或换发请求在途时同样不允许关闭，否则响应里的恢复码会随重置换丢。
+   开始设置与关闭的请求在途时仍可关闭，迟到响应由操作令牌丢弃 */
 function onDialogClose() {
-  if (stage.value === 'codes') return
+  if (issuingCodes.value || stage.value === 'codes') return
   emit('close')
 }
 
@@ -288,7 +301,7 @@ async function copyCodes() {
 </script>
 
 <template>
-  <Modal :open="open" title="两步验证" sub="使用身份验证器（TOTP）为账号增加第二道验证。" :width="640" :closable="stage !== 'codes'" @close="onDialogClose">
+  <Modal :open="open" title="两步验证" sub="使用身份验证器（TOTP）为账号增加第二道验证。" :width="640" :closable="stage !== 'codes' && !issuingCodes" @close="onDialogClose">
     <div class="mfa-panel">
       <div v-if="loading" class="mfa-loading"><span class="spinner" aria-hidden="true" />正在读取两步验证状态…</div>
       <div v-else-if="statusError" class="mfa-status-error">

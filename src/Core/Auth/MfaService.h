@@ -82,13 +82,13 @@ namespace EdgePulse::Auth
 
     /**
      * @brief 两步验证服务
-     * @details 待启用的秘密加密后放在缓存里，启用时直接落库；TOTP 校验用条件更新推进步号，
-     *          恢复码以 JSON 文本为乐观锁逐枚删除。未配置主密钥时只关闭设置与启用入口，
-     *          状态、校验与管理员重置仍可安全执行。
-     * @note TOTP 校验本身不计数；登录挑战的次数上限由 createChallenge/recordChallengeFailure
-     *       维护，挑战最多接受 5 次失败，随后连同缓存一起销毁。
-     * @note 持有会话的启用、关闭与换发恢复码入口共用一份按用户的失败计数，键为
+     * @details 待启用的秘密加密后同时写入停用行与缓存，启用时用一次条件更新把密文、恢复码、步号与启用位一起落库；
+     *          TOTP 校验用条件更新推进步号，恢复码以 JSON 文本为乐观锁逐枚删除。未配置主密钥时，
+     *          开始设置、启用、关闭与换发恢复码返回 503，状态、校验与管理员重置仍可安全执行。
+     * @note 登录挑战最多接受 5 次失败，随后连同缓存一起销毁；每次挑战失败同时记入按用户计数，签发新挑战前先检查该计数。
+     * @note 持有会话的设置口令复核、启用、关闭与换发恢复码共用一份按用户的失败计数，键为
      *       edgepulse:mfa:attempt: 加用户标识，窗口 300 秒，最多 5 次，第 6 次起直接返回 429。
+     *       登录挑战的验证码失败也计入同一份计数；只有完成第二因素校验或成功的管理操作才清零。
      * @note 恢复码以主密钥为键做 HMAC-SHA256 后落库，只有数据库泄露不足以离线还原 40 位随机码。
      */
     class MfaService
@@ -120,8 +120,9 @@ namespace EdgePulse::Auth
          * @param userId 已通过口令校验的用户
          * @param tenantId 用户归属租户
          * @param clientIp 来源 IP，校验时必须与登录请求一致
-         * @return std::optional<std::string> 成功返回一次性令牌；随机源或缓存不可用时为空
+         * @return std::optional<std::string> 成功返回一次性令牌；随机源或缓存不可用、或按用户失败计数已达上限时为空
          * @note 挑战的有效期是签发时刻起算的 300 秒绝对时长，失败重写不会延长
+         * @note 调用方在为空时应先复查 attemptLimitReached，命中计数上限要回 429 而不是服务不可用
          */
         AsynGyanis::Core::Task<std::optional<std::string>> createChallenge(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::int64_t tenantId, std::string clientIp);
 
@@ -144,11 +145,12 @@ namespace EdgePulse::Auth
         AsynGyanis::Core::Task<ChallengeFailureOutcome> recordChallengeFailure(AsynGyanis::Core::EventLoop &loop, MfaChallenge challenge);
 
         /**
-         * @brief 生成新秘密，加密后写入待启用缓存
+         * @brief 生成新秘密，加密后写入待启用缓存与一条停用记录
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份；秘密按该用户与其租户记录
-         * @return 成功返回 base32 秘密与 otpauth URI；未配置主密钥返回 503，已启用返回 409
+         * @return 成功返回 base32 秘密与 otpauth URI；未配置主密钥返回 503，已启用或并发状态变化返回 409
          * @throws Base::Exception 随机源不可用
+         * @note 启用时需要一条已存在的停用记录，因此本方法在返回秘密前先把密文写进 sys_user_mfa
          */
         AsynGyanis::Core::Task<std::expected<MfaSetup, MfaError>> beginSetup(AsynGyanis::Core::EventLoop &loop, SessionRecord session);
 
@@ -157,8 +159,9 @@ namespace EdgePulse::Auth
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份
          * @param code 身份验证器当前的 6 位验证码
-         * @return 成功返回 10 枚明文恢复码，只出现这一次；设置过期返回 400，验证码错误返回 401，已启用返回 409，
+         * @return 成功返回 10 枚明文恢复码，只出现这一次；设置过期返回 400，验证码错误返回 401，已启用或并发状态变化返回 409，
          *         失败次数用尽返回 429
+         * @note 密文、恢复码、步号与启用位由一次条件更新写入，任一步失败都不会留下半启用的行
          * @note 命中步号会写成 last_used_step，setup 口令不能在启用后继续用于登录校验
          * @note 调用方必须先复核当前口令；本方法只负责验证码与失败计数
          */
@@ -235,34 +238,36 @@ namespace EdgePulse::Auth
          */
         AsynGyanis::Core::Task<bool> reset(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
+        /**
+         * @brief 查询按用户的失败计数是否已到上限
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         * @return bool 计数不小于 kAttemptMaxFailures 时为 true
+         * @note 登录挑战、设置口令复核、启用、关闭与换发恢复码共用这一份计数
+         */
+        AsynGyanis::Core::Task<bool> attemptLimitReached(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
+
+        /**
+         * @brief 记录一次第二因素或口令复核失败，计数窗口首次创建时开始计时
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         * @note 调用方拿到失败结果后立即记录；成功完成的操作由服务内部清零
+         */
+        AsynGyanis::Core::Task<> recordAttemptFailure(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
+
+        /**
+         * @brief 清空按用户的失败计数
+         * @param loop 恢复协程用的事件循环
+         * @param userId 用户标识
+         */
+        AsynGyanis::Core::Task<> clearAttemptFailures(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
+
     private:
         /**
          * @brief 判断主密钥是否可用
          * @return bool 构造时成功解出 32 字节时为 true
          */
         [[nodiscard]] bool keyConfigured() const noexcept;
-
-        /**
-         * @brief 查询按用户的会话态失败计数是否已到上限
-         * @param loop 恢复协程用的事件循环
-         * @param userId 用户标识
-         * @return bool 计数不小于 kAttemptMaxFailures 时为 true
-         */
-        AsynGyanis::Core::Task<bool> attemptLimitReached(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
-
-        /**
-         * @brief 会话态验证失败一次，计数窗口首次创建时开始计时
-         * @param loop 恢复协程用的事件循环
-         * @param userId 用户标识
-         */
-        AsynGyanis::Core::Task<> recordAttemptFailure(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
-
-        /**
-         * @brief 清空按用户的会话态失败计数
-         * @param loop 恢复协程用的事件循环
-         * @param userId 用户标识
-         */
-        AsynGyanis::Core::Task<> clearAttemptFailures(AsynGyanis::Core::EventLoop &loop, std::int64_t userId);
 
         /**
          * @brief 解密记录里的秘密

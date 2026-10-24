@@ -148,9 +148,23 @@ namespace EdgePulse::Auth
         // 口令成立后先看第二因素：启用 MFA 的账号在完成挑战前不签发任何会话
         if (m_mfa != nullptr && co_await m_mfa->enabled(loop, user->id))
         {
+            // 挑战失败按用户累计；到上限后不再签发新挑战，避免换令牌重新获得 5 次机会
+            if (co_await m_mfa->attemptLimitReached(loop, user->id))
+            {
+                co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "两步验证尝试过于频繁", credentials.traceId, user->id,
+                                                           user->departmentId, tenantId});
+                co_return std::unexpected(AuthError{Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试"});
+            }
             const std::optional<std::string> challenge = co_await m_mfa->createChallenge(loop, user->id, user->tenantId, credentials.clientIp);
             if (!challenge.has_value())
             {
+                // 检查与签发之间可能刚好达到上限；命中计数时仍按 429 回复，而不是伪装成服务不可用
+                if (co_await m_mfa->attemptLimitReached(loop, user->id))
+                {
+                    co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "两步验证尝试过于频繁", credentials.traceId, user->id,
+                                                               user->departmentId, tenantId});
+                    co_return std::unexpected(AuthError{Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试"});
+                }
                 co_await recordAudit(loop, LoginAuditEntry{credentials.username, credentials.clientIp, false, "两步验证挑战签发失败", credentials.traceId, user->id,
                                                            user->departmentId, tenantId});
                 co_return std::unexpected(AuthError{Common::kCodeServiceUnavailable, Common::kCodeServiceUnavailable, "两步验证服务暂不可用，请稍后重试"});
@@ -201,6 +215,13 @@ namespace EdgePulse::Auth
             co_return std::unexpected(invalidChallenge());
         }
 
+        // 失败计数按用户累计，跨挑战生效；到上限后连动态码都不再计算
+        if (co_await m_mfa->attemptLimitReached(loop, user->id))
+        {
+            co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, "两步验证尝试过于频繁", traceId, user->id, user->departmentId, user->tenantId});
+            co_return std::unexpected(AuthError{Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试"});
+        }
+
         // TOTP 与恢复码共用同一失败计数：TOTP 未命中后再尝试恢复码，两者都失败才记一次
         bool verified = co_await m_mfa->verify(loop, user->id, code);
         if (!verified)
@@ -209,6 +230,8 @@ namespace EdgePulse::Auth
         }
         if (!verified)
         {
+            // 先记用户级计数再写回挑战：计数决定下一枚挑战还能不能签发
+            co_await m_mfa->recordAttemptFailure(loop, user->id);
             const ChallengeFailureOutcome outcome = co_await m_mfa->recordChallengeFailure(loop, *challenge);
             std::string                   message = "两步验证失败";
             switch (outcome)
@@ -234,6 +257,7 @@ namespace EdgePulse::Auth
         auto issued = co_await createSessionForUser(loop, *user, clientIp, traceId, "登录成功（两步验证）");
         if (issued.has_value())
         {
+            co_await m_mfa->clearAttemptFailures(loop, user->id);
             if (!co_await m_users.scoped({user->tenantId, false})->clearLoginFailures(loop, user->id))
             {
                 LOG_WARN_FMT("两步验证登录后清零失败计数未命中用户：user={} id={}", user->username, user->id);
@@ -276,9 +300,20 @@ namespace EdgePulse::Auth
         }
         if (m_mfa != nullptr && co_await m_mfa->enabled(loop, user->id))
         {
+            if (co_await m_mfa->attemptLimitReached(loop, user->id))
+            {
+                co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, "两步验证尝试过于频繁", traceId, user->id, user->departmentId, user->tenantId});
+                co_return std::unexpected(AuthError{Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试"});
+            }
             const std::optional<std::string> challenge = co_await m_mfa->createChallenge(loop, user->id, user->tenantId, clientIp);
             if (!challenge.has_value())
             {
+                // 检查与签发之间可能刚好达到上限；命中计数时仍按 429 回复，而不是伪装成服务不可用
+                if (co_await m_mfa->attemptLimitReached(loop, user->id))
+                {
+                    co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, "两步验证尝试过于频繁", traceId, user->id, user->departmentId, user->tenantId});
+                    co_return std::unexpected(AuthError{Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试"});
+                }
                 co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, false, "两步验证挑战签发失败", traceId, user->id, user->departmentId, user->tenantId});
                 co_return std::unexpected(AuthError{Common::kCodeServiceUnavailable, Common::kCodeServiceUnavailable, "两步验证服务暂不可用，请稍后重试"});
             }

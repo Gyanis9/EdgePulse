@@ -678,8 +678,8 @@ TEST_F(MfaEndpointsTest, SetupAndEnableRequireCurrentPassword)
     EXPECT_EQ(200, m_server->post("/api/auth/mfa/enable", enableBody.dump(), "application/json", bearer(token)).status);
 }
 
-// 钉住：连续错码 5 次销毁挑战，第 6 次即使口令正确也拒绝
-TEST_F(MfaEndpointsTest, FiveWrongCodesDestroyChallenge)
+// 钉住：连续错码 5 次销毁挑战，同一账号达到按用户上限后不再签发新挑战
+TEST_F(MfaEndpointsTest, FiveWrongCodesDestroyChallengeAndBlockNewOnes)
 {
     const std::string token = loginToken("admin", "admin123");
     ASSERT_FALSE(token.empty());
@@ -703,11 +703,88 @@ TEST_F(MfaEndpointsTest, FiveWrongCodesDestroyChallenge)
     EXPECT_NE(audits.end(),
               std::find_if(audits.begin(), audits.end(), [adminId](const LoginAuditRow &row) { return row.userId == adminId && row.message == "两步验证失败次数已达上限"; }));
 
-    // 账号本身没有因挑战失败被锁定，重新登录仍可拿到新挑战
-    const std::string freshChallenge = startChallenge("admin", "admin123");
-    ASSERT_FALSE(freshChallenge.empty());
-    // 前一次失败没有消费步号，同一枚正确码仍可用；失败只说明旧挑战已销毁
-    EXPECT_FALSE(verifyChallengeToken(freshChallenge, Totp::code(activation.secret, correctStep)).empty());
+    // 挑战上限与按用户计数共用同一份失败记录：正确口令也不再签发新挑战
+    const HttpResult retry = attemptLogin("admin", "admin123");
+    ASSERT_EQ(429, retry.status) << retry.body;
+    EXPECT_EQ(std::string::npos, retry.body.find("challengeToken")) << retry.body;
+    const std::vector<LoginAuditRow> afterRetry = readLoginAudits(*m_context);
+    EXPECT_NE(afterRetry.end(),
+              std::find_if(afterRetry.begin(), afterRetry.end(),
+                           [adminId](const LoginAuditRow &row) { return row.userId == adminId && row.message == "两步验证尝试过于频繁"; }));
+}
+
+// 钉住：错码在多个挑战之间累计，第 5 次失败后口令正确也拿不到新挑战
+TEST_F(MfaEndpointsTest, ChallengeFailuresAccumulateAcrossChallenges)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+
+    const std::string badCode = wrongCode(activation.secret, Totp::currentStep());
+    for (int attempt = 0; attempt < MfaService::kAttemptMaxFailures; ++attempt)
+    {
+        const std::string challenge = startChallenge("admin", "admin123");
+        ASSERT_FALSE(challenge.empty()) << "第 " << attempt + 1 << " 个挑战应可签发";
+        EXPECT_EQ(401, verifyChallenge(challenge, badCode).status) << "attempt " << attempt;
+    }
+
+    const HttpResult blocked = attemptLogin("admin", "admin123");
+    ASSERT_EQ(429, blocked.status) << blocked.body;
+    EXPECT_EQ(std::string::npos, blocked.body.find("challengeToken")) << blocked.body;
+    EXPECT_NE(std::string::npos, blocked.body.find("两步验证尝试过于频繁")) << blocked.body;
+}
+
+// 钉住：完成一次挑战会清空共享失败计数，之后的管理操作重新拥有完整 5 次机会
+TEST_F(MfaEndpointsTest, ChallengeSuccessClearsSharedAttemptCounter)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const MfaActivation activation = activateMfa(token, "admin123");
+    ASSERT_FALSE(activation.secret.empty());
+
+    const std::string badCode = wrongCode(activation.secret, Totp::currentStep());
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        const std::string challenge = startChallenge("admin", "admin123");
+        ASSERT_FALSE(challenge.empty());
+        EXPECT_EQ(401, verifyChallenge(challenge, badCode).status) << "attempt " << attempt;
+    }
+
+    // 用恢复码完成一次挑战：不推进 TOTP 步号，后续关闭仍能取到窗口内未消费的动态码
+    const std::string successChallenge = startChallenge("admin", "admin123");
+    ASSERT_FALSE(successChallenge.empty());
+    ASSERT_FALSE(verifyChallengeToken(successChallenge, activation.recoveryCodes.front()).empty());
+
+    // 若挑战成功没有清零，计数从 2 起算会在第 4 次管理失败处撞到 429
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const auto body = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}, {"code", badCode}});
+        EXPECT_EQ(401, m_server->post("/api/auth/mfa/disable", body.dump(), "application/json", bearer(token)).status) << "attempt " << attempt;
+    }
+    const auto disableBody =
+            AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}, {"code", Totp::code(activation.secret, std::max(Totp::currentStep(), activation.enableStep + 1))}});
+    EXPECT_EQ(200, m_server->post("/api/auth/mfa/disable", disableBody.dump(), "application/json", bearer(token)).status);
+}
+
+// 钉住：错误设置口令计入共享失败计数；连续 5 次后正确口令也返回 429，管理员重置清空后恢复
+TEST_F(MfaEndpointsTest, WrongSetupPasswordCountsAndBlocks)
+{
+    const std::string token = loginToken("admin", "admin123");
+    ASSERT_FALSE(token.empty());
+    const auto wrongBody = AsynGyanis::Base::ConfigValue::object({{"password", "not-the-password"}});
+    for (int attempt = 0; attempt < MfaService::kAttemptMaxFailures; ++attempt)
+    {
+        EXPECT_EQ(401, m_server->post("/api/auth/mfa/setup", wrongBody.dump(), "application/json", bearer(token)).status) << "attempt " << attempt;
+    }
+    const auto correctBody = AsynGyanis::Base::ConfigValue::object({{"password", "admin123"}});
+    EXPECT_EQ(429, m_server->post("/api/auth/mfa/setup", correctBody.dump(), "application/json", bearer(token)).status);
+
+    const std::int64_t adminId = userIdByUsername(*m_context, "admin");
+    ASSERT_GT(adminId, 0);
+    const auto reset = m_server->post("/api/system/users/" + std::to_string(adminId) + "/mfa/reset", "{}", "application/json", bearer(token));
+    ASSERT_EQ(200, reset.status) << reset.body;
+    EXPECT_EQ(200, m_server->post("/api/auth/mfa/setup", correctBody.dump(), "application/json", bearer(token)).status);
 }
 
 // 钉住：挑战续期写入失败与次数上限分成两条审计文案

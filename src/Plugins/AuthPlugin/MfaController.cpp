@@ -155,9 +155,17 @@ namespace EdgePulse::Auth
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少 password", traceId);
                             co_return;
                         }
+                        // 口令复核与动态码失败共用按用户计数；到上限后正确口令也不再放行
+                        if (co_await mfaService.attemptLimitReached(loop, session->userId))
+                        {
+                            co_await recordMfaAudit(loop, logs, *session, request, "开始设置", false, "两步验证尝试过于频繁");
+                            Common::writeFailure(response, Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试", traceId);
+                            co_return;
+                        }
                         // 只持有会话不足以登记新的第二因素：先复核当前口令
                         if (!co_await authService.verifyPassword(loop, session->userId, *password))
                         {
+                            co_await mfaService.recordAttemptFailure(loop, session->userId);
                             co_await recordMfaAudit(loop, logs, *session, request, "开始设置", false, "密码不正确");
                             Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, "密码不正确，无法开始设置两步验证", traceId);
                             co_return;
@@ -193,9 +201,16 @@ namespace EdgePulse::Auth
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少 password 或 code", traceId);
                             co_return;
                         }
+                        if (co_await mfaService.attemptLimitReached(loop, session->userId))
+                        {
+                            co_await recordMfaAudit(loop, logs, *session, request, "启用", false, "两步验证尝试过于频繁");
+                            Common::writeFailure(response, Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试", traceId);
+                            co_return;
+                        }
                         // 启用同样要求当前口令，防止被盗会话自行登记攻击者的验证器
                         if (!co_await authService.verifyPassword(loop, session->userId, *password))
                         {
+                            co_await mfaService.recordAttemptFailure(loop, session->userId);
                             co_await recordMfaAudit(loop, logs, *session, request, "启用", false, "密码不正确");
                             Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, "密码不正确，无法启用两步验证", traceId);
                             co_return;
@@ -231,9 +246,16 @@ namespace EdgePulse::Auth
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少 password 或 code", traceId);
                             co_return;
                         }
+                        if (co_await mfaService.attemptLimitReached(loop, session->userId))
+                        {
+                            co_await recordMfaAudit(loop, logs, *session, request, "关闭", false, "两步验证尝试过于频繁");
+                            Common::writeFailure(response, Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "两步验证尝试过于频繁：请 5 分钟后再试", traceId);
+                            co_return;
+                        }
                         // 关闭是降低账号保护强度的操作：先确认当前口令，再校验未消费过的 TOTP
                         if (!co_await authService.verifyPassword(loop, session->userId, *password))
                         {
+                            co_await mfaService.recordAttemptFailure(loop, session->userId);
                             co_await recordMfaAudit(loop, logs, *session, request, "关闭", false, "密码不正确");
                             Common::writeFailure(response, Common::kCodeUnauthorized, Common::kCodeUnauthorized, "密码不正确，无法关闭两步验证", traceId);
                             co_return;

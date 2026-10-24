@@ -3,6 +3,7 @@
 #include "Base/Config/ConfigValue.h"
 #include "Base/Database/SqlExecution.h"
 #include "Base/Database/SqlHelpers.h"
+#include "Base/Database/SqlRetry.h"
 #include "Base/Exception/EdgePulseException.h"
 
 #include <algorithm>
@@ -111,9 +112,9 @@ namespace EdgePulse::Auth
                 });
     }
 
-    AsynGyanis::Core::Task<> MfaRepository::upsertSecret(AsynGyanis::Core::EventLoop &loop, MfaRecord record)
+    AsynGyanis::Core::Task<bool> MfaRepository::upsertSecret(AsynGyanis::Core::EventLoop &loop, MfaRecord record)
     {
-        static_cast<void>(co_await m_database->withConnection<bool>(
+        co_return co_await m_database->withConnection<bool>(
                 loop,
                 [record = std::move(record), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> bool
                 {
@@ -144,34 +145,59 @@ namespace EdgePulse::Auth
 
                     const std::vector<AsynGyanis::Database::DatabaseValue> insertParameters{record.userId,     record.tenantId,  record.secretCiphertext, record.secretNonce,
                                                                                             record.keyVersion, record.createdAt, record.updatedAt};
-                    Sql::executeOrThrowVoid(connection,
-                                            "INSERT INTO sys_user_mfa (user_id, tenant_id, secret_ciphertext, secret_nonce, key_version, last_used_step, recovery_codes_json, "
-                                            "enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, '[]', 0, ?, ?)",
-                                            insertParameters);
+                    try
+                    {
+                        Sql::executeOrThrowVoid(connection,
+                                                "INSERT INTO sys_user_mfa (user_id, tenant_id, secret_ciphertext, secret_nonce, key_version, last_used_step, recovery_codes_json, "
+                                                "enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, '[]', 0, ?, ?)",
+                                                insertParameters);
+                    } catch (const Common::DatabaseException &failure)
+                    {
+                        // 读与写之间另一个流程刚好启用成功：主键冲突是预期的并发结果，不是 500
+                        if (Sql::isUniqueViolation(failure.what()))
+                        {
+                            return false;
+                        }
+                        throw;
+                    }
                     return true;
-                }));
-        co_return;
+                });
     }
 
-    AsynGyanis::Core::Task<bool> MfaRepository::enable(AsynGyanis::Core::EventLoop &loop, const std::int64_t userId, std::string recoveryCodesJson,
+    AsynGyanis::Core::Task<bool> MfaRepository::enable(AsynGyanis::Core::EventLoop &loop, const MfaRecord &record, std::string recoveryCodesJson,
                                                        const std::int64_t lastUsedStep, std::string now)
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [userId, recoveryCodesJson = std::move(recoveryCodesJson), lastUsedStep, now = std::move(now), tenant = m_tenant](
+                [record, recoveryCodesJson = std::move(recoveryCodesJson), lastUsedStep, now = std::move(now), tenant = m_tenant](
                         AsynGyanis::Database::DatabaseConnection &connection) -> bool
                 {
-                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{recoveryCodesJson, lastUsedStep, now, userId};
+                    if (!tenant.includes(record.tenantId))
+                    {
+                        throw Common::DatabaseException("两步验证归属租户与当前租户边界不一致");
+                    }
+
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{record.secretCiphertext,
+                                                                                record.secretNonce,
+                                                                                record.keyVersion,
+                                                                                recoveryCodesJson,
+                                                                                lastUsedStep,
+                                                                                now,
+                                                                                record.userId,
+                                                                                record.secretCiphertext};
                     std::string                                      clause;
                     if (!tenant.allTenants)
                     {
                         clause = " AND tenant_id = ?";
-                        parameters.emplace_back(tenant.tenantId);
+                        parameters.emplace_back(record.tenantId);
                     }
-                    // 只有未启用行可以转入启用；并发启用时后到的一方拿到 false
+                    // 密文、恢复码与启用位在同一条 UPDATE 里落库；条件同时要求未启用且仍是本流程设置的密文，
+                    // 并发启用或另一个设置流程替换过秘密时只有一个请求能命中
                     const auto result = Sql::executeOrThrow(
                             connection,
-                            "UPDATE sys_user_mfa SET enabled = 1, recovery_codes_json = ?, last_used_step = ?, updated_at = ? WHERE user_id = ? AND enabled = 0" + clause,
+                            "UPDATE sys_user_mfa SET secret_ciphertext = ?, secret_nonce = ?, key_version = ?, recovery_codes_json = ?, last_used_step = ?, enabled = 1, "
+                            "updated_at = ? WHERE user_id = ? AND secret_ciphertext = ? AND enabled = 0" +
+                                    clause,
                             parameters);
                     return result->affectedRowCount() > 0;
                 });
