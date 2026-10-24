@@ -58,6 +58,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace
@@ -65,6 +66,31 @@ namespace
     std::vector<std::pair<std::string, std::string>> bearer(const std::string &token)
     {
         return {{"Authorization", "Bearer " + token}};
+    }
+
+    [[nodiscard]] std::int64_t countFirmwareTasks(const std::filesystem::path &databasePath, const std::int64_t firmwareId)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result = connection->execute("SELECT COUNT(*) FROM biz_firmware_task WHERE firmware_id = " + std::to_string(firmwareId));
+        EXPECT_NE(nullptr, result) << connection->lastError();
+        if (result == nullptr || !result->next())
+        {
+            return -1;
+        }
+        const auto value = result->getValue(0);
+        return std::holds_alternative<std::int64_t>(value) ? std::get<std::int64_t>(value) : -1;
+    }
+
+    void insertFirmwareTask(const std::filesystem::path &databasePath, const std::int64_t taskId, const std::int64_t tenantId, const std::int64_t firmwareId,
+                            const std::int64_t nodeId)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::string now  = EdgePulse::Common::nowDateTimeUtc();
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection->execute(
+                "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, previous_firmware_id) VALUES (" +
+                std::to_string(taskId) + ", " + std::to_string(tenantId) + ", " + std::to_string(firmwareId) + ", " + std::to_string(nodeId) + ", 'pending', 0, '', '" + now +
+                "', '" + now + "', 0)");
+        EXPECT_NE(nullptr, result) << connection->lastError();
     }
 
     using PkeyPointer = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
@@ -1223,6 +1249,172 @@ TEST_F(FleetEndpointsTest, BatchAndScheduledCommands)
     ASSERT_EQ(200, next.status) << next.body;
     ASSERT_TRUE((*next.json())["data"].is_object()) << next.body;
     EXPECT_EQ("reboot", (*next.json())["data"]["type"].get<std::string>());
+}
+
+// 钉住：固件与目标节点必须同租户；跨租户下发整单 400，且不留下任何任务行
+TEST_F(FleetEndpointsTest, FirmwareDeployRejectsCrossTenantNodes)
+{
+    const std::string  token       = login();
+    const std::int64_t defaultNode = createNode(token, "cross-tenant-deploy-node");
+
+    EdgePulse::System::TenantProvisionRequest request;
+    request.code              = "firmware_tenant";
+    request.name              = "固件租户";
+    request.adminUsername     = "firmware-admin";
+    request.adminPasswordHash = EdgePulse::Common::hashPassword("firmware-pass-1");
+    const auto provisioned    = m_runner.run(m_context->tenants->provision(m_runner.loop(), std::move(request), 1));
+    ASSERT_TRUE(provisioned.has_value()) << provisioned.error();
+    const std::int64_t tenantId = provisioned->tenantId;
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name        = "Tenant OS";
+    record.version     = "1.0.0";
+    record.fileName    = "tenant-os.bin";
+    record.contentType = "application/octet-stream";
+    record.sha256      = std::string(64, '4');
+    record.storagePath = (m_storage / "tenant-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->scoped({tenantId, false})->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    // 平台管理员能看见别家固件，但把节点列表指向默认租户节点必须整单拒绝
+    const auto deployed =
+            m_server->post("/api/firmware/" + std::to_string(firmwareId) + "/deploy",
+                           AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({defaultNode})}}).dump(), "application/json", bearer(token));
+    EXPECT_EQ(400, deployed.status) << deployed.body;
+    EXPECT_NE(std::string::npos, deployed.body.find(std::to_string(defaultNode)));
+    EXPECT_EQ(0, countFirmwareTasks(m_context->databasePath(), firmwareId));
+}
+
+// 钉住：单次下发最多 100 个节点，超限在解析节点前就整单拒绝
+TEST_F(FleetEndpointsTest, FirmwareDeployRejectsMoreThanHundredNodes)
+{
+    const std::string token = login();
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name        = "Batch OS";
+    record.version     = "1.0.0";
+    record.fileName    = "batch-os.bin";
+    record.contentType = "application/octet-stream";
+    record.sha256      = std::string(64, '6');
+    record.storagePath = (m_storage / "batch-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    AsynGyanis::Base::ConfigValue nodeIds = AsynGyanis::Base::ConfigValue::array();
+    for (std::int64_t nodeId = 1; nodeId <= 101; ++nodeId)
+    {
+        nodeIds.push_back(nodeId);
+    }
+    const auto deployed = m_server->post("/api/firmware/" + std::to_string(firmwareId) + "/deploy",
+                                         AsynGyanis::Base::ConfigValue::object({{"nodeIds", std::move(nodeIds)}}).dump(), "application/json", bearer(token));
+    EXPECT_EQ(400, deployed.status) << deployed.body;
+    EXPECT_NE(std::string::npos, deployed.body.find("1 到 100"));
+    EXPECT_EQ(0, countFirmwareTasks(m_context->databasePath(), firmwareId));
+}
+
+// 钉住：任务列表按任务租户连接节点，历史孤儿行不能带出别家节点的名称
+TEST_F(FleetEndpointsTest, FirmwareTaskListDoesNotExposeForeignNodeName)
+{
+    const std::string  token   = login();
+    const std::int64_t ownNode = createNode(token, "task-list-own-node");
+
+    EdgePulse::System::TenantProvisionRequest request;
+    request.code              = "task_list_tenant";
+    request.name              = "任务列表租户";
+    request.adminUsername     = "task-list-admin";
+    request.adminPasswordHash = EdgePulse::Common::hashPassword("task-list-pass-1");
+    const auto provisioned    = m_runner.run(m_context->tenants->provision(m_runner.loop(), std::move(request), 1));
+    ASSERT_TRUE(provisioned.has_value()) << provisioned.error();
+    const auto foreignNode = m_runner.run(m_nodes->scoped({provisioned->tenantId, false})->create(m_runner.loop(), "task-list-foreign-node", "{}"));
+    ASSERT_EQ(provisioned->tenantId, foreignNode.tenantId);
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name        = "Task OS";
+    record.version     = "1.0.0";
+    record.fileName    = "task-os.bin";
+    record.contentType = "application/octet-stream";
+    record.sha256      = std::string(64, '7');
+    record.storagePath = (m_storage / "task-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    // 任务行都落在默认租户，其中一条指向别家节点：连接条件必须带上租户，否则会泄漏节点名
+    insertFirmwareTask(m_context->databasePath(), 900000000000000101, 1, firmwareId, ownNode);
+    insertFirmwareTask(m_context->databasePath(), 900000000000000102, 1, firmwareId, foreignNode.id);
+
+    const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
+    ASSERT_EQ(200, tasks.status) << tasks.body;
+    const auto json = tasks.json();
+    ASSERT_TRUE(json.has_value());
+    ASSERT_EQ(2, (*json)["data"].size()) << tasks.body;
+    for (const auto &task: (*json)["data"])
+    {
+        const std::int64_t nodeId = task["nodeId"].get<std::int64_t>();
+        if (nodeId == ownNode)
+        {
+            EXPECT_EQ("task-list-own-node", task["nodeName"].get<std::string>());
+        } else
+        {
+            EXPECT_EQ(foreignNode.id, nodeId);
+            EXPECT_EQ("", task["nodeName"].get<std::string>());
+        }
+    }
+}
+
+// 钉住：强制签名时回滚到未签名固件在解析目标与创建任务之前就被拒绝
+TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedRollbackBeforeTaskCreation)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "unsigned-rollback-node");
+
+    auto requiredPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(
+            EdgePulse::Firmware::FirmwareSigningPolicy{true, m_signingPolicy->verifier});
+    EdgePulse::TestSupport::ServerHarness requiredServer(
+            [this, requiredPolicy](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+            {
+                EdgePulse::Web::applySecurityHeaders(router);
+                EdgePulse::Auth::registerRoutes(router, loop, *m_context->auth, *m_context->captcha, true);
+                EdgePulse::Firmware::FirmwareDependencies firmware;
+                firmware.auth               = m_context->auth.get();
+                firmware.firmware           = m_firmware.get();
+                firmware.nodes              = m_nodes.get();
+                firmware.commands           = m_commands.get();
+                firmware.channels           = m_channels.get();
+                firmware.tenants            = m_context->tenants.get();
+                firmware.storageDirectory   = m_storage.string();
+                firmware.maximumUploadBytes = 8U * 1024U * 1024U;
+                firmware.signingPolicy      = requiredPolicy;
+                EdgePulse::Firmware::registerFirmwareRoutes(router, loop, firmware);
+            });
+
+    EdgePulse::Firmware::FirmwareRecord legacy;
+    legacy.name        = "Legacy OS";
+    legacy.version     = "0.9.0";
+    legacy.fileName    = "legacy.bin";
+    legacy.contentType = "application/octet-stream";
+    legacy.sha256      = std::string(64, '8');
+    legacy.storagePath = (m_storage / "legacy.bin").string();
+    const std::int64_t legacyId = m_runner.run(m_firmware->create(m_runner.loop(), legacy));
+    ASSERT_GT(legacyId, 0);
+
+    EdgePulse::Firmware::FirmwareRecord signedRecord = legacy;
+    signedRecord.version            = "1.0.0";
+    signedRecord.fileName           = "signed.bin";
+    signedRecord.signature          = std::string(86, 'A');
+    signedRecord.signingKeyId       = "protocol-key";
+    signedRecord.signatureAlgorithm = "ed25519-sha256";
+    const std::int64_t signedId     = m_runner.run(m_firmware->create(m_runner.loop(), signedRecord));
+    ASSERT_GT(signedId, 0);
+    // 当前版本任务把上一版记为未签名固件，回滚源解析后目标即 legacy
+    ASSERT_GT(m_runner.run(m_firmware->createTask(m_runner.loop(), signedId, nodeId, legacyId)), 0);
+
+    const auto rollback =
+            requiredServer.post("/api/firmware/" + std::to_string(signedId) + "/rollback",
+                                AsynGyanis::Base::ConfigValue::object({{"nodeIds", AsynGyanis::Base::ConfigValue::array({nodeId})}}).dump(), "application/json", bearer(token));
+    EXPECT_EQ(400, rollback.status) << rollback.body;
+    EXPECT_NE(std::string::npos, rollback.body.find("未签名"));
+    // 拒绝必须发生在建任务之前：未签名目标不能多出回滚任务行
+    EXPECT_EQ(0, countFirmwareTasks(m_context->databasePath(), legacyId));
 }
 
 // 钉住：灰度下发按批次返回剩余节点，回滚把节点切回上一版本

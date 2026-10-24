@@ -11,6 +11,7 @@ TEST(NodeRepositoryRetry, ClassifiesConcurrentFailures)
     EXPECT_TRUE(isRetryableSqlFailure("执行 SQL 失败：database is locked"));
     EXPECT_TRUE(isRetryableSqlFailure("database table is busy"));
     EXPECT_TRUE(isRetryableSqlFailure("Deadlock found when trying to get lock"));
+    EXPECT_TRUE(isRetryableSqlFailure("Lock wait timeout exceeded; try restarting transaction"));
     EXPECT_TRUE(isRetryableSqlFailure("UNIQUE constraint failed: biz_node.name"));
     EXPECT_TRUE(isRetryableSqlFailure("Duplicate entry '20260101' for key 'uq_biz_node_name'"));
 

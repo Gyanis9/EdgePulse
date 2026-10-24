@@ -100,12 +100,21 @@ namespace EdgePulse::Auth
         }
 
         // 锁定先于口令校验：锁定期内连 PBKDF2 都不跑，避免把锁定账号变成计算资源消耗点
-        if (!user->lockedUntil.empty() && user->lockedUntil > Common::nowDateTimeUtc())
+        const std::string now = Common::nowDateTimeUtc();
+        if (!user->lockedUntil.empty() && user->lockedUntil > now)
         {
             co_await recordAudit(loop,
                                  LoginAuditEntry{credentials.username, credentials.clientIp, false, "账号已锁定", credentials.traceId, user->id, user->departmentId, tenantId});
             // 分钟数是配置的锁定时长，不是剩余时间；不足一分钟也按一分钟提示
             co_return std::unexpected(AuthError{423, 423, "账号已锁定，请稍后再试（锁定时长 " + std::to_string((m_options.loginLockSeconds + 59) / 60) + " 分钟）"});
+        }
+        // 锁定已过期但失败窗口更短时，计数可能仍停在阈值上；先清零，避免下一次输错立刻把账号重新锁上
+        if (!user->lockedUntil.empty())
+        {
+            if (!co_await m_users.scoped({tenantId, false})->clearLoginFailures(loop, user->id))
+            {
+                LOG_WARN_FMT("过期锁定未清空失败计数：user={}", user->username);
+            }
         }
 
         // PBKDF2 是 CPU 密集操作，放到工作线程，避免 210000 次迭代占住事件循环

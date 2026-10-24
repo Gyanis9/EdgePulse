@@ -12,9 +12,25 @@
 #include <exception>
 #include <functional>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace EdgePulse::Web
 {
+    namespace
+    {
+        /**
+         * @brief 判断路径是否属于存活/就绪探针
+         * @param path 请求路径
+         * @return true 表示不参与限流
+         * @note /api/probe/ 覆盖 h3 与后续探针端点；探针被 429 会让编排器误判进程不健康
+         */
+        [[nodiscard]] bool isProbePath(const std::string_view path) noexcept
+        {
+            return path == "/healthz" || path == "/readyz" || path == "/api/health" || path.starts_with("/api/probe/");
+        }
+    } // namespace
+
     void applySecurityHeaders(AsynGyanis::Net::Router &router)
     {
         router.addMiddleware(
@@ -45,12 +61,27 @@ namespace EdgePulse::Web
                 });
     }
 
+    AsynGyanis::Net::MiddlewareFunc rateLimitExceptProbes(std::shared_ptr<AsynGyanis::Net::TokenBucket> bucket)
+    {
+        const auto limited = AsynGyanis::Net::tokenBucketRateLimiterMiddleware(std::move(bucket));
+        return [limited](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response, std::function<AsynGyanis::Core::Task<>()> next) -> AsynGyanis::Core::Task<>
+        {
+            // 探针不取令牌也不改响应：开销只剩一次路径比较
+            if (isProbePath(request.path()))
+            {
+                co_await next();
+                co_return;
+            }
+            co_await limited(request, response, std::move(next));
+        };
+    }
+
     void applyRateLimit(AsynGyanis::Net::Router &router, const std::shared_ptr<AsynGyanis::Net::TokenBucket> &bucket)
     {
         // 空桶代表运维显式关闭限流：不注册比注册一个恒放行的中间件更容易从路由表上确认
         if (bucket != nullptr)
         {
-            router.addMiddleware(AsynGyanis::Net::tokenBucketRateLimiterMiddleware(bucket));
+            router.addMiddleware(rateLimitExceptProbes(bucket));
         }
     }
 } // namespace EdgePulse::Web

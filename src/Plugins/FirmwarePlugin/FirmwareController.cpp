@@ -120,6 +120,47 @@ namespace EdgePulse::Firmware
             return dependencies.signingPolicy != nullptr && dependencies.signingPolicy->signatureRequired();
         }
 
+        [[nodiscard]] std::string joinedIdentifiers(const std::vector<std::int64_t> &identifiers)
+        {
+            std::string joined;
+            for (const std::int64_t identifier: identifiers)
+            {
+                if (!joined.empty())
+                {
+                    joined += "、";
+                }
+                joined += std::to_string(identifier);
+            }
+            return joined;
+        }
+
+        /**
+         * @brief 在会话租户边界内挑出不能作为下发/回滚目标的节点
+         * @param loop 恢复协程用的事件循环
+         * @param nodes 节点仓储
+         * @param scope 会话租户边界
+         * @param nodeIds 请求里的节点标识
+         * @param firmwareTenantId 固件归属租户
+         * @return 不存在、不可见或与固件不同租户的节点标识；全部合法时为空
+         * @note 平台管理员的边界是全租户，此时仍要求节点租户与固件租户一致
+         */
+        [[nodiscard]] AsynGyanis::Core::Task<std::vector<std::int64_t>> invalidFirmwareTargets(AsynGyanis::Core::EventLoop &loop, const Device::NodeRepository &nodes,
+                                                                                               const System::TenantScope scope, const std::vector<std::int64_t> &nodeIds,
+                                                                                               const std::int64_t firmwareTenantId)
+        {
+            const auto                scopedNodes = nodes.scoped(scope);
+            std::vector<std::int64_t> invalid;
+            for (const std::int64_t nodeId: nodeIds)
+            {
+                const auto node = co_await scopedNodes->findById(loop, nodeId);
+                if (!node.has_value() || node->tenantId != firmwareTenantId)
+                {
+                    invalid.push_back(nodeId);
+                }
+            }
+            co_return invalid;
+        }
+
         [[nodiscard]] std::string safeFileName(const std::string &fileName)
         {
             std::string name = std::filesystem::path(fileName).filename().string();
@@ -471,9 +512,16 @@ namespace EdgePulse::Firmware
                             co_return;
                         }
                         const auto nodeIds = Json::integerArrayField(*body, "nodeIds");
-                        if (nodeIds.empty())
+                        if (nodeIds.empty() || nodeIds.size() > 100)
                         {
-                            fail(response, Common::kCodeBadRequest, "nodeIds 不能为空", traceId);
+                            fail(response, Common::kCodeBadRequest, "nodeIds 必须是 1 到 100 个节点", traceId);
+                            co_return;
+                        }
+                        // 目标节点必须在会话租户内可见且与固件同租户：否则任务行会指向看不见的节点，任务列表还可能带出别家节点名
+                        const auto invalidTargets = co_await invalidFirmwareTargets(loop, *deps->nodes, session->tenantScope(), nodeIds, firmware->tenantId);
+                        if (!invalidTargets.empty())
+                        {
+                            fail(response, Common::kCodeBadRequest, "目标节点不存在、不可见或不属于固件所在租户：" + joinedIdentifiers(invalidTargets), traceId);
                             co_return;
                         }
                         const auto batchSize = Json::optionalInteger(*body, "batchSize");
@@ -557,7 +605,20 @@ namespace EdgePulse::Firmware
                             co_return;
                         }
                         const auto firmwareRepo = deps->firmware->scoped(session->tenantScope());
-                        const auto commandRepo  = deps->commands->scoped(session->tenantScope());
+                        const auto firmware     = co_await firmwareRepo->find(loop, *id);
+                        if (!firmware.has_value())
+                        {
+                            fail(response, Common::kCodeNotFound, "固件不存在", traceId);
+                            co_return;
+                        }
+                        // 回滚目标必须是本租户可见节点，且与源固件同租户；校验放在解析历史版本与建任务之前
+                        const auto invalidTargets = co_await invalidFirmwareTargets(loop, *deps->nodes, session->tenantScope(), nodeIds, firmware->tenantId);
+                        if (!invalidTargets.empty())
+                        {
+                            fail(response, Common::kCodeBadRequest, "目标节点不存在、不可见或不属于固件所在租户：" + joinedIdentifiers(invalidTargets), traceId);
+                            co_return;
+                        }
+                        const auto commandRepo = deps->commands->scoped(session->tenantScope());
                         // 先解析全部回滚目标并在下发前统一校验签名，避免部分节点已建任务后才发现目标未签名
                         struct RollbackTarget
                         {

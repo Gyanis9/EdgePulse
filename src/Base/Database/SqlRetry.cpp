@@ -11,8 +11,8 @@ namespace EdgePulse::Sql
 {
     namespace
     {
-        constexpr std::array<std::string_view, 5> kRetryableMarkers{"locked", "busy", "deadlock", "unique", "duplicate entry"}; ///< 并发失败原文
-        constexpr std::array<std::string_view, 2> kUniqueMarkers{"unique", "duplicate"};                                        ///< 唯一键冲突原文
+        constexpr std::array<std::string_view, 6> kRetryableMarkers{"locked", "busy", "deadlock", "unique", "duplicate entry", "lock wait timeout"}; ///< 并发失败原文
+        constexpr std::array<std::string_view, 2> kUniqueMarkers{"unique", "duplicate"};                                                             ///< 唯一键冲突原文
 
         /**
          * @brief 把错误文本折成小写，便于按固定标记匹配

@@ -10,6 +10,25 @@ namespace EdgePulse::Common
     namespace
     {
         constexpr std::size_t kMaximumPasswordLength = 64; ///< 与建号、重置接口共用的上限
+
+        /**
+         * @brief 按 UTF-8 码点计数，而不是按字节
+         * @param text 待计数的文本
+         * @return 码点数；非法 UTF-8 里孤立的延续字节不计入
+         * @note 只数非延续字节（首字节与 ASCII），对截断或畸形输入也不会放大长度
+         */
+        [[nodiscard]] std::size_t codePointCount(const std::string_view text) noexcept
+        {
+            std::size_t count = 0;
+            for (const unsigned char byte: text)
+            {
+                if ((byte & 0xC0U) != 0x80U)
+                {
+                    ++count;
+                }
+            }
+            return count;
+        }
     } // namespace
 
     PasswordPolicy::PasswordPolicy(const int minimumLength, const bool requireComplexity) : m_minimumLength(minimumLength), m_requireComplexity(requireComplexity)
@@ -18,7 +37,8 @@ namespace EdgePulse::Common
 
     std::expected<void, std::string> PasswordPolicy::validate(const std::string_view password) const
     {
-        if (password.size() < static_cast<std::size_t>(m_minimumLength) || password.size() > kMaximumPasswordLength)
+        const std::size_t length = codePointCount(password);
+        if (length < static_cast<std::size_t>(m_minimumLength) || length > kMaximumPasswordLength)
         {
             return std::unexpected("口令长度必须是 " + std::to_string(m_minimumLength) + " 到 " + std::to_string(kMaximumPasswordLength) + " 个字符");
         }

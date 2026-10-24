@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -289,6 +291,43 @@ class BackupRestoreTest(unittest.TestCase):
             self.assertFalse(target_db.exists())
             self.assertFalse(target_firmware.exists())
             self.assertEqual([], [path for path in base.rglob("evil") if path.is_file()])
+
+    @unittest.skipIf(
+        os.name == "nt", "Windows 不保留 POSIX 权限位；数据库权限由宿主 ACL 负责"
+    )
+    def test_sqlite_restore_forces_private_database_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            db = base / "edgepulse.db"
+            firmware = base / "firmware"
+            firmware.mkdir()
+            create_probe_database(db, "before")
+            archive = base / "backup.tar.gz"
+            run_script(
+                "backup.py",
+                "--driver",
+                "sqlite",
+                "--db-path",
+                str(db),
+                "--firmware-dir",
+                str(firmware),
+                "--output",
+                str(archive),
+            )
+            # 目标带着 0640 权限：旧实现会把它收敛成 0644，等于放宽到组与其他用户可读
+            os.chmod(db, 0o640)
+            run_script(
+                "restore.py",
+                "--archive",
+                str(archive),
+                "--driver",
+                "sqlite",
+                "--db-path",
+                str(db),
+                "--force",
+            )
+            self.assertEqual("before", probe_value(db))
+            self.assertEqual(0o600, stat.S_IMODE(db.stat().st_mode))
 
     def test_restore_rejects_current_directory_as_firmware_target(self) -> None:
         result = run_script(

@@ -24,3 +24,12 @@ TEST(PasswordPolicy, RejectsOverlongAndWhitespaceOnlyComplexity)
     EXPECT_FALSE(policy.validate(std::string{"Aa1!"} + std::string(61, 'a')).has_value());
     EXPECT_FALSE(policy.validate("Pass word1").has_value());
 }
+
+// 钉住：长度按 UTF-8 码点计，四个汉字不能靠 12 个字节冒充 10 个字符
+TEST(PasswordPolicy, CountsCodePointsInsteadOfBytes)
+{
+    const EdgePulse::Common::PasswordPolicy policy(10, false);
+    EXPECT_FALSE(policy.validate("口令测试").has_value());
+    EXPECT_TRUE(policy.validate("口令测试口令测试口令").has_value());
+    EXPECT_FALSE(policy.validate(std::string(65, 'a')).has_value());
+}

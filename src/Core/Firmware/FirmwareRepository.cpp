@@ -26,7 +26,7 @@ namespace EdgePulse::Firmware
                 "created_at FROM biz_firmware ";
         constexpr std::string_view kSelectTask =
                 "SELECT t.id, t.firmware_id, t.node_id, t.status, t.progress, t.message, t.created_at, t.updated_at, t.previous_firmware_id, COALESCE(n.name, '') AS node_name "
-                "FROM biz_firmware_task t LEFT JOIN biz_node n ON n.id = t.node_id ";
+                "FROM biz_firmware_task t LEFT JOIN biz_node n ON n.id = t.node_id AND n.tenant_id = t.tenant_id ";
 
         [[nodiscard]] FirmwareRecord readFirmware(const DatabaseResult &result)
         {

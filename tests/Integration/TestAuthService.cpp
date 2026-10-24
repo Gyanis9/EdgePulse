@@ -35,6 +35,17 @@ namespace
         return std::holds_alternative<std::int64_t>(value) ? std::get<std::int64_t>(value) : -1;
     }
 
+    /// 直接落一条已过期的锁定与达到阈值的失败计数，复现“锁定短于失败窗口”的残留状态
+    void seedExpiredLock(const std::filesystem::path &databasePath)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::string now  = EdgePulse::Common::nowDateTimeUtc();
+        const std::string past = EdgePulse::Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{60});
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection->execute(
+                "UPDATE sys_user SET failed_login_count = 2, last_failed_login_at = '" + now + "', locked_until = '" + past + "' WHERE username = 'admin'");
+        EXPECT_NE(nullptr, result) << connection->lastError();
+    }
+
     [[nodiscard]] std::expected<EdgePulse::Auth::LoginResult, EdgePulse::Auth::AuthError>
     loginWithCaptcha(EdgePulse::TestSupport::AuthTestContext &context, EdgePulse::TestSupport::EventLoopRunner &runner, const std::string &password)
     {
@@ -147,6 +158,22 @@ TEST(AuthService, LocksAccountAfterRepeatedFailures)
     ASSERT_TRUE(admin.has_value());
     const std::string hash = EdgePulse::Common::hashPassword("admin123");
     ASSERT_TRUE(runner.run(users.scoped({1, false})->resetPassword(runner.loop(), admin->id, hash, 1)));
+    const auto recovered = loginWithCaptcha(context, runner, "admin123");
+    ASSERT_TRUE(recovered.has_value()) << recovered.error().message;
+}
+
+// 钉住：锁定已过期而失败窗口还没过时，先清账号失败态；下一次输错不会立刻重新锁定
+TEST(AuthService, ExpiredLockClearsAccountFailureStateBeforeVerification)
+{
+    // 锁定 300 秒短于失败窗口 900 秒：不清零时，锁过期后计数仍停在阈值上
+    EdgePulse::TestSupport::AuthTestContext context({6, false, 900, 2, 300});
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    seedExpiredLock(context.databasePath());
+
+    const auto wrong = loginWithCaptcha(context, runner, "wrong-after-expiry");
+    ASSERT_FALSE(wrong.has_value());
+    EXPECT_EQ(401, wrong.error().httpStatus);
+    // 修复前这次输错会把计数推回阈值并重新锁定 300 秒，正确口令会收到 423
     const auto recovered = loginWithCaptcha(context, runner, "admin123");
     ASSERT_TRUE(recovered.has_value()) << recovered.error().message;
 }

@@ -24,8 +24,9 @@ namespace EdgePulse::Common
     public:
         /**
          * @brief 构造策略
-         * @param minimumLength 最短长度，允许 6 到 64
+         * @param minimumLength 最短长度，按 UTF-8 码点计；下限由调用方决定，生产配置范围为 8 到 64
          * @param requireComplexity 是否要求同时包含大写、小写、数字与符号
+         * @note 上限固定为 64 个码点；服务端配置校验把下限限制在 8 到 64 之间
          */
         explicit PasswordPolicy(int minimumLength = 10, bool requireComplexity = true);
 

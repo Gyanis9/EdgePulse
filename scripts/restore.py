@@ -391,7 +391,6 @@ def replace_sqlite(source: Path, target: Path, force: bool) -> None:
         if target.stat().st_size > 0 and not force:
             raise RestoreError(f"目标数据库非空，需要 --force 才能覆盖：{target}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    mode = (target.stat().st_mode & 0o777) if target.exists() else 0o600
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.restore-", dir=target.parent)
     temporary = Path(temporary_name)
     try:
@@ -399,7 +398,8 @@ def replace_sqlite(source: Path, target: Path, force: bool) -> None:
             shutil.copyfileobj(handle, output, CHUNK_SIZE)
             output.flush()
             os.fsync(output.fileno())
-        os.chmod(temporary, clamp_mode(mode))
+        # 数据库固定 0600：沿用目标旧权限会把 0640 收敛成 0644，反而放宽到组与其他用户可读
+        os.chmod(temporary, 0o600)
         # 引擎固定 journal_mode=WAL。残留的 -wal/-shm/-journal 会在下次打开时按旧日志重放，
         # 把恢复前的页盖回刚替换的快照；删不掉说明服务仍在运行，必须直接失败。
         remove_sqlite_sidecars(target)
