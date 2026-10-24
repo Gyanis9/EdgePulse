@@ -1,5 +1,6 @@
 #include "AgentApplication.h"
 #include "AgentConfiguration.h"
+#include "AgentIdentity.h"
 
 #include <exception>
 #include <filesystem>
@@ -23,6 +24,7 @@ namespace
         bool                  service{false};                  ///< 是否以系统服务方式运行
         bool                  checkConfiguration{false};       ///< 是否只校验配置
         bool                  showVersion{false};              ///< 是否只打印版本
+        bool                  printFingerprint{false};         ///< 是否只打印证书指纹
     };
 
     /**
@@ -31,7 +33,7 @@ namespace
      */
     void printUsage(std::ostream &stream)
     {
-        stream << "用法：edgepulse-agent [--config <yaml>] [--console] [--service] [--check-config] [--version]\n";
+        stream << "用法：edgepulse-agent [--config <yaml>] [--console] [--service] [--check-config] [--print-fingerprint] [--version]\n";
     }
 } // namespace
 
@@ -58,6 +60,9 @@ int main(const int argc, char **argv)
         } else if (argument == "--check-config")
         {
             options.checkConfiguration = true;
+        } else if (argument == "--print-fingerprint")
+        {
+            options.printFingerprint = true;
         } else if (argument == "--version")
         {
             options.showVersion = true;
@@ -97,6 +102,18 @@ int main(const int argc, char **argv)
         if (options.checkConfiguration)
         {
             std::cout << "配置校验通过：" << configuration->configurationFile.string() << '\n';
+            return 0;
+        }
+
+        if (options.printFingerprint)
+        {
+            const auto identity = EdgePulse::Agent::AgentIdentity::load(*configuration);
+            if (!identity.has_value())
+            {
+                std::cerr << identity.error() << '\n';
+                return 1;
+            }
+            std::cout << identity->fingerprint << '\n';
             return 0;
         }
 

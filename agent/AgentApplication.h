@@ -15,7 +15,7 @@ namespace EdgePulse::Agent
 {
     /**
      * @brief 按配置装配 Agent 运行期资源
-     * @details 当前骨架只负责状态目录、日志与启动日志；身份、心跳与执行器由后续装配接入。
+     * @details 负责状态目录、日志、证书身份、状态库与注册；心跳与执行器由后续装配接入。
      */
     class AgentApplication
     {
@@ -27,8 +27,9 @@ namespace EdgePulse::Agent
         explicit AgentApplication(AgentConfiguration configuration);
 
         /**
-         * @brief 创建状态目录、初始化日志并记录启动日志
-         * @return int 成功返回 0；目录或日志初始化失败返回 1
+         * @brief 装配日志与身份、打开状态库并完成首次注册
+         * @return int 注册成功返回 0；目录、日志、身份、状态库或注册失败返回 1
+         * @note 网络与 5xx 失败按退避重试；403 停止并记录 WARN
          */
         int run();
 

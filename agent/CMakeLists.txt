@@ -1,7 +1,11 @@
 add_library(edgepulse-agent-core STATIC
         AgentApplication.cpp
-        AgentConfiguration.cpp)
+        AgentClient.cpp
+        AgentConfiguration.cpp
+        AgentIdentity.cpp
+        AgentState.cpp)
 target_include_directories(edgepulse-agent-core PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(edgepulse-agent-core PRIVATE EDGEPULSE_AGENT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(edgepulse-agent-core PUBLIC EdgePulse::Core AsynGyanis::Net AsynGyanis::Database AsynGyanis::Core AsynGyanis::Base OpenSSL::Crypto)
 if(WIN32)
     target_link_libraries(edgepulse-agent-core PUBLIC advapi32)
