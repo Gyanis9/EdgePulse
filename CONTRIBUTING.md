@@ -40,7 +40,7 @@ ctest --preset debug -R "SystemEndpoints|RateLimit|StrictSystemEndpoints" --outp
 python scripts/run-external-tests.py
 ```
 
-脚本启动一次性 MySQL 8.4 与 Redis 7 容器、在随机宿主端口上设置 `EDGEPULSE_TEST_*`，跑完 `ExternalStores|RealtimeBus` 后删除容器；失败时加 `--keep` 保留现场，用 `docker logs <容器名>` 接着排查。镜像名可用 `--mysql-image`/`--redis-image` 覆盖，离线环境先用 `docker pull` 备好本地镜像，或指到本机已有的等价标签（如 `redis:7-alpine`）。
+脚本启动一次性 MySQL 8.4 与 Redis 7 容器、在随机宿主端口上设置 `EDGEPULSE_TEST_*`，跑完 `ExternalStores|RealtimeBus` 后删除容器；失败时加 `--keep` 保留现场，脚本会打印容器名与映射端口，用 `docker logs <容器名>` 接着排查。容器口令每次随机生成，只绑 `127.0.0.1` 的临时端口，并通过 Docker `-e` 出现在宿主进程参数里；这是仅用于测试的取舍，不要照搬到部署。镜像名可用 `--mysql-image`/`--redis-image` 覆盖，离线环境先用 `docker pull` 备好本地镜像，或指到本机已有的等价标签（如 `redis:7-alpine`）。
 
 - 也可以自己准备实例，按下面的变量接线（端口不是固定的 6379/3306 时必须显式传）：
 
