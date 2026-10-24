@@ -56,6 +56,26 @@ namespace EdgePulse::Agent
     };
 
     /**
+     * @brief 一次命令结果上报的处置分类
+     */
+    enum class ResultPostDisposition
+    {
+        Accepted,  ///< 服务端已接受，命令收口
+        Retryable, ///< 传输失败、408、425、429 或 5xx，稍后重试
+        Terminal   ///< 其余 4xx，服务端不会再接受该结果
+    };
+
+    /**
+     * @brief 一次命令结果上报的结论
+     */
+    struct ResultPostOutcome
+    {
+        ResultPostDisposition disposition{ResultPostDisposition::Retryable}; ///< 处置分类
+        int                   httpStatus{0};                                ///< HTTP 状态码；0 表示没有拿到响应
+        std::string           message;                                      ///< 中文原因，供日志使用
+    };
+
+    /**
      * @brief 持有事件循环与 TLS 身份的 Agent 客户端
      * @details 请求走带连接池的 HttpClient；https 地址会带上客户端证书，明文地址只用于显式允许的测试配置。
      */
@@ -108,10 +128,10 @@ namespace EdgePulse::Agent
          * @param status 状态文本，取 succeeded 或 failed
          * @param result 结果正文
          * @param message 中文说明
-         * @return 服务端返回 2xx 时成功；失败返回中文原因
+         * @return 200 返回 Accepted；传输失败与 408、425、429、5xx 返回 Retryable；其余状态返回 Terminal
          */
-        AsynGyanis::Core::Task<std::expected<void, std::string>> reportCommandResult(std::int64_t commandId, std::int64_t nodeId, std::string_view status, std::string_view result,
-                                                                                     std::string_view message);
+        AsynGyanis::Core::Task<ResultPostOutcome> reportCommandResult(std::int64_t commandId, std::int64_t nodeId, std::string_view status, std::string_view result,
+                                                                      std::string_view message);
 
     private:
         AsynGyanis::Core::EventLoop                 &m_loop;                ///< 请求所属事件循环

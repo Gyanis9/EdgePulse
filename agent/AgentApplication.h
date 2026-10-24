@@ -12,6 +12,7 @@
 #include "AgentConfiguration.h"
 
 #include <atomic>
+#include <mutex>
 
 namespace AsynGyanis::Core
 {
@@ -50,9 +51,10 @@ namespace EdgePulse::Agent
         void requestStop();
 
     private:
-        AgentConfiguration                         m_configuration;        ///< 本次进程使用的配置副本
-        bool                                       m_consoleMode{false};   ///< 是否接管控制台停机信号
-        std::atomic<bool>                          m_stopRequested{false}; ///< 是否已请求停止
-        std::atomic<AsynGyanis::Core::EventLoop *> m_loop{nullptr};        ///< 常驻事件循环，仅在 run() 期间有效
+        AgentConfiguration           m_configuration;        ///< 本次进程使用的配置副本
+        bool                         m_consoleMode{false};   ///< 是否接管控制台停机信号
+        std::atomic<bool>            m_stopRequested{false}; ///< 是否已请求停止
+        std::mutex                   m_loopMutex;            ///< 保护常驻循环指针与停止调用
+        AsynGyanis::Core::EventLoop *m_loop{nullptr};        ///< 常驻事件循环，仅在 run() 期间有效；受 m_loopMutex 保护
     };
 } // namespace EdgePulse::Agent

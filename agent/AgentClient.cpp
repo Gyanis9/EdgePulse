@@ -49,6 +49,17 @@ namespace EdgePulse::Agent
         }
 
         /**
+         * @brief 判断命令结果上报的状态码是否值得重试
+         * @param status HTTP 状态码
+         * @return true 表示服务端可能稍后接受该结果
+         * @details 409、403 等终态响应表示命令已结束或归属其他节点，重试同一行只会永久阻塞队列
+         */
+        [[nodiscard]] bool isResultRetryableStatus(const int status)
+        {
+            return status == 408 || status == 425 || status == 429 || status >= 500;
+        }
+
+        /**
          * @brief 判断响应是否带成功包络
          * @param body 响应正文
          * @return 成功时为空；失败返回中文原因
@@ -325,13 +336,12 @@ namespace EdgePulse::Agent
         co_return std::optional<AsynGyanis::Base::ConfigValue>{*data};
     }
 
-    AsynGyanis::Core::Task<std::expected<void, std::string>> AgentClient::reportCommandResult(const std::int64_t commandId, const std::int64_t nodeId,
-                                                                                              const std::string_view status, const std::string_view result,
-                                                                                              const std::string_view message)
+    AsynGyanis::Core::Task<ResultPostOutcome> AgentClient::reportCommandResult(const std::int64_t commandId, const std::int64_t nodeId, const std::string_view status,
+                                                                               const std::string_view result, const std::string_view message)
     {
         if (!m_initializationError.empty() || m_client == nullptr)
         {
-            co_return std::unexpected(m_initializationError);
+            co_return ResultPostOutcome{ResultPostDisposition::Retryable, 0, m_initializationError};
         }
 
         const AsynGyanis::Base::ConfigValue requestBody =
@@ -339,7 +349,7 @@ namespace EdgePulse::Agent
         const auto serialized = AsynGyanis::Base::serializeConfigValue(requestBody);
         if (!serialized.has_value())
         {
-            co_return std::unexpected("命令结果正文无法序列化为 JSON");
+            co_return ResultPostOutcome{ResultPostDisposition::Retryable, 0, "命令结果正文无法序列化为 JSON"};
         }
 
         AsynGyanis::Net::HttpClientRequest request;
@@ -353,17 +363,20 @@ namespace EdgePulse::Agent
             response = co_await m_client->send(m_commandsUrl + "/" + std::to_string(commandId) + "/result", request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
-            co_return std::unexpected("上报命令结果请求异常：" + std::string{failure.what()});
+            co_return ResultPostOutcome{ResultPostDisposition::Retryable, 0, "上报命令结果请求异常：" + std::string{failure.what()}};
         }
         if (response == nullptr)
         {
-            co_return std::unexpected("上报命令结果请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志");
+            co_return ResultPostOutcome{ResultPostDisposition::Retryable, 0, "上报命令结果请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志"};
         }
-        // 只有 200 表示结果已被服务端接受：其他 2xx 不保证命令已结束，结果继续留在队列里
-        if (response->statusCode != 200)
+        // 只有 200 表示结果已被服务端接受；408、425、429 与 5xx 可重试，其余状态重试同一行只会永久阻塞队列
+        if (response->statusCode == 200)
         {
-            co_return std::unexpected(httpFailure("上报命令结果", response->statusCode, response->body));
+            co_return ResultPostOutcome{ResultPostDisposition::Accepted, 200, {}};
         }
-        co_return std::expected<void, std::string>{};
+        const int                   httpStatus  = response->statusCode;
+        const std::string           failure     = httpFailure("上报命令结果", httpStatus, response->body);
+        const ResultPostDisposition disposition = isResultRetryableStatus(httpStatus) ? ResultPostDisposition::Retryable : ResultPostDisposition::Terminal;
+        co_return ResultPostOutcome{disposition, httpStatus, failure};
     }
 } // namespace EdgePulse::Agent

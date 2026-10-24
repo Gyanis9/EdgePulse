@@ -31,6 +31,63 @@ namespace EdgePulse::Agent
     class CommandDispatcher;
 
     /**
+     * @brief 按连续失败次数取 WebSocket 重连退避秒数
+     * @param consecutiveFailures 连续失败次数，0 表示刚断开或从未失败
+     * @return int 退避秒数，依次为 1、2、5、15、30、60，超出表长后一直为 60
+     */
+    [[nodiscard]] int webSocketReconnectBackoffSeconds(int consecutiveFailures);
+
+    /**
+     * @brief WebSocket 通道与命令轮询之间的降级状态
+     * @details 连续失败达到 3 次后启用轮询；通道通过 hello 确认可用时暂停轮询并清零失败计数。
+     *          正常断开只标记通道不可用，轮询保持暂停，直到再次连续失败 3 次。
+     * @note 只在事件循环线程上使用，内部不做同步。
+     */
+    class WebSocketFallbackState
+    {
+    public:
+        /**
+         * @brief 构造降级状态
+         * @param pollingInitiallyActive 初始是否启用轮询；关闭 WebSocket 时为 true
+         */
+        explicit WebSocketFallbackState(bool pollingInitiallyActive = false);
+
+        /**
+         * @brief 记录通道通过 hello 确认可用
+         */
+        void recordConnected();
+
+        /**
+         * @brief 记录通道正常断开
+         * @details 不清零失败计数；轮询暂停状态保持不变
+         */
+        void recordDisconnected();
+
+        /**
+         * @brief 记录一次连接失败
+         * @details 连续失败达到 3 次后启用轮询
+         */
+        void recordConnectFailure();
+
+        /**
+         * @brief 轮询是否应当运行
+         * @return 已触发降级且通道当前不可用时返回 true
+         */
+        [[nodiscard]] bool shouldPoll() const;
+
+        /**
+         * @brief 当前连续连接失败次数
+         * @return int 连续失败次数
+         */
+        [[nodiscard]] int consecutiveFailures() const;
+
+    private:
+        bool m_connected{false};           ///< 通道是否已通过 hello 确认
+        bool m_pollingActive{false};       ///< 是否已启用轮询
+        int  m_consecutiveFailures{0};     ///< 连续连接失败次数
+    };
+
+    /**
      * @brief 按配置建立 wss 或 ws 命令通道，完成 hello 并分发服务端推送
      * @details 地址从 base_url 派生：https 换成 wss、http 换成 ws，路径固定为 /api/agent/ws。
      *          连接、hello 与心跳式文本 ping 都在本类处理，命令交给 CommandDispatcher。

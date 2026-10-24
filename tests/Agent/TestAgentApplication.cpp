@@ -374,4 +374,155 @@ agent:
         EXPECT_EQ(1, application.run());
         EXPECT_EQ(3, attempts->load());
     }
+
+    TEST(AgentApplication, StopRequestedFromAnotherThreadReturnsWithinDeadline)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server(
+                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                {
+                    router.post("/api/agent/register",
+                                [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77},"traceId":"trace-register"})");
+                                    co_return;
+                                });
+                    router.post("/api/agent/heartbeat",
+                                [heartbeats](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    heartbeats->fetch_add(1, std::memory_order_release);
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":5},"traceId":"trace-heartbeat"})");
+                                    co_return;
+                                });
+                    router.get("/api/agent/commands/next",
+                               [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                               {
+                                   response.setStatus(200);
+                                   response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-next"})");
+                                   co_return;
+                               });
+                });
+
+        const auto configurationPath = directory.write("agent.yaml", std::string{"agent:\n"
+                                                                                 "  server:\n"
+                                                                                 "    base_url: http://127.0.0.1:" +
+                                                                                 std::to_string(server.port()) +
+                                                                                 "\n"
+                                                                                 "    allow_plaintext_for_tests: true\n"
+                                                                                 "    ca_file: agent.pem\n"
+                                                                                 "    certificate_file: agent.pem\n"
+                                                                                 "    private_key_file: agent-key.pem\n"
+                                                                                 "    name: edge-01\n"
+                                                                                 "    websocket_enabled: false\n"
+                                                                                 "    heartbeat_interval_seconds: 5\n"
+                                                                                 "    command_poll_interval_seconds: 5\n"
+                                                                                 "    request_timeout_seconds: 5\n"
+                                                                                 "  state:\n"
+                                                                                 "    directory: state\n"
+                                                                                 "  logging:\n"
+                                                                                 "    file: state/agent.log\n"});
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool running = waitFor(std::chrono::seconds{8}, [&heartbeats] { return heartbeats->load(std::memory_order_acquire) >= 1; });
+        EXPECT_TRUE(running) << "Agent 未在时限内进入常驻运行";
+        EXPECT_EQ(-1, exitCode.load(std::memory_order_acquire));
+
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        EXPECT_TRUE(stopped) << "跨线程停止请求未在 5 秒内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+    }
+
+    TEST(AgentApplication, HeartbeatRetriesAfterServerFailure)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server(
+                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                {
+                    router.post("/api/agent/register",
+                                [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77},"traceId":"trace-register"})");
+                                    co_return;
+                                });
+                    router.post("/api/agent/heartbeat",
+                                [heartbeats](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    const int sequence = heartbeats->fetch_add(1, std::memory_order_acq_rel) + 1;
+                                    if (sequence == 1)
+                                    {
+                                        response.setStatus(500);
+                                        response.setBody(R"({"code":500,"message":"暂时不可用","data":null,"traceId":"trace-heartbeat"})");
+                                    } else
+                                    {
+                                        response.setStatus(200);
+                                        response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":5},"traceId":"trace-heartbeat"})");
+                                    }
+                                    co_return;
+                                });
+                    router.get("/api/agent/commands/next",
+                               [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                               {
+                                   response.setStatus(200);
+                                   response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-next"})");
+                                   co_return;
+                               });
+                });
+
+        const auto configurationPath = directory.write("agent.yaml", std::string{"agent:\n"
+                                                                                 "  server:\n"
+                                                                                 "    base_url: http://127.0.0.1:" +
+                                                                                 std::to_string(server.port()) +
+                                                                                 "\n"
+                                                                                 "    allow_plaintext_for_tests: true\n"
+                                                                                 "    ca_file: agent.pem\n"
+                                                                                 "    certificate_file: agent.pem\n"
+                                                                                 "    private_key_file: agent-key.pem\n"
+                                                                                 "    name: edge-01\n"
+                                                                                 "    websocket_enabled: false\n"
+                                                                                 "    heartbeat_interval_seconds: 5\n"
+                                                                                 "    command_poll_interval_seconds: 5\n"
+                                                                                 "    request_timeout_seconds: 5\n"
+                                                                                 "  state:\n"
+                                                                                 "    directory: state\n"
+                                                                                 "  logging:\n"
+                                                                                 "    file: state/agent.log\n"});
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool retried = waitFor(std::chrono::seconds{8}, [&heartbeats] { return heartbeats->load(std::memory_order_acquire) >= 2; });
+        EXPECT_TRUE(retried) << "心跳失败后未在时限内发出下一次心跳";
+        EXPECT_EQ(-1, exitCode.load(std::memory_order_acquire)) << "心跳失败不应结束 Agent";
+
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        EXPECT_TRUE(stopped) << "停止请求未在 5 秒内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+    }
 } // namespace EdgePulse::Agent

@@ -52,17 +52,13 @@ namespace EdgePulse::Agent
         constexpr int kMaximumHeartbeatSeconds      = 600; ///< 心跳间隔上限
         constexpr int kHeartbeatFailureWarningCount = 3;   ///< 连续失败达到该次数时额外告警一次
 
-        /// WebSocket 重连退避，单位为秒；连续失败超过表长后一直使用最后一档
-        constexpr std::array<int, 6> kWebSocketBackoffSeconds{1, 2, 5, 15, 30, 60};
-
         /**
          * @brief 常驻运行期间在循环线程上共享的状态
          */
         struct RuntimeFlags
         {
-            bool webSocketConnected{false};    ///< WebSocket 通道是否已通过 hello 确认
-            bool pollingActive{false};         ///< 是否启用命令轮询
-            int  heartbeatIntervalSeconds{30}; ///< 当前心跳间隔，服务端可下发新值
+            WebSocketFallbackState fallback;               ///< WebSocket 与轮询的降级状态
+            int                    heartbeatIntervalSeconds{30}; ///< 当前心跳间隔，服务端可下发新值
         };
 
         /**
@@ -265,7 +261,13 @@ namespace EdgePulse::Agent
                     }
                     if (reply->desiredConfigVersion >= 0)
                     {
-                        state.set("desired_config_version", std::to_string(reply->desiredConfigVersion));
+                        // 值未变化时跳过写入，避免每次心跳都触发一次 SQLite 写事务
+                        const std::string desired = std::to_string(reply->desiredConfigVersion);
+                        const auto        current = state.get("desired_config_version");
+                        if (!current.has_value() || *current != desired)
+                        {
+                            state.set("desired_config_version", desired);
+                        }
                     } else
                     {
                         LOG_WARN("心跳响应没有可解析的 desiredConfigVersion，保留状态库里的旧值");
@@ -303,14 +305,16 @@ namespace EdgePulse::Agent
         {
             const AgentWebSocket::ConnectionObserver observer = [&flags](const bool connected)
             {
-                flags.webSocketConnected = connected;
                 if (connected)
                 {
+                    flags.fallback.recordConnected();
                     LOG_INFO("WebSocket 命令通道已建立，命令轮询暂停");
+                } else
+                {
+                    flags.fallback.recordDisconnected();
                 }
             };
 
-            int consecutiveFailures = 0;
             for (;;)
             {
                 if (stopRequested.load(std::memory_order_acquire))
@@ -318,19 +322,17 @@ namespace EdgePulse::Agent
                     co_return;
                 }
 
-                const auto outcome       = co_await socket.serve(dispatcher, nodeId, agentVersion, observer);
-                flags.webSocketConnected = false;
+                const auto outcome = co_await socket.serve(dispatcher, nodeId, agentVersion, observer);
                 if (outcome.has_value())
                 {
-                    consecutiveFailures = 0;
                     LOG_INFO("WebSocket 命令通道已关闭，将重新连接");
                 } else
                 {
-                    ++consecutiveFailures;
-                    LOG_WARN_FMT("WebSocket 命令通道不可用（连续 {} 次）：{}", consecutiveFailures, outcome.error());
-                    if (consecutiveFailures == 3 && !flags.pollingActive)
+                    const bool pollingBefore = flags.fallback.shouldPoll();
+                    flags.fallback.recordConnectFailure();
+                    LOG_WARN_FMT("WebSocket 命令通道不可用（连续 {} 次）：{}", flags.fallback.consecutiveFailures(), outcome.error());
+                    if (!pollingBefore && flags.fallback.shouldPoll())
                     {
-                        flags.pollingActive = true;
                         LOG_WARN("WebSocket 连续失败 3 次，已启用命令轮询兜底");
                     }
                 }
@@ -339,10 +341,8 @@ namespace EdgePulse::Agent
                 {
                     co_return;
                 }
-                const std::size_t backoffIndex =
-                        consecutiveFailures == 0 ? 0 : std::min<std::size_t>(static_cast<std::size_t>(consecutiveFailures - 1), kWebSocketBackoffSeconds.size() - 1);
                 AsynGyanis::Core::Timer timer(loop);
-                co_await timer.waitFor(std::chrono::seconds{kWebSocketBackoffSeconds[backoffIndex]});
+                co_await timer.waitFor(std::chrono::seconds{webSocketReconnectBackoffSeconds(flags.fallback.consecutiveFailures())});
             }
         }
 
@@ -364,7 +364,7 @@ namespace EdgePulse::Agent
                 {
                     co_return;
                 }
-                if (flags.pollingActive && !flags.webSocketConnected)
+                if (flags.fallback.shouldPoll())
                 {
                     co_await dispatcher.pollOnce();
                     const ResultFlush flushed = co_await dispatcher.flushResults();
@@ -386,9 +386,10 @@ namespace EdgePulse::Agent
     void AgentApplication::requestStop()
     {
         m_stopRequested.store(true, std::memory_order_release);
-        if (AsynGyanis::Core::EventLoop *loop = m_loop.load(std::memory_order_acquire); loop != nullptr)
+        const std::lock_guard lock(m_loopMutex);
+        if (m_loop != nullptr)
         {
-            loop->stop();
+            m_loop->stop();
         }
     }
 
@@ -459,7 +460,7 @@ namespace EdgePulse::Agent
 
             RuntimeFlags flags;
             flags.heartbeatIntervalSeconds = m_configuration.heartbeatIntervalSeconds;
-            flags.pollingActive            = !m_configuration.websocketEnabled;
+            flags.fallback                 = WebSocketFallbackState{!m_configuration.websocketEnabled};
 
             std::optional<AsynGyanis::Core::GracefulShutdown> shutdown;
             if (m_consoleMode)
@@ -485,13 +486,19 @@ namespace EdgePulse::Agent
                 loop.scheduler().schedule(frame.handle());
             }
 
-            m_loop.store(&loop, std::memory_order_release);
+            {
+                const std::lock_guard lock(m_loopMutex);
+                m_loop = &loop;
+            }
             if (!m_stopRequested.load(std::memory_order_acquire))
             {
                 LOG_INFO_FMT("Agent 已进入常驻运行，心跳间隔 {} 秒，轮询间隔 {} 秒", flags.heartbeatIntervalSeconds, m_configuration.commandPollIntervalSeconds);
                 loop.run();
             }
-            m_loop.store(nullptr, std::memory_order_release);
+            {
+                const std::lock_guard lock(m_loopMutex);
+                m_loop = nullptr;
+            }
             LOG_INFO("Agent 已停止");
             return 0;
         } catch (const std::exception &failure)

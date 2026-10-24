@@ -299,10 +299,17 @@ namespace EdgePulse::Agent
             const std::string status    = rawStatus == "succeeded" ? "succeeded" : "failed";
             const std::string result    = textField(*payload, "result", "{}");
             const std::string message   = textField(*payload, "message");
-            const auto        posted  = co_await m_client.reportCommandResult(row.commandId, *node, status, result, message);
-            if (!posted.has_value())
+            const ResultPostOutcome posted = co_await m_client.reportCommandResult(row.commandId, *node, status, result, message);
+            if (posted.disposition == ResultPostDisposition::Terminal)
             {
-                LOG_WARN_FMT("命令 {} 的结果上报失败，保留待重试：{}", row.commandId, posted.error());
+                // 终态拒绝不会因重试而改变；保留会永久挡住后续结果并让队列上限丢数据
+                LOG_ERROR_FMT("命令 {} 的结果被服务端以 HTTP {} 拒绝，重试不会改变结论，已从本地队列删除：{}", row.commandId, posted.httpStatus, posted.message);
+                m_state.ackResult(row.id);
+                continue;
+            }
+            if (posted.disposition == ResultPostDisposition::Retryable)
+            {
+                LOG_WARN_FMT("命令 {} 的结果上报失败，保留待重试：{}", row.commandId, posted.message);
                 report.failed = true;
                 co_return report;
             }

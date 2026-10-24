@@ -530,6 +530,125 @@ namespace EdgePulse::Agent
         EXPECT_EQ(2, capture->posts.load(std::memory_order_acquire));
     }
 
+    TEST(AgentCommand, TerminalResultStatusDropsRowAndContinues)
+    {
+        struct Capture
+        {
+            std::mutex               mutex; ///< 保护 paths
+            std::vector<std::string> paths; ///< 收到的结果上报路径
+            std::atomic<int>         posts{0}; ///< 已收到的上报次数
+        };
+        auto capture = std::make_shared<Capture>();
+
+        TestSupport::ServerHarness server(
+                [capture](AsynGyanis::Net::Router &router, EventLoop &)
+                {
+                    router.post("/api/agent/commands/:id/result",
+                                [capture](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> Task<>
+                                {
+                                    const std::string path{request.path()};
+                                    {
+                                        const std::lock_guard lock(capture->mutex);
+                                        capture->paths.push_back(path);
+                                    }
+                                    capture->posts.fetch_add(1, std::memory_order_release);
+                                    if (path.find("/1201/") != std::string::npos)
+                                    {
+                                        response.setStatus(409);
+                                        response.setBody(R"({"code":409,"message":"命令已结束","data":null,"traceId":"trace-result"})");
+                                    } else
+                                    {
+                                        response.setStatus(200);
+                                        response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-result"})");
+                                    }
+                                    co_return;
+                                });
+                });
+
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openState(directory);
+        ASSERT_TRUE(state.has_value()) << state.error();
+        state->enqueueResult(1201, ConfigValue::object({{"status", "succeeded"}, {"result", "{}"}, {"message", "已结束的命令"}}).dump());
+        state->enqueueResult(1202, ConfigValue::object({{"status", "succeeded"}, {"result", "{}"}, {"message", "后续命令"}}).dump());
+
+        AgentLoop         loop;
+        AgentClient       client(loop.loop(), plaintextConfiguration(server.port()), testIdentity());
+        CommandDispatcher dispatcher(client, *state, {});
+        LoopStopGuard     stopGuard{loop};
+
+        const auto report = loop.run(dispatcher.flushResults(), std::chrono::seconds{15}, "终态结果上报");
+        ASSERT_TRUE(report.has_value());
+        EXPECT_EQ(2, capture->posts.load(std::memory_order_acquire)) << "队首被拒绝后仍应继续投递下一条结果";
+        EXPECT_EQ(1U, report->delivered);
+        EXPECT_FALSE(report->failed);
+        EXPECT_TRUE(state->takeResults(10).empty()) << "终态拒绝与成功确认的行都应从队列删除";
+
+        std::vector<std::string> paths;
+        {
+            const std::lock_guard lock(capture->mutex);
+            paths = capture->paths;
+        }
+        ASSERT_EQ(2U, paths.size());
+        EXPECT_NE(std::string::npos, paths[0].find("/1201/"));
+        EXPECT_NE(std::string::npos, paths[1].find("/1202/"));
+    }
+
+    TEST(AgentCommand, WebSocketFallbackKeepsPollingOffBeforeThreeFailures)
+    {
+        WebSocketFallbackState fallback;
+        EXPECT_FALSE(fallback.shouldPoll());
+        EXPECT_EQ(0, fallback.consecutiveFailures());
+
+        fallback.recordConnectFailure();
+        EXPECT_FALSE(fallback.shouldPoll());
+        EXPECT_EQ(1, fallback.consecutiveFailures());
+
+        fallback.recordConnectFailure();
+        EXPECT_FALSE(fallback.shouldPoll());
+        EXPECT_EQ(2, fallback.consecutiveFailures());
+    }
+
+    TEST(AgentCommand, WebSocketFallbackEnablesPollingOnThirdFailure)
+    {
+        WebSocketFallbackState fallback;
+        fallback.recordConnectFailure();
+        fallback.recordConnectFailure();
+        EXPECT_FALSE(fallback.shouldPoll());
+
+        fallback.recordConnectFailure();
+        EXPECT_TRUE(fallback.shouldPoll());
+        EXPECT_EQ(3, fallback.consecutiveFailures());
+    }
+
+    TEST(AgentCommand, WebSocketFallbackConnectedResetsFailuresAndPausesPolling)
+    {
+        WebSocketFallbackState fallback;
+        fallback.recordConnectFailure();
+        fallback.recordConnectFailure();
+        fallback.recordConnectFailure();
+        ASSERT_TRUE(fallback.shouldPoll());
+
+        fallback.recordConnected();
+        EXPECT_FALSE(fallback.shouldPoll());
+        EXPECT_EQ(0, fallback.consecutiveFailures());
+
+        fallback.recordDisconnected();
+        EXPECT_FALSE(fallback.shouldPoll()) << "正常断开后轮询应保持暂停，直到再次连续失败三次";
+    }
+
+    TEST(AgentCommand, WebSocketFallbackBackoffTable)
+    {
+        EXPECT_EQ(1, webSocketReconnectBackoffSeconds(0));
+        EXPECT_EQ(1, webSocketReconnectBackoffSeconds(1));
+        EXPECT_EQ(2, webSocketReconnectBackoffSeconds(2));
+        EXPECT_EQ(5, webSocketReconnectBackoffSeconds(3));
+        EXPECT_EQ(15, webSocketReconnectBackoffSeconds(4));
+        EXPECT_EQ(30, webSocketReconnectBackoffSeconds(5));
+        EXPECT_EQ(60, webSocketReconnectBackoffSeconds(6));
+        EXPECT_EQ(60, webSocketReconnectBackoffSeconds(7));
+        EXPECT_EQ(60, webSocketReconnectBackoffSeconds(100));
+    }
+
     TEST(AgentCommand, WebSocketCommandExecutesOnceAndPostsResult)
     {
         auto capture      = std::make_shared<ResultCapture>();

@@ -12,6 +12,8 @@
 #include "Net/Http/Client/HttpClient.h"
 #include "Net/WebSocket/WebSocketClient.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -25,6 +27,10 @@ namespace EdgePulse::Agent
     namespace
     {
         constexpr std::chrono::seconds kCommandReceiveWait{60}; ///< 等待下一条服务端消息的时限，超时只继续等
+        constexpr int                  kPollingFailureThreshold{3}; ///< 连续失败达到该次数后启用轮询
+
+        /// WebSocket 重连退避，单位为秒；连续失败超过表长后一直使用最后一档
+        constexpr std::array<int, 6> kWebSocketBackoffSeconds{1, 2, 5, 15, 30, 60};
 
         /**
          * @brief 取对象里的字符串字段
@@ -38,6 +44,49 @@ namespace EdgePulse::Agent
             return iterator != value.end() && iterator->is_string() ? iterator->get<std::string>() : std::string{};
         }
     } // namespace
+
+    int webSocketReconnectBackoffSeconds(const int consecutiveFailures)
+    {
+        const std::size_t index =
+                consecutiveFailures <= 1 ? 0 : std::min<std::size_t>(static_cast<std::size_t>(consecutiveFailures - 1), kWebSocketBackoffSeconds.size() - 1);
+        return kWebSocketBackoffSeconds[index];
+    }
+
+    WebSocketFallbackState::WebSocketFallbackState(const bool pollingInitiallyActive) : m_pollingActive(pollingInitiallyActive)
+    {
+    }
+
+    void WebSocketFallbackState::recordConnected()
+    {
+        m_connected           = true;
+        m_pollingActive       = false;
+        m_consecutiveFailures = 0;
+    }
+
+    void WebSocketFallbackState::recordDisconnected()
+    {
+        m_connected = false;
+    }
+
+    void WebSocketFallbackState::recordConnectFailure()
+    {
+        m_connected = false;
+        ++m_consecutiveFailures;
+        if (m_consecutiveFailures >= kPollingFailureThreshold)
+        {
+            m_pollingActive = true;
+        }
+    }
+
+    bool WebSocketFallbackState::shouldPoll() const
+    {
+        return m_pollingActive && !m_connected;
+    }
+
+    int WebSocketFallbackState::consecutiveFailures() const
+    {
+        return m_consecutiveFailures;
+    }
 
     AgentWebSocket::AgentWebSocket(AsynGyanis::Core::EventLoop &loop, const AgentConfiguration &configuration) :
         m_loop(loop), m_handshakeTimeout(std::chrono::seconds{configuration.requestTimeoutSeconds > 0 ? configuration.requestTimeoutSeconds : 30})
