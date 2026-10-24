@@ -1,0 +1,19 @@
+[Unit]
+Description=EdgePulse Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/edgepulse-agent --config /etc/edgepulse-agent/agent.yaml --console
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/etc/edgepulse-agent/agent.env
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/edgepulse-agent /var/log/edgepulse-agent /etc/edgepulse-agent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

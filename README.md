@@ -19,6 +19,7 @@
 - [安全模型](#安全模型)
 - [测试与验收](#测试与验收)
 - [部署](#部署)
+- [Agent](#agent)
 - [项目结构](#项目结构)
 - [Roadmap](#roadmap)
 - [贡献](#贡献)
@@ -275,6 +276,32 @@ python scripts/check-docker-stack.py --build
 
 备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。完整步骤见 [docs/部署.md](docs/部署.md)。
 
+## Agent
+
+`edgepulse-agent` 是边缘节点上的数据面进程，通过 9443 mTLS 接入控制面。Linux 发行包包含二进制、systemd 单元、安装/卸载脚本与配置模板，包内 `manifest.json` 逐文件记录 SHA-256。
+
+节点侧准备：
+
+- 节点证书、私钥与 CA 默认读取 `/etc/edgepulse/agent.pem`、`/etc/edgepulse/agent-key.pem` 与 `/etc/edgepulse/ca.pem`，私钥权限保持 0600。开发环境可先运行 `bash scripts/dev-certs.sh`，再用 `bash scripts/gen-agent-certs.sh <节点名>` 为单个节点签发证书。
+- 在控制台签发一次性的 `enroll` 令牌（已有节点更换证书时签发 `rebind`），安装后写入 `/etc/edgepulse-agent/agent.env`，例如 `EDGEPULSE_AGENT_ENROLLMENT_TOKEN=...`。令牌只从环境变量读取，不写 YAML、不写日志。
+
+安装与卸载：
+
+```bash
+# 在 Linux 上构建 Release 并打包；也可用 --binary 指定已有二进制
+bash scripts/package-agent.sh --version 1.0.0
+
+tar -xzf build/agent-package/edgepulse-agent-1.0.0-linux-x86_64.tar.gz -C /tmp/edgepulse-agent
+sudo /tmp/edgepulse-agent/install-agent.sh
+# 安装器写入 /usr/local/bin/edgepulse-agent 与 systemd 单元，创建配置、状态与日志目录并启动服务；
+# 已有 agent.yaml、agent.env 不会被覆盖。只安装不启动时加 --no-start。
+
+sudo /tmp/edgepulse-agent/uninstall-agent.sh          # 保留配置、状态与日志
+sudo /tmp/edgepulse-agent/uninstall-agent.sh --purge  # 一并删除
+```
+
+默认路径为配置 `/etc/edgepulse-agent`、状态 `/var/lib/edgepulse-agent`、日志 `/var/log/edgepulse-agent`；`--prefix`、`--config-dir`、`--state-dir`、`--log-dir` 可整体改到自定义位置，单元里的 `ExecStart`、`EnvironmentFile` 与 `ReadWritePaths` 会同步替换。运行状态看 `systemctl status edgepulse-agent`，日志看 `journalctl -u edgepulse-agent -f`，完整步骤见 [docs/部署.md](docs/部署.md#13-agentlinux)。
+
 ## 项目结构
 
 ```text
@@ -284,7 +311,7 @@ src/
 ├─ Plugins/    功能插件：认证、系统、监控、工作台、设备、遥测、告警、固件、命令、运维
 ├─ App/        配置、生命周期、监听器与工作线程装配
 └─ Main/       进程入口
-agent/        生产 Agent 源码（配置、日志与状态骨架）
+agent/        生产 Agent 源码与 Linux 打包脚本
 frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
 3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
 migrations/    SQL 迁移 V1–V18，已应用文件不可修改
@@ -297,7 +324,7 @@ docs/          架构、API、部署、验收与覆盖率
 .github/       CI 工作流、Issue 与 PR 模板
 ```
 
-生产 Agent 入口是 `bin/edgepulse-agent`（P6 建设中，当前只有配置、日志与状态目录骨架）；`samples/DeviceAgent` 是协议探针。
+生产 Agent 入口是 `bin/edgepulse-agent`；Linux systemd 单元与安装包见上文 Agent 一节，`samples/DeviceAgent` 是协议探针。
 
 ## Roadmap
 
