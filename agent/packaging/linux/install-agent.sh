@@ -254,9 +254,25 @@ run_upgrade() {
     [[ -n "${upgrade_version}" ]] || rollback_upgrade "manifest.json 缺少 version"
     [[ "${upgrade_version}" =~ ^[0-9]+(\.[0-9]+)*([-+][0-9A-Za-z.-]+)?$ ]] || rollback_upgrade "manifest.json 的 version 不合法：${upgrade_version}"
 
+    # 平台名沿用打包脚本的映射：升级包由目标机自身架构打出，比较前先把 uname -m 归一
+    local machine architecture expected_platform
+    machine="$(uname -m)"
+    case "${machine}" in
+        x86_64|amd64)
+            architecture="x86_64"
+            ;;
+        aarch64|arm64)
+            architecture="aarch64"
+            ;;
+        *)
+            architecture="${machine}"
+            ;;
+    esac
+    expected_platform="linux-${architecture}"
+
     local platform
     platform="$(sed -n 's/.*"platform"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${extraction_dir}/manifest.json" | head -n 1)"
-    [[ "${platform}" == "linux-x86_64" ]] || rollback_upgrade "manifest.json 的 platform 不是 linux-x86_64：${platform:-缺失}"
+    [[ "${platform}" == "${expected_platform}" ]] || rollback_upgrade "manifest.json 的 platform 不是 ${expected_platform}：${platform:-缺失}"
 
     grep -Eq '^[0-9a-fA-F]{64}[[:space:]]+\*?edgepulse-agent$' "${extraction_dir}/checksums.sha256" ||
         rollback_upgrade "checksums.sha256 没有覆盖 edgepulse-agent"
@@ -267,7 +283,7 @@ run_upgrade() {
     upgrade_binary="${prefix}/bin/edgepulse-agent"
     upgrade_backup="${upgrade_binary}.previous"
     [[ -f "${upgrade_binary}" ]] || rollback_upgrade "找不到现有二进制 ${upgrade_binary}"
-    # 旧标记必须在启动新版本之前清掉；清理失败时服务尚未停止，直接结束即可
+    # 旧标记必须在启动新版本之前清掉；清理失败时不替换二进制，由 abort_before_replace 保证旧服务仍在运行
     if ! rm -f -- "${state_dir}/update-health" "${state_dir}/update-rollback"; then
         abort_before_replace "无法删除旧的升级健康标记或回滚标记"
     fi
