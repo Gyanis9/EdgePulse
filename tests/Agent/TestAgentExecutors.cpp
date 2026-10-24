@@ -534,11 +534,14 @@ namespace EdgePulse::Agent
 
     TEST(AgentExecutors, ProcessRunnerKillsOnTimeout)
     {
-        const auto             started = std::chrono::steady_clock::now();
-        const ProcessRunResult result  = runProcess(std::filesystem::path{EDGEPULSE_AGENT_TEST_HOOK_PATH}, {"--sleep", "5000"}, std::chrono::milliseconds{100});
+        const ScopedEnvironmentVariable output("EDGEPULSE_AGENT_TEST_HOOK_OUTPUT", "hook-timeout-marker");
+        const auto                      started = std::chrono::steady_clock::now();
+        const ProcessRunResult result = runProcess(std::filesystem::path{EDGEPULSE_AGENT_TEST_HOOK_PATH}, {"--sleep", "5000"}, std::chrono::milliseconds{100});
         const auto             elapsed = std::chrono::steady_clock::now() - started;
         EXPECT_TRUE(result.timedOut);
         EXPECT_FALSE(result.succeeded());
+        EXPECT_NE(std::string::npos, result.failure.find("hook-timeout-marker")) << "超时也要带上已捕获的输出尾巴：" << result.failure;
+        EXPECT_LE(result.failure.size(), 640U) << "失败原因只带 512 字节输出尾巴，不能透传整段输出";
         EXPECT_LT(elapsed, std::chrono::seconds{3});
     }
 

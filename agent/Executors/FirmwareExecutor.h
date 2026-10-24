@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -73,11 +74,21 @@ namespace EdgePulse::Agent
         };
 
         /**
+         * @brief 正文校验失败的详情
+         * @details 固件标识最先解析；后续字段失败时仍带上它，便于把 failed 回报到对应任务。
+         */
+        struct PayloadFailure
+        {
+            std::optional<std::int64_t> firmwareId; ///< 已读出的固件标识；缺失或不合法时为空
+            std::string                 message;    ///< 中文原因
+        };
+
+        /**
          * @brief 解析并校验命令正文
          * @param payload 服务端给出的 JSON 文本
-         * @return 成功返回校验后的正文；失败返回中文原因
+         * @return 成功返回校验后的正文；失败返回中文原因，能识别出固件标识时一并带回
          */
-        [[nodiscard]] std::expected<FirmwarePayload, std::string> parsePayload(std::string_view payload) const;
+        [[nodiscard]] std::expected<FirmwarePayload, PayloadFailure> parsePayload(std::string_view payload) const;
 
         /**
          * @brief 取暂存文件路径

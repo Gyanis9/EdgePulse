@@ -345,76 +345,76 @@ namespace EdgePulse::Agent
         return type == "firmware.update";
     }
 
-    std::expected<FirmwareExecutor::FirmwarePayload, std::string> FirmwareExecutor::parsePayload(const std::string_view payload) const
+    std::expected<FirmwareExecutor::FirmwarePayload, FirmwareExecutor::PayloadFailure> FirmwareExecutor::parsePayload(const std::string_view payload) const
     {
         const auto parsed = AsynGyanis::Base::parseConfigValue(payload);
         if (!parsed.has_value() || !parsed->is_object())
         {
-            return std::unexpected("firmware.update 的 payload 不是 JSON 对象");
+            return std::unexpected(PayloadFailure{std::nullopt, "firmware.update 的 payload 不是 JSON 对象"});
         }
 
         FirmwarePayload firmware;
         const auto      firmwareId = requiredPositiveInteger(*parsed, "firmwareId", "firmwareId");
         if (!firmwareId.has_value())
         {
-            return std::unexpected(firmwareId.error());
+            return std::unexpected(PayloadFailure{std::nullopt, firmwareId.error()});
         }
         firmware.firmwareId = *firmwareId;
 
         auto version = requiredString(*parsed, "version", "version");
         if (!version.has_value())
         {
-            return std::unexpected(version.error());
+            return std::unexpected(PayloadFailure{firmware.firmwareId, version.error()});
         }
         firmware.version = std::move(*version);
 
         auto sha256 = requiredString(*parsed, "sha256", "sha256");
         if (!sha256.has_value())
         {
-            return std::unexpected(sha256.error());
+            return std::unexpected(PayloadFailure{firmware.firmwareId, sha256.error()});
         }
         if (!isSha256Hex(*sha256))
         {
-            return std::unexpected("firmware.update 的 sha256 不是 64 个十六进制字符");
+            return std::unexpected(PayloadFailure{firmware.firmwareId, "firmware.update 的 sha256 不是 64 个十六进制字符"});
         }
         firmware.sha256 = lowerHex(*sha256);
 
         const auto sizeBytes = requiredPositiveInteger(*parsed, "sizeBytes", "sizeBytes");
         if (!sizeBytes.has_value())
         {
-            return std::unexpected(sizeBytes.error());
+            return std::unexpected(PayloadFailure{firmware.firmwareId, sizeBytes.error()});
         }
         firmware.sizeBytes = static_cast<std::uint64_t>(*sizeBytes);
 
         auto downloadPath = requiredString(*parsed, "downloadPath", "downloadPath");
         if (!downloadPath.has_value())
         {
-            return std::unexpected(downloadPath.error());
+            return std::unexpected(PayloadFailure{firmware.firmwareId, downloadPath.error()});
         }
         firmware.downloadPath = std::move(*downloadPath);
 
         auto signature = requiredString(*parsed, "signature", "signature");
         if (!signature.has_value())
         {
-            return std::unexpected(signature.error());
+            return std::unexpected(PayloadFailure{firmware.firmwareId, signature.error()});
         }
         firmware.signature = std::move(*signature);
 
         auto signingKeyId = requiredString(*parsed, "signingKeyId", "signingKeyId");
         if (!signingKeyId.has_value())
         {
-            return std::unexpected(signingKeyId.error());
+            return std::unexpected(PayloadFailure{firmware.firmwareId, signingKeyId.error()});
         }
         firmware.signingKeyId = std::move(*signingKeyId);
 
         auto algorithm = requiredString(*parsed, "signatureAlgorithm", "signatureAlgorithm");
         if (!algorithm.has_value())
         {
-            return std::unexpected(algorithm.error());
+            return std::unexpected(PayloadFailure{firmware.firmwareId, algorithm.error()});
         }
         if (*algorithm != "ed25519-sha256")
         {
-            return std::unexpected("firmware.update 的 signatureAlgorithm 只支持 ed25519-sha256，收到 " + *algorithm);
+            return std::unexpected(PayloadFailure{firmware.firmwareId, "firmware.update 的 signatureAlgorithm 只支持 ed25519-sha256，收到 " + *algorithm});
         }
         return firmware;
     }
@@ -452,7 +452,15 @@ namespace EdgePulse::Agent
         const auto parsed = parsePayload(command.payload);
         if (!parsed.has_value())
         {
-            co_return CommandResult{false, "{}", parsed.error()};
+            const PayloadFailure &failure = parsed.error();
+            if (failure.firmwareId.has_value())
+            {
+                co_await reportStatus(*failure.firmwareId, "failed", 100, failure.message);
+            } else
+            {
+                LOG_WARN_FMT("firmware.update 的 payload 没有可用的 firmwareId，无法上报 failed：{}", failure.message);
+            }
+            co_return CommandResult{false, "{}", failure.message};
         }
         const FirmwarePayload &payload = *parsed;
 

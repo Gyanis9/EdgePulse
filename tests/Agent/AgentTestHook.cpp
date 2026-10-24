@@ -71,6 +71,12 @@ int main(const int argc, char **argv)
         return 2;
     }
 
+    const std::string startupOutput = environmentValue("EDGEPULSE_AGENT_TEST_HOOK_OUTPUT");
+    if (!startupOutput.empty())
+    {
+        std::cout << startupOutput << std::endl;
+    }
+
     if (environmentValue("EDGEPULSE_AGENT_TEST_HOOK_REPLACE_WITH_DIRECTORY") == "1" && !arguments.empty())
     {
         std::error_code error;

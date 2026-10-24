@@ -62,21 +62,23 @@ namespace EdgePulse::Agent
         }
 
         /**
-         * @brief 按退出码与超时状态生成中文失败原因
+         * @brief 按超时状态与退出码生成中文失败原因
          * @param result 已填好退出码与输出
+         * @param timeout 等待上限
+         * @note 超时与非零退出都附加输出末尾最多 512 字节，便于定位钩子卡在哪里
          */
         void fillFailure(ProcessRunResult &result, const std::chrono::milliseconds timeout)
         {
             if (result.timedOut)
             {
                 result.failure = "外部程序在 " + std::to_string(timeout.count()) + " 毫秒内未结束，已被强制终止";
-                return;
-            }
-            if (result.exitCode == 0)
+            } else if (result.exitCode == 0)
             {
                 return;
+            } else
+            {
+                result.failure = "外部程序以退出码 " + std::to_string(result.exitCode) + " 结束";
             }
-            result.failure = "外部程序以退出码 " + std::to_string(result.exitCode) + " 结束";
             const std::string tail = outputTail(result.output);
             if (!tail.empty())
             {

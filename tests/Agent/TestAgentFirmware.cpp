@@ -474,12 +474,24 @@ namespace EdgePulse::Agent
         const CommandResult unsignedResult = harness.execute(unsignedPayload);
         EXPECT_FALSE(unsignedResult.succeeded);
         EXPECT_NE(std::string::npos, unsignedResult.message.find("signature")) << unsignedResult.message;
+        const std::vector<FirmwareStatusReport> unsignedReports = harness.statusReports();
+        ASSERT_EQ(1U, unsignedReports.size()) << "正文校验失败也必须上报 failed";
+        EXPECT_EQ("failed", unsignedReports[0].status);
+        EXPECT_EQ(100, unsignedReports[0].progress);
+        EXPECT_EQ(77, unsignedReports[0].nodeId);
+        EXPECT_NE(std::string::npos, unsignedReports[0].message.find("signature")) << unsignedReports[0].message;
 
         const std::string algorithmPayload =
                 firmwarePayload(digest, static_cast<std::int64_t>(firmwareBytes.size()), key->signDigest(digest), "prod-2026", "rsa-sha256").dump();
         const CommandResult algorithmResult = harness.execute(algorithmPayload);
         EXPECT_FALSE(algorithmResult.succeeded);
         EXPECT_NE(std::string::npos, algorithmResult.message.find("ed25519-sha256")) << algorithmResult.message;
+        const std::vector<FirmwareStatusReport> algorithmReports = harness.statusReports();
+        ASSERT_EQ(2U, algorithmReports.size()) << "每次正文校验失败都各上报一条 failed";
+        EXPECT_EQ("failed", algorithmReports[1].status);
+        EXPECT_EQ(100, algorithmReports[1].progress);
+        EXPECT_EQ(77, algorithmReports[1].nodeId);
+        EXPECT_NE(std::string::npos, algorithmReports[1].message.find("ed25519-sha256")) << algorithmReports[1].message;
 
         EXPECT_EQ(0, harness.downloads()) << "正文不合法时不得发起下载";
         EXPECT_FALSE(std::filesystem::exists(harness.hookMarkerPath()));
