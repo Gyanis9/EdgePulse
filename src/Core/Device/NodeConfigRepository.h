@@ -118,7 +118,7 @@ namespace EdgePulse::Device
          * @param note 修订说明
          * @param operatorId 写人人标识
          * @return 成功返回新影子；版本冲突或并发锁在重试后仍失败返回 VersionConflict，节点不可见返回 NotFound
-         * @note 读版本、写入、记修订与清理窗口外旧修订在同一事务里完成；整段事务在可重试的 SQL 并发失败后最多重来一次
+         * @note 读版本、写入、记修订与清理窗口外旧修订在同一事务里完成；整段事务在可重试的 SQL 并发失败后最多尝试三次
          * @note 保留窗口是含最新版本在内的最近 100 条修订，更早的版本在同一事务里删除
          */
         AsynGyanis::Core::Task<std::expected<NodeConfigRecord, NodeConfigFailure>> applyDesired(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string contentJson,
@@ -136,6 +136,7 @@ namespace EdgePulse::Device
          * @param message 上报说明，最长 255 字节；空串表示本次没有说明
          * @return 成功返回新影子；节点或配置行不存在返回 NotFound
          * @note hash 由服务端按内容重算，仓储只接受已经规范化的内容
+         * @note 整段事务在可重试的 SQL 并发失败后最多尝试三次，重试用尽时把最后一次失败抛出
          */
         AsynGyanis::Core::Task<std::expected<NodeConfigRecord, NodeConfigFailure>> report(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::int64_t version,
                                                                                           std::string contentJson, std::string contentHash, std::string status,

@@ -32,10 +32,10 @@ namespace EdgePulse::Device
 
         /// 修订保留窗口：每个节点只保留最新该数量的修订
         constexpr std::int64_t kRevisionRetentionWindow = 100;
-        /// 整段写入在可重试的 SQL 并发失败后最多尝试几次
-        constexpr int kApplyDesiredAttempts = 2;
+        /// 整段配置写入在可重试的 SQL 并发失败后最多尝试几次
+        constexpr int kConfigWriteAttempts = 3;
         /// 两次尝试之间的退避，只在工作线程上等
-        constexpr std::chrono::milliseconds kApplyDesiredBackoff{2};
+        constexpr std::chrono::milliseconds kConfigWriteBackoff{2};
 
         /**
          * @brief 回滚当前事务；回滚本身失败时不让它盖过真正的失败原因
@@ -167,7 +167,7 @@ namespace EdgePulse::Device
                 [nodeId, contentJson = std::move(contentJson), contentHash = std::move(contentHash), expectedVersion, note = std::move(note), operatorId,
                  tenant = m_tenant](DatabaseConnection &connection) -> std::expected<NodeConfigRecord, NodeConfigFailure>
                 {
-                    for (int attempt = 0; attempt < kApplyDesiredAttempts; ++attempt)
+                    for (int attempt = 0; attempt < kConfigWriteAttempts; ++attempt)
                     {
                         try
                         {
@@ -251,10 +251,10 @@ namespace EdgePulse::Device
                             {
                                 throw;
                             }
-                            if (attempt + 1 < kApplyDesiredAttempts)
+                            if (attempt + 1 < kConfigWriteAttempts)
                             {
                                 // 工作线程上的短暂退避，避开另一条写入刚拿到的写锁；不能在事件循环线程上睡
-                                std::this_thread::sleep_for(kApplyDesiredBackoff);
+                                std::this_thread::sleep_for(kConfigWriteBackoff);
                                 continue;
                             }
                             // 重试用尽：两个写入者都没能推进版本，按冲突收口让 HTTP 回 409 而不是 500
@@ -279,51 +279,71 @@ namespace EdgePulse::Device
                 [nodeId, version, contentJson = std::move(contentJson), contentHash = std::move(contentHash), status = std::move(status), message = std::move(message),
                  tenant = m_tenant](DatabaseConnection &connection) -> std::expected<NodeConfigRecord, NodeConfigFailure>
                 {
-                    try
+                    for (int attempt = 0; attempt < kConfigWriteAttempts; ++attempt)
                     {
-                        Sql::executeOrThrowVoid(connection, "BEGIN");
-                        const std::optional<std::int64_t> nodeTenant = findNodeTenantOnConnection(connection, nodeId, tenant);
-                        if (!nodeTenant.has_value())
+                        try
+                        {
+                            Sql::executeOrThrowVoid(connection, "BEGIN");
+                            const std::optional<std::int64_t> nodeTenant = findNodeTenantOnConnection(connection, nodeId, tenant);
+                            if (!nodeTenant.has_value())
+                            {
+                                rollbackQuietly(connection);
+                                return std::unexpected(NodeConfigFailure::NotFound);
+                            }
+                            const System::TenantScope ownerScope{*nodeTenant, false};
+                            const auto                existing = Sql::executeOrThrow(connection, "SELECT node_id FROM biz_node_config WHERE node_id = ? AND tenant_id = ?",
+                                                                                     std::vector<DatabaseValue>{nodeId, *nodeTenant});
+                            if (!existing->next())
+                            {
+                                rollbackQuietly(connection);
+                                return std::unexpected(NodeConfigFailure::NotFound);
+                            }
+                            const std::string now = Common::nowDateTimeUtc();
+                            if (contentJson.empty())
+                            {
+                                // 失败上报通常不带内容：保留上次上报正文与摘要，只推进状态与说明
+                                Sql::executeOrThrowVoid(connection,
+                                                        "UPDATE biz_node_config SET reported_version = ?, reported_status = ?, reported_message = ?, reported_at = ? "
+                                                        "WHERE node_id = ? AND tenant_id = ?",
+                                                        std::vector<DatabaseValue>{version, status, message, now, nodeId, *nodeTenant});
+                            } else
+                            {
+                                Sql::executeOrThrowVoid(connection,
+                                                        "UPDATE biz_node_config SET reported_json = ?, reported_version = ?, reported_hash = ?, reported_status = ?, "
+                                                        "reported_message = ?, reported_at = ? WHERE node_id = ? AND tenant_id = ?",
+                                                        std::vector<DatabaseValue>{contentJson, version, contentHash, status, message, now, nodeId, *nodeTenant});
+                            }
+                            const std::optional<NodeConfigRecord> record = findConfigOnConnection(connection, nodeId, ownerScope);
+                            if (!record.has_value())
+                            {
+                                rollbackQuietly(connection);
+                                throw Common::DatabaseException("配置上报后读回失败：节点 " + std::to_string(nodeId));
+                            }
+                            Sql::executeOrThrowVoid(connection, "COMMIT");
+                            return *record;
+                        } catch (const Common::DatabaseException &failure)
                         {
                             rollbackQuietly(connection);
-                            return std::unexpected(NodeConfigFailure::NotFound);
-                        }
-                        const System::TenantScope ownerScope{*nodeTenant, false};
-                        const auto                existing = Sql::executeOrThrow(connection, "SELECT node_id FROM biz_node_config WHERE node_id = ? AND tenant_id = ?",
-                                                                                 std::vector<DatabaseValue>{nodeId, *nodeTenant});
-                        if (!existing->next())
+                            if (!Sql::isRetryableSqlFailure(failure.what()))
+                            {
+                                throw;
+                            }
+                            if (attempt + 1 < kConfigWriteAttempts)
+                            {
+                                // 工作线程上的短暂退避，避开另一条写入刚拿到的写锁；不能在事件循环线程上睡
+                                std::this_thread::sleep_for(kConfigWriteBackoff);
+                                continue;
+                            }
+                            // 上报没有版本前置条件可以收口，重试用尽时把最后一次并发失败交回上层
+                            throw;
+                        } catch (...)
                         {
                             rollbackQuietly(connection);
-                            return std::unexpected(NodeConfigFailure::NotFound);
+                            throw;
                         }
-                        const std::string now = Common::nowDateTimeUtc();
-                        if (contentJson.empty())
-                        {
-                            // 失败上报通常不带内容：保留上次上报正文与摘要，只推进状态与说明
-                            Sql::executeOrThrowVoid(connection,
-                                                    "UPDATE biz_node_config SET reported_version = ?, reported_status = ?, reported_message = ?, reported_at = ? "
-                                                    "WHERE node_id = ? AND tenant_id = ?",
-                                                    std::vector<DatabaseValue>{version, status, message, now, nodeId, *nodeTenant});
-                        } else
-                        {
-                            Sql::executeOrThrowVoid(connection,
-                                                    "UPDATE biz_node_config SET reported_json = ?, reported_version = ?, reported_hash = ?, reported_status = ?, "
-                                                    "reported_message = ?, reported_at = ? WHERE node_id = ? AND tenant_id = ?",
-                                                    std::vector<DatabaseValue>{contentJson, version, contentHash, status, message, now, nodeId, *nodeTenant});
-                        }
-                        const std::optional<NodeConfigRecord> record = findConfigOnConnection(connection, nodeId, ownerScope);
-                        if (!record.has_value())
-                        {
-                            rollbackQuietly(connection);
-                            throw Common::DatabaseException("配置上报后读回失败：节点 " + std::to_string(nodeId));
-                        }
-                        Sql::executeOrThrowVoid(connection, "COMMIT");
-                        return *record;
-                    } catch (...)
-                    {
-                        rollbackQuietly(connection);
-                        throw;
                     }
+                    // 循环体要么返回，要么在最后一次失败后抛出；这里只兜住理论上的落空
+                    throw Common::DatabaseException("配置上报重试未产生结果：节点 " + std::to_string(nodeId));
                 });
     }
 

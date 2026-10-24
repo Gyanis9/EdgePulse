@@ -9,6 +9,8 @@
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 
+#include <Core/Crypto/Digest.h>
+
 #include <gtest/gtest.h>
 
 #include <barrier>
@@ -361,6 +363,96 @@ TEST(NodeConfig, ConcurrentAppliesReturnConflictInsteadOfThrowing)
     EXPECT_EQ(1, scalarOf(*connection, "SELECT COUNT(*) AS total FROM biz_node_config WHERE node_id = " + std::to_string(node.id)));
     EXPECT_EQ(1, scalarOf(*connection, "SELECT COUNT(*) AS total FROM biz_node_config_revision WHERE node_id = " + std::to_string(node.id)));
     EXPECT_EQ(1, scalarOf(*connection, "SELECT MAX(version) AS total FROM biz_node_config_revision WHERE node_id = " + std::to_string(node.id)));
+}
+
+// 钉住：两条连接并发上报同一节点同一版本时都不抛，最终行保持单一完整的已应用状态
+TEST(NodeConfig, ConcurrentReportsKeepAppliedRowConsistent)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    auto                                    nodes = std::make_shared<EdgePulse::Device::NodeRepository>(context.database);
+    auto                                    repoA = std::make_shared<EdgePulse::Device::NodeConfigRepository>(context.database);
+    auto                                    repoB = std::make_shared<EdgePulse::Device::NodeConfigRepository>(context.database);
+    EdgePulse::TestSupport::EventLoopRunner runnerA;
+    EdgePulse::TestSupport::EventLoopRunner runnerB;
+
+    const auto        node    = runnerA.run(nodes->create(runnerA.loop(), "config-report-race-node", "{}"));
+    const std::string content = R"({"interval":30})";
+    const std::string hash    = AsynGyanis::Core::Digest::sha256Hex(content);
+    const auto        applied = runnerA.run(repoA->applyDesired(runnerA.loop(), node.id, content, hash, 0, "", 1));
+    ASSERT_TRUE(applied.has_value()) << static_cast<int>(applied.error());
+
+    using ReportResult   = std::expected<EdgePulse::Device::NodeConfigRecord, EdgePulse::Device::NodeConfigFailure>;
+    using OptionalResult = std::optional<ReportResult>;
+    OptionalResult     resultA;
+    OptionalResult     resultB;
+    std::exception_ptr failureA;
+    std::exception_ptr failureB;
+
+    // 两条线程都到齐后才发起上报；SQLite 可能把两笔写事务串行化，用例不强制制造 busy，
+    // 但无论串行还是交错，最终行都必须是完整的一次上报，不能出现版本、状态与正文来自不同事务的混合
+    std::barrier barrier{2};
+    const auto   worker = [&barrier, nodeId = node.id, content, hash](EdgePulse::TestSupport::EventLoopRunner &runner, EdgePulse::Device::NodeConfigRepository &repository,
+                                                                      OptionalResult &result, std::exception_ptr &failure)
+    {
+        barrier.arrive_and_wait();
+        try
+        {
+            result = runner.run(repository.report(runner.loop(), nodeId, 1, content, hash, "applied", ""));
+        } catch (...)
+        {
+            failure = std::current_exception();
+        }
+    };
+    std::thread threadA(worker, std::ref(runnerA), std::ref(*repoA), std::ref(resultA), std::ref(failureA));
+    std::thread threadB(worker, std::ref(runnerB), std::ref(*repoB), std::ref(resultB), std::ref(failureB));
+    threadA.join();
+    threadB.join();
+
+    for (const std::exception_ptr &failure: {failureA, failureB})
+    {
+        if (failure != nullptr)
+        {
+            try
+            {
+                std::rethrow_exception(failure);
+            } catch (const std::exception &error)
+            {
+                FAIL() << "并发上报抛出异常，busy 必须在重试预算内消化：" << error.what();
+            } catch (...)
+            {
+                FAIL() << "并发上报抛出未知异常";
+            }
+        }
+    }
+    ASSERT_TRUE(resultA.has_value());
+    ASSERT_TRUE(resultB.has_value());
+
+    for (const OptionalResult *result: {&resultA, &resultB})
+    {
+        ASSERT_TRUE(result->has_value());
+        ASSERT_TRUE(result->value().has_value());
+        const EdgePulse::Device::NodeConfigRecord &record = result->value().value();
+        EXPECT_EQ(1, record.reportedVersion);
+        EXPECT_EQ("applied", record.reportedStatus);
+        EXPECT_EQ(content, record.reportedJson);
+        EXPECT_EQ(hash, record.reportedHash);
+        EXPECT_TRUE(record.inSync);
+    }
+
+    // 两笔事务都结束后再读一次：行里不能残留任何一半的上报
+    const auto finalRecord = runnerA.run(repoA->find(runnerA.loop(), node.id));
+    ASSERT_TRUE(finalRecord.has_value());
+    EXPECT_EQ(1, finalRecord->reportedVersion);
+    EXPECT_EQ("applied", finalRecord->reportedStatus);
+    EXPECT_EQ(content, finalRecord->reportedJson);
+    EXPECT_EQ(hash, finalRecord->reportedHash);
+    EXPECT_TRUE(finalRecord->reportedMessage.empty());
+    EXPECT_TRUE(finalRecord->inSync);
+
+    const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+    const std::string                                               nodeFilter = " WHERE node_id = " + std::to_string(node.id);
+    EXPECT_EQ(1, scalarOf(*connection, "SELECT COUNT(*) AS total FROM biz_node_config" + nodeFilter));
+    EXPECT_EQ(1, scalarOf(*connection, "SELECT COUNT(*) AS total FROM biz_node_config" + nodeFilter + " AND reported_version = 1 AND reported_status = 'applied'"));
 }
 
 // 钉住：配置已提交后命令创建或通知失败只记日志，接口仍返回已生效的配置
