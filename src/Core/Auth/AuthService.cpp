@@ -111,8 +111,12 @@ namespace EdgePulse::Auth
         // 锁定已过期但失败窗口更短时，计数可能仍停在阈值上；先清零，避免下一次输错立刻把账号重新锁上
         if (!user->lockedUntil.empty())
         {
-            // 并发成功登录可能已经清过计数，MySQL 把「值未变化」计为 0 行；返回 false 不代表清除失败
-            static_cast<void>(co_await m_users.scoped({tenantId, false})->clearLoginFailures(loop, user->id));
+            // 数据库按匹配行数（found-rows）计影响行：即使三个字段本来已是 0/NULL 也照样命中；
+            // 返回 false 只说明用户行已不匹配，例如期间被并发软删除
+            if (!co_await m_users.scoped({tenantId, false})->clearLoginFailures(loop, user->id))
+            {
+                LOG_WARN_FMT("清零过期锁定未命中用户：user={} id={}", user->username, user->id);
+            }
         }
 
         // PBKDF2 是 CPU 密集操作，放到工作线程，避免 210000 次迭代占住事件循环
@@ -135,7 +139,8 @@ namespace EdgePulse::Auth
             // 成功登录同时清空按账号与按 IP 的失败计数，避免此前几次输错影响后续正常使用
             if (!co_await m_users.scoped({user->tenantId, false})->clearLoginFailures(loop, user->id))
             {
-                LOG_WARN_FMT("登录失败计数未清空：user={}", user->username);
+                // 命中失败只可能是用户行已不匹配（例如并发软删除）；本次登录仍然成立，但要在日志里留痕
+                LOG_WARN_FMT("登录后清零失败计数未命中用户：user={} id={}", user->username, user->id);
             }
             static_cast<void>(co_await m_cache->erase(loop, failureKey));
         }

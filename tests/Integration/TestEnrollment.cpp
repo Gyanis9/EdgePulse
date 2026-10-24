@@ -219,6 +219,16 @@ TEST(Enrollment, LiveCrossTenantNameReportsNameConflict)
     const auto rejected                        = runner.run(nodes->upsertAgent(runner.loop(), conflicting));
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(EdgePulse::Device::AgentUpsertFailure::NameConflict, rejected.error());
+
+    // 经注册表返回时文案要能指导改名或清理，不能退化成「稍后重试」的并发冲突
+    EdgePulse::Device::AgentRegistry     registry(nodes, {});
+    EdgePulse::Device::AgentRegistration fromOtherTenant{"edge-cross-tenant", "1.0.0", std::string(64, 'f'), "{}"};
+    fromOtherTenant.tenantId = 2;
+    const auto rejectedByRegistry = runner.run(registry.registerAgent(runner.loop(), fromOtherTenant));
+    ASSERT_FALSE(rejectedByRegistry.has_value());
+    EXPECT_EQ(EdgePulse::Device::AgentError::Reason::Conflict, rejectedByRegistry.error().reason);
+    EXPECT_EQ("节点名已被其他租户或已删除节点占用，请改名或联系管理员清理", rejectedByRegistry.error().message);
+    EXPECT_EQ(std::string::npos, rejectedByRegistry.error().message.find("并发"));
 }
 
 // 钉住：enroll/rebind 由仓储在事务内判定；调用方给的旧快照不能当放行依据，吊销节点必须重新持令牌
@@ -279,7 +289,10 @@ TEST(Enrollment, TransactionOwnsEnrollRebindDecision)
     EXPECT_EQ("offline", afterDenial->status);
 }
 
-// 钉住：两条连接同时注册同名节点不抛异常、不产生第二行；冲突只以可重试的并发失败返回
+// 钉住：两条连接同时注册同名节点不抛异常、不产生第二行；冲突只以可重试的并发失败返回，
+// 同租户的活节点不能被误判成永久的 NameConflict
+// 说明：MySQL 上落败方插入会确定地撞 duplicate key；SQLite 夹具通常以 database is locked 收口，
+// 无法稳定制造该路径，本用例覆盖不变量，MySQL 唯一键路径未在本地强制复现。
 TEST(Enrollment, ConcurrentRegistrationsShareOneNode)
 {
     EdgePulse::TestSupport::AuthTestContext context;

@@ -48,9 +48,10 @@ namespace EdgePulse::Device
         {
             try
             {
-                // 批次与心跳并发：发布前重读，节点已恢复在线时不能再用旧快照覆盖它
+                // 批次与心跳并发：发布前重读，节点已恢复在线时不能再用旧快照覆盖它；
+                // 期间被吊销的节点也不会再心跳，同样不能补建无法销案的离线告警
                 const std::optional<NodeRecord> current = co_await m_nodes.findById(loop, node.id);
-                if (!current.has_value() || current->status != "offline")
+                if (!current.has_value() || current->status != "offline" || !current->certRevokedAt.empty())
                 {
                     continue;
                 }
