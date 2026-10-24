@@ -1,16 +1,13 @@
 #include "AgentApplication.h"
 #include "AgentConfiguration.h"
 #include "AgentIdentity.h"
+#include "AgentVersion.h"
 
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
-
-#ifndef EDGEPULSE_AGENT_VERSION
-#define EDGEPULSE_AGENT_VERSION "unknown"
-#endif
 
 namespace
 {
@@ -80,7 +77,7 @@ int main(const int argc, char **argv)
 
     if (options.showVersion)
     {
-        std::cout << "edgepulse-agent " << EDGEPULSE_AGENT_VERSION << '\n';
+        std::cout << "edgepulse-agent " << EdgePulse::Agent::kAgentVersion << '\n';
         return 0;
     }
 

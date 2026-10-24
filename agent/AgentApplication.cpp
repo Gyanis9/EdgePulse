@@ -3,8 +3,12 @@
 #include "AgentClient.h"
 #include "AgentIdentity.h"
 #include "AgentState.h"
+#include "AgentVersion.h"
 #include "AgentWebSocket.h"
 #include "CommandDispatcher.h"
+#include "Executors/ConfigExecutor.h"
+#include "Executors/DiagnosticsExecutor.h"
+#include "Executors/RestartExecutor.h"
 
 #include "Platform/Platform.h"
 
@@ -35,10 +39,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-#ifndef EDGEPULSE_AGENT_VERSION
-#define EDGEPULSE_AGENT_VERSION "unknown"
-#endif
 
 namespace EdgePulse::Agent
 {
@@ -433,7 +433,7 @@ namespace EdgePulse::Agent
             {
                 LOG_INFO_FMT("状态库已有节点标识，本次注册从换绑令牌环境变量读取令牌");
             }
-            const std::string agentVersion{EDGEPULSE_AGENT_VERSION};
+            const std::string agentVersion{kAgentVersion};
 
             std::optional<std::int64_t> nodeId;
             {
@@ -455,7 +455,14 @@ namespace EdgePulse::Agent
 
             AsynGyanis::Core::EventLoop loop;
             AgentClient                 client(loop, m_configuration, *identity);
-            CommandDispatcher           dispatcher(client, *state, {});
+            std::vector<std::shared_ptr<CommandExecutor>> executors;
+            executors.push_back(std::make_shared<ConfigExecutor>(client, m_configuration, *nodeId));
+            // 指标采集由后续的遥测任务接入；当前没有来源时诊断按空数组降级
+            executors.push_back(std::make_shared<DiagnosticsExecutor>(*state, m_configuration, agentVersion, DiagnosticsExecutor::MetricsProvider{}));
+            // 服务托管接入后，回调必须在命令结果入队并上报完成之后再重启进程，否则结果会随进程退出丢失；
+            // 当前没有可用的重启动作，执行器按失败返回，避免向服务端谎报已经重启
+            executors.push_back(std::make_shared<RestartExecutor>(RestartExecutor::RestartCallback{}));
+            CommandDispatcher           dispatcher(client, *state, std::move(executors));
             AgentWebSocket              webSocket(loop, m_configuration);
 
             RuntimeFlags flags;

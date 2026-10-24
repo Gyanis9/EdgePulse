@@ -129,6 +129,7 @@ namespace EdgePulse::Agent
         m_registerUrl  = m_baseUrl + "/api/agent/register";
         m_heartbeatUrl = m_baseUrl + "/api/agent/heartbeat";
         m_commandsUrl  = m_baseUrl + "/api/agent/commands";
+        m_agentNodesUrl = m_baseUrl + "/api/agent/nodes";
 
         try
         {
@@ -378,5 +379,139 @@ namespace EdgePulse::Agent
         const std::string           failure     = httpFailure("上报命令结果", httpStatus, response->body);
         const ResultPostDisposition disposition = isResultRetryableStatus(httpStatus) ? ResultPostDisposition::Retryable : ResultPostDisposition::Terminal;
         co_return ResultPostOutcome{disposition, httpStatus, failure};
+    }
+
+    AsynGyanis::Core::Task<std::expected<AgentConfigSnapshot, std::string>> AgentClient::fetchConfig(const std::int64_t nodeId)
+    {
+        if (!m_initializationError.empty() || m_client == nullptr)
+        {
+            co_return std::unexpected(m_initializationError);
+        }
+        if (nodeId <= 0)
+        {
+            co_return std::unexpected("节点标识无效，无法拉取配置");
+        }
+
+        AsynGyanis::Net::HttpClientRequest request;
+        request.method = "GET";
+
+        std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
+        try
+        {
+            response = co_await m_client->send(m_agentNodesUrl + "/" + std::to_string(nodeId) + "/config", request, m_requestTimeout);
+        } catch (const std::exception &failure)
+        {
+            co_return std::unexpected("拉取配置请求异常：" + std::string{failure.what()});
+        }
+        if (response == nullptr)
+        {
+            co_return std::unexpected("拉取配置请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志");
+        }
+        if (response->statusCode < 200 || response->statusCode >= 300)
+        {
+            co_return std::unexpected(httpFailure("拉取配置", response->statusCode, response->body));
+        }
+
+        const auto data = successData(response->body);
+        if (!data)
+        {
+            co_return std::unexpected("拉取配置" + data.error());
+        }
+
+        const auto version = data->find("version");
+        if (version == data->end())
+        {
+            co_return std::unexpected("拉取配置响应缺少整数 version");
+        }
+        const auto parsedVersion = AsynGyanis::Base::configValueAs<std::int64_t>(*version);
+        if (!parsedVersion.has_value())
+        {
+            co_return std::unexpected("拉取配置响应的 version 不是整数");
+        }
+        AgentConfigSnapshot snapshot;
+        snapshot.version = *parsedVersion;
+        if (snapshot.version < 0)
+        {
+            co_return std::unexpected("拉取配置响应的 version 为负数");
+        }
+
+        const auto content = data->find("content");
+        if (content == data->end() || !content->is_object())
+        {
+            co_return std::unexpected("拉取配置响应的 content 不是 JSON 对象");
+        }
+        snapshot.content = *content;
+
+        if (const auto hash = data->find("hash"); hash != data->end())
+        {
+            if (!hash->is_string())
+            {
+                co_return std::unexpected("拉取配置响应的 hash 不是字符串");
+            }
+            snapshot.hash = hash->get<std::string>();
+        }
+        co_return snapshot;
+    }
+
+    AsynGyanis::Core::Task<std::expected<void, std::string>> AgentClient::reportConfig(const std::int64_t nodeId, const std::int64_t version,
+                                                                                       const AsynGyanis::Base::ConfigValue &content, const std::string_view status,
+                                                                                       const std::string_view message)
+    {
+        if (!m_initializationError.empty() || m_client == nullptr)
+        {
+            co_return std::unexpected(m_initializationError);
+        }
+        if (nodeId <= 0)
+        {
+            co_return std::unexpected("节点标识无效，无法上报配置结果");
+        }
+        if (version < 0)
+        {
+            co_return std::unexpected("配置版本不能为负数");
+        }
+        if (status != "applied" && status != "failed")
+        {
+            co_return std::unexpected("配置上报状态只允许 applied 或 failed");
+        }
+        if (!content.is_object())
+        {
+            co_return std::unexpected("配置上报正文必须是 JSON 对象");
+        }
+
+        const AsynGyanis::Base::ConfigValue requestBody =
+                AsynGyanis::Base::ConfigValue::object({{"version", version}, {"content", content}, {"status", std::string{status}}, {"message", std::string{message}}});
+        const auto serialized = AsynGyanis::Base::serializeConfigValue(requestBody);
+        if (!serialized.has_value())
+        {
+            co_return std::unexpected("配置上报正文无法序列化为 JSON");
+        }
+
+        AsynGyanis::Net::HttpClientRequest request;
+        request.method      = "POST";
+        request.body        = *serialized;
+        request.contentType = "application/json";
+
+        std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
+        try
+        {
+            response = co_await m_client->send(m_agentNodesUrl + "/" + std::to_string(nodeId) + "/config/report", request, m_requestTimeout);
+        } catch (const std::exception &failure)
+        {
+            co_return std::unexpected("上报配置结果请求异常：" + std::string{failure.what()});
+        }
+        if (response == nullptr)
+        {
+            co_return std::unexpected("上报配置结果请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志");
+        }
+        if (response->statusCode < 200 || response->statusCode >= 300)
+        {
+            co_return std::unexpected(httpFailure("上报配置结果", response->statusCode, response->body));
+        }
+        const auto checked = checkSuccessEnvelope(response->body);
+        if (!checked)
+        {
+            co_return std::unexpected("上报配置结果" + checked.error());
+        }
+        co_return std::expected<void, std::string>{};
     }
 } // namespace EdgePulse::Agent

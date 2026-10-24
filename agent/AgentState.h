@@ -150,6 +150,18 @@ namespace EdgePulse::Agent
          */
         void setPendingUpdateResult(std::string text);
 
+        /**
+         * @brief 读取遥测离线队列当前条数
+         * @return 条数；查询失败时记录 ERROR 并返回 0
+         */
+        std::size_t telemetryQueueDepth();
+
+        /**
+         * @brief 读取命令结果队列当前条数
+         * @return 条数；查询失败时记录 ERROR 并返回 0
+         */
+        std::size_t resultQueueDepth();
+
     private:
         /**
          * @brief 接管一条已连接的 SQLite 连接

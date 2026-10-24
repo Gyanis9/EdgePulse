@@ -76,6 +76,16 @@ namespace EdgePulse::Agent
     };
 
     /**
+     * @brief 服务端当前下发的配置
+     */
+    struct AgentConfigSnapshot
+    {
+        std::int64_t                  version{0}; ///< 期望配置版本；0 表示从未下发
+        AsynGyanis::Base::ConfigValue content;    ///< 配置正文，JSON 对象
+        std::string                   hash;       ///< 服务端给出的摘要
+    };
+
+    /**
      * @brief 持有事件循环与 TLS 身份的 Agent 客户端
      * @details 请求走带连接池的 HttpClient；https 地址会带上客户端证书，明文地址只用于显式允许的测试配置。
      */
@@ -133,6 +143,26 @@ namespace EdgePulse::Agent
         AsynGyanis::Core::Task<ResultPostOutcome> reportCommandResult(std::int64_t commandId, std::int64_t nodeId, std::string_view status, std::string_view result,
                                                                       std::string_view message);
 
+        /**
+         * @brief 拉取服务端当前下发的配置
+         * @param nodeId 节点 ID
+         * @return 成功返回版本、正文与摘要；失败返回中文原因
+         * @note 版本 0 与空对象表示服务端从未下发过配置
+         */
+        AsynGyanis::Core::Task<std::expected<AgentConfigSnapshot, std::string>> fetchConfig(std::int64_t nodeId);
+
+        /**
+         * @brief 上报一次配置应用结果
+         * @param nodeId 节点 ID
+         * @param version 配置版本
+         * @param content 配置正文，必须是 JSON 对象
+         * @param status 上报状态，只允许 applied 或 failed
+         * @param message 中文说明
+         * @return 成功为空；失败返回中文原因
+         */
+        AsynGyanis::Core::Task<std::expected<void, std::string>> reportConfig(std::int64_t nodeId, std::int64_t version, const AsynGyanis::Base::ConfigValue &content,
+                                                                              std::string_view status, std::string_view message);
+
     private:
         AsynGyanis::Core::EventLoop                 &m_loop;                ///< 请求所属事件循环
         AgentConfiguration                           m_configuration;       ///< 本次进程使用的配置副本
@@ -142,6 +172,7 @@ namespace EdgePulse::Agent
         std::string                                  m_registerUrl;         ///< 注册接口的绝对地址
         std::string                                  m_heartbeatUrl;        ///< 心跳接口的绝对地址
         std::string                                  m_commandsUrl;         ///< 命令接口的绝对地址前缀
+        std::string                                  m_agentNodesUrl;       ///< Agent 节点接口的绝对地址前缀
         std::string                                  m_initializationError; ///< 客户端装配失败原因，空表示可用
         std::chrono::milliseconds                    m_requestTimeout;      ///< 单次注册请求的整体时限
     };

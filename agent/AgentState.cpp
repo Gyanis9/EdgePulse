@@ -490,4 +490,28 @@ namespace EdgePulse::Agent
             LOG_ERROR_FMT("写入升级待上报结果失败：{}", written.error());
         }
     }
+
+    std::size_t AgentState::telemetryQueueDepth()
+    {
+        std::lock_guard lock(*m_mutex);
+        const auto      rows = queryStatement(*m_connection, "SELECT COUNT(*) AS total FROM telemetry_queue");
+        if (!rows)
+        {
+            LOG_ERROR_FMT("读取遥测队列深度失败：{}", rows.error());
+            return 0;
+        }
+        return (*rows)->next() ? static_cast<std::size_t>(Sql::integer(**rows, "total")) : 0;
+    }
+
+    std::size_t AgentState::resultQueueDepth()
+    {
+        std::lock_guard lock(*m_mutex);
+        const auto      rows = queryStatement(*m_connection, "SELECT COUNT(*) AS total FROM result_queue");
+        if (!rows)
+        {
+            LOG_ERROR_FMT("读取命令结果队列深度失败：{}", rows.error());
+            return 0;
+        }
+        return (*rows)->next() ? static_cast<std::size_t>(Sql::integer(**rows, "total")) : 0;
+    }
 } // namespace EdgePulse::Agent
