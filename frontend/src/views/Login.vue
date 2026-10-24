@@ -150,7 +150,17 @@ function beginMfa(challenge: MfaChallenge, target: string, rememberLogin: boolea
   // 挑战已替代密码凭据；返回账号登录时重新输入口令与验证码
   form.password = ''
   form.captcha = ''
+  dropOidcQuery()
   void nextTick(() => document.querySelector<HTMLInputElement>('.mfa-code input')?.focus())
+}
+
+/* 一次性 code 已换成挑战，从地址栏移除，避免刷新或复制链接时再次提交 */
+function dropOidcQuery() {
+  if (!route.query.oidcCode && !route.query.oidcError) return
+  const query = Object.fromEntries(
+    Object.entries(route.query).filter(([key]) => key !== 'oidcCode' && key !== 'oidcError'),
+  )
+  void router.replace({ path: route.path, query })
 }
 
 function toggleRecovery() {
@@ -174,6 +184,7 @@ function backToPassword() {
 }
 
 async function submitMfa() {
+  if (submitting.value) return
   mfaError.value = ''
   mfaFieldError.value = ''
   if (!mfaChallenge.value) {

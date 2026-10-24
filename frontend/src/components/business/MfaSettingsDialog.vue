@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import QRCode from 'qrcode'
 import Modal from '@/components/ui/Modal.vue'
 import Button from '@/components/ui/Button.vue'
 import Field from '@/components/ui/Field.vue'
@@ -34,6 +33,17 @@ const errors = ref<{ password?: string; code?: string }>({})
 const enabled = computed(() => Boolean(status.value?.enabled))
 const recoveryCount = computed(() => status.value?.recoveryCodesRemaining ?? 0)
 
+/* 每次打开或发起动作都递增；关闭后到达的响应凭它识别并丢弃，避免把密钥或恢复码带回界面 */
+let operation = 0
+
+function nextOperation() {
+  return ++operation
+}
+
+function isCurrent(token: number) {
+  return props.open && token === operation
+}
+
 const totpCodeRule = (value: unknown) => {
   const text = String(value ?? '').trim()
   if (!text) return '请输入 6 位动态码'
@@ -45,6 +55,7 @@ function messageOf(error: unknown, fallback: string) {
 }
 
 function reset() {
+  operation += 1
   stage.value = 'overview'
   status.value = null
   loading.value = false
@@ -71,34 +82,42 @@ function backToOverview() {
 }
 
 async function loadStatus() {
+  const token = nextOperation()
   loading.value = true
   statusError.value = ''
   try {
-    status.value = await authApi.mfaStatus()
+    const data = await authApi.mfaStatus()
+    if (!isCurrent(token)) return
+    status.value = data
   } catch (error) {
+    if (!isCurrent(token)) return
     statusError.value = messageOf(error, '两步验证状态加载失败')
   } finally {
-    loading.value = false
+    if (isCurrent(token)) loading.value = false
   }
 }
 
 watch(() => props.open, (open) => {
-  if (!open) {
-    reset()
-    return
-  }
   reset()
-  void loadStatus()
+  if (open) void loadStatus()
 }, { immediate: true })
 
 async function renderQr() {
+  const snapshot = setup.value
+  const token = operation
   await nextTick()
-  if (!setup.value || !qrCanvas.value) return
+  if (!isCurrent(token) || !snapshot || setup.value !== snapshot || !qrCanvas.value) return
   try {
-    await QRCode.toCanvas(qrCanvas.value, setup.value.otpauthUri, { width: 180, margin: 1 })
+    // 按需加载编码器，登录页与首屏不必带上二维码库
+    const { default: QRCode } = await import('qrcode')
+    if (!isCurrent(token) || setup.value !== snapshot || !qrCanvas.value) return
+    await QRCode.toCanvas(qrCanvas.value, snapshot.otpauthUri, { width: 180, margin: 1 })
+    if (!isCurrent(token) || setup.value !== snapshot) return
     qrError.value = ''
   } catch {
-    qrError.value = '二维码生成失败，请改用下方密钥手动添加'
+    if (isCurrent(token) && setup.value === snapshot) {
+      qrError.value = '二维码生成失败，请改用下方密钥手动添加'
+    }
   }
 }
 
@@ -131,32 +150,40 @@ function openDisable() {
 }
 
 async function beginSetup() {
+  if (saving.value) return
   formError.value = ''
   errors.value = validate({ password: password.value }, { password: [required('请输入当前密码')] })
   if (Object.keys(errors.value).length) return
+  const token = nextOperation()
   saving.value = true
   try {
-    setup.value = await authApi.setupMfa({ password: password.value })
+    const result = await authApi.setupMfa({ password: password.value })
+    if (!isCurrent(token)) return
+    setup.value = result
     code.value = ''
     errors.value = {}
   } catch (error) {
+    if (!isCurrent(token)) return
     formError.value = messageOf(error, '无法开始设置两步验证')
     toastError(error, '无法开始设置两步验证')
   } finally {
-    saving.value = false
+    if (isCurrent(token)) saving.value = false
   }
 }
 
 async function enable() {
+  if (saving.value) return
   formError.value = ''
   errors.value = validate(
     { password: password.value, code: code.value },
     { password: [required('请输入当前密码')], code: [totpCodeRule] },
   )
   if (Object.keys(errors.value).length) return
+  const token = nextOperation()
   saving.value = true
   try {
     const result = await authApi.enableMfa({ password: password.value, code: code.value.trim() })
+    if (!isCurrent(token)) return
     recoveryCodes.value = result.recoveryCodes
     status.value = { enabled: true, recoveryCodesRemaining: result.recoveryCodes.length }
     setup.value = null
@@ -165,53 +192,62 @@ async function enable() {
     stage.value = 'codes'
     pushToast('两步验证已启用')
   } catch (error) {
+    if (!isCurrent(token)) return
     formError.value = messageOf(error, '两步验证启用失败')
     toastError(error, '两步验证启用失败')
   } finally {
-    saving.value = false
+    if (isCurrent(token)) saving.value = false
   }
 }
 
 async function disable() {
+  if (saving.value) return
   formError.value = ''
   errors.value = validate(
     { password: password.value, code: code.value },
     { password: [required('请输入当前密码')], code: [totpCodeRule] },
   )
   if (Object.keys(errors.value).length) return
+  const token = nextOperation()
   saving.value = true
   try {
     await authApi.disableMfa({ password: password.value, code: code.value.trim() })
+    if (!isCurrent(token)) return
     status.value = { enabled: false, recoveryCodesRemaining: 0 }
     password.value = ''
     code.value = ''
     stage.value = 'overview'
     pushToast('两步验证已关闭')
   } catch (error) {
+    if (!isCurrent(token)) return
     formError.value = messageOf(error, '两步验证关闭失败')
     toastError(error, '两步验证关闭失败')
   } finally {
-    saving.value = false
+    if (isCurrent(token)) saving.value = false
   }
 }
 
 async function regenerate() {
+  if (saving.value) return
   formError.value = ''
   errors.value = validate({ code: code.value }, { code: [totpCodeRule] })
   if (Object.keys(errors.value).length) return
+  const token = nextOperation()
   saving.value = true
   try {
     const result = await authApi.recoveryCodes({ code: code.value.trim() })
+    if (!isCurrent(token)) return
     recoveryCodes.value = result.recoveryCodes
     status.value = { enabled: true, recoveryCodesRemaining: result.recoveryCodes.length }
     code.value = ''
     stage.value = 'codes'
     pushToast('恢复码已重新生成')
   } catch (error) {
+    if (!isCurrent(token)) return
     formError.value = messageOf(error, '恢复码生成失败')
     toastError(error, '恢复码生成失败')
   } finally {
-    saving.value = false
+    if (isCurrent(token)) saving.value = false
   }
 }
 
@@ -221,15 +257,28 @@ function finishCodes() {
   stage.value = 'overview'
 }
 
+/* 恢复码只显示一次，保存确认前不接受标题栏、Escape 与返回操作 */
+function onDialogClose() {
+  if (stage.value === 'codes') return
+  emit('close')
+}
+
 function onCancel() {
+  if (saving.value) return
   if (stage.value === 'overview') emit('close')
-  else backToOverview()
+  else if (stage.value !== 'codes') backToOverview()
 }
 
 async function copySecret() {
   if (!setup.value) return
   const copied = await copyText(setup.value.secret)
   pushToast(copied ? '密钥已复制' : '复制失败，请手动选择密钥文本', copied ? 'ok' : 'danger')
+}
+
+async function copyUri() {
+  if (!setup.value) return
+  const copied = await copyText(setup.value.otpauthUri)
+  pushToast(copied ? '链接已复制' : '复制失败，请手动选择链接文本', copied ? 'ok' : 'danger')
 }
 
 async function copyCodes() {
@@ -239,7 +288,7 @@ async function copyCodes() {
 </script>
 
 <template>
-  <Modal :open="open" title="两步验证" sub="使用身份验证器（TOTP）为账号增加第二道验证。" :width="640" @close="emit('close')">
+  <Modal :open="open" title="两步验证" sub="使用身份验证器（TOTP）为账号增加第二道验证。" :width="640" :closable="stage !== 'codes'" @close="onDialogClose">
     <div class="mfa-panel">
       <div v-if="loading" class="mfa-loading"><span class="spinner" aria-hidden="true" />正在读取两步验证状态…</div>
       <div v-else-if="statusError" class="mfa-status-error">
@@ -271,7 +320,7 @@ async function copyCodes() {
           <template v-if="!setup">
             <p class="muted">开始设置前需要确认当前密码。密钥只在本次设置期间显示，关闭对话框即丢弃。</p>
             <Field label="当前密码" required :error="errors.password" span>
-              <TextInput v-model="password" type="password" autocomplete="current-password" :invalid="!!errors.password" @enter="beginSetup" />
+              <TextInput v-model="password" type="password" autocomplete="current-password" :invalid="!!errors.password" :disabled="saving" @enter="beginSetup" />
             </Field>
           </template>
           <template v-else>
@@ -287,11 +336,16 @@ async function copyCodes() {
                 <Button variant="text" size="sm" icon="copy" @click="copySecret">复制密钥</Button>
               </div>
             </div>
+            <div class="mfa-uri-block">
+              <div class="section-label">otpauth 链接</div>
+              <pre class="code-block mfa-uri">{{ setup.otpauthUri }}</pre>
+              <Button variant="text" size="sm" icon="copy" @click="copyUri">复制链接</Button>
+            </div>
             <Field label="当前密码" required :error="errors.password" span>
-              <TextInput v-model="password" type="password" autocomplete="current-password" :invalid="!!errors.password" />
+              <TextInput v-model="password" type="password" autocomplete="current-password" :invalid="!!errors.password" :disabled="saving" />
             </Field>
             <Field label="动态验证码" required :error="errors.code" hint="身份验证器每 30 秒刷新一次" span>
-              <TextInput v-model="code" placeholder="6 位数字" :maxlength="6" autocomplete="one-time-code" :invalid="!!errors.code" @enter="enable" />
+              <TextInput v-model="code" placeholder="6 位数字" :maxlength="6" autocomplete="one-time-code" :invalid="!!errors.code" :disabled="saving" @enter="enable" />
             </Field>
           </template>
         </template>
@@ -315,17 +369,17 @@ async function copyCodes() {
         <template v-else-if="stage === 'disable'">
           <p class="muted">关闭后登录只需密码。请输入当前密码和身份验证器动态码确认。</p>
           <Field label="当前密码" required :error="errors.password" span>
-            <TextInput v-model="password" type="password" autocomplete="current-password" :invalid="!!errors.password" @enter="disable" />
+            <TextInput v-model="password" type="password" autocomplete="current-password" :invalid="!!errors.password" :disabled="saving" @enter="disable" />
           </Field>
           <Field label="动态验证码" required :error="errors.code" span>
-            <TextInput v-model="code" placeholder="6 位数字" :maxlength="6" autocomplete="one-time-code" :invalid="!!errors.code" @enter="disable" />
+            <TextInput v-model="code" placeholder="6 位数字" :maxlength="6" autocomplete="one-time-code" :invalid="!!errors.code" :disabled="saving" @enter="disable" />
           </Field>
         </template>
 
         <template v-else>
           <p class="muted">重新生成会使现有恢复码全部失效。请输入身份验证器动态码确认。</p>
           <Field label="动态验证码" required :error="errors.code" span>
-            <TextInput v-model="code" placeholder="6 位数字" :maxlength="6" autocomplete="one-time-code" :invalid="!!errors.code" @enter="regenerate" />
+            <TextInput v-model="code" placeholder="6 位数字" :maxlength="6" autocomplete="one-time-code" :invalid="!!errors.code" :disabled="saving" @enter="regenerate" />
           </Field>
         </template>
 
@@ -334,7 +388,7 @@ async function copyCodes() {
     </div>
 
     <template #footer>
-      <Button variant="ghost" :disabled="saving" @click="onCancel">{{ stage === 'overview' ? '关闭' : '返回' }}</Button>
+      <Button v-if="stage !== 'codes'" variant="ghost" :disabled="saving" @click="onCancel">{{ stage === 'overview' ? '关闭' : '返回' }}</Button>
       <template v-if="!loading && !statusError">
         <Button v-if="stage === 'overview' && !enabled" variant="primary" icon="shield" @click="startSetup">开始设置</Button>
         <Button v-if="stage === 'overview' && enabled" variant="secondary" icon="refresh" @click="openRegenerate">重新生成恢复码</Button>
@@ -368,6 +422,8 @@ async function copyCodes() {
 .mfa-qr canvas { display: block; width: 180px; height: 180px; }
 .mfa-secret-block { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; flex: 1; min-width: 200px; }
 .mfa-secret { margin: 0; white-space: pre-wrap; word-break: break-all; letter-spacing: .06em; }
+.mfa-uri-block { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.mfa-uri { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
 .mfa-codes {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

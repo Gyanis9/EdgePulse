@@ -11,8 +11,11 @@ const props = withDefaults(defineProps<{
   width?: number
   /** 点击遮罩是否关闭（表单弹窗默认不关，避免误触丢失输入） */
   closeOnOverlay?: boolean
+  /** 是否允许关闭（标题栏按钮与 Escape）；一次性内容阶段可临时禁用 */
+  closable?: boolean
 }>(), {
   width: 560,
+  closable: true,
 })
 const emit = defineEmits<{ (e: 'close'): void }>()
 
@@ -23,7 +26,7 @@ const titleId = `mt-${Math.random().toString(36).slice(2, 8)}`
 function onKey(event: KeyboardEvent) {
   if (event.key === 'Escape' && trap.isTop()) {
     event.stopImmediatePropagation()
-    emit('close')
+    if (props.closable) emit('close')
   }
 }
 
@@ -66,7 +69,7 @@ function onOverlay(event: MouseEvent) {
               <h2 :id="titleId" class="modal-title">{{ title }}</h2>
               <p v-if="sub" class="modal-sub">{{ sub }}</p>
             </div>
-            <IconButton name="x" label="关闭" @click="emit('close')" />
+            <IconButton v-if="closable" name="x" label="关闭" @click="emit('close')" />
           </header>
           <div class="modal-body"><slot /></div>
           <footer v-if="$slots.footer" class="modal-foot"><slot name="footer" /></footer>

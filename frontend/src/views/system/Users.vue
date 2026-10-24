@@ -274,12 +274,14 @@ async function resetMfa(row: UserRow) {
   if (!ok) return
   try {
     await systemApi.users.resetMfa(row.id)
-    pushToast(`已重置「${row.nickname}」的两步验证`)
-    await list.load()
-    if (view.value === 'board') await loadBoard()
   } catch (error) {
     toastError(error, '两步验证重置失败')
+    return
   }
+  pushToast(`已重置「${row.nickname}」的两步验证`)
+  // 列表与看板各自上报刷新失败，不能再被当成重置失败
+  await list.load()
+  if (view.value === 'board') await loadBoard()
 }
 
 /* ── 删除 / 批量 ── */
