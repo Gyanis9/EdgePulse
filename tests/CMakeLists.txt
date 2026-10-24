@@ -64,6 +64,7 @@ gtest_discover_tests(edgepulse-integration-tests DISCOVERY_MODE PRE_TEST)
 
 add_executable(edgepulse-protocol-tests
         Protocol/TestApiResponse.cpp
+        Protocol/TestApiTokenEndpoints.cpp
         Protocol/TestApplicationConfiguration.cpp
         Protocol/TestAuthEndpoints.cpp
         Protocol/TestEnrollmentEndpoints.cpp

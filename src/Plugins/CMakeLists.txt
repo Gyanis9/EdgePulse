@@ -16,6 +16,7 @@ add_library(edgepulse-plugins STATIC
         TelemetryPlugin/TelemetryController.cpp
         SystemPlugin/SystemController.cpp
         SystemPlugin/TenantController.cpp
+        SystemPlugin/ApiTokenController.cpp
         SystemPlugin/NotificationController.cpp)
 add_library(EdgePulse::Plugins ALIAS edgepulse-plugins)
 

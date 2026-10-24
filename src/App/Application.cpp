@@ -70,6 +70,7 @@
 #include "Plugins/MonitorPlugin/MonitorController.h"
 #include "Plugins/SystemPlugin/SystemController.h"
 #include "Plugins/SystemPlugin/TenantController.h"
+#include "Plugins/SystemPlugin/ApiTokenController.h"
 #include "Plugins/SystemPlugin/NotificationController.h"
 #include "Core/Notification/NotificationDispatcher.h"
 #include "Core/Notification/NotificationRepository.h"
@@ -774,6 +775,10 @@ namespace EdgePulse::App
         systemDependencies.dictionaries = m_dictionaryRepository.get();
         systemDependencies.tenants      = m_tenantRepository.get();
         System::registerSystemRoutes(router, loop, systemDependencies);
+        System::ApiTokenDependencies tokenDependencies;
+        tokenDependencies.auth   = m_authService.get();
+        tokenDependencies.tokens = m_apiTokenService.get();
+        System::registerApiTokenRoutes(router, loop, tokenDependencies);
         System::TenantDependencies tenantDependencies;
         tenantDependencies.auth    = m_authService.get();
         tenantDependencies.tenants = m_tenantRepository.get();
