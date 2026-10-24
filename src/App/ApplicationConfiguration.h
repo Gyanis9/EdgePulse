@@ -97,6 +97,7 @@ namespace EdgePulse::App
         std::int64_t             oidcDefaultRoleId{0};                                ///< 自动建号角色
         std::int64_t             oidcDefaultDepartmentId{101};                        ///< 自动建号部门
         std::string              oidcTenantCode{"default"};                           ///< 外部身份绑定租户
+        std::string              mfaEncryptionKey;                                    ///< 两步验证主密钥的 base64 文本，只从环境变量读取
 
         double                   requestsPerSecond{0.0};                              ///< 每个实例的全局请求速率上限，可为小数，0 表示关闭
         double                   rateLimitBurstCapacity{1.0};                         ///< 令牌桶容量，即允许的瞬时突发量

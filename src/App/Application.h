@@ -49,6 +49,7 @@ namespace EdgePulse::Auth
     class CaptchaService;
     class DataScopeService;
     class LoginAudit;
+    class MfaService;
     class OidcService;
     class SessionStore;
 } // namespace EdgePulse::Auth
@@ -227,6 +228,7 @@ namespace EdgePulse::App
         std::shared_ptr<Auth::LoginAudit>                         m_loginAudit;             ///< 登录审计
         std::shared_ptr<Auth::AuthService>                        m_authService;            ///< 认证服务
         std::shared_ptr<Auth::ApiTokenService>                    m_apiTokenService;        ///< API 令牌服务
+        std::shared_ptr<Auth::MfaService>                         m_mfaService;             ///< 两步验证服务
         std::unique_ptr<Auth::OidcService>                        m_oidcService;            ///< OIDC 登录
         std::shared_ptr<Web::BrowserWebSocket>                    m_browserWebSocket;       ///< 浏览器 WebSocket 与节点扇出
         std::shared_ptr<Device::NodeRepository>                   m_nodeRepository;         ///< 节点仓储

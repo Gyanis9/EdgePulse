@@ -9,6 +9,7 @@
 #include "Core/Auth/OidcService.h"
 #include "Core/Auth/CaptchaService.h"
 #include "Core/Auth/LoginAudit.h"
+#include "Core/Auth/MfaService.h"
 #include "Core/Auth/SessionStore.h"
 #include "Core/Auth/DataScopeService.h"
 #include "Core/Cache/MemoryKeyValueStore.h"
@@ -208,6 +209,9 @@ namespace EdgePulse::App
             authOptions.loginMaximumFailures      = m_configuration.loginMaximumFailures;
             authOptions.loginLockSeconds          = m_configuration.loginLockSeconds;
             m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache, m_tenantRepository, authOptions);
+            m_mfaService       = std::make_shared<Auth::MfaService>(m_database, m_cache, m_configuration.mfaEncryptionKey);
+            // 只报告是否配置；密钥内容与长度都不进日志
+            LOG_INFO_FMT("两步验证加密密钥：{}", m_configuration.mfaEncryptionKey.empty() ? "未配置" : "已配置");
             m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>();
             m_sseBroadcaster   = std::make_shared<Web::SseBroadcaster>();
             Web::RealtimeBusOptions realtimeOptions;

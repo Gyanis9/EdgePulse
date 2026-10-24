@@ -4,7 +4,11 @@ add_library(edgepulse-core STATIC
         Auth/AuthService.cpp
         Auth/CaptchaService.cpp
         Auth/LoginAudit.cpp
+        Auth/MfaCrypto.cpp
+        Auth/MfaRepository.cpp
+        Auth/MfaService.cpp
         Auth/SessionStore.cpp
+        Auth/Totp.cpp
         Auth/DataScopeService.cpp
         Auth/Jwt.cpp
         Auth/OidcService.cpp

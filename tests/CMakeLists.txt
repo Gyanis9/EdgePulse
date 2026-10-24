@@ -20,6 +20,7 @@ add_executable(edgepulse-unit-tests
         Unit/TestCsvWriter.cpp
         Unit/TestIdGenerator.cpp
         Unit/TestMemoryKeyValueStore.cpp
+        Unit/TestMfaCrypto.cpp
         Unit/TestOidcJwt.cpp
         Unit/TestMigrationSqlSplitter.cpp
         Unit/TestNodeRepositoryRetry.cpp
@@ -30,6 +31,7 @@ add_executable(edgepulse-unit-tests
         Unit/TestSessionStore.cpp
         Unit/TestSseBroadcaster.cpp
         Unit/TestTimeFormat.cpp
+        Unit/TestTotp.cpp
         Unit/TestUdpTelemetryProtocol.cpp)
 target_include_directories(edgepulse-unit-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(edgepulse-unit-tests PRIVATE EdgePulse::Core GTest::gtest_main)
@@ -52,6 +54,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestOutboundUrlGuard.cpp
         Integration/TestRealtimeBus.cpp
         Integration/TestFleetServices.cpp
+        Integration/TestMfaService.cpp
         Integration/TestSystemServices.cpp
         Integration/TestTenantIsolation.cpp
         Integration/TestUdpTelemetry.cpp)

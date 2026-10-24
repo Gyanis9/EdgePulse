@@ -1,5 +1,6 @@
 #include "App/ApplicationConfiguration.h"
 
+#include "Base/Coding/Base64.h"
 #include "Base/Config/ConfigManager.h"
 #include "Base/Runtime/Environment.h"
 
@@ -339,6 +340,16 @@ namespace EdgePulse::App
         if (const auto secret = Common::environmentValue("EDGEPULSE_OIDC_CLIENT_SECRET"); secret.has_value())
         {
             configuration.oidcClientSecret = *secret;
+        }
+        // 两步验证密钥只从环境变量读取；非法值必须在启动期拒绝，而不是等到用户设置时才发现
+        if (const std::optional<std::string> mfaKey = Common::environmentValue("EDGEPULSE_MFA_KEY"); mfaKey.has_value())
+        {
+            const std::optional<std::string> decoded = AsynGyanis::Base::base64Decode(*mfaKey);
+            if (!decoded.has_value() || decoded->size() != 32)
+            {
+                return std::unexpected(ConfigurationError{"EDGEPULSE_MFA_KEY 必须是 base64 编码的 32 字节密钥，当前值解码后不是 32 字节"});
+            }
+            configuration.mfaEncryptionKey = *mfaKey;
         }
         if (configuration.oidcEnabled)
         {
