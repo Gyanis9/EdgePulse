@@ -100,7 +100,22 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_node_config_revision') AS il, pragma_index_info(il.name) AS ii "
                                                      "WHERE il.\"unique\" = 1 AND ii.name IN ('node_id', 'version')"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 18"));
-        EXPECT_EQ(18, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 19"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sys_api_token'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sys_idempotency'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sys_user_mfa'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_api_token') WHERE name = 'idx_api_token_tenant'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_api_token') WHERE name = 'idx_api_token_previous'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_idempotency') WHERE name = 'idx_idempotency_expires'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('sys_user_mfa') WHERE name = 'idx_user_mfa_tenant'"));
+        // 令牌表按令牌哈希查、幂等表按令牌与非空响应体回放：两处缺列都会让后续接口在运行期才发现
+        EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('sys_api_token') WHERE name IN ('token_hash', 'previous_hash')"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('sys_idempotency') WHERE name = 'response_body'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_menu WHERE id = 1210 AND parent_id = 1100 AND menu_type = 'menu' AND permission = 'system:token:list'"));
+        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_menu WHERE id IN (1211, 1212, 1213) AND parent_id = 1210 AND menu_type = 'btn'"));
+        EXPECT_EQ(4, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_role_menu WHERE menu_id IN (1210,1211,1212,1213) AND role_id = 1"));
+        EXPECT_EQ(4, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_role_menu WHERE menu_id IN (1210,1211,1212,1213) AND role_id = 3"));
+        EXPECT_EQ(19, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }
