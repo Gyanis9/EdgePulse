@@ -137,6 +137,16 @@ namespace EdgePulse::Agent
         void enqueueResult(std::int64_t commandId, std::string payload);
 
         /**
+         * @brief 用新结果替换同一命令已在队列里的结果
+         * @param commandId 服务端命令标识
+         * @param payload 新结果正文
+         * @return 成功为空；写入失败时返回中文原因
+         * @note 删除已有行与写入新行在同一个写事务里完成，队列上限与入队相同。
+         *       升级结果必须覆盖安装器启动时已入队的成功结果，否则唯一索引会把真正的结论丢弃
+         */
+        [[nodiscard]] std::expected<void, std::string> replaceResult(std::int64_t commandId, std::string payload);
+
+        /**
          * @brief 判断某个命令是否已有待上报的结果
          * @param commandId 服务端命令标识
          * @return true 表示结果队列里已有该命令的结果

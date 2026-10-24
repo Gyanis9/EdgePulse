@@ -1,6 +1,7 @@
 #include "AgentApplication.h"
 
 #include "AgentState.h"
+#include "AgentVersion.h"
 #include "CertificateFixture.h"
 #include "AgentConfiguration.h"
 #include "TestSupport/HttpClientHarness.h"
@@ -621,10 +622,13 @@ agent:
             auto state = AgentState::open(directory.path() / "state" / "agent.db");
             ASSERT_TRUE(state.has_value()) << state.error();
             UpdateStateRecord record;
-            record.version       = "9.9.9";
-            record.pendingResult = R"({"commandId":123,"version":"9.9.9","status":"pending"})";
+            record.version       = std::string{kAgentVersion};
+            record.pendingResult = "{\"commandId\":123,\"version\":\"" + std::string{kAgentVersion} + "\",\"status\":\"pending\"}";
             const auto written   = state->setUpdateState(record);
             ASSERT_TRUE(written.has_value()) << written.error();
+
+            // 安装器启动时已为同一命令入队过成功结果；健康确认必须替换它而不是被唯一索引丢弃
+            state->enqueueResult(123, R"({"status":"succeeded","result":"{}","message":"升级包已校验，安装器已启动"})");
         }
 
         LoggingSinkReset loggingReset;
@@ -699,6 +703,9 @@ agent:
             const auto written   = state->setUpdateState(record);
             ASSERT_TRUE(written.has_value()) << written.error();
 
+            // 安装器启动时已入队的成功结果仍在队列里；回滚结论必须替换它
+            state->enqueueResult(456, R"({"status":"succeeded","result":"{}","message":"升级包已校验，安装器已启动"})");
+
             std::ofstream marker(rollbackMarker, std::ios::binary | std::ios::trunc);
             marker << "9.9.9\n";
             marker.close();
@@ -752,5 +759,76 @@ agent:
         EXPECT_EQ("failed", payload->value("status", std::string{}));
         EXPECT_EQ("升级未通过健康检查，已回滚到旧版本", payload->value("message", std::string{}));
         EXPECT_EQ("{}", payload->value("result", std::string{}));
+    }
+
+    TEST(AgentApplication, ReportsFailedUpdateWhenTargetVersionDiffersFromRunningVersion)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server(
+                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+
+        {
+            auto state = AgentState::open(directory.path() / "state" / "agent.db");
+            ASSERT_TRUE(state.has_value()) << state.error();
+            UpdateStateRecord record;
+            record.version       = "9.9.9";
+            record.healthyAt     = "2026-10-24T00:00:00Z";
+            record.pendingResult = R"({"commandId":789,"version":"9.9.9","status":"pending"})";
+            const auto written   = state->setUpdateState(record);
+            ASSERT_TRUE(written.has_value()) << written.error();
+            state->enqueueResult(789, R"({"status":"succeeded","result":"{}","message":"升级包已校验，安装器已启动"})");
+        }
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool cleared = waitFor(std::chrono::seconds{10},
+                                     [&directory]
+                                     {
+                                         auto state = AgentState::open(directory.path() / "state" / "agent.db");
+                                         if (!state.has_value())
+                                         {
+                                             return false;
+                                         }
+                                         const auto record = state->updateState();
+                                         return record.has_value() && record->pendingResult.empty();
+                                     });
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        ASSERT_TRUE(cleared) << "目标版本不一致时未在时限内清除待上报结果";
+        ASSERT_TRUE(stopped) << "停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+        EXPECT_FALSE(std::filesystem::exists(directory.path() / "state" / "update-health")) << "目标版本不一致时不得写健康标记";
+
+        auto state = AgentState::open(directory.path() / "state" / "agent.db");
+        ASSERT_TRUE(state.has_value()) << state.error();
+        const std::string runningVersion = state->get("agent_version").value_or("");
+        ASSERT_FALSE(runningVersion.empty());
+        const auto record = state->updateState();
+        ASSERT_TRUE(record.has_value()) << record.error();
+        EXPECT_TRUE(record->pendingResult.empty());
+        EXPECT_TRUE(record->healthyAt.empty()) << "失败结论不得保留健康确认时刻";
+
+        const std::vector<QueuedResult> results = state->takeResults(10);
+        ASSERT_EQ(1U, results.size()) << "失败结论应替换安装器启动时入队的结果";
+        EXPECT_EQ(789, results.front().commandId);
+        const auto payload = AsynGyanis::Base::parseConfigValue(results.front().payload);
+        ASSERT_TRUE(payload.has_value()) << results.front().payload;
+        EXPECT_EQ("failed", payload->value("status", std::string{}));
+        const std::string message = payload->value("message", std::string{});
+        EXPECT_NE(std::string::npos, message.find("9.9.9"));
+        EXPECT_NE(std::string::npos, message.find(runningVersion));
+        EXPECT_NE(std::string::npos, message.find("不一致"));
     }
 } // namespace EdgePulse::Agent

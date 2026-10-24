@@ -433,6 +433,29 @@ namespace EdgePulse::Agent
         }
     }
 
+    std::expected<void, std::string> AgentState::replaceResult(const std::int64_t commandId, std::string payload)
+    {
+        std::lock_guard                    lock(*m_mutex);
+        const std::array<DatabaseValue, 1> keys{commandId};
+        const std::array<DatabaseValue, 3> parameters{commandId, std::move(payload), currentUtcText()};
+        return runWriteTransaction(*m_connection,
+                                   [&keys, &parameters](DatabaseConnection &connection) -> std::expected<void, std::string>
+                                   {
+                                       const auto removed = executeStatement(connection, "DELETE FROM result_queue WHERE command_id = ?", keys);
+                                       if (!removed)
+                                       {
+                                           return removed;
+                                       }
+                                       const auto inserted = executeStatement(
+                                               connection, "INSERT INTO result_queue (command_id, payload, created_at) VALUES (?, ?, ?)", parameters);
+                                       if (!inserted)
+                                       {
+                                           return inserted;
+                                       }
+                                       return pruneQueue(connection, "result_queue", kResultQueueLimit, "命令结果");
+                                   });
+    }
+
     bool AgentState::hasResult(const std::int64_t commandId)
     {
         std::lock_guard                    lock(*m_mutex);

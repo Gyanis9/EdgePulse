@@ -20,6 +20,7 @@ add_executable(edgepulse-agent-tests
         TestAgentState.cpp
         TestAgentTelemetry.cpp)
 target_compile_definitions(edgepulse-agent-tests PRIVATE EDGEPULSE_AGENT_TEST_HOOK_PATH="$<TARGET_FILE:edgepulse-agent-test-hook>"
+                                                          EDGEPULSE_AGENT_VERSION="${PROJECT_VERSION}"
                                                           EDGEPULSE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_dependencies(edgepulse-agent-tests edgepulse-agent-test-hook)
 target_link_libraries(edgepulse-agent-tests PRIVATE edgepulse-agent-core edgepulse-test-support GTest::gtest_main)

@@ -330,7 +330,6 @@ function Invoke-AgentUpgrade {
     $backupPath = $binaryPath + '.previous'
     $version = ''
     $binaryReplaced = $false
-    $serviceStoppedByUs = $false
 
     $null = New-Item -ItemType Directory -Path $StateDir -Force
     $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('edgepulse-agent-upgrade-' + [Guid]::NewGuid().ToString('N'))
@@ -392,7 +391,6 @@ function Invoke-AgentUpgrade {
                 if ($existingService.Status -ne 'StopPending') {
                     Write-UpgradeLog -LogPath $logPath -Message "停止服务 $ServiceName"
                     Invoke-Sc -Arguments "stop $ServiceName" -Description "停止服务 $ServiceName"
-                    $serviceStoppedByUs = $true
                 }
                 try {
                     $existingService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
@@ -481,15 +479,24 @@ function Invoke-AgentUpgrade {
             if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
                 Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
             }
-            if ($serviceStoppedByUs) {
+            # 启动器进程已经退出，旧服务可能处于停止状态；替换前失败也要把它重新拉起来
+            $oldService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($null -eq $oldService) {
+                Write-UpgradeLog -LogPath $logPath -Message "旧版本服务 $ServiceName 不存在，无法重新启动；二进制未改动"
+            } else {
                 try {
-                    Invoke-Sc -Arguments "start $ServiceName" -Description "重新启动服务 $ServiceName" | Out-Null
-                    Write-UpgradeLog -LogPath $logPath -Message '已重新启动旧版本服务'
+                    if ($oldService.Status -eq 'Running') {
+                        Write-UpgradeLog -LogPath $logPath -Message '旧版本服务仍在运行，二进制未改动'
+                    } else {
+                        Start-Service -Name $ServiceName -ErrorAction Stop
+                        Write-UpgradeLog -LogPath $logPath -Message '旧版本服务已重新启动，二进制未改动'
+                    }
                 } catch {
                     Write-UpgradeLog -LogPath $logPath -Message "错误：重新启动旧版本服务失败：$($_.Exception.Message)"
+                } finally {
+                    $oldService.Dispose()
                 }
             }
-            Write-UpgradeLog -LogPath $logPath -Message '失败发生在替换二进制之前，服务与二进制未改动'
         }
         throw
     } finally {

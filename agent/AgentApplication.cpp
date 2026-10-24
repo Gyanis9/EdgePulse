@@ -37,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -462,6 +463,74 @@ namespace EdgePulse::Agent
                 }
             }
         }
+
+        /**
+         * @brief 在阻塞执行器上检查升级标记是否存在
+         * @param loop 事件循环
+         * @param path 标记路径
+         * @return 协程任务，结果为 true 表示标记存在；失败返回中文原因
+         * @note 状态目录可能位于慢盘，存在检查不能占住事件循环
+         */
+        AsynGyanis::Core::Task<std::expected<bool, std::string>> markerExists(AsynGyanis::Core::EventLoop &loop, std::filesystem::path path)
+        {
+            std::expected<bool, std::string> found;
+            try
+            {
+                found = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<bool, std::string>>(
+                        loop,
+                        [path]() -> std::expected<bool, std::string>
+                        {
+                            std::string     pathText = AsynGyanis::Platform::FileSystem::utf8FromPath(path);
+                            std::error_code filesystemError;
+                            const bool      exists = std::filesystem::exists(path, filesystemError);
+                            if (filesystemError)
+                            {
+                                return std::unexpected("检查升级标记 " + pathText + " 失败：" + filesystemError.message());
+                            }
+                            return exists;
+                        });
+            } catch (const std::exception &failure)
+            {
+                found = std::unexpected("提交升级标记检查任务失败：" + std::string{failure.what()});
+            } catch (...)
+            {
+                found = std::unexpected("提交升级标记检查任务失败：未知异常");
+            }
+            co_return found;
+        }
+
+        /**
+         * @brief 在阻塞执行器上删除升级标记，文件不存在视为成功
+         * @param loop 事件循环
+         * @param path 标记路径
+         * @return 协程任务；删除失败时返回中文原因
+         */
+        AsynGyanis::Core::Task<std::expected<void, std::string>> removeMarker(AsynGyanis::Core::EventLoop &loop, std::filesystem::path path)
+        {
+            std::expected<void, std::string> removed;
+            try
+            {
+                removed = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                        loop,
+                        [path]() -> std::expected<void, std::string>
+                        {
+                            std::error_code filesystemError;
+                            std::filesystem::remove(path, filesystemError);
+                            if (filesystemError)
+                            {
+                                return std::unexpected("删除升级标记 " + AsynGyanis::Platform::FileSystem::utf8FromPath(path) + " 失败：" + filesystemError.message());
+                            }
+                            return {};
+                        });
+            } catch (const std::exception &failure)
+            {
+                removed = std::unexpected("提交升级标记删除任务失败：" + std::string{failure.what()});
+            } catch (...)
+            {
+                removed = std::unexpected("提交升级标记删除任务失败：未知异常");
+            }
+            co_return removed;
+        }
     } // namespace
 
     AgentApplication::AgentApplication(AgentConfiguration configuration, const bool consoleMode) : m_configuration(std::move(configuration)), m_consoleMode(consoleMode)
@@ -486,19 +555,26 @@ namespace EdgePulse::Agent
             LOG_ERROR_FMT("读取升级状态失败，本次跳过升级健康确认：{}", update.error());
             co_return;
         }
+
+        const std::filesystem::path rollbackMarker = m_configuration.stateDirectory / "update-rollback";
         if (update->pendingResult.empty())
         {
+            // 没有待上报结果时回滚标记只可能是上一次升级清理失败的残留，已无法补报，删掉免得下次启动重复判断
+            const auto removed = co_await removeMarker(loop, rollbackMarker);
+            if (!removed.has_value())
+            {
+                LOG_WARN_FMT("清理残留的升级回滚标记失败：{}", removed.error());
+            }
             co_return;
         }
 
-        const std::filesystem::path rollbackMarker = m_configuration.stateDirectory / "update-rollback";
-        std::error_code             markerError;
-        const bool                  rollbackPending = std::filesystem::exists(rollbackMarker, markerError);
-        if (markerError)
+        const auto rollbackFound = co_await markerExists(loop, rollbackMarker);
+        if (!rollbackFound.has_value())
         {
-            LOG_ERROR_FMT("检查升级回滚标记 {} 失败，保留待上报结果等待下次启动：{}", AsynGyanis::Platform::FileSystem::utf8FromPath(rollbackMarker), markerError.message());
+            LOG_ERROR_FMT("{}，保留待上报结果等待下次启动", rollbackFound.error());
             co_return;
         }
+        const bool rollbackPending = *rollbackFound;
 
         const auto parsed = AsynGyanis::Base::parseConfigValue(update->pendingResult);
         std::int64_t commandId = 0;
@@ -524,24 +600,40 @@ namespace EdgePulse::Agent
             if (!cleared.has_value())
             {
                 LOG_ERROR_FMT("清除损坏的升级待上报结果失败：{}", cleared.error());
+                co_return;
             }
             if (rollbackPending)
             {
-                std::error_code removeError;
-                std::filesystem::remove(rollbackMarker, removeError);
-                if (removeError)
+                const auto removed = co_await removeMarker(loop, rollbackMarker);
+                if (!removed.has_value())
                 {
-                    LOG_ERROR_FMT("删除升级回滚标记 {} 失败：{}", AsynGyanis::Platform::FileSystem::utf8FromPath(rollbackMarker), removeError.message());
+                    LOG_ERROR_FMT("{}", removed.error());
                 }
             }
             co_return;
         }
 
-        if (rollbackPending)
+        // 目标版本与当前运行版本不一致说明二进制没有被替换；写健康标记会把旧版本报成升级成功
+        const bool versionMismatch = !update->version.empty() && update->version != agentVersion;
+        if (rollbackPending || versionMismatch)
         {
+            std::string message;
+            if (rollbackPending)
+            {
+                message = "升级未通过健康检查，已回滚到旧版本";
+            } else
+            {
+                message = "升级目标版本 " + update->version + " 与当前运行版本 " + agentVersion + " 不一致";
+            }
             const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object(
-                    {{"status", "failed"}, {"result", "{}"}, {"message", "升级未通过健康检查，已回滚到旧版本"}});
-            state.enqueueResult(commandId, payload.dump());
+                    {{"status", "failed"}, {"result", "{}"}, {"message", message}});
+            // 安装器启动时已为同一命令入队过一条成功结果，直接入队会被唯一索引丢弃，必须整行替换
+            const auto replaced = state.replaceResult(commandId, payload.dump());
+            if (!replaced.has_value())
+            {
+                LOG_ERROR_FMT("升级失败结果替换入队失败，保留待上报结果等待下次启动：{}", replaced.error());
+                co_return;
+            }
 
             UpdateStateRecord record = *update;
             record.healthyAt.clear();
@@ -549,16 +641,22 @@ namespace EdgePulse::Agent
             const auto cleared = state.setUpdateState(record);
             if (!cleared.has_value())
             {
-                LOG_ERROR_FMT("清除升级待上报结果失败：{}", cleared.error());
+                LOG_ERROR_FMT("清除升级待上报结果失败，保留回滚标记等待下次启动重新上报：{}", cleared.error());
+                co_return;
             }
 
-            std::error_code removeError;
-            std::filesystem::remove(rollbackMarker, removeError);
-            if (removeError)
+            if (rollbackPending)
             {
-                LOG_ERROR_FMT("删除升级回滚标记 {} 失败：{}", AsynGyanis::Platform::FileSystem::utf8FromPath(rollbackMarker), removeError.message());
+                const auto removed = co_await removeMarker(loop, rollbackMarker);
+                if (!removed.has_value())
+                {
+                    LOG_ERROR_FMT("{}", removed.error());
+                }
+                LOG_WARN_FMT("升级未通过健康检查，命令 {} 已按失败上报并恢复旧版本状态", commandId);
+            } else
+            {
+                LOG_WARN_FMT("升级目标版本 {} 与当前运行版本 {} 不一致，命令 {} 已按失败上报", update->version, agentVersion, commandId);
             }
-            LOG_WARN_FMT("升级未通过健康检查，命令 {} 已按失败上报并恢复旧版本状态", commandId);
             co_return;
         }
 
@@ -590,6 +688,15 @@ namespace EdgePulse::Agent
             co_return;
         }
 
+        const AsynGyanis::Base::ConfigValue detail  = AsynGyanis::Base::ConfigValue::object({{"version", agentVersion}});
+        const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object({{"status", "succeeded"}, {"result", detail.dump()}, {"message", "升级成功"}});
+        const auto                          replaced = state.replaceResult(commandId, payload.dump());
+        if (!replaced.has_value())
+        {
+            LOG_ERROR_FMT("升级成功结果替换入队失败，保留待上报结果等待下次启动：{}", replaced.error());
+            co_return;
+        }
+
         UpdateStateRecord record = *update;
         record.healthyAt          = utcNowText();
         record.pendingResult.clear();
@@ -598,10 +705,6 @@ namespace EdgePulse::Agent
         {
             LOG_ERROR_FMT("升级健康标记已写入，但记录确认时刻或清除待上报结果失败：{}", saved.error());
         }
-
-        const AsynGyanis::Base::ConfigValue detail  = AsynGyanis::Base::ConfigValue::object({{"version", agentVersion}});
-        const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object({{"status", "succeeded"}, {"result", detail.dump()}, {"message", "升级成功"}});
-        state.enqueueResult(commandId, payload.dump());
         LOG_INFO_FMT("升级健康标记已写入，版本 {}，命令 {} 已按成功上报", agentVersion, commandId);
         co_return;
     }

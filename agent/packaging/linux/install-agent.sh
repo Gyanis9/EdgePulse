@@ -30,6 +30,8 @@ usage() {
   --state-dir DIR          状态目录；健康标记与回滚标记位于该目录
   --prefix DIR             安装前缀；只替换 DIR/bin/edgepulse-agent
 
+升级模式不接受 --no-start；--config-dir 与 --log-dir 在升级模式中不使用。
+
 环境变量：
   SYSTEMD_UNIT_DIR   单元文件目录，默认 /etc/systemd/system；测试时指向临时目录
 
@@ -149,6 +151,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "${upgrade_package}" && "${no_start}" -eq 1 ]]; then
+    die "--upgrade 不接受 --no-start：升级必须启动服务并等待健康标记"
+fi
+
 # 升级日志与状态目录在解析参数后确定；日志固定写在状态目录，便于新旧两个版本共用
 upgrade_log=""
 upgrade_binary=""
@@ -162,15 +168,28 @@ log_upgrade() {
     printf '%s\n' "${line}" >&2
 }
 
+# 替换前的失败不改二进制；启动器进程退出后旧服务可能已是停的，必须把旧版本重新拉起来
+abort_before_replace() {
+    local reason="$1"
+    log_upgrade "升级失败：${reason}"
+    if systemctl is-active --quiet edgepulse-agent.service; then
+        log_upgrade "旧版本服务仍在运行，二进制未改动"
+    elif systemctl start edgepulse-agent.service >>"${upgrade_log}" 2>&1; then
+        log_upgrade "旧版本服务已重新启动，二进制未改动"
+    else
+        log_upgrade "错误：重新启动旧版本服务失败，请检查 systemctl status edgepulse-agent.service"
+    fi
+    exit 1
+}
+
 # 升级期间的所有失败都走这里：先停服务，再恢复备份、写回滚标记、启动旧版本
 rollback_upgrade() {
     local reason="$1"
-    log_upgrade "升级失败：${reason}"
-    # 备份尚未建立说明失败发生在停止服务之前，二进制与运行中的服务都没有改动
+    # 备份尚未建立说明失败发生在替换之前，二进制没改动，但旧服务可能已被启动器带停
     if [[ -z "${upgrade_binary}" || ! -f "${upgrade_backup}" ]]; then
-        log_upgrade "失败发生在替换二进制之前，服务与二进制未改动"
-        exit 1
+        abort_before_replace "${reason}"
     fi
+    log_upgrade "升级失败：${reason}"
     systemctl stop edgepulse-agent.service >>"${upgrade_log}" 2>&1 || true
 
     if [[ -f "${upgrade_backup}" ]]; then
@@ -235,6 +254,10 @@ run_upgrade() {
     [[ -n "${upgrade_version}" ]] || rollback_upgrade "manifest.json 缺少 version"
     [[ "${upgrade_version}" =~ ^[0-9]+(\.[0-9]+)*([-+][0-9A-Za-z.-]+)?$ ]] || rollback_upgrade "manifest.json 的 version 不合法：${upgrade_version}"
 
+    local platform
+    platform="$(sed -n 's/.*"platform"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${extraction_dir}/manifest.json" | head -n 1)"
+    [[ "${platform}" == "linux-x86_64" ]] || rollback_upgrade "manifest.json 的 platform 不是 linux-x86_64：${platform:-缺失}"
+
     grep -Eq '^[0-9a-fA-F]{64}[[:space:]]+\*?edgepulse-agent$' "${extraction_dir}/checksums.sha256" ||
         rollback_upgrade "checksums.sha256 没有覆盖 edgepulse-agent"
     if ! (cd "${extraction_dir}" && sha256sum -c --strict checksums.sha256) >>"${upgrade_log}" 2>&1; then
@@ -246,14 +269,12 @@ run_upgrade() {
     [[ -f "${upgrade_binary}" ]] || rollback_upgrade "找不到现有二进制 ${upgrade_binary}"
     # 旧标记必须在启动新版本之前清掉；清理失败时服务尚未停止，直接结束即可
     if ! rm -f -- "${state_dir}/update-health" "${state_dir}/update-rollback"; then
-        log_upgrade "无法删除旧的升级健康标记或回滚标记，升级未开始"
-        exit 1
+        abort_before_replace "无法删除旧的升级健康标记或回滚标记"
     fi
 
     if ! cp -p -- "${upgrade_binary}" "${upgrade_backup}"; then
         rm -f -- "${upgrade_backup}" 2>/dev/null || true
-        log_upgrade "备份现有二进制失败，升级未开始"
-        exit 1
+        abort_before_replace "备份现有二进制失败"
     fi
     log_upgrade "已备份现有二进制到 ${upgrade_backup}"
 
@@ -322,10 +343,11 @@ fi
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 binary_source="${package_dir}/edgepulse-agent"
+installer_source="${package_dir}/install-agent.sh"
 unit_source="${package_dir}/edgepulse-agent.service"
 config_source="${package_dir}/agent.yaml.example"
 
-for file in "${binary_source}" "${unit_source}" "${config_source}"; do
+for file in "${binary_source}" "${installer_source}" "${unit_source}" "${config_source}"; do
     [[ -f "${file}" ]] || die "安装包不完整，缺少 ${file}"
 done
 
@@ -375,9 +397,11 @@ fi
 
 install -m 0755 "${binary_source}" "${prefix}/bin/edgepulse-agent"
 install -m 0644 "${work_dir}/edgepulse-agent.service" "${unit_dir}/edgepulse-agent.service"
-# Agent 的升级命令按配置里的 installer_script 启动安装器；普通安装把本脚本复制到前缀下，
-# 后续升级不必再依赖解包目录
-install -m 0755 -- "${BASH_SOURCE[0]}" "${prefix}/lib/edgepulse/install-agent.sh"
+# Agent 的升级命令按配置里的 installer_script 启动安装器；普通安装把解包目录里的安装器复制到
+# 前缀下，后续升级不必再依赖解包目录。直接跑已安装副本时源与目标相同，跳过复制
+if [[ "${installer_source}" != "${prefix}/lib/edgepulse/install-agent.sh" ]]; then
+    install -m 0755 -- "${installer_source}" "${prefix}/lib/edgepulse/install-agent.sh"
+fi
 
 echo "已安装二进制：${prefix}/bin/edgepulse-agent"
 echo "已安装升级安装器：${prefix}/lib/edgepulse/install-agent.sh"

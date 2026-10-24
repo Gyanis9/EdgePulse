@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 在 Linux 上验证 install-agent.sh 的升级成功与健康超时回滚：假 systemctl 负责启停，
-# 假 Agent 二进制在收到健康开关时写健康标记。默认用于 ubuntu:24.04 容器。
+# 在 Linux 上验证 install-agent.sh 的升级成功、健康超时回滚与替换前失败重启旧服务：假 systemctl
+# 记录服务状态并启停假 Agent 二进制，假二进制在收到健康开关时写健康标记。默认用于 ubuntu:24.04 容器。
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -41,12 +41,22 @@ action="${1:-}"
 if [[ $# -ge 2 ]]; then
     shift
 fi
+state_file="${FAKE_AGENT_STATE_DIR:-}/service-state"
 case "${action}" in
+    is-active)
+        [[ -n "${FAKE_AGENT_STATE_DIR:-}" && -f "${state_file}" && "$(cat "${state_file}")" == "active" ]]
+        exit $?
+        ;;
     stop)
+        if [[ -n "${FAKE_AGENT_STATE_DIR:-}" ]]; then
+            printf 'inactive\n' > "${state_file}"
+        fi
         exit 0
         ;;
     start)
         if [[ -n "${FAKE_AGENT_PREFIX:-}" && -x "${FAKE_AGENT_PREFIX}/bin/edgepulse-agent" ]]; then
+            printf 'active\n' > "${state_file}"
+            sha256sum "${FAKE_AGENT_PREFIX}/bin/edgepulse-agent" >>"${FAKE_AGENT_STATE_DIR}/systemctl.log"
             "${FAKE_AGENT_PREFIX}/bin/edgepulse-agent" >>"${FAKE_AGENT_STATE_DIR}/fake-agent.log" 2>&1 &
         fi
         exit 0
@@ -166,6 +176,46 @@ say "PASS: 超时路径恢复旧二进制、写入回滚标记并以非零退出
 say "超时路径日志：${timeout_state}/update-installer.log，回滚标记内容 $(cat "${timeout_state}/update-rollback")"
 grep -E "升级失败|已恢复旧二进制|回滚完成" "${timeout_state}/update-installer.log" | sed 's/^/  /'
 
+# 替换前失败：坏包（校验不符）时旧服务已随启动器退出而停着，安装器必须把它重新拉起来
+corrupt_root="${work}/corrupt"
+corrupt_prefix="${corrupt_root}/prefix"
+corrupt_state="${corrupt_root}/state"
+corrupt_package="${work}/corrupt-3.0.0.tar.gz"
+corrupt_stage="${work}/corrupt-stage"
+mkdir -p "${corrupt_state}" "${corrupt_stage}"
+install_old_binary "${corrupt_prefix}"
+corrupt_old_digest="$(file_digest "${corrupt_prefix}/bin/edgepulse-agent")"
+make_package "3.0.0" "${corrupt_package}"
+tar -xzf "${corrupt_package}" -C "${corrupt_stage}"
+printf '\n# tampered after checksums were written\n' >> "${corrupt_stage}/edgepulse-agent"
+(cd "${corrupt_stage}" && tar -czf "${corrupt_package}" edgepulse-agent manifest.json checksums.sha256)
+# 启动器进程退出后旧服务处于停止状态
+printf 'inactive\n' > "${corrupt_state}/service-state"
+
+set +e
+PATH="${fakebin}:${PATH}" FAKE_AGENT_PREFIX="${corrupt_prefix}" FAKE_AGENT_STATE_DIR="${corrupt_state}" \
+    "${installer}" --upgrade "${corrupt_package}" --health-timeout 2 --state-dir "${corrupt_state}" --prefix "${corrupt_prefix}" \
+    >"${corrupt_root}/stdout.log" 2>&1
+corrupt_rc=$?
+set -e
+
+if [[ "${corrupt_rc}" -eq 0 ]]; then
+    cat "${corrupt_state}/update-installer.log" >&2 || true
+    fail "校验失败时安装器应返回非零"
+fi
+[[ "$(file_digest "${corrupt_prefix}/bin/edgepulse-agent")" == "${corrupt_old_digest}" ]] || fail "校验失败时二进制不应被替换"
+[[ "$(cat "${corrupt_state}/service-state")" == "active" ]] || fail "替换前失败后旧服务未重新启动"
+[[ -f "${corrupt_state}/systemctl.log" ]] || fail "替换前失败后未记录服务启动"
+[[ "$(cut -d' ' -f1 "${corrupt_state}/systemctl.log" | head -n 1)" == "${corrupt_old_digest}" ]] || fail "重新启动的服务用的不是旧二进制"
+grep -q "旧版本服务已重新启动" "${corrupt_state}/update-installer.log" || fail "升级日志缺少旧服务重新启动记录"
+if grep -q "服务与二进制未改动" "${corrupt_state}/update-installer.log"; then
+    fail "替换前失败时不应声称服务与二进制未改动"
+fi
+[[ ! -e "${corrupt_state}/update-rollback" ]] || fail "替换前失败不应写回滚标记"
+say "PASS: 校验失败时安装器以非零退出并用旧二进制重新启动旧服务"
+say "校验失败路径日志：${corrupt_state}/update-installer.log"
+grep -E "升级失败|旧版本服务已重新启动" "${corrupt_state}/update-installer.log" | sed 's/^/  /'
+
 # 普通安装：复制安装器到前缀并替换配置里的安装器路径
 normal_stage="${work}/normal-package"
 normal_root="${work}/normal"
@@ -216,6 +266,8 @@ if [[ -n "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS:-}" ]]; then
     cp "${success_state}/update-installer.log" "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}/success-update-installer.log"
     cp "${timeout_state}/update-installer.log" "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}/timeout-update-installer.log"
     cp "${timeout_state}/update-rollback" "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}/timeout-update-rollback"
+    cp "${corrupt_state}/update-installer.log" "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}/corrupt-update-installer.log"
+    cp "${corrupt_state}/systemctl.log" "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}/corrupt-systemctl.log"
     cp "${normal_root}/config/agent.yaml" "${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}/normal-agent.yaml"
     say "安装器日志已复制到 ${EDGEPULSE_INSTALLER_TEST_ARTIFACTS}"
 fi

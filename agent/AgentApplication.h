@@ -58,13 +58,14 @@ namespace EdgePulse::Agent
     private:
         /**
          * @brief 首次成功心跳后确认一次升级结果
-         * @param loop 事件循环，健康标记的原子写在阻塞执行器上执行
+         * @param loop 事件循环，健康标记的检查、写入与删除都在阻塞执行器上执行
          * @param state 本地状态库
-         * @param agentVersion 当前进程版本，写入健康标记并作为成功结果
+         * @param agentVersion 当前进程版本，写入健康标记并用于核对升级目标版本
          * @return 协程任务
-         * @details 没有待上报的升级结果时直接返回。存在回滚标记时按失败上报并删除标记，
-         *          不写健康标记；否则在首次心跳后写健康标记、记录确认时刻并按成功上报。
-         *          待上报内容损坏时记 ERROR 并清除，避免每次启动重复处理同一行。
+         * @details 没有待上报的升级结果时清理残留的回滚标记后返回。存在回滚标记或升级目标版本与
+         *          当前运行版本不一致时按失败上报并删除回滚标记，不写健康标记；否则在首次心跳后
+         *          写健康标记、记录确认时刻并按成功上报。失败与成功都整行替换同一命令此前入队的
+         *          结果。待上报内容损坏时记 ERROR 并清除，避免每次启动重复处理同一行。
          */
         AsynGyanis::Core::Task<> confirmUpdateHealth(AsynGyanis::Core::EventLoop &loop, AgentState &state, std::string agentVersion);
 
