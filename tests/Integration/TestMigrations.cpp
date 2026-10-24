@@ -119,11 +119,24 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         // 令牌表按令牌哈希查、幂等表按令牌与非空响应体回放：两处缺列都会让后续接口在运行期才发现
         EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('sys_api_token') WHERE name IN ('token_hash', 'previous_hash')"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('sys_idempotency') WHERE name = 'response_body'"));
-        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_menu WHERE id = 1210 AND parent_id = 1100 AND menu_type = 'menu' AND permission = 'system:token:list'"));
+        EXPECT_EQ(1, querySingleInteger(*connection,
+                                        "SELECT COUNT(*) FROM sys_menu WHERE id = 1210 AND parent_id = 1100 AND menu_type = 'menu' AND permission = 'system:token:list'"));
         EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_menu WHERE id IN (1211, 1212, 1213) AND parent_id = 1210 AND menu_type = 'btn'"));
         EXPECT_EQ(4, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_role_menu WHERE menu_id IN (1210,1211,1212,1213) AND role_id = 1"));
         EXPECT_EQ(4, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_role_menu WHERE menu_id IN (1210,1211,1212,1213) AND role_id = 3"));
-        EXPECT_EQ(19, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 20"));
+        // 轮换要同时读到当前与上一枚证书，缺任一列都会让重叠窗口在运行期静默失效
+        EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_node') "
+                                                     "WHERE name IN ('previous_cert_fingerprint', 'previous_cert_not_after')"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'biz_agent_certificate'"));
+        EXPECT_EQ(0, querySingleInteger(*connection, "SELECT COUNT(*) FROM biz_agent_certificate"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_agent_certificate') WHERE name = 'idx_agent_certificate_node'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_agent_certificate') WHERE name = 'idx_agent_certificate_fingerprint'"));
+        // 历史按节点与签发时间读取，列序反了会退化成回表扫描
+        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_info('idx_agent_certificate_node') "
+                                                     "WHERE (name = 'tenant_id' AND seqno = 0) OR (name = 'node_id' AND seqno = 1) OR (name = 'issued_at' AND seqno = 2)"));
+        EXPECT_EQ(11, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_agent_certificate')"));
+        EXPECT_EQ(20, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }

@@ -41,6 +41,7 @@ gtest_discover_tests(edgepulse-unit-tests DISCOVERY_MODE PRE_TEST)
 
 add_executable(edgepulse-integration-tests
         Integration/TestAgentAuthorization.cpp
+        Integration/TestAgentCertificateRepository.cpp
         Integration/TestApiTokenService.cpp
         Integration/TestAuthService.cpp
         Integration/TestDeviceService.cpp

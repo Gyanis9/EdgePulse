@@ -82,7 +82,7 @@ namespace
     }
 } // namespace
 
-// 钉住：MySQL 上能完整应用十九版迁移，V7 归属列与 V15 至 V19 的注册、配置、签名、登录加固与企业身份表列生效，日志仓储按部门范围过滤
+// 钉住：MySQL 上能完整应用二十版迁移，V7 归属列与 V15 至 V20 的注册、配置、签名、登录加固、企业身份与证书轮换表列生效，日志仓储按部门范围过滤
 TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
 {
     const std::optional<std::string> host = environmentText("EDGEPULSE_TEST_MYSQL_HOST");
@@ -95,22 +95,27 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
     const std::optional<std::string> database = environmentText("EDGEPULSE_TEST_MYSQL_DATABASE");
 
     EdgePulse::Common::DatabaseOptions options;
-    options.driver   = "mysql";
-    options.host     = *host;
-    options.port     = environmentPort("EDGEPULSE_TEST_MYSQL_PORT", 3306);
-    options.userName = user.value_or("root");
-    options.password = password.value_or("");
-    options.database = database.value_or("edgepulse_test");
+    options.driver          = "mysql";
+    options.host            = *host;
+    options.port            = environmentPort("EDGEPULSE_TEST_MYSQL_PORT", 3306);
+    options.userName        = user.value_or("root");
+    options.password        = password.value_or("");
+    options.database        = database.value_or("edgepulse_test");
     options.maximumPoolSize = 4;
 
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirect(options);
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
-        EXPECT_EQ(19, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
-        EXPECT_EQ(6, queryCount(*connection,
+        EXPECT_EQ(20, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
+        EXPECT_EQ(7, queryCount(*connection,
                                 "SELECT COUNT(*) AS total FROM information_schema.tables WHERE table_schema = ? AND table_name IN "
-                                "('biz_agent_enrollment', 'biz_node_config', 'biz_node_config_revision', 'sys_api_token', 'sys_idempotency', 'sys_user_mfa')",
+                                "('biz_agent_enrollment', 'biz_node_config', 'biz_node_config_revision', 'biz_agent_certificate', 'sys_api_token', 'sys_idempotency', "
+                                "'sys_user_mfa')",
+                                std::array<AsynGyanis::Database::DatabaseValue, 1>{options.database}));
+        EXPECT_EQ(2, queryCount(*connection,
+                                "SELECT COUNT(*) AS total FROM information_schema.columns WHERE table_schema = ? AND table_name = 'biz_node' AND column_name IN "
+                                "('previous_cert_fingerprint', 'previous_cert_not_after')",
                                 std::array<AsynGyanis::Database::DatabaseValue, 1>{options.database}));
         EXPECT_EQ(1, queryCount(*connection,
                                 "SELECT COUNT(*) AS total FROM information_schema.columns WHERE table_schema = ? AND table_name = 'biz_firmware' AND "
@@ -132,9 +137,9 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
     }
 
     const std::shared_ptr<EdgePulse::Common::Database> databaseHandle = EdgePulse::Common::Database::open(options);
-    EdgePulse::TestSupport::EventLoopRunner          runner;
-    EdgePulse::System::LogRepository                 logs(databaseHandle);
-    EdgePulse::Auth::LoginAudit                      audit(databaseHandle);
+    EdgePulse::TestSupport::EventLoopRunner            runner;
+    EdgePulse::System::LogRepository                   logs(databaseHandle);
+    EdgePulse::Auth::LoginAudit                        audit(databaseHandle);
 
     const std::int64_t baseDept = 900000 + static_cast<std::int64_t>(std::chrono::steady_clock::now().time_since_epoch().count() % 100000);
     const std::string  tag      = "mysql-test-" + std::to_string(baseDept);
@@ -149,16 +154,16 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
     ASSERT_TRUE(runner.run(logs.insertOperLog(runner.loop(), first)));
 
     EdgePulse::System::OperLogRecord second = first;
-    second.operName = "other-user";
-    second.operId   = 8;
-    second.deptId   = baseDept + 1;
+    second.operName                         = "other-user";
+    second.operId                           = 8;
+    second.deptId                           = baseDept + 1;
     ASSERT_TRUE(runner.run(logs.insertOperLog(runner.loop(), second)));
     ASSERT_TRUE(runner.run(audit.record(runner.loop(), EdgePulse::Auth::LoginAuditEntry{"mysql-user", "127.0.0.1", true, "ok", tag, 7, baseDept})));
 
     EdgePulse::System::LogScope scope;
-    scope.all      = false;
-    scope.selfOnly = false;
-    scope.deptIds  = {baseDept};
+    scope.all            = false;
+    scope.selfOnly       = false;
+    scope.deptIds        = {baseDept};
     const auto operPage  = runner.run(logs.listOperLogs(runner.loop(), tag, "", EdgePulse::Common::PageParameters{1, 10}, scope));
     const auto loginPage = runner.run(logs.listLoginLogs(runner.loop(), "", "", EdgePulse::Common::PageParameters{1, 10}, scope));
     EXPECT_EQ(1, operPage.total);
@@ -172,7 +177,7 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
 
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirect(options);
-        const std::array<AsynGyanis::Database::DatabaseValue, 1>         parameters{tag};
+        const std::array<AsynGyanis::Database::DatabaseValue, 1>        parameters{tag};
         ASSERT_NE(nullptr, connection->execute("DELETE FROM sys_oper_log WHERE module = ?", parameters));
         ASSERT_NE(nullptr, connection->execute("DELETE FROM sys_login_log WHERE trace_id = ?", parameters));
     }
@@ -188,7 +193,7 @@ TEST(ExternalStores, RedisKeyValueStoreRoundTrip)
     }
     const std::optional<std::string> password = environmentText("EDGEPULSE_TEST_REDIS_PASSWORD");
 
-    EdgePulse::Cache::RedisKeyValueStore store(*host, environmentPort("EDGEPULSE_TEST_REDIS_PORT", 6379), password.value_or(""), 15);
+    EdgePulse::Cache::RedisKeyValueStore    store(*host, environmentPort("EDGEPULSE_TEST_REDIS_PORT", 6379), password.value_or(""), 15);
     EdgePulse::TestSupport::EventLoopRunner runner;
 
     const std::string base = "edgepulse:acceptance:" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());

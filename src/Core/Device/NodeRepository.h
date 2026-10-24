@@ -31,21 +31,23 @@ namespace EdgePulse::Device
      */
     struct NodeRecord
     {
-        std::int64_t id{0};           ///< 主键
-        std::int64_t tenantId{1};     ///< 归属租户
-        std::string  name;            ///< 节点名
-        std::string  status;          ///< online / offline
-        std::string  agentVersion;    ///< Agent 版本
-        std::string  certFingerprint; ///< 自报的证书 SHA-256，小写
-        std::string  certNotAfter;    ///< 叶证书到期时间，可空
-        std::string  certRevokedAt;   ///< 证书吊销时间，可空
-        std::string  labelsJson;      ///< 标签 JSON 文本，可空
-        std::string  lastSeen;        ///< 最近心跳时间，可空
-        std::int64_t groupId{0};      ///< 所属分组
-        std::string  groupName;       ///< 分组名
-        std::int64_t ownerDeptId{0};  ///< 归属部门，供数据范围
-        std::int64_t createdBy{0};    ///< 创建人，供 SELF 范围
-        std::int64_t version{1};      ///< 乐观锁版本
+        std::int64_t id{0};                   ///< 主键
+        std::int64_t tenantId{1};             ///< 归属租户
+        std::string  name;                    ///< 节点名
+        std::string  status;                  ///< online / offline
+        std::string  agentVersion;            ///< Agent 版本
+        std::string  certFingerprint;         ///< 自报的证书 SHA-256，小写
+        std::string  certNotAfter;            ///< 叶证书到期时间，可空
+        std::string  certRevokedAt;           ///< 证书吊销时间，可空
+        std::string  previousCertFingerprint; ///< 上一枚证书的 SHA-256，可空
+        std::string  previousCertNotAfter;    ///< 上一枚证书退出重叠窗口的时间，可空
+        std::string  labelsJson;              ///< 标签 JSON 文本，可空
+        std::string  lastSeen;                ///< 最近心跳时间，可空
+        std::int64_t groupId{0};              ///< 所属分组
+        std::string  groupName;               ///< 分组名
+        std::int64_t ownerDeptId{0};          ///< 归属部门，供数据范围
+        std::int64_t createdBy{0};            ///< 创建人，供 SELF 范围
+        std::int64_t version{1};              ///< 乐观锁版本
     };
 
     /**
@@ -102,6 +104,21 @@ namespace EdgePulse::Device
     {
         NotFound, ///< 节点不存在或已删除
         Conflict, ///< 版本不匹配
+    };
+
+    /**
+     * @brief 一次证书轮换要写入的证书字段
+     * @details previous 两列开启新旧证书的重叠窗口，调用方应从轮换前的节点记录取值。
+     */
+    struct AgentCertificateRotation
+    {
+        std::string fingerprint;         ///< 新证书 SHA-256 指纹，小写
+        std::string notAfter;            ///< 新证书到期时间，UTC
+        std::string previousFingerprint; ///< 被替换的旧证书指纹；空表示没有旧证书
+        std::string previousNotAfter;    ///< 旧证书退出重叠窗口的时间，可空
+        std::string serial;              ///< 新证书序列号
+        std::string subject;             ///< 新证书主题
+        std::string notBefore;           ///< 新证书生效时间，UTC
     };
 
     /**
@@ -211,6 +228,22 @@ namespace EdgePulse::Device
          * @return 成功返回更新后的节点；节点不存在或已删除时为空
          */
         AsynGyanis::Core::Task<std::optional<NodeRecord>> revokeCertificate(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
+
+        /**
+         * @brief 以版本比较交换轮换当前证书并追加签发历史
+         * @details 同一事务内更新节点的 active/previous 字段、把旧 active 历史行改为 previous，再插入新 active 行；
+         *          版本不匹配或节点不可见时不写任何行。
+         * @param loop 恢复协程用的事件循环
+         * @param tenant 本次操作的租户边界；边界外的节点按不存在处理
+         * @param nodeId 节点标识
+         * @param expectedVersion 调用方读到的节点版本
+         * @param rotation 新证书字段与被替换的旧证书字段
+         * @return true 轮换完成
+         * @return false 节点不存在、已删除、已吊销或版本不匹配；事务已回滚，无任何写入
+         * @return unexpected 数据库失败，文本为中文原因
+         */
+        AsynGyanis::Core::Task<std::expected<bool, std::string>> rotateCertificate(AsynGyanis::Core::EventLoop &loop, System::TenantScope tenant, std::int64_t nodeId,
+                                                                                   std::int64_t expectedVersion, AgentCertificateRotation rotation);
 
         /**
          * @brief 统计指定天数内到期或已经到期的证书

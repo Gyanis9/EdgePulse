@@ -6,6 +6,7 @@
 #include "Base/Log/LogMacros.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
+#include "Core/Device/CertificateBinding.h"
 #include "Database/Common/DatabaseResult.h"
 #include "Database/Common/DatabaseValue.h"
 
@@ -24,7 +25,8 @@ namespace EdgePulse::Device
 {
     namespace
     {
-        constexpr const char *kNodeColumns = "id, tenant_id, name, status, agent_version, cert_fingerprint, cert_not_after, cert_revoked_at, labels, last_seen, version, group_id, "
+        constexpr const char *kNodeColumns = "id, tenant_id, name, status, agent_version, cert_fingerprint, cert_not_after, cert_revoked_at, previous_cert_fingerprint, "
+                                             "previous_cert_not_after, labels, last_seen, version, group_id, "
                                              "owner_dept_id, created_by, "
                                              "(SELECT name FROM biz_node_group g WHERE g.id = biz_node.group_id AND g.deleted = 0) AS group_name";
 
@@ -71,21 +73,23 @@ namespace EdgePulse::Device
         [[nodiscard]] NodeRecord readNode(const AsynGyanis::Database::DatabaseResult &result)
         {
             NodeRecord node;
-            node.id              = readInteger(result.getValue("id"));
-            node.tenantId        = readInteger(result.getValue("tenant_id"));
-            node.name            = readText(result.getValue("name"));
-            node.status          = readText(result.getValue("status"));
-            node.agentVersion    = readText(result.getValue("agent_version"));
-            node.certFingerprint = readText(result.getValue("cert_fingerprint"));
-            node.certNotAfter    = readText(result.getValue("cert_not_after"));
-            node.certRevokedAt   = readText(result.getValue("cert_revoked_at"));
-            node.labelsJson      = readText(result.getValue("labels"));
-            node.lastSeen        = readText(result.getValue("last_seen"));
-            node.groupId         = readInteger(result.getValue("group_id"));
-            node.groupName       = readText(result.getValue("group_name"));
-            node.ownerDeptId     = readInteger(result.getValue("owner_dept_id"));
-            node.createdBy       = readInteger(result.getValue("created_by"));
-            node.version         = readInteger(result.getValue("version"));
+            node.id                      = readInteger(result.getValue("id"));
+            node.tenantId                = readInteger(result.getValue("tenant_id"));
+            node.name                    = readText(result.getValue("name"));
+            node.status                  = readText(result.getValue("status"));
+            node.agentVersion            = readText(result.getValue("agent_version"));
+            node.certFingerprint         = readText(result.getValue("cert_fingerprint"));
+            node.certNotAfter            = readText(result.getValue("cert_not_after"));
+            node.certRevokedAt           = readText(result.getValue("cert_revoked_at"));
+            node.previousCertFingerprint = readText(result.getValue("previous_cert_fingerprint"));
+            node.previousCertNotAfter    = readText(result.getValue("previous_cert_not_after"));
+            node.labelsJson              = readText(result.getValue("labels"));
+            node.lastSeen                = readText(result.getValue("last_seen"));
+            node.groupId                 = readInteger(result.getValue("group_id"));
+            node.groupName               = readText(result.getValue("group_name"));
+            node.ownerDeptId             = readInteger(result.getValue("owner_dept_id"));
+            node.createdBy               = readInteger(result.getValue("created_by"));
+            node.version                 = readInteger(result.getValue("version"));
             return node;
         }
 
@@ -444,10 +448,12 @@ namespace EdgePulse::Device
                                                                                                 current->id,
                                                                                                 current->version};
                             // 走到这里说明本次出示的证书已被事务内确认允许写入（同指纹、已消费令牌或 off 模式），才清掉旧的吊销时间
+                            // 重新入场或改绑不是续期：旧证书没有重叠窗口，previous 两列必须一并清空
                             // 版本条件把读取与写入绑成一次比较交换：期间提交的吊销或改绑会让这次更新落空，而不是被覆盖
                             const auto update = Sql::executeOrThrow(
                                     connection,
                                     "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
+                                    "previous_cert_fingerprint = '', previous_cert_not_after = NULL, "
                                     "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0",
                                     parameters);
                             if (update->affectedRowCount() == 0)
@@ -471,6 +477,8 @@ namespace EdgePulse::Device
                             node.certFingerprint = registration.certFingerprint;
                             node.certNotAfter    = registration.certNotAfter;
                             node.certRevokedAt.clear();
+                            node.previousCertFingerprint.clear();
+                            node.previousCertNotAfter.clear();
                             node.labelsJson = registration.labelsJson;
                             node.lastSeen   = now;
                             node.version    = current->version + 1;
@@ -543,6 +551,103 @@ namespace EdgePulse::Device
                         return std::nullopt;
                     }
                     return findByIdOnConnection(connection, nodeId, tenant);
+                });
+    }
+
+    AsynGyanis::Core::Task<std::expected<bool, std::string>> NodeRepository::rotateCertificate(AsynGyanis::Core::EventLoop &loop, const System::TenantScope tenant,
+                                                                                               const std::int64_t nodeId, const std::int64_t expectedVersion,
+                                                                                               AgentCertificateRotation rotation)
+    {
+        co_return co_await m_database->withConnection<std::expected<bool, std::string>>(
+                loop,
+                [tenant, nodeId, expectedVersion, rotation = std::move(rotation)](AsynGyanis::Database::DatabaseConnection &connection) mutable -> std::expected<bool, std::string>
+                {
+                    // 指纹会与 TLS 对端身份逐字比较，写入前统一成 64 位小写十六进制，避免大小写或长度差异造成静默失配
+                    const std::optional<std::string> normalizedFingerprint = normalizeCertificateFingerprint(rotation.fingerprint);
+                    if (!normalizedFingerprint.has_value())
+                    {
+                        return std::unexpected("轮换 Agent 证书失败：新证书指纹必须是 64 位十六进制");
+                    }
+                    rotation.fingerprint = *normalizedFingerprint;
+                    if (!rotation.previousFingerprint.empty())
+                    {
+                        const std::optional<std::string> normalizedPrevious = normalizeCertificateFingerprint(rotation.previousFingerprint);
+                        if (!normalizedPrevious.has_value())
+                        {
+                            return std::unexpected("轮换 Agent 证书失败：旧证书指纹必须是 64 位十六进制");
+                        }
+                        rotation.previousFingerprint = *normalizedPrevious;
+                    }
+                    if (rotation.serial.empty() || rotation.serial.size() > 64)
+                    {
+                        return std::unexpected("轮换 Agent 证书失败：证书序列号不能为空且不能超过 64 个字符");
+                    }
+                    if (rotation.subject.size() > 255)
+                    {
+                        return std::unexpected("轮换 Agent 证书失败：证书主题不能超过 255 个字符");
+                    }
+                    if (rotation.notBefore.empty() || rotation.notAfter.empty())
+                    {
+                        return std::unexpected("轮换 Agent 证书失败：证书生效时间与到期时间不能为空");
+                    }
+                    try
+                    {
+                        Sql::executeOrThrowVoid(connection, "BEGIN");
+                        const std::optional<NodeRecord> current = findByIdOnConnection(connection, nodeId, tenant);
+                        // 已吊销的节点只能重新入场，不能通过续期把证书重新挂回去
+                        if (!current.has_value() || !current->certRevokedAt.empty())
+                        {
+                            rollbackQuietly(connection);
+                            return false;
+                        }
+                        // previous 只能是被替换的当前证书；否则调用方可以借轮换把任意指纹塞进重叠窗口
+                        if (rotation.previousFingerprint != current->certFingerprint)
+                        {
+                            rollbackQuietly(connection);
+                            return std::unexpected("轮换 Agent 证书失败：旧证书指纹与节点当前证书不一致");
+                        }
+                        const std::string                                now = Common::nowDateTimeUtc();
+                        std::vector<AsynGyanis::Database::DatabaseValue> parameters{rotation.fingerprint,
+                                                                                    nullableText(rotation.notAfter),
+                                                                                    rotation.previousFingerprint,
+                                                                                    nullableText(rotation.previousNotAfter),
+                                                                                    now,
+                                                                                    nodeId,
+                                                                                    current->tenantId,
+                                                                                    expectedVersion};
+                        // 版本条件把读取与写入绑成一次比较交换：期间提交的吊销或版本推进都会让这次更新落空
+                        const auto update = Sql::executeOrThrow(connection,
+                                                                "UPDATE biz_node SET cert_fingerprint = ?, cert_not_after = ?, previous_cert_fingerprint = ?, "
+                                                                "previous_cert_not_after = ?, version = version + 1, updated_at = ? "
+                                                                "WHERE id = ? AND tenant_id = ? AND version = ? AND deleted = 0 AND cert_revoked_at IS NULL",
+                                                                parameters);
+                        if (update->affectedRowCount() == 0)
+                        {
+                            // 节点不存在、已删除、已吊销或版本已推进：整笔回滚，调用方拿到冲突后重新读取
+                            rollbackQuietly(connection);
+                            return false;
+                        }
+                        // 同一节点最多只有一条 active 历史；旧证书从这里退出重叠窗口，但记录保留供审计
+                        Sql::executeOrThrowVoid(connection, "UPDATE biz_agent_certificate SET status = 'previous' WHERE tenant_id = ? AND node_id = ? AND status = 'active'",
+                                                std::vector<AsynGyanis::Database::DatabaseValue>{current->tenantId, nodeId});
+                        const std::vector<AsynGyanis::Database::DatabaseValue> historyParameters{Common::nextIdentifier(), current->tenantId,    nodeId,
+                                                                                                 rotation.serial,          rotation.fingerprint, rotation.subject,
+                                                                                                 rotation.notBefore,       rotation.notAfter,    now};
+                        Sql::executeOrThrowVoid(connection,
+                                                "INSERT INTO biz_agent_certificate (id, tenant_id, node_id, serial, fingerprint, subject, not_before, not_after, status, "
+                                                "issued_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL)",
+                                                historyParameters);
+                        Sql::executeOrThrowVoid(connection, "COMMIT");
+                        return true;
+                    } catch (const Common::DatabaseException &failure)
+                    {
+                        rollbackQuietly(connection);
+                        return std::unexpected(std::string{"轮换 Agent 证书失败："} + failure.what());
+                    } catch (...)
+                    {
+                        rollbackQuietly(connection);
+                        throw;
+                    }
                 });
     }
 
