@@ -18,9 +18,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,6 +31,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace EdgePulse::Agent
 {
@@ -120,6 +124,83 @@ namespace EdgePulse::Agent
                 std::this_thread::sleep_for(std::chrono::milliseconds{20});
             }
             return predicate();
+        }
+
+        /**
+         * @brief 读取整个文本文件
+         * @param path 文件路径
+         * @return std::string 文件正文；打不开时为空
+         */
+        [[nodiscard]] std::string readTextFile(const std::filesystem::path &path)
+        {
+            std::ifstream stream(path, std::ios::binary);
+            return std::string{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+        }
+
+        /**
+         * @brief 注册升级健康用例需要的服务端路由
+         * @param router 服务端路由表
+         * @param heartbeats 心跳计数
+         * @details 注册与心跳返回成功；命令轮询返回空；结果上报返回 500 以便用例从本地队列核对内容。
+         */
+        void registerUpdateHealthRoutes(AsynGyanis::Net::Router &router, const std::shared_ptr<std::atomic<int>> &heartbeats)
+        {
+            router.post("/api/agent/register",
+                        [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                        {
+                            response.setStatus(200);
+                            response.setBody(R"({"code":200,"message":"ok","data":{"id":77},"traceId":"trace-register"})");
+                            co_return;
+                        });
+            router.post("/api/agent/heartbeat",
+                        [heartbeats](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                        {
+                            heartbeats->fetch_add(1, std::memory_order_acq_rel);
+                            response.setStatus(200);
+                            response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":5},"traceId":"trace-heartbeat"})");
+                            co_return;
+                        });
+            router.get("/api/agent/commands/next",
+                       [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                       {
+                           response.setStatus(200);
+                           response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-next"})");
+                           co_return;
+                       });
+            router.post("/api/agent/commands/:id/result",
+                        [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                        {
+                            response.setStatus(500);
+                            response.setBody(R"({"code":500,"message":"暂时不可用","data":null,"traceId":"trace-result"})");
+                            co_return;
+                        });
+        }
+
+        /**
+         * @brief 构造升级健康用例的配置文本
+         * @param port 回环服务器端口
+         * @return std::string YAML 配置
+         */
+        [[nodiscard]] std::string updateHealthConfiguration(const std::uint16_t port)
+        {
+            return std::string{"agent:\n"
+                               "  server:\n"
+                               "    base_url: http://127.0.0.1:" +
+                               std::to_string(port) +
+                               "\n"
+                               "    allow_plaintext_for_tests: true\n"
+                               "    ca_file: agent.pem\n"
+                               "    certificate_file: agent.pem\n"
+                               "    private_key_file: agent-key.pem\n"
+                               "    name: edge-01\n"
+                               "    websocket_enabled: false\n"
+                               "    heartbeat_interval_seconds: 5\n"
+                               "    command_poll_interval_seconds: 5\n"
+                               "    request_timeout_seconds: 5\n"
+                               "  state:\n"
+                               "    directory: state\n"
+                               "  logging:\n"
+                               "    file: state/agent.log\n"};
         }
     } // namespace
 
@@ -524,5 +605,152 @@ agent:
 
         EXPECT_TRUE(stopped) << "停止请求未在 5 秒内结束 run()";
         EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+    }
+
+    TEST(AgentApplication, WritesHealthMarkerAndReportsUpdateAfterFirstHeartbeat)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server(
+                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+
+        {
+            auto state = AgentState::open(directory.path() / "state" / "agent.db");
+            ASSERT_TRUE(state.has_value()) << state.error();
+            UpdateStateRecord record;
+            record.version       = "9.9.9";
+            record.pendingResult = R"({"commandId":123,"version":"9.9.9","status":"pending"})";
+            const auto written   = state->setUpdateState(record);
+            ASSERT_TRUE(written.has_value()) << written.error();
+        }
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const std::filesystem::path healthMarker = directory.path() / "state" / "update-health";
+        const bool                  marked       = waitFor(std::chrono::seconds{10}, [&healthMarker] { return std::filesystem::exists(healthMarker); });
+        const bool                  cleared      = waitFor(std::chrono::seconds{5},
+                                                           [&directory]
+                                                           {
+                                                               auto state = AgentState::open(directory.path() / "state" / "agent.db");
+                                                               if (!state.has_value())
+                                                               {
+                                                                   return false;
+                                                               }
+                                                               const auto record = state->updateState();
+                                                               return record.has_value() && record->pendingResult.empty();
+                                                           });
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        ASSERT_TRUE(marked) << "首次心跳后未写出升级健康标记";
+        ASSERT_TRUE(cleared) << "升级待上报结果未在时限内清除";
+        ASSERT_TRUE(stopped) << "停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+
+        auto state = AgentState::open(directory.path() / "state" / "agent.db");
+        ASSERT_TRUE(state.has_value()) << state.error();
+        const std::string currentVersion = state->get("agent_version").value_or("");
+        ASSERT_FALSE(currentVersion.empty());
+        EXPECT_EQ(currentVersion, readTextFile(healthMarker)) << "健康标记必须只包含当前 Agent 版本";
+        const auto record = state->updateState();
+        ASSERT_TRUE(record.has_value()) << record.error();
+        EXPECT_TRUE(record->pendingResult.empty());
+        EXPECT_FALSE(record->healthyAt.empty()) << "健康确认时刻未写入状态库";
+
+        const std::vector<QueuedResult> results = state->takeResults(10);
+        ASSERT_EQ(1U, results.size()) << "健康确认应恰好入队一条升级结果";
+        EXPECT_EQ(123, results.front().commandId);
+        const auto payload = AsynGyanis::Base::parseConfigValue(results.front().payload);
+        ASSERT_TRUE(payload.has_value()) << results.front().payload;
+        EXPECT_EQ("succeeded", payload->value("status", std::string{}));
+        EXPECT_EQ("升级成功", payload->value("message", std::string{}));
+        const auto detail = AsynGyanis::Base::parseConfigValue(payload->value("result", std::string{}));
+        ASSERT_TRUE(detail.has_value()) << payload->value("result", std::string{});
+        EXPECT_EQ(currentVersion, detail->value("version", std::string{}));
+    }
+
+    TEST(AgentApplication, ReportsRolledBackUpdateAfterFirstHeartbeat)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server(
+                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+
+        const std::filesystem::path rollbackMarker = directory.path() / "state" / "update-rollback";
+        {
+            auto state = AgentState::open(directory.path() / "state" / "agent.db");
+            ASSERT_TRUE(state.has_value()) << state.error();
+            UpdateStateRecord record;
+            record.version       = "9.9.9";
+            record.pendingResult = R"({"commandId":456,"version":"9.9.9","status":"pending"})";
+            const auto written   = state->setUpdateState(record);
+            ASSERT_TRUE(written.has_value()) << written.error();
+
+            std::ofstream marker(rollbackMarker, std::ios::binary | std::ios::trunc);
+            marker << "9.9.9\n";
+            marker.close();
+            ASSERT_TRUE(marker) << "无法写入升级回滚标记";
+        }
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool cleared = waitFor(std::chrono::seconds{10},
+                                     [&directory, &rollbackMarker]
+                                     {
+                                         if (std::filesystem::exists(rollbackMarker))
+                                         {
+                                             return false;
+                                         }
+                                         auto state = AgentState::open(directory.path() / "state" / "agent.db");
+                                         if (!state.has_value())
+                                         {
+                                             return false;
+                                         }
+                                         const auto record = state->updateState();
+                                         return record.has_value() && record->pendingResult.empty();
+                                     });
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+
+        ASSERT_TRUE(cleared) << "回滚标记或待上报结果未在时限内清除";
+        ASSERT_TRUE(stopped) << "停止请求未在时限内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+        EXPECT_FALSE(std::filesystem::exists(directory.path() / "state" / "update-health")) << "回滚后不得写健康标记";
+
+        auto state = AgentState::open(directory.path() / "state" / "agent.db");
+        ASSERT_TRUE(state.has_value()) << state.error();
+        const auto record = state->updateState();
+        ASSERT_TRUE(record.has_value()) << record.error();
+        EXPECT_TRUE(record->pendingResult.empty());
+        EXPECT_TRUE(record->healthyAt.empty());
+
+        const std::vector<QueuedResult> results = state->takeResults(10);
+        ASSERT_EQ(1U, results.size()) << "回滚确认应恰好入队一条失败结果";
+        EXPECT_EQ(456, results.front().commandId);
+        const auto payload = AsynGyanis::Base::parseConfigValue(results.front().payload);
+        ASSERT_TRUE(payload.has_value()) << results.front().payload;
+        EXPECT_EQ("failed", payload->value("status", std::string{}));
+        EXPECT_EQ("升级未通过健康检查，已回滚到旧版本", payload->value("message", std::string{}));
+        EXPECT_EQ("{}", payload->value("result", std::string{}));
     }
 } // namespace EdgePulse::Agent

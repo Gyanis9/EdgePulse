@@ -1,10 +1,14 @@
-﻿# 安装 EdgePulse Agent 为 Windows 服务：落二进制与配置模板、收紧目录权限、注册服务并配置失败恢复。
+﻿# 安装 EdgePulse Agent 为 Windows 服务：落二进制与配置模板、收紧目录权限、注册服务并配置失败恢复；
+# 加 -Upgrade 时按健康检查窗口替换单个二进制，失败自动恢复上一版。
 [CmdletBinding()]
 param(
     [string]$InstallDir = 'C:\Program Files\EdgePulse\Agent',
     [string]$DataDir = 'C:\ProgramData\EdgePulse\Agent',
     [string]$ServiceName = 'EdgePulseAgent',
-    [switch]$NoStart
+    [switch]$NoStart,
+    [string]$Upgrade = '',
+    [int]$HealthTimeout = 60,
+    [string]$StateDir = ''
 )
 
 Set-StrictMode -Version Latest
@@ -234,6 +238,251 @@ function Assert-Administrator {
     }
 }
 
+function Write-UpgradeLog {
+    param(
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    $line = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') + ' ' + $Message
+    [System.IO.File]::AppendAllText($LogPath, $line + [Environment]::NewLine)
+    Write-Host $line
+}
+
+function Test-UpgradeArchiveEntries {
+    param([Parameter(Mandatory = $true)][string]$ArchivePath)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            $name = $entry.FullName
+            $segments = @($name -split '[\\/]')
+            if ([System.IO.Path]::IsPathRooted($name) -or ($segments -contains '..')) {
+                throw "升级包包含不安全路径：$name"
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+function Test-UpgradeChecksums {
+    param([Parameter(Mandatory = $true)][string]$Directory)
+    $checksumsPath = Join-Path $Directory 'checksums.sha256'
+    if (-not (Test-Path -LiteralPath $checksumsPath -PathType Leaf)) {
+        throw '升级包不完整，缺少 checksums.sha256'
+    }
+    $agentCovered = $false
+    foreach ($line in [System.IO.File]::ReadAllLines($checksumsPath)) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        $match = [regex]::Match($line, '^([0-9a-fA-F]{64})\s+\*?(.+)$')
+        if (-not $match.Success) {
+            throw "checksums.sha256 行格式不合法：$line"
+        }
+        $expected = $match.Groups[1].Value.ToLowerInvariant()
+        $name = $match.Groups[2].Value.Trim()
+        if ($name -match '[\\/]' -or $name -eq '.' -or $name -eq '..') {
+            throw "checksums.sha256 含不安全的文件名：$name"
+        }
+        $filePath = Join-Path $Directory $name
+        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+            throw "checksums.sha256 指向的文件不存在：$name"
+        }
+        $actual = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            throw "文件 $name 的 SHA-256 与 checksums.sha256 不符"
+        }
+        if ($name -eq 'edgepulse-agent.exe') {
+            $agentCovered = $true
+        }
+    }
+    if (-not $agentCovered) {
+        throw 'checksums.sha256 没有覆盖 edgepulse-agent.exe'
+    }
+}
+
+function Invoke-AgentUpgrade {
+    Assert-Administrator
+    if ($ServiceName -ne 'EdgePulseAgent') {
+        throw "升级模式只支持默认服务名 EdgePulseAgent，收到 $ServiceName：自定义服务名需要手工升级"
+    }
+    if ($NoStart) {
+        throw '升级模式不接受 -NoStart：安装器需要启动服务并等待健康标记'
+    }
+    if ($HealthTimeout -lt 1) {
+        throw "-HealthTimeout 必须是正整数：$HealthTimeout"
+    }
+    if ([string]::IsNullOrWhiteSpace($Upgrade)) {
+        throw '升级模式缺少 -Upgrade 安装包路径'
+    }
+    if ([string]::IsNullOrWhiteSpace($StateDir)) {
+        throw '升级模式缺少 -StateDir 状态目录'
+    }
+
+    $InstallDir = Assert-SafeTargetPath -Path $InstallDir -Option '-InstallDir'
+    $StateDir = Assert-SafeTargetPath -Path $StateDir -Option '-StateDir'
+    $upgradePackage = [System.IO.Path]::GetFullPath($Upgrade)
+    $logPath = Join-Path $StateDir 'update-installer.log'
+    $healthMarker = Join-Path $StateDir 'update-health'
+    $rollbackMarker = Join-Path $StateDir 'update-rollback'
+    $binaryPath = Join-Path $InstallDir 'edgepulse-agent.exe'
+    $backupPath = $binaryPath + '.previous'
+    $version = ''
+    $binaryReplaced = $false
+
+    $null = New-Item -ItemType Directory -Path $StateDir -Force
+    $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('edgepulse-agent-upgrade-' + [Guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $workDirectory -Force
+
+    try {
+        Write-UpgradeLog -LogPath $logPath -Message "开始升级：包 $upgradePackage，安装目录 $InstallDir，健康时限 $HealthTimeout 秒"
+        if (-not (Test-Path -LiteralPath $upgradePackage -PathType Leaf)) {
+            throw "升级包不存在或不是普通文件：$upgradePackage"
+        }
+
+        Test-UpgradeArchiveEntries -ArchivePath $upgradePackage
+        $zipCopy = Join-Path $workDirectory 'package.zip'
+        Copy-Item -LiteralPath $upgradePackage -Destination $zipCopy -Force
+        $extractDirectory = Join-Path $workDirectory 'package'
+        $null = New-Item -ItemType Directory -Path $extractDirectory -Force
+        Expand-Archive -LiteralPath $zipCopy -DestinationPath $extractDirectory -Force
+
+        Test-UpgradeChecksums -Directory $extractDirectory
+        $manifestPath = Join-Path $extractDirectory 'manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw '升级包不完整，缺少 manifest.json'
+        }
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $version = [string]$manifest.version
+        if ([string]::IsNullOrWhiteSpace($version)) {
+            throw 'manifest.json 缺少 version'
+        }
+        if ([string]$manifest.platform -notmatch '^windows-') {
+            throw "manifest.json 的 platform 不是 Windows 包：$($manifest.platform)"
+        }
+        $newBinary = Join-Path $extractDirectory 'edgepulse-agent.exe'
+        if (-not (Test-Path -LiteralPath $newBinary -PathType Leaf)) {
+            throw '升级包不完整，缺少 edgepulse-agent.exe'
+        }
+        if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+            throw "找不到现有二进制 $binaryPath"
+        }
+
+        # 备份在停服务之前完成；停服务失败时二进制未改动，回滚分支不会触发
+        Copy-Item -LiteralPath $binaryPath -Destination $backupPath -Force
+        Write-UpgradeLog -LogPath $logPath -Message "已备份现有二进制到 $backupPath"
+
+        $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($null -eq $existingService) {
+            throw "服务 $ServiceName 不存在：升级模式要求 Agent 已注册为 Windows 服务"
+        }
+        try {
+            Wait-ServiceThroughStartPending -Service $existingService -ServiceName $ServiceName
+            if ($existingService.Status -ne 'Stopped') {
+                if ($existingService.Status -ne 'StopPending') {
+                    Write-UpgradeLog -LogPath $logPath -Message "停止服务 $ServiceName"
+                    Invoke-Sc -Arguments "stop $ServiceName" -Description "停止服务 $ServiceName"
+                }
+                try {
+                    $existingService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+                } catch {
+                    throw "停止服务 $ServiceName 超时：请手动停止后重试升级"
+                }
+            }
+        } finally {
+            $existingService.Dispose()
+        }
+
+        Remove-Item -LiteralPath $healthMarker -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $rollbackMarker -Force -ErrorAction SilentlyContinue
+        $binaryReplaced = $true
+        Copy-Item -LiteralPath $newBinary -Destination $binaryPath -Force
+        Write-UpgradeLog -LogPath $logPath -Message "已替换二进制，等待健康标记 $healthMarker 出现版本 $version"
+
+        Invoke-Sc -Arguments "start $ServiceName" -Description "启动服务 $ServiceName"
+        $startedService = Get-Service -Name $ServiceName
+        try {
+            $startedService.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+        } finally {
+            $startedService.Dispose()
+        }
+
+        $deadline = (Get-Date).AddSeconds($HealthTimeout)
+        $healthy = $false
+        while ((Get-Date) -lt $deadline) {
+            if (Test-Path -LiteralPath $healthMarker -PathType Leaf) {
+                $observed = [System.IO.File]::ReadAllText($healthMarker, [System.Text.Encoding]::UTF8).Trim()
+                if ($observed -eq $version) {
+                    $healthy = $true
+                    break
+                }
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $healthy) {
+            throw "健康检查超时：$HealthTimeout 秒内未看到版本 $version 的健康标记"
+        }
+
+        try {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $healthMarker -Force -ErrorAction Stop
+        } catch {
+            Write-UpgradeLog -LogPath $logPath -Message "警告：清理备份或健康标记失败：$($_.Exception.Message)"
+        }
+        Write-UpgradeLog -LogPath $logPath -Message "升级成功：版本 $version 已通过健康检查"
+    } catch {
+        $failure = $_.Exception.Message
+        Write-UpgradeLog -LogPath $logPath -Message "升级失败：$failure"
+        if ($binaryReplaced) {
+            try {
+                Invoke-Sc -Arguments "stop $ServiceName" -Description "停止服务 $ServiceName" | Out-Null
+                $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+                if ($null -ne $service) {
+                    try {
+                        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+                    } finally {
+                        $service.Dispose()
+                    }
+                }
+            } catch {
+                Write-UpgradeLog -LogPath $logPath -Message "警告：停止新版本服务失败：$($_.Exception.Message)"
+            }
+            try {
+                Copy-Item -LiteralPath $backupPath -Destination $binaryPath -Force
+                Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+                Write-UpgradeLog -LogPath $logPath -Message "已恢复旧二进制 $binaryPath"
+            } catch {
+                Write-UpgradeLog -LogPath $logPath -Message "错误：恢复旧二进制失败，备份保留在 $backupPath：$($_.Exception.Message)"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($version)) {
+                try {
+                    $encoding = New-Object System.Text.UTF8Encoding($false)
+                    [System.IO.File]::WriteAllText($rollbackMarker, $version + [Environment]::NewLine, $encoding)
+                } catch {
+                    Write-UpgradeLog -LogPath $logPath -Message "错误：写入回滚标记 $rollbackMarker 失败：$($_.Exception.Message)"
+                }
+            }
+            try {
+                Invoke-Sc -Arguments "start $ServiceName" -Description "启动回滚后的服务 $ServiceName" | Out-Null
+                Write-UpgradeLog -LogPath $logPath -Message "回滚完成：目标版本 $version 未通过健康检查"
+            } catch {
+                Write-UpgradeLog -LogPath $logPath -Message "错误：启动旧版本服务失败：$($_.Exception.Message)"
+            }
+        } else {
+            if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+                Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+            }
+            Write-UpgradeLog -LogPath $logPath -Message '失败发生在替换二进制之前，服务与二进制未改动'
+        }
+        throw
+    } finally {
+        if (Test-Path -LiteralPath $workDirectory) {
+            Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Install-Agent {
     Assert-Administrator
 
@@ -381,7 +630,11 @@ function Install-Agent {
 }
 
 try {
-    Install-Agent
+    if (-not [string]::IsNullOrWhiteSpace($Upgrade)) {
+        Invoke-AgentUpgrade
+    } else {
+        Install-Agent
+    }
 } catch {
     [Console]::Error.WriteLine('安装失败：' + $_.Exception.Message)
     exit 1

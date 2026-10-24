@@ -1,30 +1,41 @@
 #!/usr/bin/env bash
-# 安装 EdgePulse Agent：复制二进制与 systemd 单元、生成配置与环境文件模板，并按需启动服务。
+# 安装 EdgePulse Agent：复制二进制与 systemd 单元、生成配置与环境文件模板，并按需启动服务；
+# 加 --upgrade 时按健康检查窗口替换单个二进制，失败自动恢复上一版。
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
 用法：install-agent.sh [选项]
+      install-agent.sh --upgrade 包 --health-timeout 秒 --state-dir DIR --prefix DIR
 
 在解包后的安装包目录中运行。默认安装路径：
   二进制     /usr/local/bin/edgepulse-agent
+  安装器副本 /usr/local/lib/edgepulse/install-agent.sh
   单元文件   /etc/systemd/system/edgepulse-agent.service
   配置目录   /etc/edgepulse-agent
   状态目录   /var/lib/edgepulse-agent
   日志目录   /var/log/edgepulse-agent
 
-选项：
+普通安装选项：
   --prefix DIR       安装前缀，二进制写入 DIR/bin（默认 /usr/local）
   --config-dir DIR   配置目录（默认 /etc/edgepulse-agent）
-  --state-dir DIR    SQLite 状态与固件暂存目录（默认 /var/lib/edgepulse-agent）
+  --state-dir DIR    SQLite 状态、升级暂存与安装器日志目录（默认 /var/lib/edgepulse-agent）
   --log-dir DIR      日志目录（默认 /var/log/edgepulse-agent）
   --no-start         只安装文件，不执行 systemctl daemon-reload 与 enable --now
   -h, --help         显示本帮助
 
+升级选项：
+  --upgrade 包             升级包（tar.gz），包内 checksums.sha256 必须覆盖 edgepulse-agent
+  --health-timeout 秒      等待新版本健康标记的秒数，必须为正整数
+  --state-dir DIR          状态目录；健康标记与回滚标记位于该目录
+  --prefix DIR             安装前缀；只替换 DIR/bin/edgepulse-agent
+
 环境变量：
   SYSTEMD_UNIT_DIR   单元文件目录，默认 /etc/systemd/system；测试时指向临时目录
 
-默认系统路径需要 root。已有 agent.yaml 与 agent.env 不会被覆盖。
+升级只替换二进制，配置、状态、安装器副本与 systemd 单元保持不变；日志写入
+<state-dir>/update-installer.log。默认系统路径需要 root。已有 agent.yaml 与
+agent.env 不会被覆盖。
 EOF
 }
 
@@ -89,9 +100,21 @@ state_dir="/var/lib/edgepulse-agent"
 log_dir="/var/log/edgepulse-agent"
 unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 no_start=0
+upgrade_package=""
+health_timeout=60
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --upgrade)
+            [[ $# -ge 2 ]] || die "--upgrade 缺少安装包"
+            upgrade_package="$2"
+            shift 2
+            ;;
+        --health-timeout)
+            [[ $# -ge 2 ]] || die "--health-timeout 缺少秒数"
+            health_timeout="$2"
+            shift 2
+            ;;
         --prefix)
             [[ $# -ge 2 ]] || die "--prefix 缺少目录"
             prefix="$2"
@@ -126,6 +149,137 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 升级日志与状态目录在解析参数后确定；日志固定写在状态目录，便于新旧两个版本共用
+upgrade_log=""
+upgrade_binary=""
+upgrade_backup=""
+upgrade_version=""
+
+log_upgrade() {
+    local line
+    line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') $*"
+    printf '%s\n' "${line}" >> "${upgrade_log}"
+    printf '%s\n' "${line}" >&2
+}
+
+# 升级期间的所有失败都走这里：先停服务，再恢复备份、写回滚标记、启动旧版本
+rollback_upgrade() {
+    local reason="$1"
+    log_upgrade "升级失败：${reason}"
+    # 备份尚未建立说明失败发生在停止服务之前，二进制与运行中的服务都没有改动
+    if [[ -z "${upgrade_binary}" || ! -f "${upgrade_backup}" ]]; then
+        log_upgrade "失败发生在替换二进制之前，服务与二进制未改动"
+        exit 1
+    fi
+    systemctl stop edgepulse-agent.service >>"${upgrade_log}" 2>&1 || true
+
+    if [[ -f "${upgrade_backup}" ]]; then
+        if install -m 0755 -- "${upgrade_backup}" "${upgrade_binary}"; then
+            rm -f -- "${upgrade_backup}"
+            log_upgrade "已恢复旧二进制：${upgrade_binary}"
+        else
+            log_upgrade "错误：恢复旧二进制失败，备份保留在 ${upgrade_backup}"
+        fi
+    else
+        log_upgrade "错误：找不到旧二进制备份 ${upgrade_backup}"
+    fi
+
+    if [[ -n "${upgrade_version}" ]] && ! printf '%s\n' "${upgrade_version}" > "${state_dir}/update-rollback"; then
+        log_upgrade "错误：写入回滚标记 ${state_dir}/update-rollback 失败"
+    fi
+    if ! systemctl start edgepulse-agent.service >>"${upgrade_log}" 2>&1; then
+        log_upgrade "错误：启动旧版本服务失败，请检查 systemctl status edgepulse-agent.service"
+    fi
+    log_upgrade "回滚完成：目标版本 ${upgrade_version} 未通过健康检查"
+    exit 1
+}
+
+# 升级模式只替换二进制；配置、状态、安装器副本与 unit 均不改动
+run_upgrade() {
+    local package="${upgrade_package}"
+    local work_dir=""
+    local extraction_dir=""
+    local observed=""
+    local elapsed=0
+
+    mkdir -p -- "${state_dir}" || die "无法创建状态目录 ${state_dir}"
+    upgrade_log="${state_dir}/update-installer.log"
+    log_upgrade "开始升级：包 ${package}，前缀 ${prefix}，健康时限 ${health_timeout} 秒"
+
+    for tool in tar sha256sum install systemctl; do
+        command -v "${tool}" >/dev/null 2>&1 || rollback_upgrade "缺少 ${tool}"
+    done
+    [[ -f "${package}" ]] || rollback_upgrade "升级包不存在或不是普通文件：${package}"
+
+    work_dir="$(mktemp -d "${TMPDIR:-/tmp}/edgepulse-agent-upgrade.XXXXXX")" || rollback_upgrade "无法创建临时目录"
+    trap 'rm -rf "${work_dir}"' EXIT
+    extraction_dir="${work_dir}/package"
+    mkdir -p -- "${extraction_dir}"
+
+    # 先拒绝绝对路径与 .. 路径段，再解包；tar 自身的解包顺序不应成为写入任意位置的机会
+    local entry
+    while IFS= read -r entry; do
+        case "${entry}" in
+            /*|..|../*|*/../*|*/..)
+                rollback_upgrade "升级包包含不安全路径：${entry}"
+                ;;
+        esac
+    done < <(tar -tzf "${package}")
+    tar -xzf "${package}" -C "${extraction_dir}" >>"${upgrade_log}" 2>&1 || rollback_upgrade "解包升级包失败"
+
+    for file in manifest.json checksums.sha256 edgepulse-agent; do
+        [[ -f "${extraction_dir}/${file}" ]] || rollback_upgrade "升级包不完整，缺少 ${file}"
+    done
+
+    upgrade_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${extraction_dir}/manifest.json" | head -n 1)"
+    [[ -n "${upgrade_version}" ]] || rollback_upgrade "manifest.json 缺少 version"
+    [[ "${upgrade_version}" =~ ^[0-9]+(\.[0-9]+)*([-+][0-9A-Za-z.-]+)?$ ]] || rollback_upgrade "manifest.json 的 version 不合法：${upgrade_version}"
+
+    grep -Eq '^[0-9a-fA-F]{64}[[:space:]]+\*?edgepulse-agent$' "${extraction_dir}/checksums.sha256" ||
+        rollback_upgrade "checksums.sha256 没有覆盖 edgepulse-agent"
+    if ! (cd "${extraction_dir}" && sha256sum -c --strict checksums.sha256) >>"${upgrade_log}" 2>&1; then
+        rollback_upgrade "checksums.sha256 校验失败"
+    fi
+
+    upgrade_binary="${prefix}/bin/edgepulse-agent"
+    upgrade_backup="${upgrade_binary}.previous"
+    [[ -f "${upgrade_binary}" ]] || rollback_upgrade "找不到现有二进制 ${upgrade_binary}"
+    if ! cp -p -- "${upgrade_binary}" "${upgrade_backup}"; then
+        rm -f -- "${upgrade_backup}" 2>/dev/null || true
+        log_upgrade "备份现有二进制失败，升级未开始"
+        exit 1
+    fi
+    log_upgrade "已备份现有二进制到 ${upgrade_backup}"
+
+    log_upgrade "停止服务 edgepulse-agent.service"
+    if ! systemctl stop edgepulse-agent.service >>"${upgrade_log}" 2>&1; then
+        log_upgrade "警告：systemctl stop 返回非零（服务可能已停止），继续升级"
+    fi
+
+    rm -f -- "${state_dir}/update-health" "${state_dir}/update-rollback"
+    install -m 0755 -- "${extraction_dir}/edgepulse-agent" "${upgrade_binary}" || rollback_upgrade "替换二进制失败"
+    log_upgrade "已替换二进制，等待健康标记 ${state_dir}/update-health 出现版本 ${upgrade_version}"
+
+    if ! systemctl start edgepulse-agent.service >>"${upgrade_log}" 2>&1; then
+        rollback_upgrade "启动新版本服务失败"
+    fi
+
+    while (( elapsed < health_timeout )); do
+        if [[ -f "${state_dir}/update-health" ]]; then
+            observed="$(cat -- "${state_dir}/update-health" 2>/dev/null || true)"
+            if [[ "${observed}" == "${upgrade_version}" ]]; then
+                rm -f -- "${upgrade_backup}" "${state_dir}/update-health"
+                log_upgrade "升级成功：版本 ${upgrade_version} 已通过健康检查"
+                exit 0
+            fi
+            log_upgrade "健康标记内容为 ${observed}，等待版本 ${upgrade_version}"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    rollback_upgrade "健康检查超时（${health_timeout} 秒内未看到版本 ${upgrade_version} 的健康标记）"
+}
+
 require_realpath
 
 prefix="$(canonical_path "${prefix}" "--prefix")"
@@ -139,6 +293,11 @@ check_path "${config_dir}" "--config-dir" "/etc/edgepulse-agent"
 check_path "${state_dir}" "--state-dir" "/var/lib/edgepulse-agent"
 check_path "${log_dir}" "--log-dir" "/var/log/edgepulse-agent"
 check_path "${unit_dir}" "SYSTEMD_UNIT_DIR" "/etc/systemd/system"
+[[ "${health_timeout}" =~ ^[1-9][0-9]*$ ]] || die "--health-timeout 必须是正整数：${health_timeout}"
+
+if [[ -n "${upgrade_package}" && "${EUID}" -ne 0 ]]; then
+    die "升级需要 root：请用 sudo 运行，或把安装器交给服务管理进程执行"
+fi
 
 if [[ "${EUID}" -ne 0 ]]; then
     if [[ "${prefix}" == "/usr/local" || "${config_dir}" == "/etc/edgepulse-agent" ||
@@ -149,6 +308,11 @@ if [[ "${EUID}" -ne 0 ]]; then
     if [[ "${no_start}" -eq 0 ]]; then
         die "注册并启动 systemd 服务需要 root：非 root 安装请加 --no-start"
     fi
+fi
+
+if [[ -n "${upgrade_package}" ]]; then
+    run_upgrade
+    exit 0
 fi
 
 package_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,7 +338,7 @@ awk \
     { print }
 ' "${unit_source}" > "${work_dir}/edgepulse-agent.service"
 
-install -d -m 0755 "${prefix}/bin" "${unit_dir}"
+install -d -m 0755 "${prefix}/bin" "${prefix}/lib/edgepulse" "${unit_dir}"
 install -d -m 0750 "${config_dir}" "${state_dir}" "${log_dir}"
 
 if [[ -e "${config_dir}/agent.yaml" ]]; then
@@ -184,6 +348,7 @@ else
         -e "s|/etc/edgepulse-agent|$(escape_sed_replacement "${config_dir}")|g" \
         -e "s|/var/lib/edgepulse-agent|$(escape_sed_replacement "${state_dir}")|g" \
         -e "s|/var/log/edgepulse-agent|$(escape_sed_replacement "${log_dir}")|g" \
+        -e "s|/usr/local/lib/edgepulse|$(escape_sed_replacement "${prefix}/lib/edgepulse")|g" \
         "${config_source}" > "${work_dir}/agent.yaml"
     install -m 0600 "${work_dir}/agent.yaml" "${config_dir}/agent.yaml"
     echo "已写入配置模板：${config_dir}/agent.yaml"
@@ -205,8 +370,12 @@ fi
 
 install -m 0755 "${binary_source}" "${prefix}/bin/edgepulse-agent"
 install -m 0644 "${work_dir}/edgepulse-agent.service" "${unit_dir}/edgepulse-agent.service"
+# Agent 的升级命令按配置里的 installer_script 启动安装器；普通安装把本脚本复制到前缀下，
+# 后续升级不必再依赖解包目录
+install -m 0755 -- "${BASH_SOURCE[0]}" "${prefix}/lib/edgepulse/install-agent.sh"
 
 echo "已安装二进制：${prefix}/bin/edgepulse-agent"
+echo "已安装升级安装器：${prefix}/lib/edgepulse/install-agent.sh"
 echo "已安装 systemd 单元：${unit_dir}/edgepulse-agent.service"
 
 if [[ "${no_start}" -eq 1 ]]; then

@@ -14,8 +14,11 @@
 #include "Executors/UpdateExecutor.h"
 #include "TelemetryCollector.h"
 
+#include "Platform/FileSystem/AtomicFileWriter.h"
+#include "Platform/FileSystem/FileSystem.h"
 #include "Platform/Platform.h"
 
+#include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogLevel.h"
 #include "Base/Log/LogMacros.h"
 #include "Base/Log/LoggerRegistry.h"
@@ -35,6 +38,8 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <format>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -56,6 +61,16 @@ namespace EdgePulse::Agent
         constexpr int kMinimumHeartbeatSeconds      = 5;   ///< 心跳间隔下限
         constexpr int kMaximumHeartbeatSeconds      = 600; ///< 心跳间隔上限
         constexpr int kHeartbeatFailureWarningCount = 3;   ///< 连续失败达到该次数时额外告警一次
+
+        /**
+         * @brief 取当前 UTC 时刻的秒级文本
+         * @return std::string 形如 2026-10-24T08:00:00Z
+         */
+        [[nodiscard]] std::string utcNowText()
+        {
+            const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+            return std::format("{:%Y-%m-%dT%H:%M:%S}Z", now);
+        }
 
         /**
          * @brief 常驻运行期间在循环线程上共享的状态
@@ -235,13 +250,17 @@ namespace EdgePulse::Agent
          * @param agentVersion 当前版本
          * @param flags 循环线程共享状态
          * @param stopRequested 停止标记
+         * @param firstHealthyHeartbeat 首次成功心跳后的确认动作，可为空
          * @return 协程任务
-         * @note 心跳失败只记日志并继续下一轮，任何心跳失败都不会结束 Agent
+         * @note 心跳失败只记日志并继续下一轮，任何心跳失败都不会结束 Agent；
+         *       确认动作只在第一次成功心跳后执行一次，之后的心跳不再重复
          */
         AsynGyanis::Core::Task<> runHeartbeat(AsynGyanis::Core::EventLoop &loop, AgentClient &client, AgentState &state, CommandDispatcher &dispatcher, const std::int64_t nodeId,
-                                              std::string agentVersion, RuntimeFlags &flags, const std::atomic<bool> &stopRequested)
+                                              std::string agentVersion, RuntimeFlags &flags, const std::atomic<bool> &stopRequested,
+                                              std::function<AsynGyanis::Core::Task<>()> firstHealthyHeartbeat)
         {
-            int consecutiveFailures = 0;
+            int  consecutiveFailures = 0;
+            bool healthCheckDone     = false;
             for (;;)
             {
                 const auto reply = co_await client.heartbeat(nodeId, agentVersion);
@@ -276,6 +295,14 @@ namespace EdgePulse::Agent
                     } else
                     {
                         LOG_WARN("心跳响应没有可解析的 desiredConfigVersion，保留状态库里的旧值");
+                    }
+                    if (!healthCheckDone)
+                    {
+                        healthCheckDone = true;
+                        if (firstHealthyHeartbeat)
+                        {
+                            co_await firstHealthyHeartbeat();
+                        }
                     }
                     const ResultFlush flushed = co_await dispatcher.flushResults();
                     if (flushed.failed)
@@ -451,6 +478,134 @@ namespace EdgePulse::Agent
         }
     }
 
+    AsynGyanis::Core::Task<> AgentApplication::confirmUpdateHealth(AsynGyanis::Core::EventLoop &loop, AgentState &state, std::string agentVersion)
+    {
+        const auto update = state.updateState();
+        if (!update.has_value())
+        {
+            LOG_ERROR_FMT("读取升级状态失败，本次跳过升级健康确认：{}", update.error());
+            co_return;
+        }
+        if (update->pendingResult.empty())
+        {
+            co_return;
+        }
+
+        const std::filesystem::path rollbackMarker = m_configuration.stateDirectory / "update-rollback";
+        std::error_code             markerError;
+        const bool                  rollbackPending = std::filesystem::exists(rollbackMarker, markerError);
+        if (markerError)
+        {
+            LOG_ERROR_FMT("检查升级回滚标记 {} 失败，保留待上报结果等待下次启动：{}", AsynGyanis::Platform::FileSystem::utf8FromPath(rollbackMarker), markerError.message());
+            co_return;
+        }
+
+        const auto parsed = AsynGyanis::Base::parseConfigValue(update->pendingResult);
+        std::int64_t commandId = 0;
+        if (parsed.has_value() && parsed->is_object())
+        {
+            const auto iterator = parsed->find("commandId");
+            if (iterator != parsed->end())
+            {
+                const auto value = AsynGyanis::Base::configValueAs<std::int64_t>(*iterator);
+                if (value.has_value())
+                {
+                    commandId = *value;
+                }
+            }
+        }
+        if (commandId <= 0)
+        {
+            LOG_ERROR_FMT("升级待上报结果缺少可用的 commandId，已清除：{}", update->pendingResult);
+            UpdateStateRecord clearedRecord = *update;
+            clearedRecord.healthyAt.clear();
+            clearedRecord.pendingResult.clear();
+            const auto cleared = state.setUpdateState(clearedRecord);
+            if (!cleared.has_value())
+            {
+                LOG_ERROR_FMT("清除损坏的升级待上报结果失败：{}", cleared.error());
+            }
+            if (rollbackPending)
+            {
+                std::error_code removeError;
+                std::filesystem::remove(rollbackMarker, removeError);
+                if (removeError)
+                {
+                    LOG_ERROR_FMT("删除升级回滚标记 {} 失败：{}", AsynGyanis::Platform::FileSystem::utf8FromPath(rollbackMarker), removeError.message());
+                }
+            }
+            co_return;
+        }
+
+        if (rollbackPending)
+        {
+            const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object(
+                    {{"status", "failed"}, {"result", "{}"}, {"message", "升级未通过健康检查，已回滚到旧版本"}});
+            state.enqueueResult(commandId, payload.dump());
+
+            UpdateStateRecord record = *update;
+            record.healthyAt.clear();
+            record.pendingResult.clear();
+            const auto cleared = state.setUpdateState(record);
+            if (!cleared.has_value())
+            {
+                LOG_ERROR_FMT("清除升级待上报结果失败：{}", cleared.error());
+            }
+
+            std::error_code removeError;
+            std::filesystem::remove(rollbackMarker, removeError);
+            if (removeError)
+            {
+                LOG_ERROR_FMT("删除升级回滚标记 {} 失败：{}", AsynGyanis::Platform::FileSystem::utf8FromPath(rollbackMarker), removeError.message());
+            }
+            LOG_WARN_FMT("升级未通过健康检查，命令 {} 已按失败上报并恢复旧版本状态", commandId);
+            co_return;
+        }
+
+        const std::filesystem::path healthMarker = m_configuration.stateDirectory / "update-health";
+        std::expected<void, std::string> written;
+        try
+        {
+            written = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<void, std::string>>(
+                    loop,
+                    [healthMarker, agentVersion]() -> std::expected<void, std::string>
+                    {
+                        std::string writeError;
+                        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(healthMarker, agentVersion, std::nullopt, &writeError))
+                        {
+                            return std::unexpected("写入升级健康标记 " + AsynGyanis::Platform::FileSystem::utf8FromPath(healthMarker) + " 失败：" + writeError);
+                        }
+                        return {};
+                    });
+        } catch (const std::exception &failure)
+        {
+            written = std::unexpected("提交升级健康标记写入任务失败：" + std::string{failure.what()});
+        } catch (...)
+        {
+            written = std::unexpected("提交升级健康标记写入任务失败：未知异常");
+        }
+        if (!written.has_value())
+        {
+            LOG_ERROR_FMT("{}", written.error());
+            co_return;
+        }
+
+        UpdateStateRecord record = *update;
+        record.healthyAt          = utcNowText();
+        record.pendingResult.clear();
+        const auto saved = state.setUpdateState(record);
+        if (!saved.has_value())
+        {
+            LOG_ERROR_FMT("升级健康标记已写入，但记录确认时刻或清除待上报结果失败：{}", saved.error());
+        }
+
+        const AsynGyanis::Base::ConfigValue detail  = AsynGyanis::Base::ConfigValue::object({{"version", agentVersion}});
+        const AsynGyanis::Base::ConfigValue payload = AsynGyanis::Base::ConfigValue::object({{"status", "succeeded"}, {"result", detail.dump()}, {"message", "升级成功"}});
+        state.enqueueResult(commandId, payload.dump());
+        LOG_INFO_FMT("升级健康标记已写入，版本 {}，命令 {} 已按成功上报", agentVersion, commandId);
+        co_return;
+    }
+
     int AgentApplication::run()
     {
         try
@@ -541,7 +696,8 @@ namespace EdgePulse::Agent
 
             // 帧的寿命与常驻循环绑定：先停循环，再在 run() 返回前销毁这些帧
             std::vector<AsynGyanis::Core::Task<>> frames;
-            frames.push_back(runHeartbeat(loop, client, *state, dispatcher, *nodeId, agentVersion, flags, m_stopRequested));
+            frames.push_back(runHeartbeat(loop, client, *state, dispatcher, *nodeId, agentVersion, flags, m_stopRequested,
+                                          [this, &loop, statePointer = &*state, agentVersion] { return confirmUpdateHealth(loop, *statePointer, agentVersion); }));
             if (m_configuration.websocketEnabled)
             {
                 frames.push_back(runWebSocket(loop, webSocket, dispatcher, *nodeId, agentVersion, flags, m_stopRequested));
