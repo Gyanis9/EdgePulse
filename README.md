@@ -151,7 +151,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `EDGEPULSE_INITIAL_PASSWORD` | 新建用户与重置密码表单的默认初始口令（预填、可改；不落库、不写日志） |
 | `EDGEPULSE_UDP_TELEMETRY_SECRET` | UDP 遥测 HMAC 密钥；启用时至少 16 字节 |
 | `EDGEPULSE_OIDC_CLIENT_SECRET` | OIDC 客户端密钥；公共客户端可留空 |
-| `EDGEPULSE_MFA_KEY` | 两步验证主密钥，base64 编码的 32 字节；未配置时设置、启用与关闭返回 503，已启用账号的登录校验也会失败，只能先恢复同一密钥或由管理员重置 |
+| `EDGEPULSE_MFA_KEY` | 两步验证主密钥，base64 编码的 32 字节；未配置时设置、启用、关闭与换发恢复码返回 503，已启用账号的登录校验也会失败，只能先恢复同一密钥或由管理员重置 |
 
 关键配置项（默认值按开发档 / 生产样例列出）：
 
@@ -201,7 +201,7 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 - 响应包络 `{ code, message, data, traceId }`；分页 `{ pageNum, pageSize, total, rows }`，`pageSize` 上限 100。
 - 写接口先过 `requireSession(..., 权限码)`，数据查询带租户边界与数据范围。
 - 自动化客户端可带 `Idempotency-Key`（8–128 字符）安全重试写请求；24 小时内同键同内容重放首次响应，内容或权限变化返回 409。认证、Agent、令牌、用户/租户写入与流式固件上传等路径不参与缓存。
-- `GET /api/openapi.json` 返回 OpenAPI 3.1 契约；`frontend/public/openapi.json` 由 `python scripts/generate-openapi.py` 生成，CI 用 `--check` 阻止漂移。当前仍是 `/api`，没有 `/api/v1` 前缀。
+- `GET /api/openapi.json` 返回 OpenAPI 3.1 契约，包含 `/api/health`；`frontend/public/openapi.json` 由 `python scripts/generate-openapi.py` 生成，CI 用 `--check` 阻止漂移。契约在服务启动时读入内存，重建 `web/` 后需要重启服务。当前仍是 `/api`，没有 `/api/v1` 前缀。
 
 | 分组 | 代表端点 | 说明 |
 |---|---|---|
@@ -225,8 +225,8 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 ## 安全模型
 
 - 浏览器会话：32 字节不透明 Bearer token，存在 Redis 或进程内存储，TTL 默认 7200 秒并滑动续期；不使用 Cookie 承载会话。
-- API Token：明文形如 `ep_api_` 加 64 位十六进制，只在创建或轮换响应出现一次；数据库只存 SHA-256 与前缀。令牌继承 owner 的身份但 `platformAdmin` 恒为 false，每次请求按 owner 当前权限与令牌 scope 的交集授权；owner 或租户停用、令牌吊销/过期立即失效。令牌身份不能访问只要求登录的浏览器接口、浏览器 WebSocket，也不能修改账户口令。
-- TOTP 两步验证：秘密用 `EDGEPULSE_MFA_KEY` 做 AES-256-GCM 加密后落库，恢复码用同一主密钥做 HMAC-SHA256，二者都只存不可逆材料。登录挑战放在缓存中、300 秒过期、最多 5 次失败并绑定来源 IP；启用、关闭与换发恢复码另有每用户 5 次/300 秒的失败上限。MFA 是用户自助启用，没有租户级强制策略。
+- API Token：明文形如 `ep_api_` 加 64 位十六进制，只在创建或轮换响应出现一次；数据库只存 SHA-256 与前缀。令牌继承 owner 的身份但 `platformAdmin` 恒为 false，每次请求按 owner 当前权限与令牌 scope 的交集授权；令牌吊销/过期立即失效，owner 或租户停用在一个 5 秒缓存 TTL 内失效（平台管理员豁免）。`/api/auth/me` 保留给令牌自省；`/api/auth/routes`、`/api/auth/logout` 等浏览器会话端点、浏览器 WebSocket 与改密入口会拒绝令牌。
+- TOTP 两步验证：秘密用 `EDGEPULSE_MFA_KEY` 做 AES-256-GCM 加密后落库（可解密用于校验），恢复码用同一主密钥做 HMAC-SHA256 后存储（不可逆）；两者都不以明文落库。登录挑战放在缓存中、300 秒过期、最多 5 次失败并绑定来源 IP；启用、关闭与换发恢复码对错误动态码另有每用户 5 次/300 秒的失败上限，设置入口不计数。MFA 是用户自助启用，没有租户级强制策略。
 - 幂等键：只在带 Bearer 的写请求上生效，按令牌与幂等键的 SHA-256 分区；请求指纹覆盖方法、完整 URI、表示头、权限摘要与正文，权限降级后同键重试返回 409 而不是旧的已授权响应。401、403、5xx 与超过 256 KiB 的响应不缓存，认证、Agent、令牌、用户/租户写入与流式上传路径整段排除，避免一次性明文或口令进入幂等表。
 - Agent 身份：9443 在 TLS 层校验客户端证书；注册自报的 SHA-256 指纹必须等于本条连接出示的叶证书；心跳、遥测、命令与固件状态都按叶证书绑定节点。吊销会清空指纹、置离线并以 1008 关闭已建立的 Agent WebSocket。
 - 注册令牌：`enroll` 与 `rebind` 一次性使用，数据库只存 SHA-256，明文只在签发响应出现一次；有效期限制在 300 到 2592000 秒。
@@ -285,10 +285,10 @@ python scripts/check-docker-stack.py --build
 
 ## 部署
 
-- Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌后 `docker compose up -d`。样例含 MySQL 8、Redis 7 与 Prometheus。
+- Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌后 `docker compose up -d`；需要两步验证时再填入 `EDGEPULSE_MFA_KEY`（`openssl rand -base64 32`）。样例含 MySQL 8、Redis 7 与 Prometheus。
 - systemd：`deploy/systemd/edgepulse.service` 是单实例模板，二进制、`web/`、`migrations/` 与配置分目录放置，秘密走 `EnvironmentFile`。
 - 静态站点：`bash scripts/build-web.sh`，由后端直接托管。
-- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、实时扇出）、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、可用备份。
+- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、两步验证挑战与尝试计数、实时扇出）、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、可用备份。
 
 备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。完整步骤见 [docs/部署.md](docs/部署.md)。
 
