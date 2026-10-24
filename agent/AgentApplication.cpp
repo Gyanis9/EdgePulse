@@ -3,6 +3,8 @@
 #include "AgentClient.h"
 #include "AgentIdentity.h"
 #include "AgentState.h"
+#include "AgentWebSocket.h"
+#include "CommandDispatcher.h"
 
 #include "Platform/Platform.h"
 
@@ -15,9 +17,12 @@
 
 #include "Core/Coroutine/Task.h"
 #include "Core/EventLoop/EventLoop.h"
+#include "Core/EventLoop/Timer.h"
+#include "Core/Process/GracefulShutdown.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <filesystem>
@@ -42,6 +47,23 @@ namespace EdgePulse::Agent
         using RegistrationOutcome = std::expected<std::int64_t, RegistrationFailure>;
 
         constexpr int kMaximumConflictResponses = 3; ///< 单次启动允许的 409 响应次数，达到后按永久名字冲突停止
+
+        constexpr int kMinimumHeartbeatSeconds      = 5;   ///< 心跳间隔下限
+        constexpr int kMaximumHeartbeatSeconds      = 600; ///< 心跳间隔上限
+        constexpr int kHeartbeatFailureWarningCount = 3;   ///< 连续失败达到该次数时额外告警一次
+
+        /// WebSocket 重连退避，单位为秒；连续失败超过表长后一直使用最后一档
+        constexpr std::array<int, 6> kWebSocketBackoffSeconds{1, 2, 5, 15, 30, 60};
+
+        /**
+         * @brief 常驻运行期间在循环线程上共享的状态
+         */
+        struct RuntimeFlags
+        {
+            bool webSocketConnected{false};    ///< WebSocket 通道是否已通过 hello 确认
+            bool pollingActive{false};         ///< 是否启用命令轮询
+            int  heartbeatIntervalSeconds{30}; ///< 当前心跳间隔，服务端可下发新值
+        };
 
         /**
          * @brief 确保目录存在
@@ -201,10 +223,173 @@ namespace EdgePulse::Agent
                 std::this_thread::sleep_for(std::chrono::seconds{delaySeconds});
             }
         }
+
+        /**
+         * @brief 按服务端节奏发送心跳，并顺带补报命令结果
+         * @param loop 事件循环
+         * @param client 服务端客户端
+         * @param state 本地状态库
+         * @param dispatcher 命令分发器
+         * @param nodeId 节点标识
+         * @param agentVersion 当前版本
+         * @param flags 循环线程共享状态
+         * @param stopRequested 停止标记
+         * @return 协程任务
+         * @note 心跳失败只记日志并继续下一轮，任何心跳失败都不会结束 Agent
+         */
+        AsynGyanis::Core::Task<> runHeartbeat(AsynGyanis::Core::EventLoop &loop, AgentClient &client, AgentState &state, CommandDispatcher &dispatcher, const std::int64_t nodeId,
+                                              std::string agentVersion, RuntimeFlags &flags, const std::atomic<bool> &stopRequested)
+        {
+            int consecutiveFailures = 0;
+            for (;;)
+            {
+                const auto reply = co_await client.heartbeat(nodeId, agentVersion);
+                if (!reply.has_value())
+                {
+                    ++consecutiveFailures;
+                    LOG_WARN_FMT("心跳失败（连续 {} 次）：{}", consecutiveFailures, reply.error());
+                    if (consecutiveFailures == kHeartbeatFailureWarningCount)
+                    {
+                        LOG_WARN_FMT("心跳已连续失败 {} 次：WebSocket 与命令轮询继续运行，Agent 不会退出", consecutiveFailures);
+                    }
+                } else
+                {
+                    consecutiveFailures = 0;
+                    if (reply->heartbeatIntervalSeconds >= kMinimumHeartbeatSeconds && reply->heartbeatIntervalSeconds <= kMaximumHeartbeatSeconds)
+                    {
+                        flags.heartbeatIntervalSeconds = reply->heartbeatIntervalSeconds;
+                    } else
+                    {
+                        LOG_WARN_FMT("服务端下发的心跳间隔 {} 秒不在 {}..{} 内，继续使用 {} 秒", reply->heartbeatIntervalSeconds, kMinimumHeartbeatSeconds,
+                                     kMaximumHeartbeatSeconds, flags.heartbeatIntervalSeconds);
+                    }
+                    if (reply->desiredConfigVersion >= 0)
+                    {
+                        state.set("desired_config_version", std::to_string(reply->desiredConfigVersion));
+                    } else
+                    {
+                        LOG_WARN("心跳响应没有可解析的 desiredConfigVersion，保留状态库里的旧值");
+                    }
+                    const ResultFlush flushed = co_await dispatcher.flushResults();
+                    if (flushed.failed)
+                    {
+                        LOG_WARN("命令结果补报未完成，将在下一轮心跳后重试");
+                    }
+                }
+
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return;
+                }
+                AsynGyanis::Core::Timer timer(loop);
+                co_await timer.waitFor(std::chrono::seconds{flags.heartbeatIntervalSeconds});
+            }
+        }
+
+        /**
+         * @brief 维持 WebSocket 命令通道：断线按 1、2、5、15、30、60 秒退避重连
+         * @param loop 事件循环
+         * @param socket 命令长连接
+         * @param dispatcher 命令分发器
+         * @param nodeId 节点标识
+         * @param agentVersion 当前版本
+         * @param flags 循环线程共享状态
+         * @param stopRequested 停止标记
+         * @return 协程任务
+         * @note 连续失败 3 次后启用轮询；通道确认可用期间轮询暂停
+         */
+        AsynGyanis::Core::Task<> runWebSocket(AsynGyanis::Core::EventLoop &loop, AgentWebSocket &socket, CommandDispatcher &dispatcher, const std::int64_t nodeId,
+                                              std::string agentVersion, RuntimeFlags &flags, const std::atomic<bool> &stopRequested)
+        {
+            const AgentWebSocket::ConnectionObserver observer = [&flags](const bool connected)
+            {
+                flags.webSocketConnected = connected;
+                if (connected)
+                {
+                    LOG_INFO("WebSocket 命令通道已建立，命令轮询暂停");
+                }
+            };
+
+            int consecutiveFailures = 0;
+            for (;;)
+            {
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return;
+                }
+
+                const auto outcome       = co_await socket.serve(dispatcher, nodeId, agentVersion, observer);
+                flags.webSocketConnected = false;
+                if (outcome.has_value())
+                {
+                    consecutiveFailures = 0;
+                    LOG_INFO("WebSocket 命令通道已关闭，将重新连接");
+                } else
+                {
+                    ++consecutiveFailures;
+                    LOG_WARN_FMT("WebSocket 命令通道不可用（连续 {} 次）：{}", consecutiveFailures, outcome.error());
+                    if (consecutiveFailures == 3 && !flags.pollingActive)
+                    {
+                        flags.pollingActive = true;
+                        LOG_WARN("WebSocket 连续失败 3 次，已启用命令轮询兜底");
+                    }
+                }
+
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return;
+                }
+                const std::size_t backoffIndex =
+                        consecutiveFailures == 0 ? 0 : std::min<std::size_t>(static_cast<std::size_t>(consecutiveFailures - 1), kWebSocketBackoffSeconds.size() - 1);
+                AsynGyanis::Core::Timer timer(loop);
+                co_await timer.waitFor(std::chrono::seconds{kWebSocketBackoffSeconds[backoffIndex]});
+            }
+        }
+
+        /**
+         * @brief 按固定间隔轮询命令，WebSocket 可用期间暂停
+         * @param loop 事件循环
+         * @param dispatcher 命令分发器
+         * @param intervalSeconds 轮询间隔
+         * @param flags 循环线程共享状态
+         * @param stopRequested 停止标记
+         * @return 协程任务
+         */
+        AsynGyanis::Core::Task<> runPolling(AsynGyanis::Core::EventLoop &loop, CommandDispatcher &dispatcher, const int intervalSeconds, RuntimeFlags &flags,
+                                            const std::atomic<bool> &stopRequested)
+        {
+            for (;;)
+            {
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return;
+                }
+                if (flags.pollingActive && !flags.webSocketConnected)
+                {
+                    co_await dispatcher.pollOnce();
+                    const ResultFlush flushed = co_await dispatcher.flushResults();
+                    if (flushed.failed)
+                    {
+                        LOG_WARN("命令结果上报未完成，将在下一轮轮询后重试");
+                    }
+                }
+                AsynGyanis::Core::Timer timer(loop);
+                co_await timer.waitFor(std::chrono::seconds{intervalSeconds > 0 ? intervalSeconds : 15});
+            }
+        }
     } // namespace
 
-    AgentApplication::AgentApplication(AgentConfiguration configuration) : m_configuration(std::move(configuration))
+    AgentApplication::AgentApplication(AgentConfiguration configuration, const bool consoleMode) : m_configuration(std::move(configuration)), m_consoleMode(consoleMode)
     {
+    }
+
+    void AgentApplication::requestStop()
+    {
+        m_stopRequested.store(true, std::memory_order_release);
+        if (AsynGyanis::Core::EventLoop *loop = m_loop.load(std::memory_order_acquire); loop != nullptr)
+        {
+            loop->stop();
+        }
     }
 
     int AgentApplication::run()
@@ -247,10 +432,15 @@ namespace EdgePulse::Agent
             {
                 LOG_INFO_FMT("状态库已有节点标识，本次注册从换绑令牌环境变量读取令牌");
             }
-            const std::string           agentVersion{EDGEPULSE_AGENT_VERSION};
-            AsynGyanis::Core::EventLoop loop;
-            AgentClient                 client(loop, m_configuration, *identity);
-            const auto                  nodeId = registerWithBackoff(loop, client, registrationToken, agentVersion, m_configuration.requestTimeoutSeconds);
+            const std::string agentVersion{EDGEPULSE_AGENT_VERSION};
+
+            std::optional<std::int64_t> nodeId;
+            {
+                // 注册阶段的循环在注册结束后停止，而 EventLoop 的停止请求是粘性的，常驻段必须另起一条循环
+                AsynGyanis::Core::EventLoop registrationLoop;
+                AgentClient                 registrationClient(registrationLoop, m_configuration, *identity);
+                nodeId = registerWithBackoff(registrationLoop, registrationClient, registrationToken, agentVersion, m_configuration.requestTimeoutSeconds);
+            }
             if (!nodeId.has_value())
             {
                 return 1;
@@ -261,6 +451,48 @@ namespace EdgePulse::Agent
             state->set("cert_fingerprint", identity->fingerprint);
             state->set("cert_expiry", identity->expiresAt);
             LOG_INFO_FMT("注册成功，节点 {} 的 ID 为 {}，指纹与版本已写入状态库", m_configuration.name, *nodeId);
+
+            AsynGyanis::Core::EventLoop loop;
+            AgentClient                 client(loop, m_configuration, *identity);
+            CommandDispatcher           dispatcher(client, *state, {});
+            AgentWebSocket              webSocket(loop, m_configuration);
+
+            RuntimeFlags flags;
+            flags.heartbeatIntervalSeconds = m_configuration.heartbeatIntervalSeconds;
+            flags.pollingActive            = !m_configuration.websocketEnabled;
+
+            std::optional<AsynGyanis::Core::GracefulShutdown> shutdown;
+            if (m_consoleMode)
+            {
+                shutdown.emplace(loop);
+                shutdown->onShutdown([this] { requestStop(); });
+            }
+
+            // 帧的寿命与常驻循环绑定：先停循环，再在 run() 返回前销毁这些帧
+            std::vector<AsynGyanis::Core::Task<>> frames;
+            frames.push_back(runHeartbeat(loop, client, *state, dispatcher, *nodeId, agentVersion, flags, m_stopRequested));
+            if (m_configuration.websocketEnabled)
+            {
+                frames.push_back(runWebSocket(loop, webSocket, dispatcher, *nodeId, agentVersion, flags, m_stopRequested));
+            } else
+            {
+                LOG_INFO("配置已关闭 WebSocket，命令通道立即使用轮询");
+            }
+            frames.push_back(runPolling(loop, dispatcher, m_configuration.commandPollIntervalSeconds, flags, m_stopRequested));
+            // 循环尚未开始运行，此时入本地就绪队列；帧由上面那个容器持有到 run() 结束
+            for (auto &frame: frames)
+            {
+                loop.scheduler().schedule(frame.handle());
+            }
+
+            m_loop.store(&loop, std::memory_order_release);
+            if (!m_stopRequested.load(std::memory_order_acquire))
+            {
+                LOG_INFO_FMT("Agent 已进入常驻运行，心跳间隔 {} 秒，轮询间隔 {} 秒", flags.heartbeatIntervalSeconds, m_configuration.commandPollIntervalSeconds);
+                loop.run();
+            }
+            m_loop.store(nullptr, std::memory_order_release);
+            LOG_INFO("Agent 已停止");
             return 0;
         } catch (const std::exception &failure)
         {

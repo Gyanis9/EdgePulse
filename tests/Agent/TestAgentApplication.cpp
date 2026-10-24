@@ -17,13 +17,16 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace EdgePulse::Agent
@@ -98,6 +101,26 @@ namespace EdgePulse::Agent
             std::string                m_name;     ///< 变量名
             std::optional<std::string> m_previous; ///< 用例开始前的原值
         };
+
+        /**
+         * @brief 在有时限的轮询里等待条件成立
+         * @param timeout 等待上限
+         * @param predicate 条件
+         * @return 条件在时限内成立返回 true
+         */
+        [[nodiscard]] bool waitFor(const std::chrono::seconds timeout, const std::function<bool()> &predicate)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline)
+            {
+                if (predicate())
+                {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            }
+            return predicate();
+        }
     } // namespace
 
     TEST(AgentApplication, RejectsStartupWhenLogFileCannotBeOpened)
@@ -181,6 +204,7 @@ agent:
                                                                                  "    certificate_file: agent.pem\n"
                                                                                  "    private_key_file: agent-key.pem\n"
                                                                                  "    name: edge-01\n"
+                                                                                 "    websocket_enabled: false\n"
                                                                                  "    request_timeout_seconds: 5\n"
                                                                                  "  state:\n"
                                                                                  "    directory: state\n"
@@ -192,7 +216,20 @@ agent:
         ASSERT_TRUE(configuration.has_value()) << configuration.error();
 
         AgentApplication application(*configuration);
-        EXPECT_EQ(0, application.run());
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool registered = waitFor(std::chrono::seconds{15},
+                                        [&directory]
+                                        {
+                                            auto persisted = AgentState::open(directory.path() / "state" / "agent.db");
+                                            return persisted.has_value() && persisted->get("node_id").value_or("") == "77";
+                                        });
+        application.requestStop();
+        runner.join();
+
+        EXPECT_TRUE(registered) << "注册结果未在时限内写入状态库";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
 
         auto state = AgentState::open(directory.path() / "state" / "agent.db");
         ASSERT_TRUE(state.has_value()) << state.error();
@@ -242,6 +279,7 @@ agent:
                                                                                  "    certificate_file: agent.pem\n"
                                                                                  "    private_key_file: agent-key.pem\n"
                                                                                  "    name: edge-01\n"
+                                                                                 "    websocket_enabled: false\n"
                                                                                  "    enrollment_token_env: EDGEPULSE_AGENT_TEST_ENROLLMENT_TOKEN\n"
                                                                                  "    rebind_token_env: EDGEPULSE_AGENT_TEST_REBIND_TOKEN\n"
                                                                                  "    request_timeout_seconds: 5\n"
@@ -261,7 +299,18 @@ agent:
         ASSERT_TRUE(configuration.has_value()) << configuration.error();
 
         AgentApplication application(*configuration);
-        EXPECT_EQ(0, application.run());
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        static_cast<void>(waitFor(std::chrono::seconds{15},
+                                  [&capture]
+                                  {
+                                      const std::lock_guard lock(capture->mutex);
+                                      return !capture->body.empty();
+                                  }));
+        application.requestStop();
+        runner.join();
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
 
         std::string body;
         {

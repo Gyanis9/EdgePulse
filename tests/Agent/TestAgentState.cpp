@@ -240,6 +240,23 @@ namespace EdgePulse::Agent
         EXPECT_EQ(R"({"version":"2.0.0","status":"healthy"})", reopened->pendingUpdateResult().value_or(""));
     }
 
+    TEST(AgentState, HasResultSeesQueuedResults)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = AgentState::open(directory.path() / "agent.db");
+        ASSERT_TRUE(state.has_value()) << state.error();
+
+        EXPECT_FALSE(state->hasResult(7));
+        state->enqueueResult(7, R"({"status":"succeeded","result":"{}","message":"done"})");
+        EXPECT_TRUE(state->hasResult(7));
+        EXPECT_FALSE(state->hasResult(8));
+
+        const std::vector<QueuedResult> rows = state->takeResults(10);
+        ASSERT_EQ(1U, rows.size());
+        state->ackResult(rows[0].id);
+        EXPECT_FALSE(state->hasResult(7));
+    }
+
     TEST(AgentState, OpenReturnsChineseReasonWhenPathIsDirectory)
     {
         TestSupport::TemporaryDirectory directory;

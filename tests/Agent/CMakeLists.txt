@@ -2,6 +2,7 @@ add_executable(edgepulse-agent-tests
         CertificateFixture.cpp
         TestAgentApplication.cpp
         TestAgentClient.cpp
+        TestAgentCommand.cpp
         TestAgentConfiguration.cpp
         TestAgentIdentity.cpp
         TestAgentState.cpp)

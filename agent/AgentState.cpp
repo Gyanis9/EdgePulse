@@ -402,6 +402,19 @@ namespace EdgePulse::Agent
         }
     }
 
+    bool AgentState::hasResult(const std::int64_t commandId)
+    {
+        std::lock_guard                    lock(*m_mutex);
+        const std::array<DatabaseValue, 1> parameters{commandId};
+        const auto                         rows = queryStatement(*m_connection, "SELECT 1 FROM result_queue WHERE command_id = ? LIMIT 1", parameters);
+        if (!rows)
+        {
+            LOG_ERROR_FMT("查询命令 {} 是否有结果失败：{}；按已有结果处理", commandId, rows.error());
+            return true;
+        }
+        return (*rows)->next();
+    }
+
     std::vector<QueuedResult> AgentState::takeResults(const std::size_t limit)
     {
         const std::size_t boundedLimit = std::min<std::size_t>(limit, static_cast<std::size_t>(kResultQueueLimit));

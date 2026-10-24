@@ -117,7 +117,7 @@ int main(const int argc, char **argv)
             return 0;
         }
 
-        EdgePulse::Agent::AgentApplication application(*configuration);
+        EdgePulse::Agent::AgentApplication application(*configuration, options.console);
         return application.run();
     } catch (const std::exception &failure)
     {

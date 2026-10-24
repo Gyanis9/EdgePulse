@@ -118,6 +118,14 @@ namespace EdgePulse::Agent
         void enqueueResult(std::int64_t commandId, std::string payload);
 
         /**
+         * @brief 判断某个命令是否已有待上报的结果
+         * @param commandId 服务端命令标识
+         * @return true 表示结果队列里已有该命令的结果
+         * @note 查询失败时按已有结果处理并记录 ERROR：状态不可知时重复执行比漏执行更危险
+         */
+        bool hasResult(std::int64_t commandId);
+
+        /**
          * @brief 读取最多 limit 条命令结果，不删除
          * @param limit 本次最多读取的条数，超过队列上限时按上限截断
          * @return 按入队顺序排列的结果记录；读取失败时为空
