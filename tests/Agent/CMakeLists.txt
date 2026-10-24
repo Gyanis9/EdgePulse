@@ -1,4 +1,5 @@
 add_executable(edgepulse-agent-tests
+        TestAgentApplication.cpp
         TestAgentConfiguration.cpp)
 target_link_libraries(edgepulse-agent-tests PRIVATE edgepulse-agent-core edgepulse-test-support GTest::gtest_main)
 edgepulse_enable_warnings(edgepulse-agent-tests)

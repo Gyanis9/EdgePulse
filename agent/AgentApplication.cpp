@@ -41,6 +41,7 @@ namespace EdgePulse::Agent
         /**
          * @brief 装配根日志器：控制台加按大小滚动的文件输出
          * @param configuration 已校验的配置
+         * @throws std::exception 文件 Sink 打不开日志路径时由构造抛出，交给 run() 的边界捕获并拒绝启动
          * @details Agent 配置里的日志段是部署形态（文件、等级、大小与备份份数），与引擎日志加载器
          *          要求的树形段落不同，因此直接复用引擎的 Sink 与等级工具完成装配。
          */
@@ -55,18 +56,10 @@ namespace EdgePulse::Agent
             {
                 logDirectory = std::filesystem::current_path();
             }
-            try
-            {
-                const auto maximumSizeBytes =
-                        static_cast<std::size_t>(configuration.logMaxSizeMb) * 1024U * 1024U;
-                rootLogger.addSink(std::make_shared<AsynGyanis::Base::RollingFileSink>(
-                        configuration.logFile.filename(), logDirectory, AsynGyanis::Base::RollingPolicy::Size, maximumSizeBytes,
-                        static_cast<std::size_t>(configuration.logMaxBackup), true));
-            } catch (const std::exception &failure)
-            {
-                // 文件日志打不开时保留控制台输出，进程仍可启动并把原因留给运维
-                std::cerr << "日志文件不可用，仅输出到控制台：" << failure.what() << '\n';
-            }
+            const auto maximumSizeBytes = static_cast<std::size_t>(configuration.logMaxSizeMb) * 1024U * 1024U;
+            rootLogger.addSink(std::make_shared<AsynGyanis::Base::RollingFileSink>(
+                    configuration.logFile.filename(), logDirectory, AsynGyanis::Base::RollingPolicy::Size, maximumSizeBytes,
+                    static_cast<std::size_t>(configuration.logMaxBackup), true));
         }
     } // namespace
 

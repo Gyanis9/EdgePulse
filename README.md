@@ -284,6 +284,7 @@ src/
 ├─ Plugins/    功能插件：认证、系统、监控、工作台、设备、遥测、告警、固件、命令、运维
 ├─ App/        配置、生命周期、监听器与工作线程装配
 └─ Main/       进程入口
+agent/        生产 Agent 源码（配置、日志与状态骨架）
 frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
 3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
 migrations/    SQL 迁移 V1–V18，已应用文件不可修改
@@ -296,9 +297,11 @@ docs/          架构、API、部署、验收与覆盖率
 .github/       CI 工作流、Issue 与 PR 模板
 ```
 
+生产 Agent 入口是 `bin/edgepulse-agent`（P6 建设中，当前只有配置、日志与状态目录骨架）；`samples/DeviceAgent` 是协议探针。
+
 ## Roadmap
 
-已明确延后、暂不纳入默认运行形态的能力与理由见 [docs/ROADMAP.md](docs/ROADMAP.md)，包括生产 `edgepulse-agent` 守护进程、API v1/OpenAPI/幂等键、OTLP tracing、HA 选主、MFA、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入与 API Token。
+已明确延后、暂不纳入默认运行形态的能力与理由见 [docs/ROADMAP.md](docs/ROADMAP.md)，包括 API v1/OpenAPI/幂等键、OTLP tracing、HA 选主、MFA、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入与 API Token。
 
 ## 贡献
 
