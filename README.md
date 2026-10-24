@@ -250,7 +250,7 @@ python scripts/check-acceptance.py
 python scripts/check-docker-stack.py --build
 ```
 
-- 2026-10-24 全量回归：`ctest --preset debug` 注册 185 项，通过 182，跳过 3（缺真实 MySQL/Redis 环境变量的 `ExternalStores.*` 与 `RealtimeBus.RedisFanoutReachesSecondInstance`），失败 0，耗时 56.51 秒；`npm run test:unit` 25 项、`npm run test:e2e` 7 项全部通过，`npm run build` 类型检查与构建通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/backup_restore_test.py` 5 项通过。
+- 2026-10-24 全量回归：`ctest --preset debug` 注册 198 项，通过 195，跳过 3（缺真实 MySQL/Redis 环境变量的 `ExternalStores.*` 与 `RealtimeBus.RedisFanoutReachesSecondInstance`），失败 0，耗时 60.59 秒；`npm run test:unit` 13 个文件 30 项、`npm run test:e2e` 7 项全部通过，`npm run build` 类型检查与构建通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/backup_restore_test.py` 6 项中 5 项通过，1 项 Windows 文件权限位用例按平台跳过。
 - `ExternalStores.*` 需要真实 MySQL/Redis，用 `EDGEPULSE_TEST_MYSQL_*` 与 `EDGEPULSE_TEST_REDIS_*` 门控；缺变量时用例 SKIP，不伪造通过。
 - 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
 - CI 只跑后端构建/ctest、前端单测/构建与密钥扫描；Playwright 在本地用系统 Edge 运行。
