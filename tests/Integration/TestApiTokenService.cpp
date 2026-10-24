@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -468,32 +469,36 @@ TEST(ApiTokenService, TouchLastUsedStaysInsideTenant)
     EXPECT_TRUE(fixture.runner.run(repository->touchLastUsed(fixture.runner.loop(), 1, created->token.id, now, cutoff)));
 }
 
-// 钉住：令牌会话只能签发自身 scope 内的子令牌，不能借 owner 的完整权限提权
-TEST(ApiTokenService, RejectsCreateBeyondTokenSessionScopes)
+// 钉住：令牌会话不能签发任何子令牌，即使自身带 system:token:add；浏览器会话仍可创建
+TEST(ApiTokenService, RejectsTokenSessionCreate)
 {
     TokenFixture fixture;
-    const auto   delegated = fixture.create("delegate", {"system:token:add"});
+    const auto   delegated = fixture.create("delegate", {"system:token:add", "device:node:list"});
     ASSERT_TRUE(delegated.has_value()) << delegated.error().message;
     const auto restricted = authenticate(fixture, delegated->plaintext);
     ASSERT_TRUE(restricted.has_value());
     EXPECT_TRUE(restricted->apiToken);
 
-    const auto escalation = fixture.runner.run(fixture.tokens->create(fixture.runner.loop(), *restricted, "child", {"device:node:write"}, 3600));
-    ASSERT_FALSE(escalation.has_value());
-    EXPECT_EQ(403, escalation.error().httpStatus);
-    EXPECT_NE(std::string::npos, escalation.error().message.find("令牌"));
+    const auto child = fixture.runner.run(fixture.tokens->create(fixture.runner.loop(), *restricted, "child", {"system:token:add"}, 3600));
+    ASSERT_FALSE(child.has_value());
+    EXPECT_EQ(403, child.error().httpStatus);
+    EXPECT_NE(std::string::npos, child.error().message.find("API 令牌"));
+    EXPECT_NE(std::string::npos, child.error().message.find("浏览器会话"));
 
-    const auto delegatedChild = fixture.runner.run(fixture.tokens->create(fixture.runner.loop(), *restricted, "child", {"system:token:add"}, 3600));
-    ASSERT_TRUE(delegatedChild.has_value()) << delegatedChild.error().message;
-    const auto stored = readToken(fixture.context, delegatedChild->token.id);
+    // 缩到空 scope 之外也不行：拒绝发生在校验 scope 之前，令牌会话没有签发入口
+    const auto narrower = fixture.runner.run(fixture.tokens->create(fixture.runner.loop(), *restricted, "child", {"device:node:list"}, 3600));
+    ASSERT_FALSE(narrower.has_value());
+    EXPECT_EQ(403, narrower.error().httpStatus);
+
+    const auto browserChild = fixture.create("browser-child", {"system:token:add"});
+    ASSERT_TRUE(browserChild.has_value()) << browserChild.error().message;
+    const auto stored = readToken(fixture.context, browserChild->token.id);
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(fixture.owner.userId, stored->ownerUserId);
-    const std::vector<std::string> expectedScopes{"system:token:add"};
-    EXPECT_EQ(expectedScopes, delegatedChild->token.scopes);
 }
 
-// 钉住：令牌会话只能轮换或吊销本人且 scope 不宽于自身的令牌，浏览器会话仍可管理本租户令牌
-TEST(ApiTokenService, RejectsTokenSessionTakeover)
+// 钉住：令牌会话不能轮换任何令牌，包括自己；浏览器会话仍可轮换与吊销
+TEST(ApiTokenService, RejectsTokenSessionRotation)
 {
     TokenFixture fixture;
     const auto   delegated = fixture.create("delegate", {"system:token:edit", "system:token:remove"});
@@ -503,18 +508,23 @@ TEST(ApiTokenService, RejectsTokenSessionTakeover)
 
     insertTokenRow(fixture.context, 990010, 2, "other-owner", "[\"system:token:edit\"]");
     insertTokenRow(fixture.context, 990011, fixture.owner.userId, "wider-scope", "[\"device:node:write\"]");
+    const auto otherBefore = readToken(fixture.context, 990010);
+    ASSERT_TRUE(otherBefore.has_value());
 
-    const auto otherRotate = fixture.runner.run(fixture.tokens->rotate(fixture.runner.loop(), *restricted, 990010));
-    ASSERT_FALSE(otherRotate.has_value()) << "不得轮换他人的令牌";
-    EXPECT_EQ(404, otherRotate.error().httpStatus);
-    const auto widerRotate = fixture.runner.run(fixture.tokens->rotate(fixture.runner.loop(), *restricted, 990011));
-    ASSERT_FALSE(widerRotate.has_value()) << "不得轮换 scope 更宽的令牌";
-    EXPECT_EQ(403, widerRotate.error().httpStatus);
+    for (const std::int64_t id: std::array<std::int64_t, 3>{990010, 990011, delegated->token.id})
+    {
+        const auto rotated = fixture.runner.run(fixture.tokens->rotate(fixture.runner.loop(), *restricted, id));
+        ASSERT_FALSE(rotated.has_value()) << "令牌会话不得轮换 " << id;
+        EXPECT_EQ(403, rotated.error().httpStatus);
+        EXPECT_NE(std::string::npos, rotated.error().message.find("API 令牌"));
+        EXPECT_NE(std::string::npos, rotated.error().message.find("浏览器会话"));
+    }
     EXPECT_FALSE(fixture.runner.run(fixture.tokens->revoke(fixture.runner.loop(), *restricted, 990010))) << "不得吊销他人的令牌";
     EXPECT_FALSE(fixture.runner.run(fixture.tokens->revoke(fixture.runner.loop(), *restricted, 990011))) << "不得吊销 scope 更宽的令牌";
 
     const auto other = readToken(fixture.context, 990010);
     ASSERT_TRUE(other.has_value());
+    EXPECT_EQ(otherBefore->tokenHash, other->tokenHash) << "被拒的轮换不得留下新哈希";
     EXPECT_TRUE(other->revokedAt.empty());
     const auto wider = readToken(fixture.context, 990011);
     ASSERT_TRUE(wider.has_value());

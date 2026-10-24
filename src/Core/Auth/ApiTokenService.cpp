@@ -103,6 +103,11 @@ namespace EdgePulse::Auth
     AsynGyanis::Core::Task<std::expected<ApiTokenCreated, AuthError>> ApiTokenService::create(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session, std::string name,
                                                                                               std::vector<std::string> scopes, const int expiresInSeconds)
     {
+        // 令牌会话不能再签发子令牌：子令牌没有父级到期上限与级联吊销，会活过父令牌
+        if (session.apiToken)
+        {
+            co_return std::unexpected(forbidden("API 令牌不能创建新令牌，请使用浏览器会话"));
+        }
         if (name.empty() || codePointCount(name) > 64)
         {
             co_return std::unexpected(badRequest("令牌名称长度必须在 1 到 64 个字符之间"));
@@ -136,17 +141,11 @@ namespace EdgePulse::Auth
         }
         const std::vector<std::string>        permissions = co_await m_users->permissionsFor(loop, owner->id);
         const std::unordered_set<std::string> allowed(permissions.begin(), permissions.end());
-        const std::unordered_set<std::string> delegable(session.permissions.begin(), session.permissions.end());
         for (const std::string &scope: scopes)
         {
             if (!allowed.contains(scope))
             {
                 co_return std::unexpected(badRequest("权限范围不在当前用户权限内：" + scope));
-            }
-            // 令牌会话的可授予范围是自身 scope 与 owner 当前权限的交集，不能借 owner 完整权限提权
-            if (session.apiToken && !delegable.contains(scope))
-            {
-                co_return std::unexpected(forbidden("权限范围超出当前令牌的授权范围：" + scope));
             }
         }
 
@@ -197,22 +196,15 @@ namespace EdgePulse::Auth
     AsynGyanis::Core::Task<std::expected<ApiTokenCreated, AuthError>> ApiTokenService::rotate(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session,
                                                                                               const std::int64_t id)
     {
+        // 轮换会交出新的独立记录；令牌会话不能轮换任何令牌，避免子记录绕过父令牌的到期与吊销
+        if (session.apiToken)
+        {
+            co_return std::unexpected(forbidden("API 令牌不能轮换令牌，请使用浏览器会话"));
+        }
         const std::optional<ApiTokenRecord> existing = co_await m_tokens.scoped({session.tenantId, false})->findById(loop, id);
         if (!existing.has_value())
         {
             co_return std::unexpected(notFound("令牌不存在或不属于当前租户"));
-        }
-        if (session.apiToken)
-        {
-            // 轮换会交出新的明文，令牌会话必须同时满足归属与 scope 包含关系
-            if (existing->ownerUserId != session.userId)
-            {
-                co_return std::unexpected(notFound("令牌不存在或不属于当前租户"));
-            }
-            if (!scopesWithin(existing->scopes, session.permissions))
-            {
-                co_return std::unexpected(forbidden("无权轮换超出当前令牌授权范围的令牌"));
-            }
         }
         if (!existing->revokedAt.empty())
         {

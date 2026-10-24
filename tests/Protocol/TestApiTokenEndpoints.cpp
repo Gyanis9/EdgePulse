@@ -383,6 +383,14 @@ TEST_F(ApiTokenEndpointsTest, CreatesListsAndRevokesTokens)
     ASSERT_TRUE(afterJson.has_value());
     ASSERT_EQ(1U, (*afterJson)["data"].size());
     EXPECT_FALSE((*afterJson)["data"][0]["revokedAt"].get<std::string>().empty());
+
+    // 令牌会话即使带 system:token:add 也不能签发子令牌；服务层返回 403 与浏览器会话提示
+    const CreatedToken adder = createToken(session, "adder", {"system:token:add"});
+    const HttpResult  tokenCreate = createTokenRequest(adder.plaintext, "child", {"system:token:add"});
+    ASSERT_EQ(403, tokenCreate.status) << tokenCreate.body;
+    const auto tokenCreateJson = tokenCreate.json();
+    ASSERT_TRUE(tokenCreateJson.has_value());
+    EXPECT_NE(std::string::npos, (*tokenCreateJson)["message"].get<std::string>().find("API 令牌不能创建新令牌"));
 }
 
 TEST_F(ApiTokenEndpointsTest, RotatesWithOneHourOverlap)
@@ -437,9 +445,13 @@ TEST_F(ApiTokenEndpointsTest, EnforcesControllerPermissionsPerRoute)
     // 拒绝没有副作用，原令牌仍可读列表
     EXPECT_EQ(200, m_server->get("/api/system/api-tokens", bearer(listOnly.plaintext)).status);
 
-    // list + edit：够轮换，不够吊销
+    // list + edit：控制器权限够，但令牌会话不能轮换，服务层拒绝
     const CreatedToken editor = createToken(session, "editor", {"system:token:list", "system:token:edit"});
-    ASSERT_EQ(200, rotateRequest(editor.plaintext, editor.id).status);
+    const HttpResult  editorRotate = rotateRequest(editor.plaintext, editor.id);
+    ASSERT_EQ(403, editorRotate.status) << editorRotate.body;
+    const auto editorRotateJson = editorRotate.json();
+    ASSERT_TRUE(editorRotateJson.has_value());
+    EXPECT_NE(std::string::npos, (*editorRotateJson)["message"].get<std::string>().find("API 令牌不能轮换令牌"));
     ASSERT_EQ(403, deleteRequest(editor.plaintext, editor.id).status);
 
     // list + remove：够吊销，不够轮换

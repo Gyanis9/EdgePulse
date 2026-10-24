@@ -74,14 +74,14 @@ namespace EdgePulse::Auth
         ApiTokenService(std::shared_ptr<Common::Database> database, std::shared_ptr<System::UserRepository> users, std::shared_ptr<System::TenantRepository> tenants);
 
         /**
-         * @brief 为当前身份签发一枚令牌
+         * @brief 为当前浏览器会话签发一枚令牌
          * @param loop 恢复协程用的事件循环
          * @param session 当前身份，令牌归属该用户与其租户
          * @param name 管理名，长度 1 到 64 个字符
-         * @param scopes 权限范围，必须非空、去重且不超出调用者的可授予范围
+         * @param scopes 权限范围，必须非空、去重且不超出 owner 当前权限
          * @param expiresInSeconds 有效期，0 表示默认 30 天；其余取值限 300 到 31536000
          * @return 成功返回对外摘要与一次性明文；校验失败返回可恢复错误
-         * @note 浏览器会话按 owner 当前权限校验；令牌会话只能下放自身 permissions 内的 scope
+         * @note 只接受浏览器会话；令牌会话调用返回 403，避免签发没有父级到期上限与级联吊销的子令牌
          */
         AsynGyanis::Core::Task<std::expected<ApiTokenCreated, AuthError>> create(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session, std::string name,
                                                                                  std::vector<std::string> scopes, int expiresInSeconds = 0);
@@ -107,9 +107,10 @@ namespace EdgePulse::Auth
         /**
          * @brief 轮换一条令牌，保留原到期时间并开启一小时旧哈希重叠窗口
          * @param loop 恢复协程用的事件循环
-         * @param session 当前身份；只能轮换本租户内自己有权管理的令牌
+         * @param session 当前身份；只接受浏览器会话
          * @param id 令牌标识
          * @return 成功返回对外摘要与新明文；令牌不存在、已吊销、已过期或并发冲突返回可恢复错误
+         * @note 令牌会话调用返回 403；轮换出的新记录与旧记录同属一个租户，但不与任何父令牌建立级联
          */
         AsynGyanis::Core::Task<std::expected<ApiTokenCreated, AuthError>> rotate(AsynGyanis::Core::EventLoop &loop, const SessionRecord &session, std::int64_t id);
 
