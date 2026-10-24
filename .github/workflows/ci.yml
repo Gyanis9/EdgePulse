@@ -28,6 +28,48 @@ jobs:
         run: cmake --preset debug
       - name: Build
         run: cmake --build --preset debug
+      - name: Build agent targets
+        run: cmake --build --preset debug --target edgepulse-agent edgepulse-agent-test-hook
+      - name: Assert agent binaries exist
+        shell: pwsh
+        run: |
+          foreach ($path in @('build/debug/bin/edgepulse-agent.exe', 'build/debug/bin/edgepulse-agent-test-hook.exe')) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "缺少 Agent 构建产物：$path"
+            }
+            Write-Host "FOUND: $path"
+          }
+      - name: PowerShell parser check
+        shell: pwsh
+        run: |
+          $files = @(
+            'agent/packaging/windows/install-agent.ps1',
+            'agent/packaging/windows/uninstall-agent.ps1',
+            'scripts/package-agent.ps1',
+            'scripts/check-agent-windows-service.ps1'
+          )
+          $failed = $false
+          foreach ($file in $files) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              Write-Host "PARSE_ERROR: $file 不存在"
+              $failed = $true
+              continue
+            }
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $file).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              foreach ($parseError in $errors) {
+                Write-Host "PARSE_ERROR: $file`: $($parseError.Message)"
+              }
+            } else {
+              Write-Host "PARSE_OK: $file"
+            }
+          }
+          if ($failed) {
+            exit 1
+          }
       - name: Test
         run: ctest --preset debug --output-on-failure
 
@@ -79,6 +121,13 @@ jobs:
         run: cmake --preset debug
       - name: Build
         run: cmake --build --preset debug
+      - name: Build agent targets
+        run: cmake --build --preset debug --target edgepulse-agent edgepulse-agent-test-hook
+      - name: Assert agent binaries exist
+        run: |
+          test -x build/debug/bin/edgepulse-agent
+          test -x build/debug/bin/edgepulse-agent-test-hook
+          echo "Agent binaries found"
       - name: Test
         run: ctest --preset debug --output-on-failure
       # 环境变量门控的用例被跳过时全量 ctest 仍会绿，这里点名外部依赖用例并断言没有 Skipped
@@ -90,6 +139,34 @@ jobs:
       # 服务容器已拉取 mysql:8.4，脚本复用本地镜像，不额外等待下载
       - name: Backup and restore round trip
         run: python scripts/backup_restore_mysql_test.py
+
+  agent-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++ libssl-dev default-libmysqlclient-dev
+      - name: Install Conan
+        run: |
+          pip install conan
+          conan profile detect --force
+      - name: Build engine package
+        run: conan create 3rd/AsynGyanis/packaging/conan --build=missing -s compiler.cppstd=23 -s build_type=Release -o "&:with_mysql=True"
+      - name: Install dependencies
+        run: conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
+      - name: Configure
+        run: cmake --preset debug
+      # E2E 只用 SQLite，不需要 MySQL/Redis 服务容器；测试钩子随 Agent 构建产出
+      - name: Build control plane and agent
+        run: cmake --build --preset debug --target edgepulse-server edgepulse-agent edgepulse-agent-test-hook
+      - name: Run agent end-to-end
+        run: python scripts/check-agent-e2e.py
 
   frontend:
     runs-on: ubuntu-latest
