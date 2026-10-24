@@ -244,9 +244,12 @@ namespace EdgePulse::Agent
         }
 
         const AsynGyanis::Base::ConfigValue requestBody = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"agentVersion", std::move(agentVersion)}});
+        // HttpClientRequest::body 是 string_view：序列化结果必须落在协程帧里的具名局部量，
+        // 直接绑定 dump() 的临时串会在 send 读取前释放
+        const std::string                   bodyText = requestBody.dump();
         AsynGyanis::Net::HttpClientRequest  request;
         request.method      = "POST";
-        request.body        = requestBody.dump();
+        request.body        = bodyText;
         request.contentType = "application/json";
 
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
