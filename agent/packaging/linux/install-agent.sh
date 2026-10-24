@@ -35,10 +35,38 @@ die() {
 
 normalize_path() {
     local path="$1"
+    path="${path//\/\//\/}"
     while [[ "${path}" == */ && "${path}" != "/" ]]; do
         path="${path%/}"
     done
     printf '%s' "${path}"
+}
+
+# 系统目录不接受为安装目标；各选项的文档默认值除外，默认安装仍使用 /usr/local
+# 与 /etc/systemd/system。
+is_system_dir() {
+    case "$1" in
+        /|/etc|/usr|/var|/home|/tmp|/opt|/root|/srv|/var/lib|/var/log|/usr/local|/etc/systemd|/etc/systemd/system)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 路径选项必须是绝对路径，且不能是系统目录、不能含 .. 路径段或以 . 结尾，
+# 避免 install -d 改写已有目录的权限。
+check_path() {
+    local path="$1"
+    local option="$2"
+    local default_value="$3"
+    [[ -n "${path}" ]] || die "${option} 不能为空"
+    [[ "${path}" == /* ]] || die "${option} 必须是绝对路径：${path}"
+    [[ "${path}" != *[[:space:]]* ]] || die "${option} 不能包含空白字符：${path}"
+    [[ "${path}" != */../* && "${path}" != */.. ]] || die "${option} 不能包含 .. 路径段：${path}"
+    [[ "${path}" != */. ]] || die "${option} 不能以 . 结尾：${path}"
+    if [[ "${path}" != "${default_value}" ]] && is_system_dir "${path}"; then
+        die "${option} 不能是系统目录：${path}"
+    fi
 }
 
 escape_sed_replacement() {
@@ -94,11 +122,11 @@ state_dir="$(normalize_path "${state_dir}")"
 log_dir="$(normalize_path "${log_dir}")"
 unit_dir="$(normalize_path "${unit_dir}")"
 
-for path in "${prefix}" "${config_dir}" "${state_dir}" "${log_dir}" "${unit_dir}"; do
-    [[ -n "${path}" ]] || die "安装路径不能为空"
-    [[ "${path}" != "/" ]] || die "安装路径不能是 /"
-    [[ "${path}" != *[[:space:]]* ]] || die "安装路径不能包含空白字符：${path}"
-done
+check_path "${prefix}" "--prefix" "/usr/local"
+check_path "${config_dir}" "--config-dir" "/etc/edgepulse-agent"
+check_path "${state_dir}" "--state-dir" "/var/lib/edgepulse-agent"
+check_path "${log_dir}" "--log-dir" "/var/log/edgepulse-agent"
+check_path "${unit_dir}" "SYSTEMD_UNIT_DIR" "/etc/systemd/system"
 
 if [[ "${EUID}" -ne 0 ]]; then
     if [[ "${prefix}" == "/usr/local" || "${config_dir}" == "/etc/edgepulse-agent" ||

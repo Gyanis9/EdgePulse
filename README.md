@@ -291,7 +291,8 @@ python scripts/check-docker-stack.py --build
 # 在 Linux 上构建 Release 并打包；也可用 --binary 指定已有二进制
 bash scripts/package-agent.sh --version 1.0.0
 
-tar -xzf build/agent-package/edgepulse-agent-1.0.0-linux-x86_64.tar.gz -C /tmp/edgepulse-agent
+mkdir -p /tmp/edgepulse-agent
+tar -xzf build/agent-package/edgepulse-agent-*.tar.gz -C /tmp/edgepulse-agent
 sudo /tmp/edgepulse-agent/install-agent.sh
 # 安装器写入 /usr/local/bin/edgepulse-agent 与 systemd 单元，创建配置、状态与日志目录并启动服务；
 # 已有 agent.yaml、agent.env 不会被覆盖。只安装不启动时加 --no-start。
@@ -299,6 +300,8 @@ sudo /tmp/edgepulse-agent/install-agent.sh
 sudo /tmp/edgepulse-agent/uninstall-agent.sh          # 保留配置、状态与日志
 sudo /tmp/edgepulse-agent/uninstall-agent.sh --purge  # 一并删除
 ```
+
+重装或升级前先 `sudo systemctl stop edgepulse-agent`，再运行安装器替换二进制；安装器不会重启已在运行的进程，旧进程会一直持有旧二进制，直到下次重启。当前包未签名，安装器也不校验签名。
 
 默认路径为配置 `/etc/edgepulse-agent`、状态 `/var/lib/edgepulse-agent`、日志 `/var/log/edgepulse-agent`；`--prefix`、`--config-dir`、`--state-dir`、`--log-dir` 可整体改到自定义位置，单元里的 `ExecStart`、`EnvironmentFile` 与 `ReadWritePaths` 会同步替换。运行状态看 `systemctl status edgepulse-agent`，日志看 `journalctl -u edgepulse-agent -f`，完整步骤见 [docs/部署.md](docs/部署.md#13-agentlinux)。
 

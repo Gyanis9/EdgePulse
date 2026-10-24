@@ -36,10 +36,38 @@ die() {
 
 normalize_path() {
     local path="$1"
+    path="${path//\/\//\/}"
     while [[ "${path}" == */ && "${path}" != "/" ]]; do
         path="${path%/}"
     done
     printf '%s' "${path}"
+}
+
+# 系统目录不接受为卸载目标；各选项的文档默认值除外，默认卸载仍使用 /usr/local
+# 与 /etc/systemd/system。
+is_system_dir() {
+    case "$1" in
+        /|/etc|/usr|/var|/home|/tmp|/opt|/root|/srv|/var/lib|/var/log|/usr/local|/etc/systemd|/etc/systemd/system)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 路径选项必须是绝对路径，且不能是系统目录、不能含 .. 路径段或以 . 结尾，
+# 避免删除单元、二进制或清理目录时误伤上级目录。
+check_path() {
+    local path="$1"
+    local option="$2"
+    local default_value="$3"
+    [[ -n "${path}" ]] || die "${option} 不能为空"
+    [[ "${path}" == /* ]] || die "${option} 必须是绝对路径：${path}"
+    [[ "${path}" != *[[:space:]]* ]] || die "${option} 不能包含空白字符：${path}"
+    [[ "${path}" != */../* && "${path}" != */.. ]] || die "${option} 不能包含 .. 路径段：${path}"
+    [[ "${path}" != */. ]] || die "${option} 不能以 . 结尾：${path}"
+    if [[ "${path}" != "${default_value}" ]] && is_system_dir "${path}"; then
+        die "${option} 不能是系统目录：${path}"
+    fi
 }
 
 prefix="/usr/local"
@@ -96,10 +124,20 @@ state_dir="$(normalize_path "${state_dir}")"
 log_dir="$(normalize_path "${log_dir}")"
 unit_dir="$(normalize_path "${unit_dir}")"
 
-for path in "${prefix}" "${config_dir}" "${state_dir}" "${log_dir}" "${unit_dir}"; do
-    [[ -n "${path}" ]] || die "卸载路径不能为空"
-    [[ "${path}" != "/" && "${path}" != "." && "${path}" != ".." ]] || die "拒绝删除可疑路径：${path}"
-done
+check_path "${prefix}" "--prefix" "/usr/local"
+check_path "${config_dir}" "--config-dir" "/etc/edgepulse-agent"
+check_path "${state_dir}" "--state-dir" "/var/lib/edgepulse-agent"
+check_path "${log_dir}" "--log-dir" "/var/log/edgepulse-agent"
+check_path "${unit_dir}" "SYSTEMD_UNIT_DIR" "/etc/systemd/system"
+
+if [[ "${purge}" -eq 1 ]]; then
+    for path in "${config_dir}" "${state_dir}" "${log_dir}"; do
+        [[ "${path}" == */*/* ]] || die "--purge 目标至少要有两级路径：${path}"
+        base_name="${path##*/}"
+        [[ -n "${base_name}" && "${base_name}" != "." && "${base_name}" != ".." ]] ||
+            die "--purge 目标目录名不能为空、. 或 ..：${path}"
+    done
+fi
 
 if [[ "${EUID}" -ne 0 ]]; then
     if [[ "${prefix}" == "/usr/local" || "${config_dir}" == "/etc/edgepulse-agent" ||
