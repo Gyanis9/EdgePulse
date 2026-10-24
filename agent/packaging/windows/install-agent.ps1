@@ -330,6 +330,7 @@ function Invoke-AgentUpgrade {
     $backupPath = $binaryPath + '.previous'
     $version = ''
     $binaryReplaced = $false
+    $serviceStoppedByUs = $false
 
     $null = New-Item -ItemType Directory -Path $StateDir -Force
     $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('edgepulse-agent-upgrade-' + [Guid]::NewGuid().ToString('N'))
@@ -369,6 +370,14 @@ function Invoke-AgentUpgrade {
             throw "找不到现有二进制 $binaryPath"
         }
 
+        # 旧标记必须在启动新版本之前清掉；清理失败时服务尚未停止，直接结束即可
+        if (Test-Path -LiteralPath $healthMarker) {
+            Remove-Item -LiteralPath $healthMarker -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $rollbackMarker) {
+            Remove-Item -LiteralPath $rollbackMarker -Force -ErrorAction Stop
+        }
+
         # 备份在停服务之前完成；停服务失败时二进制未改动，回滚分支不会触发
         Copy-Item -LiteralPath $binaryPath -Destination $backupPath -Force
         Write-UpgradeLog -LogPath $logPath -Message "已备份现有二进制到 $backupPath"
@@ -383,6 +392,7 @@ function Invoke-AgentUpgrade {
                 if ($existingService.Status -ne 'StopPending') {
                     Write-UpgradeLog -LogPath $logPath -Message "停止服务 $ServiceName"
                     Invoke-Sc -Arguments "stop $ServiceName" -Description "停止服务 $ServiceName"
+                    $serviceStoppedByUs = $true
                 }
                 try {
                     $existingService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
@@ -394,8 +404,6 @@ function Invoke-AgentUpgrade {
             $existingService.Dispose()
         }
 
-        Remove-Item -LiteralPath $healthMarker -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $rollbackMarker -Force -ErrorAction SilentlyContinue
         $binaryReplaced = $true
         Copy-Item -LiteralPath $newBinary -Destination $binaryPath -Force
         Write-UpgradeLog -LogPath $logPath -Message "已替换二进制，等待健康标记 $healthMarker 出现版本 $version"
@@ -472,6 +480,14 @@ function Invoke-AgentUpgrade {
         } else {
             if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
                 Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+            }
+            if ($serviceStoppedByUs) {
+                try {
+                    Invoke-Sc -Arguments "start $ServiceName" -Description "重新启动服务 $ServiceName" | Out-Null
+                    Write-UpgradeLog -LogPath $logPath -Message '已重新启动旧版本服务'
+                } catch {
+                    Write-UpgradeLog -LogPath $logPath -Message "错误：重新启动旧版本服务失败：$($_.Exception.Message)"
+                }
             }
             Write-UpgradeLog -LogPath $logPath -Message '失败发生在替换二进制之前，服务与二进制未改动'
         }

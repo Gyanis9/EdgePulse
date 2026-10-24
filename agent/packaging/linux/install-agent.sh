@@ -175,7 +175,7 @@ rollback_upgrade() {
 
     if [[ -f "${upgrade_backup}" ]]; then
         if install -m 0755 -- "${upgrade_backup}" "${upgrade_binary}"; then
-            rm -f -- "${upgrade_backup}"
+            rm -f -- "${upgrade_backup}" || log_upgrade "警告：删除旧二进制备份 ${upgrade_backup} 失败"
             log_upgrade "已恢复旧二进制：${upgrade_binary}"
         else
             log_upgrade "错误：恢复旧二进制失败，备份保留在 ${upgrade_backup}"
@@ -244,6 +244,12 @@ run_upgrade() {
     upgrade_binary="${prefix}/bin/edgepulse-agent"
     upgrade_backup="${upgrade_binary}.previous"
     [[ -f "${upgrade_binary}" ]] || rollback_upgrade "找不到现有二进制 ${upgrade_binary}"
+    # 旧标记必须在启动新版本之前清掉；清理失败时服务尚未停止，直接结束即可
+    if ! rm -f -- "${state_dir}/update-health" "${state_dir}/update-rollback"; then
+        log_upgrade "无法删除旧的升级健康标记或回滚标记，升级未开始"
+        exit 1
+    fi
+
     if ! cp -p -- "${upgrade_binary}" "${upgrade_backup}"; then
         rm -f -- "${upgrade_backup}" 2>/dev/null || true
         log_upgrade "备份现有二进制失败，升级未开始"
@@ -256,7 +262,6 @@ run_upgrade() {
         log_upgrade "警告：systemctl stop 返回非零（服务可能已停止），继续升级"
     fi
 
-    rm -f -- "${state_dir}/update-health" "${state_dir}/update-rollback"
     install -m 0755 -- "${extraction_dir}/edgepulse-agent" "${upgrade_binary}" || rollback_upgrade "替换二进制失败"
     log_upgrade "已替换二进制，等待健康标记 ${state_dir}/update-health 出现版本 ${upgrade_version}"
 
@@ -268,7 +273,7 @@ run_upgrade() {
         if [[ -f "${state_dir}/update-health" ]]; then
             observed="$(cat -- "${state_dir}/update-health" 2>/dev/null || true)"
             if [[ "${observed}" == "${upgrade_version}" ]]; then
-                rm -f -- "${upgrade_backup}" "${state_dir}/update-health"
+                rm -f -- "${upgrade_backup}" "${state_dir}/update-health" || log_upgrade "警告：清理旧二进制备份或健康标记失败"
                 log_upgrade "升级成功：版本 ${upgrade_version} 已通过健康检查"
                 exit 0
             fi
