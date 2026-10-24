@@ -6,9 +6,9 @@ import Button from '@/components/ui/Button.vue'
 import Field from '@/components/ui/Field.vue'
 import TextInput from '@/components/ui/TextInput.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
-import { ApiError, authApi, portalApi } from '@/api'
+import { ApiError, authApi, portalApi, type MfaChallenge } from '@/api'
 import NeuralNet from '@/components/NeuralNet.vue'
-import { login, loginWithOidc } from '@/composables/auth'
+import { completeMfaLogin, login, loginWithOidc } from '@/composables/auth'
 import { EASE, afterTwoFrames, gsap, motionSkipped, prefersReducedMotion, trackGlow } from '@/composables/motion'
 import { required, validate } from '@/utils/validate'
 import { APP } from '@/data'
@@ -30,6 +30,16 @@ const root = ref<HTMLElement | null>(null)
 const card = ref<HTMLElement | null>(null)
 const succeeded = ref(false)
 const oidcEnabled = ref(false)
+
+/* ── 第二因素：密码或企业登录确认后只拿挑战，完成动态码校验才落会话 ── */
+const mfaStep = ref(false)
+const mfaChallenge = ref<MfaChallenge | null>(null)
+const mfaCode = ref('')
+const mfaRecovery = ref(false)
+const mfaError = ref('')
+const mfaFieldError = ref('')
+const mfaTarget = ref('/')
+const mfaRemember = ref(true)
 
 /* ── 左侧仪表：实时时钟（秒针刻度逐格推进）与服务健康 ── */
 const now = ref(new Date())
@@ -116,6 +126,83 @@ async function refreshCaptcha() {
   form.captcha = ''
 }
 
+function redirectTarget() {
+  const value = route.query.redirect
+  return typeof value === 'string' && value.startsWith('/') ? value : '/'
+}
+
+/** 进入外壳；导航被取消（如菜单加载期间会话过期）时仍停在登录页并恢复按钮 */
+async function enterShell(target: string) {
+  await playSuccess()
+  const failure = await router.replace(target)
+  if (failure || router.currentRoute.value.name === 'login') succeeded.value = false
+}
+
+function beginMfa(challenge: MfaChallenge, target: string, rememberLogin: boolean) {
+  mfaChallenge.value = challenge
+  mfaTarget.value = target
+  mfaRemember.value = rememberLogin
+  mfaStep.value = true
+  mfaCode.value = ''
+  mfaRecovery.value = false
+  mfaError.value = ''
+  mfaFieldError.value = ''
+  // 挑战已替代密码凭据；返回账号登录时重新输入口令与验证码
+  form.password = ''
+  form.captcha = ''
+  void nextTick(() => document.querySelector<HTMLInputElement>('.mfa-code input')?.focus())
+}
+
+function toggleRecovery() {
+  mfaRecovery.value = !mfaRecovery.value
+  mfaCode.value = ''
+  mfaError.value = ''
+  mfaFieldError.value = ''
+  void nextTick(() => document.querySelector<HTMLInputElement>('.mfa-code input')?.focus())
+}
+
+function backToPassword() {
+  if (submitting.value) return
+  mfaStep.value = false
+  mfaChallenge.value = null
+  mfaCode.value = ''
+  mfaRecovery.value = false
+  mfaError.value = ''
+  mfaFieldError.value = ''
+  form.password = ''
+  void refreshCaptcha()
+}
+
+async function submitMfa() {
+  mfaError.value = ''
+  mfaFieldError.value = ''
+  if (!mfaChallenge.value) {
+    mfaError.value = '两步验证挑战已失效，请返回重新登录'
+    return
+  }
+  const value = mfaCode.value.trim()
+  if (mfaRecovery.value) {
+    if (value.replace(/[^a-z0-9]/gi, '').length !== 8) {
+      mfaFieldError.value = '请输入 8 位恢复码'
+      return
+    }
+  } else if (!/^\d{6}$/.test(value)) {
+    mfaFieldError.value = '请输入 6 位数字动态码'
+    return
+  }
+  submitting.value = true
+  try {
+    await completeMfaLogin(mfaChallenge.value.challengeToken, value, mfaRemember.value)
+    await enterShell(mfaTarget.value)
+  } catch (error) {
+    succeeded.value = false
+    mfaError.value = error instanceof ApiError ? error.message : '两步验证失败，请稍后重试'
+    mfaCode.value = ''
+  } finally {
+    submitting.value = false
+  }
+}
+
 async function submit() {
   formError.value = ''
   errors.value = validate(form, {
@@ -126,12 +213,12 @@ async function submit() {
   if (Object.keys(errors.value).length) return
   submitting.value = true
   try {
-    await login({ tenantCode: form.tenantCode.trim() || undefined, username: form.username.trim(), password: form.password, captcha: form.captcha.trim(), captchaUuid: captchaUuid.value }, remember.value)
-    await playSuccess()
-    const redirect = typeof route.query.redirect === 'string' && route.query.redirect.startsWith('/') ? route.query.redirect : '/'
-    const failure = await router.replace(redirect)
-    // 进入外壳的导航被取消（如菜单加载期间会话过期）时仍停在登录页：恢复登录按钮
-    if (failure || router.currentRoute.value.name === 'login') succeeded.value = false
+    const result = await login({ tenantCode: form.tenantCode.trim() || undefined, username: form.username.trim(), password: form.password, captcha: form.captcha.trim(), captchaUuid: captchaUuid.value }, remember.value)
+    if (result.mfaRequired) {
+      beginMfa(result, redirectTarget(), remember.value)
+      return
+    }
+    await enterShell(redirectTarget())
   } catch (error) {
     succeeded.value = false
     formError.value = error instanceof ApiError ? error.message : '登录失败，请稍后重试'
@@ -141,16 +228,11 @@ async function submit() {
   }
 }
 
-function redirectTarget() {
-  const value = route.query.redirect
-  return typeof value === 'string' && value.startsWith('/') ? value : '/'
-}
-
 function startOidc() {
   window.location.assign('/api/auth/oidc/start?return=' + encodeURIComponent(redirectTarget()))
 }
 
-/** OIDC 回调：用一次性 code 换会话，成功后进入原目标页。 */
+/** OIDC 回调：用一次性 code 换会话，成功后进入原目标页；本地账号需第二因素时改走动态码。 */
 async function completeOidc() {
   const code = typeof route.query.oidcCode === 'string' ? route.query.oidcCode : ''
   const errorText = typeof route.query.oidcError === 'string' ? route.query.oidcError : ''
@@ -159,10 +241,11 @@ async function completeOidc() {
   submitting.value = true
   try {
     const result = await loginWithOidc(code, true)
-    await playSuccess()
-    const target = result.returnPath || redirectTarget()
-    const failure = await router.replace(target)
-    if (failure || router.currentRoute.value.name === 'login') succeeded.value = false
+    if (result.mfaRequired) {
+      beginMfa(result, result.returnPath || redirectTarget(), true)
+      return
+    }
+    await enterShell(result.returnPath || redirectTarget())
   } catch (error) {
     succeeded.value = false
     formError.value = error instanceof ApiError ? error.message : '企业登录失败，请稍后重试'
@@ -302,11 +385,13 @@ onBeforeUnmount(() => {
       <div ref="card" class="login-card m-float m-glow" role="region" aria-labelledby="login-heading" @pointermove="trackGlow">
         <span class="glow-layer" aria-hidden="true" />
         <div class="login-card-inner">
-          <span class="eyebrow">账号登录</span>
-          <h2 id="login-heading" class="login-card-title">登录</h2>
-          <p class="login-card-sub">使用管理员分配的账号登录系统</p>
+          <span class="eyebrow">{{ mfaStep ? '第二因素' : '账号登录' }}</span>
+          <h2 id="login-heading" class="login-card-title">{{ mfaStep ? '两步验证' : '登录' }}</h2>
+          <p class="login-card-sub">
+            {{ mfaStep ? (mfaRecovery ? '输入一枚恢复码，完成本次登录' : '输入身份验证器中的 6 位动态码') : '使用管理员分配的账号登录系统' }}
+          </p>
 
-          <form class="login-form" novalidate @submit.prevent="submit">
+          <form v-if="!mfaStep" class="login-form" novalidate @submit.prevent="submit">
             <Field label="租户编码">
               <TextInput v-model="form.tenantCode" icon="dept" placeholder="默认租户可留空" autocomplete="organization" />
             </Field>
@@ -343,6 +428,41 @@ onBeforeUnmount(() => {
             </div>
             <Button v-if="oidcEnabled && !succeeded" type="button" variant="secondary" block class="login-oidc" :disabled="submitting" @click="startOidc">
               企业登录
+            </Button>
+          </form>
+
+          <form v-else class="login-form" novalidate @submit.prevent="submitMfa">
+            <Field :label="mfaRecovery ? '恢复码' : '动态验证码'" :error="mfaFieldError">
+              <div class="mfa-code">
+                <TextInput
+                  v-model="mfaCode"
+                  icon="shield"
+                  :placeholder="mfaRecovery ? '请输入 8 位恢复码' : '请输入 6 位动态码'"
+                  :maxlength="mfaRecovery ? 12 : 6"
+                  autocomplete="one-time-code"
+                  :invalid="!!mfaFieldError"
+                  :disabled="submitting"
+                />
+              </div>
+            </Field>
+            <p v-if="mfaError" class="login-error" role="alert"><Icon name="alert" :size="15" />{{ mfaError }}</p>
+            <div class="login-options">
+              <button type="button" class="link-btn" :disabled="submitting" @click="toggleRecovery">
+                {{ mfaRecovery ? '使用身份验证器' : '使用恢复码' }}
+              </button>
+              <span class="faint" style="font-size: 12px">账号已启用两步验证</span>
+            </div>
+            <div class="login-submit-slot">
+              <Button v-if="!succeeded" type="submit" variant="primary" block :loading="submitting" class="login-submit">验证并登录</Button>
+              <div v-else class="success-orb" role="status" aria-label="登录成功，正在进入">
+                <svg width="30" height="30" viewBox="0 0 46 46" aria-hidden="true">
+                  <circle cx="23" cy="23" r="20" stroke-dasharray="126" />
+                  <path d="m15 23.5 5.5 5.5L31.5 18" stroke-dasharray="24" />
+                </svg>
+              </div>
+            </div>
+            <Button v-if="!succeeded" type="button" variant="ghost" block :disabled="submitting" @click="backToPassword">
+              返回账号登录
             </Button>
           </form>
         </div>

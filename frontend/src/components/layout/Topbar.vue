@@ -12,6 +12,7 @@ const emit = defineEmits<{
   (e: 'command'): void
   (e: 'appearance'): void
   (e: 'password'): void
+  (e: 'mfa'): void
   (e: 'logout'): void
 }>()
 
@@ -60,10 +61,11 @@ function onKey(event: KeyboardEvent) {
   }
 }
 
-function pick(action: 'appearance' | 'password' | 'logout') {
+function pick(action: 'appearance' | 'password' | 'mfa' | 'logout') {
   closeMenu()
   if (action === 'appearance') emit('appearance')
   else if (action === 'password') emit('password')
+  else if (action === 'mfa') emit('mfa')
   else emit('logout')
 }
 
@@ -108,6 +110,7 @@ onBeforeUnmount(() => closeMenu())
             <div class="soft" style="font-size: 12px">@{{ currentUser?.username }}<template v-if="currentUser?.deptName"> · {{ currentUser.deptName }}</template></div>
           </div>
           <button type="button" class="menu-item" role="menuitem" @click="pick('password')"><Icon name="key" :size="16" />修改密码</button>
+          <button type="button" class="menu-item" role="menuitem" @click="pick('mfa')"><Icon name="shield" :size="16" />两步验证</button>
           <button type="button" class="menu-item" role="menuitem" @click="pick('appearance')"><Icon name="contrast" :size="16" />外观设置</button>
           <button type="button" class="menu-item is-danger" role="menuitem" @click="pick('logout')"><Icon name="logout" :size="16" />退出登录</button>
         </div>

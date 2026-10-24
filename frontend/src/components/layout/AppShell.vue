@@ -6,6 +6,7 @@ import Topbar from './Topbar.vue'
 import CommandPalette from './CommandPalette.vue'
 import AppearanceDialog from './AppearanceDialog.vue'
 import PasswordDialog from './PasswordDialog.vue'
+import MfaSettingsDialog from '@/components/business/MfaSettingsDialog.vue'
 import { logout } from '@/composables/auth'
 import { appearance } from '@/composables/appearance'
 import { pageEnter, pageLeave, playShellEntrance } from '@/composables/motion'
@@ -20,6 +21,7 @@ const mobileOpen = ref(false)
 const commandOpen = ref(false)
 const appearanceOpen = ref(false)
 const passwordOpen = ref(false)
+const mfaOpen = ref(false)
 const scrolled = ref(false)
 
 // 内容滚动后顶栏凝结：只切换一层静态玻璃的 opacity，不补间 backdrop-filter
@@ -87,6 +89,7 @@ onBeforeUnmount(() => {
           @command="commandOpen = true"
           @appearance="appearanceOpen = true"
           @password="passwordOpen = true"
+          @mfa="mfaOpen = true"
           @logout="onLogout"
         />
         <main ref="content" class="content" tabindex="-1" @scroll.passive="onContentScroll">
@@ -101,5 +104,6 @@ onBeforeUnmount(() => {
     <CommandPalette :open="commandOpen" @close="commandOpen = false" @action="onCommandAction" />
     <AppearanceDialog :open="appearanceOpen" @close="appearanceOpen = false" />
     <PasswordDialog :open="passwordOpen" @close="passwordOpen = false" />
+    <MfaSettingsDialog :open="mfaOpen" @close="mfaOpen = false" />
   </div>
 </template>

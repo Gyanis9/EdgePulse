@@ -25,6 +25,7 @@ export interface UserRow {
   postName: string
   roleName: string
   status: number
+  mfaEnabled?: boolean
   lockedUntil: string
   createTime: string
   lastLogin: string
@@ -290,6 +291,7 @@ export function createSystemApi(client: HttpClient) {
       export: (query?: QueryParams) => client.download('/system/users/export', query),
       updateStatus: (id: number, status: number) => client.put<void>(`/system/users/${id}/status`, { status }),
       resetPassword: (id: number, password: string) => client.put<void>(`/system/users/${id}/password`, { password }),
+      resetMfa: (id: number) => client.post<void>(`/system/users/${id}/mfa/reset`),
     },
     tenants: {
       ...crudPage<TenantRow, TenantUpdateRequest>(client, '/system/tenants'),

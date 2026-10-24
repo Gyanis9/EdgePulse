@@ -1,6 +1,6 @@
 import { ref, type Component } from 'vue'
 import type { RouteRecordRaw } from 'vue-router'
-import { ApiError, authApi, authSession, type CurrentUser, type LoginRequest, type RouteItem } from '@/api'
+import { ApiError, authApi, authSession, type CurrentUser, type LoginRequest, type MfaChallenge, type RouteItem } from '@/api'
 import { setPermissions } from '@/directives/permission'
 import type { NavGroup, NavLeaf } from '@/data'
 import { clearDictCache } from './dict'
@@ -136,16 +136,51 @@ function remainingSeconds() {
   return Math.max(60, Math.round((authSession.expiresAt() - Date.now()) / 1000))
 }
 
-export async function login(credentials: LoginRequest, remember: boolean) {
+export type LoginOutcome =
+  | { mfaRequired: false; user: CurrentUser }
+  | MfaChallenge
+
+export type OidcLoginOutcome =
+  | { mfaRequired: false; user: CurrentUser; returnPath: string }
+  | (MfaChallenge & { returnPath: string })
+
+export async function login(credentials: LoginRequest, remember: boolean): Promise<LoginOutcome> {
   clearSession()
   const version = sessionVersion.value
   try {
     const loginResponse = await authApi.login(credentials)
     if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
-    authSession.save(loginResponse, { username: credentials.username, nickname: credentials.username }, remember)
+    if (loginResponse.mfaRequired) {
+      if (!loginResponse.challengeToken) throw new Error('登录响应缺少两步验证挑战')
+      return { mfaRequired: true, challengeToken: loginResponse.challengeToken, expiresIn: loginResponse.expiresIn }
+    }
+    if (!loginResponse.token) throw new Error('登录响应缺少会话令牌')
+    const session = { token: loginResponse.token, expiresIn: loginResponse.expiresIn }
+    authSession.save(session, { username: credentials.username, nickname: credentials.username }, remember)
     const user = await authApi.me()
     if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
-    authSession.save(loginResponse, user, remember)
+    authSession.save(session, user, remember)
+    currentUser.value = user
+    setPermissions(user.permissions ?? [])
+    authed.value = true
+    return { mfaRequired: false, user }
+  } catch (error) {
+    if (version === sessionVersion.value) clearSession()
+    throw error
+  }
+}
+
+/** 用第二因素挑战换会话；密码与 OIDC 两条登录路径共用。 */
+export async function completeMfaLogin(challengeToken: string, code: string, remember: boolean): Promise<CurrentUser> {
+  clearSession()
+  const version = sessionVersion.value
+  try {
+    const verified = await authApi.verifyMfa({ challengeToken, code })
+    if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
+    authSession.save(verified, { username: 'mfa', nickname: 'mfa' }, remember)
+    const user = await authApi.me()
+    if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
+    authSession.save(verified, user, remember)
     currentUser.value = user
     setPermissions(user.permissions ?? [])
     authed.value = true
@@ -157,12 +192,22 @@ export async function login(credentials: LoginRequest, remember: boolean) {
 }
 
 /** OIDC 回调带回的一次性 code 换会话；成功后加载当前身份与权限。 */
-export async function loginWithOidc(code: string, remember: boolean) {
+export async function loginWithOidc(code: string, remember: boolean): Promise<OidcLoginOutcome> {
   clearSession()
   const version = sessionVersion.value
   try {
     const exchanged = await authApi.oidcExchange({ code })
     if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
+    if (exchanged.mfaRequired) {
+      if (!exchanged.challengeToken) throw new Error('登录响应缺少两步验证挑战')
+      return {
+        mfaRequired: true,
+        challengeToken: exchanged.challengeToken,
+        expiresIn: exchanged.expiresIn,
+        returnPath: exchanged.returnPath,
+      }
+    }
+    if (!exchanged.token) throw new Error('登录响应缺少会话令牌')
     authSession.save({ token: exchanged.token, expiresIn: exchanged.expiresIn }, { username: 'oidc', nickname: 'oidc' }, remember)
     const user = await authApi.me()
     if (version !== sessionVersion.value) throw new Error('登录状态已变化，请重新登录')
@@ -170,7 +215,7 @@ export async function loginWithOidc(code: string, remember: boolean) {
     currentUser.value = user
     setPermissions(user.permissions ?? [])
     authed.value = true
-    return { user, returnPath: exchanged.returnPath }
+    return { mfaRequired: false, user, returnPath: exchanged.returnPath }
   } catch (error) {
     if (version === sessionVersion.value) clearSession()
     throw error

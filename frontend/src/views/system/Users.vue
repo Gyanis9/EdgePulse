@@ -39,9 +39,9 @@ const columns = computed<Column[]>(() => [
   { key: 'postName', title: '岗位' },
   { key: 'roleName', title: '角色' },
   { key: 'phone', title: '手机号' },
-  { key: 'status', title: '状态', width: 140 },
+  { key: 'status', title: '状态', width: 170 },
   { key: 'createTime', title: '创建时间', width: 150 },
-  { key: 'actions', title: '操作', width: 150, className: 'col-actions' },
+  { key: 'actions', title: '操作', width: 190, className: 'col-actions' },
 ])
 
 /* ── 看板视图：按部门 / 角色 / 状态分列；只有「按状态」允许拖动（改状态是单字段接口） ── */
@@ -263,6 +263,25 @@ async function submitReset() {
   }
 }
 
+/* ── 重置两步验证：仅针对已启用的账号，重置后需重新绑定身份验证器 ── */
+async function resetMfa(row: UserRow) {
+  const ok = await confirm({
+    title: '重置两步验证',
+    message: `确认重置「${row.nickname}」的两步验证吗？重置后该账号登录只需密码，需重新绑定身份验证器。`,
+    confirmText: '重置',
+    danger: true,
+  })
+  if (!ok) return
+  try {
+    await systemApi.users.resetMfa(row.id)
+    pushToast(`已重置「${row.nickname}」的两步验证`)
+    await list.load()
+    if (view.value === 'board') await loadBoard()
+  } catch (error) {
+    toastError(error, '两步验证重置失败')
+  }
+}
+
 /* ── 删除 / 批量 ── */
 async function remove(row: UserRow) {
   const ok = await confirm({ title: '删除用户', message: `确认删除用户「${row.nickname}」吗？删除后该账号将无法登录。`, confirmText: '删除', danger: true })
@@ -358,6 +377,7 @@ async function batchRemove(ids: (string | number)[]) {
           <div class="ucard-tags">
             <Tag v-if="item.roleName && groupBy !== 'role'" tone="info">{{ item.roleName }}</Tag>
             <Tag v-if="item.postName && groupBy !== 'dept'">{{ item.postName }}</Tag>
+            <Tag v-if="item.mfaEnabled" tone="ok" dot>两步验证</Tag>
           </div>
           <div class="ucard-foot">
             <span class="ucard-time">{{ item.lastLogin ? `最近登录 ${item.lastLogin}` : '从未登录' }}</span>
@@ -419,6 +439,7 @@ async function batchRemove(ids: (string | number)[]) {
     <template #cell-status="{ row }">
       <div class="flag-row">
         <StatusTag :status="row.status" />
+        <Tag v-if="row.mfaEnabled" tone="ok" dot>两步验证</Tag>
         <Tag v-if="isLockActive(row.lockedUntil)" tone="danger" dot>已锁定</Tag>
       </div>
     </template>
@@ -428,6 +449,7 @@ async function batchRemove(ids: (string | number)[]) {
         <PermissionButton perm="system:user:edit" icon-only icon="edit" label="编辑" @click="openEdit(row)" />
         <PermissionButton v-if="tracePath" perm="system:role:list" icon-only icon="shield" label="权限溯源" @click="openTrace(row)" />
         <PermissionButton perm="system:user:reset" icon-only icon="key" label="重置密码" @click="openReset(row)" />
+        <PermissionButton v-if="row.mfaEnabled" perm="system:user:edit" icon-only icon="shield" label="重置两步验证" @click="resetMfa(row)" />
         <PermissionButton perm="system:user:remove" icon-only icon="trash" label="删除" danger @click="remove(row)" />
       </div>
     </template>

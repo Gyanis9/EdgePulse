@@ -1,8 +1,14 @@
-import type { CurrentUser, LoginResponse } from './auth'
+import type { CurrentUser } from './auth'
 
 const TOKEN_KEY = 'scaffold.token'
 const USER_KEY = 'scaffold.user'
 const EXPIRES_KEY = 'scaffold.expiresAt'
+
+/** 已完成的登录会话；两因素挑战不能落盘，因此令牌在这里必填 */
+interface SessionToken {
+  token: string
+  expiresIn: number
+}
 
 export interface AuthSessionOptions {
   localStorage?: Storage
@@ -26,7 +32,7 @@ export function createAuthSession(options: AuthSessionOptions = {}) {
     return local.getItem(TOKEN_KEY) ? local : session
   }
 
-  function save(login: LoginResponse, user: StoredUser | CurrentUser, remember: boolean) {
+  function save(login: SessionToken, user: StoredUser | CurrentUser, remember: boolean) {
     clear()
     const storage = remember ? local : session
     storage.setItem(TOKEN_KEY, login.token)

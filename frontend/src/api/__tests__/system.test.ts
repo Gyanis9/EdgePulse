@@ -132,3 +132,22 @@ test('system api maps api token list, create, rotate and revoke calls', async ()
   assert.deepEqual(JSON.parse(calls[1].body ?? '{}'), { name: 'ci', scopes: ['device:node:list'], expiresInSeconds: 86400 })
   assert.equal(calls[2].body, undefined)
 })
+
+test('system api resets a user second factor through the admin endpoint', async () => {
+  const calls: Array<{ url: string; method: string; body?: string }> = []
+  const fetcher = async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body as string | undefined })
+    return new Response(JSON.stringify({ code: 200, message: 'success', data: null, traceId: 't' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  const api = createSystemApi(createHttpClient({ baseUrl: '/api', tokenProvider: () => 'token', fetcher }))
+
+  await api.users.resetMfa(42)
+
+  assert.deepEqual(calls.map(call => `${call.method} ${call.url}`), [
+    'POST /api/system/users/42/mfa/reset',
+  ])
+  assert.equal(calls[0].body, undefined)
+})
