@@ -16,6 +16,7 @@
 - [配置](#配置)
 - [运行与端口](#运行与端口)
 - [API 与实时通道](#api-与实时通道)
+- [固件灰度发布（OTA）](#固件灰度发布ota)
 - [安全模型](#安全模型)
 - [测试与验收](#测试与验收)
 - [部署](#部署)
@@ -45,7 +46,7 @@
 | 多租户 | 租户编码登录、平台管理员跨租户、租户级 RBAC/部门/岗位/字典、节点与遥测/告警/固件/命令按租户隔离、停用租户阻断新登录、实时主题按租户分区 |
 | 设备生命周期 | Agent mTLS 注册、叶证书指纹绑定、一次性 `enroll`/`rebind` 令牌、内部 CA 按 CSR 自动签发与续期（旧指纹重叠窗口）、证书到期与吊销、心跳超时离线、系统离线告警、节点详情与分组 |
 | 遥测与告警 | HTTP 与 UDP 遥测（HMAC-SHA256 防重放）、告警规则与确认/恢复生命周期、Webhook（HMAC 签名）与 SMTP 通知、投递记录与失败原因 |
-| 固件与命令 | 流式上传、ETag 与单段 Range 下载、Ed25519 签名与验签门禁、分批灰度与回滚、命令批量/计划/取消、Agent WebSocket 推送与轮询兜底 |
+| 固件与命令 | 流式上传、ETag 与单段 Range 下载、Ed25519 签名与验签门禁、按波次自动推进的灰度与健康门控、自动回滚、命令批量/计划/取消、Agent WebSocket 推送与轮询兜底 |
 | 实时 | 浏览器 WebSocket 的节点/告警/命令主题、告警 SSE、Redis 跨实例事件扇出、Agent 命令长连接 |
 | 高可用 | 双实例共享 MySQL/Redis/固件卷，nginx 统一 8080/8443/9443；`sys_lease` 租约与 fence 单飞、MySQL 迁移锁、跨实例 Agent 命令路由、`/readyz` 五项依赖、优雅停机与崩溃切换 |
 | 可观测 | Prometheus HTTP 与业务指标、`/readyz`、运维总览、OTLP 指标出口、操作/登录统计与热力图 |
@@ -232,6 +233,81 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 
 浏览器 WebSocket 升级后 5 秒内发送 `{"type":"auth","token":"..."}`，成功后订阅 `nodes`、`alarms`、`commands` 主题。告警 SSE 用 `event: alarm` 推送，每 15 秒注释保活。
 
+## 固件灰度发布（OTA）
+
+灰度发布把一次固件下发拆成有序波次，由 leader 每 5 秒推进一拍；只有上一波健康门控通过才派发下一波，失败可以暂停或自动回滚。创建、查看与人工动作沿用 `device:firmware:upload` / `device:firmware:list`，目标节点必须与固件同租户；强制签名时目标固件与回滚目标都必须已签名。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/firmware/{id}/rollouts` | 创建；`{name,nodeIds,policy}`，也可用 `policyJson` 字符串 |
+| GET | `/api/firmware/{id}/rollouts` | 按固件分页列出发布头 |
+| GET | `/api/firmware/rollouts/{id}` | 发布聚合：发布、波次、目标与门控快照 |
+| POST | `/api/firmware/rollouts/{id}/pause` | 暂停；可带 `reason` |
+| POST | `/api/firmware/rollouts/{id}/resume` | 恢复；重新开启当前波次观察窗口，不重发已绑定命令 |
+| POST | `/api/firmware/rollouts/{id}/promote` | 人工提升；跳过当前波次，最后一波则完成 |
+| POST | `/api/firmware/rollouts/{id}/force-promote` | 强制提升；必须带非空 `reason` 并写入波次门控 |
+| POST | `/api/firmware/rollouts/{id}/abort` | 中止任意非终止发布，取消在途命令与任务 |
+| POST | `/api/firmware/rollouts/{id}/rollback` | 人工回滚；重新下发每个目标的历史已安装版本 |
+
+策略字段（未给出的字段取默认值；未知字段直接拒绝）：
+
+| 字段 | 默认 | 范围与语义 |
+|---|---|---|
+| `waves` | 必填 | 1–50 波；每波 `percent` 1–100（按累计覆盖比例解释）或 `size` 固定数量且不小于 1；最后一波必须覆盖全部目标 |
+| `maxConcurrentPerWave` | `0` | 0–1000，0 表示不限；只约束仍在执行的命令 |
+| `settleSeconds` | `60` | 1–604800，且不小于两个 Agent 心跳周期 |
+| `observeSeconds` | `120` | 0–604800，沉降结束后继续观察心跳、遥测与告警的时间 |
+| `maxWaveSeconds` | `1800` | 1–604800，且不小于 `settleSeconds` 与 `observeSeconds` 的较大值 |
+| `minWaveSuccessRatio` | `1.0` | 0–1，本波健康目标占本波目标的最低比例 |
+| `minCumulativeSuccessRatio` | `1.0` | 0–1，全部已派发目标的最低健康比例 |
+| `maxFailures` | `0` | 0–1000000，0 表示不设上限；按单波失败目标数计 |
+| `autoRollback` | `false` | 门控失败或超时后自动回滚 |
+| `onTimeout` | `pause` | `pause` 或 `fail`；只在未开启自动回滚时决定超时去向 |
+| `requiredFreshTelemetrySeconds` | `300` | 1–604800，门控可接受的最新遥测年龄 |
+| `exemptAlarmMetrics` | `[]` | 最多 100 项，每项不超过 64 字节且不能重复 |
+| `maintenanceWindow` | 无 | `{start,end,days?}`，HH:MM 按 UTC 当日分钟、可跨午夜；`days` 为 ISO 星期 1–7 |
+| `requireInstalledVersion` | `true` | 要求节点上报 `installedFirmwareVersion` 且与目标版本一致 |
+
+发布状态机：
+
+```text
+scheduled/preparing -> running -> completed
+scheduled/preparing/running -> paused -> running
+running/paused/failed -> rolling_back -> rolled_back | rollback_unavailable | failed
+任意非终止状态 -> aborted
+```
+
+波次状态为 `pending -> dispatching -> observing -> passed | failed`，中止时进入 `skipped`，回滚时为 `rolling_back -> rolled_back | failed`。目标状态为 `pending -> installing -> healthy | failed`，回滚时为 `rolling_back -> rolled_back | failed`；回滚失败的目标在 `health.gate` 里区分 `rollback_failed` 与 `rollback_unavailable`。
+
+健康门控逐个目标检查：
+
+- 命令必须 `succeeded`；任务必须绑定同一 `commandId` 并进入 `installed`，任务自身的 `failed` 或命令 `failed/timeout/canceled` 直接判失败。
+- 节点在线，且 `lastSeen` 不早于沉降窗口结束；观察窗口结束时仍未覆盖则判失败。
+- `requireInstalledVersion=true` 时 `installedFirmwareVersion` 必须非空且等于目标版本；不一致保持等待，直到观察结束或超时。
+- 最新遥测的接收时间不早于本波派发，年龄不超过 `requiredFreshTelemetrySeconds`，采集时间不能早于派发前 300 秒。
+- 本波派发后新增的告警判失败，`exemptAlarmMetrics` 中的指标除外。
+- 单波/累计成功率与 `maxFailures` 同时满足才通过；乐观估计已无法达标时提前失败，观察结束仍有未定目标时失败，到达 `maxWaveSeconds` 按超时处理。
+
+人工动作：`pause` 接受 `scheduled/preparing/running`（已暂停重复暂停视为成功），`resume` 接受 `paused`（已运行重复恢复视为成功）并把当前波次的观察窗口从恢复时刻重开；`promote` 与 `force-promote` 只接受 `running/paused`，会把当前波次未完成目标按失败收尾；`abort` 接受全部非终止状态（含 `rolling_back`）；`rollback` 接受 `running/paused/failed/rolling_back`，下一次 tick 才真正派发。
+
+自动回滚只重新下发历史版本，不依赖 Agent 本地槽位：
+
+- 回滚命令是新的 `firmware.update`，目标为每个目标记录的 `previousFirmwareId`，必须重新下载、验签、安装并上报版本；没有 A/B 分区、差分下载或本地快照。
+- 未下发过安装命令、没有历史版本、历史固件不存在或强制签名下历史固件未签名时，目标记为 `failed` 且 `gate=rollback_unavailable`。
+- 命令失败、任务失败或超时记为 `gate=rollback_failed`；全部目标确认安装历史版本后发布进入 `rolled_back`，部分无法回滚进入 `failed`，全部无法回滚进入 `rollback_unavailable`。
+- 回滚确认要求命令成功、任务 `installed` 且节点 `installedFirmwareVersion` 等于历史版本；回滚期限从进入 `rolling_back` 起算，最长 `maxWaveSeconds`。
+- 进程在回滚中途重启会沿用已绑定的回滚任务与命令，不重复建单；仍在执行的安装命令与在途任务在回滚派发前会被取消，已完成的目标直接进入回滚。
+
+协调与限制：
+
+- 只有 leader 的 `LeaderTick` 每 5 秒调用一次推进，服务自身不判断领导权；每个发布以头部 `version` 做比较交换，follower 不推进。leader 切换可能让某一拍或一次租约过期的推进延后。
+- V22 新增 `biz_firmware_rollout`、`biz_firmware_rollout_wave`、`biz_firmware_rollout_target`，并给任务加 `rollout_id/wave_id/command_id`、给节点加 `installed_firmware_version`；V23 增加 `(rollout_id,wave_index)` 唯一索引。迁移只追加，升级前照常备份。
+- 已知限制：目标只接受节点标识，界面没有分组选择；波次与目标的多次写入和发布头 CAS 不在同一事务，崩溃后由下一拍按目标状态继续；`listDueRollouts` 固定 `LIMIT 20`，大批积压时较新的发布会排队，已登记为 P11 审计项。
+
+节点通过心跳上报 `installedFirmwareVersion`，空值不会清空已有版本；Agent 的固件状态上报可带 `commandId`，只推进该命令绑定的任务，避免不同波次或手工下发的任务互相覆盖。
+
+管理端操作：固件页的“灰度发布”打开向导，按加载到的节点勾选目标（勾选顺序决定波次归属），填写累计波次百分比（默认 5/25/100，最后一波必须 100%），按需调整并发、沉降、观察、单波上限、成功率、失败数、遥测新鲜度、超时动作与自动回滚，提交后直接打开详情。详情每 5 秒轮询，展示发布/波次/目标状态、门控原因与已安装版本，并按状态提供暂停、恢复、提升、强制提升、中止与回滚；发布历史列表接口已提供，但页面尚无独立历史入口。
+
 ## 安全模型
 
 - 浏览器会话：32 字节不透明 Bearer token，存在 Redis 或进程内存储，TTL 默认 7200 秒并滑动续期；不使用 Cookie 承载会话。
@@ -269,7 +345,7 @@ cd ..
 python scripts/generate-openapi.py --check
 python scripts/check-acceptance.py
 
-# Agent 端到端：真实 server/agent 二进制，临时 SQLite 库
+# Agent 端到端：真实 server/agent 二进制，临时 SQLite 库；含双节点灰度与自动回滚
 python scripts/check-agent-e2e.py
 
 # SQLite 备份与恢复：往返、边车清理、路径与私钥过滤
@@ -292,6 +368,7 @@ python scripts/check-ha-stack.py --require-docker
 - 2026-10-25 P7 门禁（代码基线 `8e3885c`，只含文档改动）：`cmake --build --preset debug` 无待编译目标；`ctest --preset debug` 注册 401 项，通过 397，跳过 4，失败 0，耗时 143.85 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42 项、E2E 18 项全部通过，`npm run build` 通过且产物含 `openapi.json`；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0。
 - 2026-10-25 P8 门禁（`feat/enterprise-hardening`，最终评审修复后）：`cmake --build --preset debug` 退出 0；`ctest --preset debug` 注册 512 项，通过 507，跳过 5，失败 0，耗时 167.96 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42/42、E2E 20/20 通过（38.8 秒），`npm run build` 通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 66 项、失败 0、跳过 0，覆盖短期证书自动续期、PID 不变、旧指纹重叠窗口、WebSocket 命令通道与续期后的心跳/遥测/命令。
 - 2026-10-25 P9 门禁（`feat/enterprise-hardening`，最终部署修复后）：`cmake --build --preset debug` 无待编译目标；`ctest --preset debug` 注册 553 项，通过 544，跳过 9，失败 0，耗时 184.86 秒；`python scripts/check-ha-stack.py --require-docker` 68 项全部通过（跨实例会话、命令 0.03 秒送达、跨实例吊销 1008、nginx WS/WSS 与 SSE、Redis 停机 503 与恢复、SIGTERM 后 6.76 秒接管、SIGKILL 后 16.75 秒接管且 fence 2→3）；`python scripts/generate-openapi.py --check` 无漂移；`python scripts/run-external-tests.py` 7/7 通过；前端单测 42/42、E2E 20/20（38.7 秒），`npm run build` 通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 66 项、失败 0、跳过 0。
+- 2026-10-26 P10 门禁（`feat/enterprise-hardening`，OTA 灰度合入后）：`cmake --build --preset debug` 无待编译目标；`ctest --preset debug` 注册 616 项，通过 607，跳过 9，失败 0，耗时 231.39 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 43/43（498 毫秒）、E2E 22/22（40.7 秒），`npm run build` 通过（1.96 秒）；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 83 项、失败 0、跳过 0，覆盖双真实 Agent 的 1→2 波灰度、第二波安装失败与自动回滚确认。
 - 远程 Linux 实测（阿里云 ECS，Ubuntu 24.04/systemd 255）：真实 `edgepulse-agent` 的 50 项端到端检查通过；`install-agent.sh` 安装后服务为 active，`systemctl stop/start` 正常，注册退避期间停止立即生效，`uninstall-agent.sh --purge` 清理二进制、unit、配置、状态与日志。
 - `ExternalStores.*`、`RealtimeBus.Redis*` 与 `AgentCommandBus.RedisFanout*` 需要真实 MySQL/Redis：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性容器并注入 `EDGEPULSE_TEST_MYSQL_*`、`EDGEPULSE_TEST_REDIS_*`，随后断言 7 项用例确实执行且输出不含 Skipped；镜像可用 `--mysql-image`/`--redis-image` 覆盖。直接跑 `ctest` 缺变量时仍 SKIP，不伪造通过。
 - 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
@@ -327,7 +404,7 @@ flowchart LR
 ```
 
 - 实例身份：每个实例显式配置唯一的 `edgepulse.instance_id`；Docker HA 编排用入口脚本按 `EDGEPULSE_INSTANCE_ID` 生成各自的配置副本，两个容器挂同一份只读 `prod.yaml`。
-- 租约与单飞：`sys_lease` 的 `control-plane` 行是唯一协调点，TTL 15 秒、每 5 秒续约；条件 UPDATE 命中才算 leader，接管时 fence 递增。只有 leader 执行计划命令调度、保留期清理、离线扫描与离线告警；指标读数每个实例都刷新。旧 leader 恢复后不能续约；崩溃重启的实例要等一个 TTL 才能重新当选。
+- 租约与单飞：`sys_lease` 的 `control-plane` 行是唯一协调点，TTL 15 秒、每 5 秒续约；条件 UPDATE 命中才算 leader，接管时 fence 递增。只有 leader 执行计划命令调度、保留期清理、离线扫描与离线告警、固件灰度推进；指标读数每个实例都刷新。旧 leader 恢复后不能续约；崩溃重启的实例要等一个 TTL 才能重新当选。
 - 迁移：MySQL 迁移前持有 `GET_LOCK('edgepulse:migrations:<库名>', 30)`，并发启动的实例串行迁移，拿不到锁的实例拒绝启动。SQLite 仍是单实例开发档。
 - Agent 命令：先在本地投递，再经 Redis 的 `target=agent` 信封转给持有该节点连接的实例；Agent 在已连接时仍每 60 秒轮询一次，断开时按 `command_poll_interval_seconds`（默认 15 秒）轮询，重复投递按命令标识去重。
 - 就绪：`/readyz` 依次检查数据库、启停状态、缓存探针、实时总线与固件目录可写，任一不就绪返回 503 和第一条原因；容器健康检查以它为准，`/api/health` 只表示进程存活。nginx 不读取 `/readyz`，只看 upstream 的 `max_fails`/`fail_timeout` 被动摘除失败实例，`fail_timeout` 到期后会重新尝试该上游。
@@ -354,7 +431,7 @@ docker compose -f docker-compose.ha.yml exec -T mysql \
 - 优雅停机：向实例发 SIGTERM，`/readyz` 先变 503 并立即清空租约 holder，随后按 HTTP、HTTPS、mTLS、QUIC、Ops 顺序排空，容器 `stop_grace_period` 为 40 秒。实测停机后新 leader 在 6.76 秒内接管、fence 递增。
 - 崩溃切换：`SIGKILL` 后旧 holder 留在租约行直到 TTL 过期，新 leader 在 2 个 TTL（30 秒）内接管；实测 16.75 秒，fence 由 2 升到 3，重启的旧 leader 不抢占有效租约。
 - 滚动升级：一次只动一个实例，先摘流（或 `docker compose stop edgepulse-1`），等 `/readyz` 503 并退出，再用新镜像 `up -d edgepulse-1`；新实例 `/readyz` 200 后，等 `fail_timeout`（5 秒）过去，nginx 会重新尝试该上游。nginx 不读 `/readyz`；容器重建换了 IP 时还要 `docker compose restart nginx` 或 `nginx -s reload` 让 Docker DNS 重新解析。两个实例不要同时重启，否则 nginx 没有可用上游，Agent 长连接与在途请求都会中断。
-- 全量门禁：`python scripts/check-ha-stack.py --require-docker` 覆盖跨实例会话、Agent 命令路由、跨实例吊销 1008、nginx WS/WSS 与 SSE、共享固件、CA 私钥权限、Redis 停机 503 与恢复、SIGTERM 与 SIGKILL 两条停机路径。
+- 全量门禁：`python scripts/check-ha-stack.py --require-docker` 覆盖跨实例会话、Agent 命令路由、跨实例吊销 1008、nginx WS/WSS 与 SSE、共享固件、CA 私钥权限、灰度单飞（单目标仅一条任务与命令）、Redis 停机 503 与恢复、SIGTERM 与 SIGKILL 两条停机路径。
 
 已知限制：
 
@@ -433,7 +510,7 @@ src/
 agent/        生产 Agent 源码与 Linux/Windows 打包脚本
 frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
 3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
-migrations/    SQL 迁移 V1–V21，已应用文件不可修改
+migrations/    SQL 迁移 V1–V23，已应用文件不可修改
 config/        非敏感配置样例；生产配置与信任键目录不入库
 deploy/        Docker（含 HA 编排）、nginx、systemd、Prometheus
 scripts/       证书、开发运行、固件签名、备份恢复、HA 与验收
@@ -447,7 +524,7 @@ docs/          架构、API、部署、验收与覆盖率
 
 ## Roadmap
 
-P7 已交付 API Token、TOTP 两步验证、写请求幂等键与 OpenAPI 3.1 契约；P8 已交付控制面内部 CA、Agent CSR 续期与旧指纹重叠窗口；P9 已交付控制面双实例 HA：租约与 fence 单飞、MySQL 迁移锁、跨实例 Agent 命令路由、五项依赖的 `/readyz` 与 Compose/nginx/systemd 编排。仍延后的能力见 [docs/ROADMAP.md](docs/ROADMAP.md)：`/api/v1` 版本前缀、OTLP tracing、跨地域多活与存储层 HA、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入，以及租户级 MFA 强制策略、按令牌或按租户限流等后续项。
+P7 已交付 API Token、TOTP 两步验证、写请求幂等键与 OpenAPI 3.1 契约；P8 已交付控制面内部 CA、Agent CSR 续期与旧指纹重叠窗口；P9 已交付控制面双实例 HA：租约与 fence 单飞、MySQL 迁移锁、跨实例 Agent 命令路由、五项依赖的 `/readyz` 与 Compose/nginx/systemd 编排；P10 已交付固件灰度发布：波次物化、健康门控、自动回滚、leader 单飞与管理端向导/详情。仍延后的能力见 [docs/ROADMAP.md](docs/ROADMAP.md)：`/api/v1` 版本前缀、OTLP tracing、跨地域多活与存储层 HA、通用事件订阅、固件 A/B 与差分下载、灰度分组目标与大批积压轮转、批量节点编辑/CSV 导入，以及租户级 MFA 强制策略、按令牌或按租户限流等后续项。
 
 ## 贡献
 

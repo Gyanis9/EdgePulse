@@ -40,8 +40,9 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 - Agent 凭据与服务权限：注册与改绑令牌只从环境变量读取，Linux 写在 0600 的 `agent.env`，Windows 写在服务注册表项的 `Environment` 值；令牌不写 YAML、日志或状态库，注册成功后清空。Linux 以 systemd 单元运行，配置文件 0600、配置/状态/日志目录 0750，单元启用 `NoNewPrivileges`、`ProtectSystem=strict`、`PrivateTmp` 并只放开必要目录；Windows 以 SCM 服务运行，默认 LocalSystem，数据目录 ACL 只授予 Administrators 与 SYSTEM，安装目录给 Users 读取/执行，并配置失败自动重启。
 - 注册令牌：`enroll` 用于新节点，`rebind` 用于已有节点换证；令牌一次性消费，数据库只存 SHA-256，明文只在签发响应出现一次。有效期限制在 300 到 2592000 秒。生产使用 `enrollment_mode=required`，新注册与换证都必须持对应令牌。
 - 固件签名：固件签名覆盖文件 SHA-256 的 32 字节原始摘要，算法为 Ed25519，传输标识 `ed25519-sha256`。服务端只从 `trusted_keys_dir` 加载 Ed25519 公钥；`require_signature=true` 时缺签名、未知 key id、摘要不符或签名格式错误的固件不能上传、部署或回滚。公钥变更后重启加载，`GET /api/firmware/policy` 可确认已加载的 key id。
+- 固件灰度发布：创建、暂停、恢复、提升、强制提升、中止与回滚都要求 `device:firmware:upload`，列表与详情要求 `device:firmware:list`；目标节点必须与会话租户及固件租户一致，跨租户标识返回 400。强制签名时灰度目标与回滚目标都必须带有效签名，未签名的历史版本不能作为回滚目标，只能记录为 `rollback_unavailable`。推进只由 leader 的 `LeaderTick` 每 5 秒执行，发布头以 `version` 做比较交换，follower 不创建任务或命令；单波并发上限与人工暂停/中止在每次下发前重读发布头。自动回滚是重新下发历史固件，不是 Agent 本地槽位切换，仍受签名、下载、安装钩子与回滚期限约束；命令与任务失败会落成 `rollback_failed`，不会谎报已回滚。灰度的人工动作与其他写请求一样进入操作审计，审计正文对 `token`、`password` 等字段脱敏。
 - 运维口：`/metrics`、`/debug/loops`、`/debug/connections` 与 `/debug/log-level` 需要 Bearer；`/healthz` 与 `/readyz` 只暴露进程与就绪状态。代码默认监听回环；生产样例与 Compose 为容器抓取绑 `0.0.0.0`，必须用主机防火墙或容器网络策略限制来源。
-- 控制面租约与 fence：多实例用 `sys_lease` 的 `control-plane` 行选出唯一 leader，获取是带过期条件的 UPDATE 并回读 fence，续约是带 `holder` 与 `fence` 条件的 UPDATE。接管时 fence 递增，旧 leader 恢复后无法续约或写回；失去租约只停止计划命令调度、保留期清理与离线扫描，不阻断请求处理。租约时间取本机 UTC，所有实例必须 NTP 对齐，偏差超过 TTL 会形成双 leader。
+- 控制面租约与 fence：多实例用 `sys_lease` 的 `control-plane` 行选出唯一 leader，获取是带过期条件的 UPDATE 并回读 fence，续约是带 `holder` 与 `fence` 条件的 UPDATE。接管时 fence 递增，旧 leader 恢复后无法续约或写回；失去租约只停止计划命令调度、保留期清理、离线扫描与固件灰度推进，不阻断请求处理。租约时间取本机 UTC，所有实例必须 NTP 对齐，偏差超过 TTL 会形成双 leader。
 - Agent 命令通道的信任边界：命令先本地投递，再经 Redis 频道 `edgepulse:events` 的 `target=agent` 信封转给持有该节点连接的实例；只有写出成功才把命令推进到 `running`，关闭消息最多重试 3 次。信封在 Redis 层没有额外签名或加密，能写该频道或改写 `sys_lease` 的攻击者可以伪造命令、关闭在线 Agent 或抢占 leader；Redis 与数据库必须放在受信内网、使用强口令并限制可达来源，样例未启用 Redis TLS。Agent 侧仍按 mTLS 叶证书绑定节点，命令执行只接受白名单类型，重复投递按命令标识去重。
 - 证书与私钥分离：应用只读证书目录放 `ca.pem`、`server.pem` 与 `server-key.pem`；nginx 证书目录只放 `server.pem` 与 `server-key.pem`，看不到 CA 信任锚；Agent CA 私钥走独立 Compose secret，由一次性初始化容器复制到属主为服务账号、权限 0400 的命名卷，应用只读挂载。三层互不越权，泄露 nginx 证书不会带出签发能力。
 - 出站 SSRF：租户填写的 Webhook 地址在创建/修改与每次投递前都要通过地址检查。默认拒绝回环、RFC1918 私网、CGNAT、组播、保留与文档示例段、IPv4/IPv6 链路本地段以及云元数据地址和主机名。开启 `allow_private_webhooks` 会跳过整个私网/保留段分类，只保留云元数据主机名与地址、链路本地元数据段（169.254.0.0/16、fe80::/10 及已知 IPv6 元数据端点）的拒绝；CGNAT、0.0.0.0/8、文档与基准测试段、组播、240/4、IPv6 ULA 等其余私网与保留地址都会放行，只应在受信的自托管网关开启，不能当作通用的 SSRF 豁免。该防护只覆盖 Webhook 的 HTTP(S) 出站；SMTP 邮件渠道的 `smtp://`、`smtps://` 与 `starttls://` 端点不经过这道 HTTP 地址检查，必须由运维选择可信服务器并自行校验。
@@ -62,6 +63,7 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 - 备份与恢复：恢复必须停止服务，运行中的进程会持有数据库、WAL 或固件文件句柄；SQLite 备份支持在线快照，但一致性归档仍建议放在维护窗口。证书、运维令牌与固件签名私钥不要和数据库备份放在同一份未加密介质里。
 - Agent 身份绑定只存在于 mTLS 通道：开发与测试的明文链路不做叶证书绑定，不要把 Agent 路由暴露到明文监听器。
 - 开启固件签名门禁后，历史已入库的未签名固件仍可被 Agent 下载。需要继续下发时，先重新上传带签名的同版本固件，再按新记录部署。
+- 固件灰度的边界：没有 A/B 分区、差分下载或本地快照，自动回滚必须重新下载并安装历史版本，缺历史版本或历史版本未签名时只能记为 `rollback_unavailable`；回滚未在 `maxWaveSeconds` 内确认时发布以失败收尾。波次与目标的多行写入与发布头 CAS 不在同一事务，进程崩溃后由下一拍按目标状态继续，可能短暂出现目标进度领先发布头；`listDueRollouts` 固定 `LIMIT 20`，大批积压时较新的发布要排队，已在 P11 审计。leader 切换或租约过期会让推进延后一拍或一个 TTL，不会让 follower 同时推进。
 
 ## 密钥与证书管理
 

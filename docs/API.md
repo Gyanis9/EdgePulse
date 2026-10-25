@@ -268,6 +268,15 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 | GET | `/api/firmware/{id}/tasks` | `device:firmware:list` |
 | POST | `/api/firmware/{id}/deploy` | `device:firmware:upload`；`{nodeIds:[...],batchSize?}` |
 | POST | `/api/firmware/{id}/rollback` | `device:firmware:upload`；`{nodeIds:[...]}` |
+| POST | `/api/firmware/{id}/rollouts` | `device:firmware:upload`；`{name,nodeIds,policy}` 或 `policyJson`；见 5.1 |
+| GET | `/api/firmware/{id}/rollouts` | `device:firmware:list`；分页列出该固件的发布头 |
+| GET | `/api/firmware/rollouts/{id}` | `device:firmware:list`；发布、波次、目标与门控聚合 |
+| POST | `/api/firmware/rollouts/{id}/pause` | `device:firmware:upload`；可带 `reason` |
+| POST | `/api/firmware/rollouts/{id}/resume` | `device:firmware:upload`；重开当前波次观察窗口 |
+| POST | `/api/firmware/rollouts/{id}/promote` | `device:firmware:upload`；人工提升当前波次 |
+| POST | `/api/firmware/rollouts/{id}/force-promote` | `device:firmware:upload`；`{reason}` 必填，写入波次门控 |
+| POST | `/api/firmware/rollouts/{id}/abort` | `device:firmware:upload`；任意非终止状态可中止 |
+| POST | `/api/firmware/rollouts/{id}/rollback` | `device:firmware:upload`；下一次 tick 派发历史版本 |
 | DELETE | `/api/firmware/{id}` | `device:firmware:remove` |
 | GET | `/api/commands` | `device:command:list`；`status,nodeId` |
 | POST | `/api/commands` | `device:command:send`；`{nodeId,type,payload,timeoutSeconds}` |
@@ -285,6 +294,71 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 | `X-Firmware-Key-Id` | 信任键目录里公钥文件的 stem，例如 `prod-2026` |
 
 两个头必须成对出现。`requireSignature=true` 时缺任一头在收正文前返回 400；key id 未加载、摘要不符或签名格式错误在写完文件后返回 400 并删除成品。`requireSignature=true` 时未签名固件也不能部署或回滚。历史未签名固件仍可被 Agent 下载，但下载不带签名头。
+
+### 5.1 固件灰度发布
+
+创建请求：
+
+```json
+{
+  "name": "生产环境灰度",
+  "nodeIds": [101, 102],
+  "policy": {
+    "waves": [{"size": 1}, {"size": 1}],
+    "settleSeconds": 60,
+    "observeSeconds": 120,
+    "maxWaveSeconds": 1800,
+    "autoRollback": true
+  }
+}
+```
+
+`name` 1–128 字节，`nodeIds` 1–1000 个正整数且不能重复；节点必须与会话租户可见且与固件同租户。`policy` 可换成 `policyJson` 字符串。策略字段与默认值：
+
+| 字段 | 默认 | 约束 |
+|---|---|---|
+| `waves` | 必填 | 1–50 波；每波只能是 `percent`（1–100，累计覆盖）或 `size`（≥1），不能同时给；最后一波必须覆盖全部目标 |
+| `maxConcurrentPerWave` | `0` | 0–1000；0 不限；只统计仍在执行的命令 |
+| `settleSeconds` | `60` | 1–604800，且 ≥ 两倍 Agent 心跳周期 |
+| `observeSeconds` | `120` | 0–604800 |
+| `maxWaveSeconds` | `1800` | 1–604800，且 ≥ `max(settleSeconds, observeSeconds)` |
+| `minWaveSuccessRatio` | `1.0` | 0–1 |
+| `minCumulativeSuccessRatio` | `1.0` | 0–1 |
+| `maxFailures` | `0` | 0–1000000；0 不限 |
+| `autoRollback` | `false` | 失败或超时后自动回滚 |
+| `onTimeout` | `pause` | `pause` 或 `fail` |
+| `requiredFreshTelemetrySeconds` | `300` | 1–604800 |
+| `exemptAlarmMetrics` | `[]` | ≤100 项，每项非空 ≤64 字节且不重复 |
+| `maintenanceWindow` | 无 | `{start,end,days?}`；HH:MM UTC，start≠end，可跨午夜；days 为 1–7 |
+| `requireInstalledVersion` | `true` | 要求节点上报版本且与目标一致 |
+
+未知字段、类型不符、波次未覆盖全部目标、百分比递减或固定数量超出剩余目标都返回 400。创建响应是完整聚合；`GET /api/firmware/rollouts/{id}` 与人工动作成功后也返回同一形状：
+
+```json
+{
+  "id": 31, "firmwareId": 5, "name": "生产环境灰度", "policy": {},
+  "status": "running", "currentWave": 1, "totalWaves": 2, "version": 7,
+  "pausedAt": "", "pauseReason": "", "lastError": "",
+  "waves": [{"waveIndex": 0, "status": "passed", "targetCount": 1, "dispatchedAt": "...", "deadlineAt": "...", "gate": [{}]}],
+  "targets": [{"nodeId": 101, "waveId": 11, "previousFirmwareId": 4, "taskId": 201, "commandId": 301,
+               "status": "healthy", "health": {"gate": "healthy", "reason": "...", "installedVersion": "2.0.0"}}]
+}
+```
+
+发布状态：`scheduled`、`preparing`、`running`、`paused`、`rolling_back`、`rolled_back`、`rollback_unavailable`、`completed`、`aborted`、`failed`。波次状态：`pending`、`dispatching`、`observing`、`passed`、`failed`、`skipped`、`rolling_back`、`rolled_back`。目标状态：`pending`、`installing`、`healthy`、`failed`、`rolling_back`、`rolled_back`；回滚结论在 `health.gate` 里区分 `rollback_pending`、`rollback_failed`、`rollback_unavailable`、`rolled_back`。
+
+健康门控（逐目标，沉降结束后每 5 秒评估）：
+
+- 命令 `succeeded`；任务绑定同一 `commandId` 且 `installed`；命令 `failed/timeout/canceled`、任务 `failed` 或命令号不匹配直接失败。
+- 节点在线且 `lastSeen` 不早于沉降结束；观察结束时仍未覆盖判失败。
+- `requireInstalledVersion=true` 时 `installedFirmwareVersion` 必须非空并等于目标版本；不一致保持等待。
+- 最新遥测接收时间不早于本波派发，年龄不超过 `requiredFreshTelemetrySeconds`，采集时间不早于派发前 300 秒。
+- 本波派发后新增告警判失败，`exemptAlarmMetrics` 除外。
+- 单波/累计成功率与 `maxFailures` 同时满足才通过；乐观估计无法达标时提前失败，观察结束仍有未定目标时失败，`maxWaveSeconds` 到达按超时处理。
+
+人工动作：`pause` 接受 `scheduled/preparing/running`（已暂停重复暂停视为成功），`resume` 接受 `paused`（已运行重复恢复视为成功）；`promote`/`force-promote` 只接受 `running/paused`，未完成目标按失败收尾；`abort` 接受全部非终止状态；`rollback` 接受 `running/paused/failed/rolling_back`。强制提升缺 `reason` 返回 400，状态不允许返回 409，发布不存在返回 404。
+
+自动回滚：对每个尚无回滚决定的目标创建新的 `firmware.update`，目标是其 `previousFirmwareId`；没有历史版本、历史固件不存在或（强制签名时）未签名记为 `failed` + `health.gate=rollback_unavailable`。命令/任务失败记为 `rollback_failed`；全部目标确认后发布 `rolled_back`，部分无法回滚为 `failed`，全部无法回滚为 `rollback_unavailable`。确认条件为命令成功、任务 `installed` 且节点 `installedFirmwareVersion` 等于历史版本；期限为进入 `rolling_back` 后的 `maxWaveSeconds`。回滚是重新下载与安装，没有 A/B 槽位或差分。
 
 告警规则字段：`name,nodeId(0=全部),metric,comparison,threshold,level,enabled,cooldownSeconds`。
 
