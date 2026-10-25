@@ -36,7 +36,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
+#include <ctime>
 #include <exception>
 #include <expected>
 #include <filesystem>
@@ -79,6 +81,58 @@ namespace EdgePulse::Agent
         {
             const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
             return std::format("{:%Y-%m-%dT%H:%M:%S}Z", now);
+        }
+
+        /**
+         * @brief 解析形如 2026-10-24T08:00:00Z 的 UTC 文本
+         * @param text 待解析文本
+         * @return 成功返回对应时刻；格式不符或字段越界时为空
+         */
+        [[nodiscard]] std::optional<std::chrono::system_clock::time_point> parseUtcTimestamp(const std::string &text)
+        {
+            // 固定形如 2026-10-24T08:00:00Z；长度与分隔符先定死，再按位解析数字
+            constexpr std::size_t kTimestampLength = 20;
+            if (text.size() != kTimestampLength || text[4] != '-' || text[7] != '-' || text[10] != 'T' || text[13] != ':' || text[16] != ':' || text[19] != 'Z')
+            {
+                return std::nullopt;
+            }
+            const auto readInteger = [&text](const std::size_t offset, const std::size_t length, int &value) -> bool
+            {
+                const auto [end, error] = std::from_chars(text.data() + offset, text.data() + offset + length, value);
+                return error == std::errc{} && end == text.data() + offset + length;
+            };
+            int year   = 0;
+            int month  = 0;
+            int day    = 0;
+            int hour   = 0;
+            int minute = 0;
+            int second = 0;
+            if (!readInteger(0, 4, year) || !readInteger(5, 2, month) || !readInteger(8, 2, day) || !readInteger(11, 2, hour) || !readInteger(14, 2, minute) ||
+                !readInteger(17, 2, second))
+            {
+                return std::nullopt;
+            }
+            if (month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60)
+            {
+                return std::nullopt;
+            }
+            tm value{};
+            value.tm_year = year - 1900;
+            value.tm_mon  = month - 1;
+            value.tm_mday = day;
+            value.tm_hour = hour;
+            value.tm_min  = minute;
+            value.tm_sec  = second;
+#ifdef _WIN32
+            const std::time_t seconds = _mkgmtime(&value);
+#else
+            const std::time_t seconds = timegm(&value);
+#endif
+            if (seconds == static_cast<std::time_t>(-1))
+            {
+                return std::nullopt;
+            }
+            return std::chrono::system_clock::from_time_t(seconds);
         }
 
         /**
@@ -946,6 +1000,171 @@ namespace EdgePulse::Agent
         co_return;
     }
 
+    AsynGyanis::Core::Task<> AgentApplication::runCertificateRenewal(AsynGyanis::Core::EventLoop &loop, AgentState &state, const std::int64_t nodeId,
+                                                                     const AgentConfiguration &configuration, CertificateRenewalDependencies dependencies,
+                                                                     const std::atomic<bool> &stopRequested)
+    {
+        const auto nowProvider   = dependencies.now ? dependencies.now : []() { return std::chrono::system_clock::now(); };
+        const auto checkInterval = dependencies.checkInterval.count() > 0
+                                           ? dependencies.checkInterval
+                                           : std::chrono::milliseconds{std::chrono::seconds{std::clamp(configuration.certificateRenewalCheckSeconds, 60, 86400)}};
+        const auto renewBefore   = std::chrono::days{std::clamp(configuration.certificateRenewBeforeDays, 1, 90)};
+        const std::vector<std::chrono::milliseconds>  defaultBackoff{std::chrono::seconds{5}, std::chrono::seconds{10}, std::chrono::seconds{30}, std::chrono::seconds{60},
+                                                                     std::chrono::seconds{300}};
+        const std::vector<std::chrono::milliseconds> &backoff = dependencies.retryBackoff.empty() ? defaultBackoff : dependencies.retryBackoff;
+
+        std::string currentExpiresAt = dependencies.expiresAt;
+        std::size_t retryIndex       = 0;
+        const auto  nextFailureDelay = [&backoff, &retryIndex]()
+        {
+            const auto delay = backoff[std::min(retryIndex, backoff.size() - 1)];
+            if (retryIndex + 1 < backoff.size())
+            {
+                ++retryIndex;
+            }
+            return delay;
+        };
+
+        // 等待按一秒切片：停止标记置位后最迟一秒退出，不把小时级的检查间隔变成停机等待
+        const auto waitFor = [&loop, &dependencies, &stopRequested](const std::chrono::milliseconds duration) -> AsynGyanis::Core::Task<bool>
+        {
+            if (stopRequested.load(std::memory_order_acquire))
+            {
+                co_return false;
+            }
+            if (dependencies.waitObserver)
+            {
+                dependencies.waitObserver(duration);
+            }
+            auto remaining = duration;
+            while (remaining > std::chrono::milliseconds::zero())
+            {
+                if (stopRequested.load(std::memory_order_acquire))
+                {
+                    co_return false;
+                }
+                const auto              slice = std::min(remaining, std::chrono::milliseconds{1000});
+                AsynGyanis::Core::Timer timer(loop);
+                co_await timer.waitFor(slice);
+                remaining -= slice;
+            }
+            co_return !stopRequested.load(std::memory_order_acquire);
+        };
+
+        for (;;)
+        {
+            if (stopRequested.load(std::memory_order_acquire))
+            {
+                co_return;
+            }
+
+            const auto expiry = parseUtcTimestamp(currentExpiresAt);
+            if (!expiry.has_value())
+            {
+                LOG_ERROR_FMT("证书到期时间无法解析（{}），本轮跳过自动续期；请检查证书文件", currentExpiresAt);
+                if (!co_await waitFor(checkInterval))
+                {
+                    co_return;
+                }
+                continue;
+            }
+            if (nowProvider() < *expiry - renewBefore)
+            {
+                if (!co_await waitFor(checkInterval))
+                {
+                    co_return;
+                }
+                continue;
+            }
+
+            LOG_INFO_FMT("证书将在 {} 到期，开始自动续期", currentExpiresAt);
+            if (!dependencies.generateRequest || !dependencies.renew || !dependencies.install)
+            {
+                LOG_ERROR("自动续期缺少生成、续期或安装入口，本循环停止");
+                co_return;
+            }
+
+            const auto material = dependencies.generateRequest();
+            if (!material)
+            {
+                const auto delay = nextFailureDelay();
+                LOG_WARN_FMT("生成续期密钥与 CSR 失败：{}；{} 毫秒后重试", material.error(), delay.count());
+                if (!co_await waitFor(delay))
+                {
+                    co_return;
+                }
+                continue;
+            }
+
+            const auto renewed = co_await dependencies.renew(nodeId, material->csrPem);
+            if (!renewed)
+            {
+                const CertificateRenewalFailure &failure = renewed.error();
+                if (failure.authorizationRejected)
+                {
+                    LOG_ERROR_FMT("自动续期被服务端拒绝：{}；请重新入场注册并重启 Agent，自动续期已停止", failure.message);
+                    co_return;
+                }
+                if (!failure.retryable)
+                {
+                    LOG_ERROR_FMT("自动续期失败且不可重试：{}；自动续期已停止", failure.message);
+                    co_return;
+                }
+                const auto delay = nextFailureDelay();
+                LOG_WARN_FMT("自动续期失败：{}；{} 毫秒后重试", failure.message, delay.count());
+                if (!co_await waitFor(delay))
+                {
+                    co_return;
+                }
+                continue;
+            }
+
+            const auto installed = dependencies.install(renewed->certificatePem);
+            if (!installed)
+            {
+                const auto delay = nextFailureDelay();
+                LOG_WARN_FMT("安装新证书失败，旧证书继续使用：{}；{} 毫秒后重试", installed.error(), delay.count());
+                if (!co_await waitFor(delay))
+                {
+                    co_return;
+                }
+                continue;
+            }
+
+            // HTTP 身份没换过去说明文件已经回退，本轮按失败处理；WebSocket 的换代失败不影响
+            // 已建立的连接（服务端在重叠窗口内仍接受旧证书），下一次重连自然用新证书
+            if (dependencies.reloadHttpIdentity && !dependencies.reloadHttpIdentity())
+            {
+                const auto delay = nextFailureDelay();
+                LOG_WARN_FMT("HTTP 通道重载新证书失败，已回退旧身份；{} 毫秒后重试", delay.count());
+                if (!co_await waitFor(delay))
+                {
+                    co_return;
+                }
+                continue;
+            }
+            if (dependencies.reloadWebSocketIdentity && !dependencies.reloadWebSocketIdentity())
+            {
+                LOG_WARN("WebSocket 通道未能装载新证书，现有连接继续使用旧证书，下一次重连时生效");
+            }
+
+            currentExpiresAt = installed->expiresAt;
+            state.set("cert_fingerprint", installed->fingerprint);
+            state.set("cert_expiry", installed->expiresAt);
+            retryIndex = 0;
+            LOG_INFO_FMT("证书续期完成：新指纹 {}，到期 {}（UTC），HTTP 与 WebSocket 已切换到新身份", installed->fingerprint, installed->expiresAt);
+
+            if (stopRequested.load(std::memory_order_acquire))
+            {
+                co_return;
+            }
+            if (!co_await waitFor(checkInterval))
+            {
+                co_return;
+            }
+        }
+    }
+
     int AgentApplication::run()
     {
         try
@@ -1032,10 +1251,11 @@ namespace EdgePulse::Agent
             // 重启动作必须在命令结果入队并尝试上报之后执行，否则结果会随进程退出丢失；
             // 平台服务管理器（systemd 或 SCM）负责把进程重新拉起来
             executors.push_back(std::make_shared<RestartExecutor>(true));
-            CommandDispatcher  dispatcher(client, *state, std::move(executors),
-                                          [this, &loop]() -> AsynGyanis::Core::Task<> { co_await restartAgentService(loop, [this] { requestStop(); }); });
-            AgentWebSocket     webSocket(loop, m_configuration);
-            TelemetryPublisher telemetryPublisher(client, *state);
+            CommandDispatcher       dispatcher(client, *state, std::move(executors),
+                                               [this, &loop]() -> AsynGyanis::Core::Task<> { co_await restartAgentService(loop, [this] { requestStop(); }); });
+            AgentWebSocket          webSocket(loop, m_configuration);
+            TelemetryPublisher      telemetryPublisher(client, *state);
+            AgentCertificateManager certificateManager(m_configuration);
 
             RuntimeFlags flags;
             flags.heartbeatIntervalSeconds = m_configuration.heartbeatIntervalSeconds;
@@ -1061,6 +1281,21 @@ namespace EdgePulse::Agent
             }
             frames.push_back(runPolling(loop, dispatcher, m_configuration.commandPollIntervalSeconds, flags, m_stopRequested));
             frames.push_back(runTelemetry(loop, telemetryCollector, telemetryPublisher, *nodeId, m_configuration.telemetryIntervalSeconds, m_stopRequested));
+            if (m_configuration.baseUrl.starts_with("https://"))
+            {
+                CertificateRenewalDependencies renewal;
+                renewal.expiresAt          = identity->expiresAt;
+                renewal.generateRequest    = [&certificateManager]() { return certificateManager.generateKeyAndCsr(); };
+                renewal.renew              = [&client](std::int64_t renewingNodeId, std::string csrPem) { return client.renewCertificate(renewingNodeId, std::move(csrPem)); };
+                renewal.install            = [&certificateManager](std::string_view certificatePem) { return certificateManager.install(certificatePem); };
+                renewal.reloadHttpIdentity = [&client, &certificateManager]()
+                { return client.reloadIdentityFromDisk([&certificateManager]() { return certificateManager.restorePrevious().has_value(); }); };
+                renewal.reloadWebSocketIdentity = [&webSocket]() { return webSocket.reloadIdentityFromDisk(); };
+                frames.push_back(runCertificateRenewal(loop, *state, *nodeId, m_configuration, std::move(renewal), m_stopRequested));
+            } else
+            {
+                LOG_INFO("明文测试配置不启用证书自动续期");
+            }
             // 循环尚未开始运行，此时入本地就绪队列；帧由上面那个容器持有到 run() 结束
             for (auto &frame: frames)
             {

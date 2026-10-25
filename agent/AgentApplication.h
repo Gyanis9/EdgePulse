@@ -9,13 +9,22 @@
 
 #pragma once
 
+#include "AgentCertificateManager.h"
+#include "AgentClient.h"
 #include "AgentConfiguration.h"
+#include "AgentIdentity.h"
 
 #include "Core/Coroutine/Task.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <expected>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace AsynGyanis::Core
 {
@@ -27,9 +36,28 @@ namespace EdgePulse::Agent
     class AgentState;
 
     /**
+     * @brief 证书续期循环依赖的外部动作
+     * @details 生产装配把生成、续期、安装与两条通道的重载接到真实对象上；用例注入替身即可在
+     *          不联网、不落盘的前提下核对调度与退避。
+     */
+    struct CertificateRenewalDependencies
+    {
+        std::string                                                             expiresAt;       ///< 当前证书到期时间（UTC，形如 2027-01-01T00:00:00Z）
+        std::function<std::expected<CertificateRequestMaterial, std::string>()> generateRequest; ///< 生成新私钥与 CSR
+        std::function<AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>(std::int64_t, std::string)> renew;              ///< 提交 CSR
+        std::function<std::expected<AgentIdentity, std::string>(std::string_view)>                                                     install;            ///< 安装新证书
+        std::function<bool()>                                                                                                          reloadHttpIdentity; ///< 重载 HTTP 通道身份
+        std::function<bool()>                                  reloadWebSocketIdentity; ///< 重载 WebSocket 通道身份
+        std::function<std::chrono::system_clock::time_point()> now;                     ///< 当前时刻，空表示系统时钟
+        std::chrono::milliseconds                              checkInterval{0};        ///< 检查间隔覆盖值，0 表示按配置
+        std::vector<std::chrono::milliseconds>                 retryBackoff;            ///< 失败退避表，空表示 5、10、30、60、300 秒
+        std::function<void(std::chrono::milliseconds)>         waitObserver;            ///< 每次等待前收到计划时长
+    };
+
+    /**
      * @brief 按配置装配 Agent 运行期资源并常驻运行
      * @details 负责状态目录、日志、证书身份、状态库与注册；注册成功后在同一条事件循环上
-     *          运行心跳、WebSocket 命令通道与轮询兜底，直到收到停止请求。
+     *          运行心跳、WebSocket 命令通道、轮询兜底、遥测与证书自动续期，直到收到停止请求。
      */
     class AgentApplication
     {
@@ -54,6 +82,24 @@ namespace EdgePulse::Agent
          * @note 可被任意线程调用；在注册阶段调用时，注册完成后的常驻段会直接跳过
          */
         void requestStop();
+
+        /**
+         * @brief 按证书到期时间自动续期并热切换 HTTP 与 WebSocket 身份
+         * @param loop 事件循环
+         * @param state 本地状态库，成功后写入 cert_fingerprint 与 cert_expiry
+         * @param nodeId 服务端分配的节点 ID
+         * @param configuration 已校验的配置，提供提前天数与检查间隔
+         * @param dependencies 生成、续期、安装与重载动作
+         * @param stopRequested 停止标记；等待按一秒切片，置位后最迟一秒内退出
+         * @return 协程任务
+         * @details 每轮先比较到期时间与提前天数，未到点就等待下一次检查；到点后生成新密钥与 CSR，
+         *          换回证书、校验安装、重载 HTTP 与 WebSocket，最后更新状态库。可重试失败按
+         *          dependencies.retryBackoff（默认 5、10、30、60、300 秒）退避后重试；403 与其他
+         *          不可重试的失败记录 ERROR 后终止本循环，注册、心跳、遥测与命令通道不受影响。
+         * @note 日志只写指纹、到期时间与失败原因，不写私钥与 CSR 正文
+         */
+        static AsynGyanis::Core::Task<> runCertificateRenewal(AsynGyanis::Core::EventLoop &loop, AgentState &state, std::int64_t nodeId, const AgentConfiguration &configuration,
+                                                              CertificateRenewalDependencies dependencies, const std::atomic<bool> &stopRequested);
 
     private:
         /**

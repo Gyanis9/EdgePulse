@@ -46,8 +46,7 @@ namespace EdgePulse::Agent
 
     int webSocketReconnectBackoffSeconds(const int consecutiveFailures)
     {
-        const std::size_t index =
-                consecutiveFailures <= 1 ? 0 : std::min<std::size_t>(static_cast<std::size_t>(consecutiveFailures - 1), kWebSocketBackoffSeconds.size() - 1);
+        const std::size_t index = consecutiveFailures <= 1 ? 0 : std::min<std::size_t>(static_cast<std::size_t>(consecutiveFailures - 1), kWebSocketBackoffSeconds.size() - 1);
         return kWebSocketBackoffSeconds[index];
     }
 
@@ -278,5 +277,18 @@ namespace EdgePulse::Agent
         }
 
         co_return std::expected<void, std::string>{};
+    }
+
+    bool AgentWebSocket::reloadIdentityFromDisk()
+    {
+        if (!m_endpoint.tls)
+        {
+            return true;
+        }
+        if (m_tls == nullptr)
+        {
+            return false;
+        }
+        return m_tls->reloadCertificate();
     }
 } // namespace EdgePulse::Agent

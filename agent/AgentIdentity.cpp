@@ -209,4 +209,9 @@ namespace EdgePulse::Agent
         identity.expiresAt   = *expiresAt;
         return identity;
     }
+
+    std::expected<AgentIdentity, std::string> AgentIdentity::reload(const AgentConfiguration &configuration)
+    {
+        return load(configuration);
+    }
 } // namespace EdgePulse::Agent

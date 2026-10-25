@@ -33,5 +33,14 @@ namespace EdgePulse::Agent
          *       私钥内容不在这里解析，证书与私钥是否配对由注册时装载 TLS 客户端身份来判定。
          */
         [[nodiscard]] static std::expected<AgentIdentity, std::string> load(const AgentConfiguration &configuration);
+
+        /**
+         * @brief 重新读取磁盘上的证书与私钥并提取身份
+         * @param configuration 已通过形态校验的配置
+         * @return 成功返回新指纹与到期时间；失败返回中文原因
+         * @note 证书与私钥文件被原地替换后用它刷新内存身份；口径与 load() 完全一致，
+         *       包括 POSIX 上的私钥权限检查与即将到期的 WARN
+         */
+        [[nodiscard]] static std::expected<AgentIdentity, std::string> reload(const AgentConfiguration &configuration);
     };
 } // namespace EdgePulse::Agent

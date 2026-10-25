@@ -1,5 +1,6 @@
 add_library(edgepulse-agent-core STATIC
         AgentApplication.cpp
+        AgentCertificateManager.cpp
         AgentClient.cpp
         AgentConfiguration.cpp
         AgentIdentity.cpp

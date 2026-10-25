@@ -10,6 +10,7 @@ add_executable(edgepulse-agent-tests
         CertificateFixture.cpp
         FirmwareKeyFixture.cpp
         TestAgentApplication.cpp
+        TestAgentCertificateManager.cpp
         TestAgentClient.cpp
         TestAgentCommand.cpp
         TestAgentConfiguration.cpp

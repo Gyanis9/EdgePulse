@@ -1,5 +1,6 @@
 #include "AgentApplication.h"
 
+#include "AgentLoop.h"
 #include "AgentState.h"
 #include "AgentVersion.h"
 #include "CertificateFixture.h"
@@ -22,7 +23,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -30,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -545,7 +549,7 @@ agent:
         TestSupport::TemporaryDirectory directory;
         static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
 
-        auto heartbeats = std::make_shared<std::atomic<int>>(0);
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
         TestSupport::ServerHarness server(
                 [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
                 {
@@ -617,7 +621,7 @@ agent:
         TestSupport::TemporaryDirectory directory;
         static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
 
-        auto heartbeats = std::make_shared<std::atomic<int>>(0);
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
         TestSupport::ServerHarness server(
                 [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
                 {
@@ -697,9 +701,8 @@ agent:
         static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
 
         auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
-        TestSupport::ServerHarness server(
-                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
-        const auto configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+        TestSupport::ServerHarness server([heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto                 configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
 
         {
             auto state = AgentState::open(directory.path() / "state" / "agent.db");
@@ -727,13 +730,13 @@ agent:
         const bool                  cleared      = waitFor(std::chrono::seconds{5},
                                                            [&directory]
                                                            {
-                                                               auto state = AgentState::open(directory.path() / "state" / "agent.db");
-                                                               if (!state.has_value())
-                                                               {
-                                                                   return false;
-                                                               }
-                                                               const auto record = state->updateState();
-                                                               return record.has_value() && record->pendingResult.empty();
+                                         auto state = AgentState::open(directory.path() / "state" / "agent.db");
+                                         if (!state.has_value())
+                                         {
+                                             return false;
+                                         }
+                                         const auto record = state->updateState();
+                                         return record.has_value() && record->pendingResult.empty();
                                                            });
         application.requestStop();
         const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
@@ -772,9 +775,8 @@ agent:
         static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
 
         auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
-        TestSupport::ServerHarness server(
-                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
-        const auto configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+        TestSupport::ServerHarness server([heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto                 configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
 
         const std::filesystem::path rollbackMarker = directory.path() / "state" / "update-rollback";
         {
@@ -850,9 +852,8 @@ agent:
         static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
 
         auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
-        TestSupport::ServerHarness server(
-                [heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
-        const auto configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
+        TestSupport::ServerHarness server([heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { registerUpdateHealthRoutes(router, heartbeats); });
+        const auto                 configurationPath = directory.write("agent.yaml", updateHealthConfiguration(server.port()));
 
         {
             auto state = AgentState::open(directory.path() / "state" / "agent.db");
@@ -1213,5 +1214,340 @@ agent:
         EXPECT_FALSE(std::filesystem::exists(healthMarker)) << "版本不符不得写健康标记";
         ASSERT_TRUE(std::filesystem::exists(expectedMarker)) << "版本不符必须保留标记供安装器回滚";
         EXPECT_EQ(0U, readTextFile(expectedMarker).find("9.9.9"));
+    }
+
+    namespace
+    {
+        /**
+         * @brief 把时刻写成与身份一致的 UTC 文本
+         * @param point 目标时刻
+         * @return std::string 形如 2027-01-01T00:00:00Z
+         */
+        [[nodiscard]] std::string utcTextAt(const std::chrono::system_clock::time_point point)
+        {
+            const std::time_t seconds = std::chrono::system_clock::to_time_t(point);
+            tm                utc{};
+#ifdef _WIN32
+            gmtime_s(&utc, &seconds);
+#else
+            gmtime_r(&seconds, &utc);
+#endif
+            char buffer[32]{};
+            std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ", utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec);
+            return std::string{buffer};
+        }
+
+        /**
+         * @brief 续期循环各动作的调用计数与等待记录
+         */
+        struct RenewalProbe
+        {
+            std::atomic<int>                       generate{0};        ///< 生成密钥与 CSR 的次数
+            std::atomic<int>                       renew{0};           ///< 向服务端续期的次数
+            std::atomic<int>                       install{0};         ///< 安装新证书的次数
+            std::atomic<int>                       reloadHttp{0};      ///< 重载 HTTP 身份的次数
+            std::atomic<int>                       reloadWebSocket{0}; ///< 重载 WebSocket 身份的次数
+            std::mutex                             mutex;              ///< 保护 waits
+            std::vector<std::chrono::milliseconds> waits;              ///< 每次等待前收到的计划时长
+
+            /**
+             * @brief 记录一次计划等待
+             * @param duration 计划时长
+             */
+            void recordWait(const std::chrono::milliseconds duration)
+            {
+                const std::lock_guard lock(mutex);
+                waits.push_back(duration);
+            }
+
+            /**
+             * @brief 取等待时长副本
+             * @return std::vector<std::chrono::milliseconds> 副本
+             */
+            [[nodiscard]] std::vector<std::chrono::milliseconds> waitDurations()
+            {
+                const std::lock_guard lock(mutex);
+                return waits;
+            }
+        };
+
+        /**
+         * @brief 打开用例用的状态库
+         * @param directory 临时目录
+         * @return AgentState 已就绪的状态库
+         */
+        [[nodiscard]] AgentState openRenewalState(const TestSupport::TemporaryDirectory &directory)
+        {
+            auto state = AgentState::open(directory.path() / "agent.db");
+            if (!state.has_value())
+            {
+                throw std::runtime_error(state.error());
+            }
+            return std::move(*state);
+        }
+    } // namespace
+
+    TEST(AgentApplication, RenewalRunsWhenCertificateIsDueAndUpdatesState)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openRenewalState(directory);
+        state.set("cert_fingerprint", "old-fingerprint");
+
+        AgentConfiguration configuration;
+        configuration.certificateRenewBeforeDays     = 7;
+        configuration.certificateRenewalCheckSeconds = 3600;
+
+        AgentLoop         agentLoop;
+        std::atomic<bool> stop{false};
+        RenewalProbe      probe;
+
+        CertificateRenewalDependencies dependencies;
+        dependencies.expiresAt       = utcTextAt(std::chrono::system_clock::now() + std::chrono::days{5});
+        dependencies.generateRequest = [&probe]
+        {
+            probe.generate.fetch_add(1, std::memory_order_acq_rel);
+            return std::expected<CertificateRequestMaterial, std::string>{CertificateRequestMaterial{"key-pem", "csr-pem"}};
+        };
+        dependencies.renew = [&probe](const std::int64_t nodeId, std::string csrPem) -> AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>
+        {
+            probe.renew.fetch_add(1, std::memory_order_acq_rel);
+            if (nodeId != 4242 || csrPem != "csr-pem")
+            {
+                co_return std::unexpected(CertificateRenewalFailure{"请求参数不符合预期", false, false, 0});
+            }
+            co_return RenewedCertificate{"cert-pem", std::string(64U, 'b'), "2026-10-25 08:00:00", "2027-10-25 08:00:00", "0a"};
+        };
+        dependencies.install = [&probe](const std::string_view certificatePem)
+        {
+            probe.install.fetch_add(1, std::memory_order_acq_rel);
+            if (certificatePem != "cert-pem")
+            {
+                return std::expected<AgentIdentity, std::string>{std::unexpected("证书记录不符合预期")};
+            }
+            return std::expected<AgentIdentity, std::string>{AgentIdentity{std::string(64U, 'b'), "2027-10-25T08:00:00Z"}};
+        };
+        dependencies.reloadHttpIdentity = [&probe]
+        {
+            probe.reloadHttp.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        };
+        dependencies.reloadWebSocketIdentity = [&probe, &stop]
+        {
+            probe.reloadWebSocket.fetch_add(1, std::memory_order_acq_rel);
+            stop.store(true, std::memory_order_release);
+            return true;
+        };
+        dependencies.checkInterval = std::chrono::milliseconds{25};
+        dependencies.waitObserver  = [&probe](const std::chrono::milliseconds duration) { probe.recordWait(duration); };
+
+        const bool completed =
+                agentLoop.run(AgentApplication::runCertificateRenewal(agentLoop.loop(), state, 4242, configuration, dependencies, stop), std::chrono::seconds{10}, "续期循环");
+        ASSERT_TRUE(completed) << "续期循环未在时限内退出";
+
+        EXPECT_EQ(1, probe.generate.load(std::memory_order_acquire));
+        EXPECT_EQ(1, probe.renew.load(std::memory_order_acquire));
+        EXPECT_EQ(1, probe.install.load(std::memory_order_acquire));
+        EXPECT_EQ(1, probe.reloadHttp.load(std::memory_order_acquire));
+        EXPECT_EQ(1, probe.reloadWebSocket.load(std::memory_order_acquire));
+        EXPECT_EQ(std::string(64U, 'b'), state.get("cert_fingerprint").value_or(""));
+        EXPECT_EQ("2027-10-25T08:00:00Z", state.get("cert_expiry").value_or(""));
+    }
+
+    TEST(AgentApplication, RenewalIsSkippedWhileCertificateIsBeyondWindow)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openRenewalState(directory);
+
+        AgentConfiguration configuration;
+        configuration.certificateRenewBeforeDays     = 7;
+        configuration.certificateRenewalCheckSeconds = 3600;
+
+        AgentLoop         agentLoop;
+        std::atomic<bool> stop{false};
+        RenewalProbe      probe;
+        std::atomic<int>  clockReads{0};
+        const auto        fixedNow = std::chrono::system_clock::now();
+
+        CertificateRenewalDependencies dependencies;
+        dependencies.expiresAt = utcTextAt(fixedNow + std::chrono::days{30});
+        dependencies.now       = [&clockReads, &stop, fixedNow]
+        {
+            if (clockReads.fetch_add(1, std::memory_order_acq_rel) + 1 >= 3)
+            {
+                stop.store(true, std::memory_order_release);
+            }
+            return fixedNow;
+        };
+        dependencies.generateRequest = [&probe]
+        {
+            probe.generate.fetch_add(1, std::memory_order_acq_rel);
+            return std::expected<CertificateRequestMaterial, std::string>{CertificateRequestMaterial{"key-pem", "csr-pem"}};
+        };
+        dependencies.renew = [&probe](std::int64_t, std::string) -> AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>
+        {
+            probe.renew.fetch_add(1, std::memory_order_acq_rel);
+            co_return std::unexpected(CertificateRenewalFailure{"不应发起续期", false, false, 0});
+        };
+        dependencies.checkInterval = std::chrono::milliseconds{10};
+        dependencies.waitObserver  = [&probe](const std::chrono::milliseconds duration) { probe.recordWait(duration); };
+
+        const bool completed =
+                agentLoop.run(AgentApplication::runCertificateRenewal(agentLoop.loop(), state, 4242, configuration, dependencies, stop), std::chrono::seconds{10}, "续期循环");
+        ASSERT_TRUE(completed);
+        EXPECT_EQ(0, probe.generate.load(std::memory_order_acquire));
+        EXPECT_EQ(0, probe.renew.load(std::memory_order_acquire));
+        EXPECT_GE(probe.waitDurations().size(), 2U);
+    }
+
+    TEST(AgentApplication, RenewalRetriesWithConfiguredBackoff)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openRenewalState(directory);
+
+        AgentConfiguration configuration;
+        configuration.certificateRenewBeforeDays     = 7;
+        configuration.certificateRenewalCheckSeconds = 3600;
+
+        AgentLoop         agentLoop;
+        std::atomic<bool> stop{false};
+        RenewalProbe      probe;
+
+        CertificateRenewalDependencies dependencies;
+        dependencies.expiresAt       = utcTextAt(std::chrono::system_clock::now() + std::chrono::days{1});
+        dependencies.generateRequest = [] { return std::expected<CertificateRequestMaterial, std::string>{CertificateRequestMaterial{"key-pem", "csr-pem"}}; };
+        dependencies.renew           = [&probe, &stop](std::int64_t, std::string) -> AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>
+        {
+            const int attempt = probe.renew.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (attempt >= 3)
+            {
+                stop.store(true, std::memory_order_release);
+            }
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期返回 HTTP 429：同一节点两次签发至少间隔 60 秒", true, false, 429});
+        };
+        dependencies.install       = [](std::string_view) { return std::expected<AgentIdentity, std::string>{std::unexpected("重试阶段不应安装证书")}; };
+        dependencies.checkInterval = std::chrono::milliseconds{10};
+        dependencies.retryBackoff  = {std::chrono::milliseconds{30}, std::chrono::milliseconds{40}, std::chrono::milliseconds{50}};
+        dependencies.waitObserver  = [&probe](const std::chrono::milliseconds duration) { probe.recordWait(duration); };
+
+        const bool completed =
+                agentLoop.run(AgentApplication::runCertificateRenewal(agentLoop.loop(), state, 4242, configuration, dependencies, stop), std::chrono::seconds{10}, "续期循环");
+        ASSERT_TRUE(completed);
+        EXPECT_EQ(3, probe.renew.load(std::memory_order_acquire));
+        EXPECT_EQ(0, probe.install.load(std::memory_order_acquire));
+        const auto waits = probe.waitDurations();
+        ASSERT_EQ(2U, waits.size()) << "第三次失败后已请求停止，不应再等待";
+        EXPECT_EQ(std::chrono::milliseconds{30}, waits[0]);
+        EXPECT_EQ(std::chrono::milliseconds{40}, waits[1]);
+    }
+
+    TEST(AgentApplication, RenewalStopsOnForbiddenResponseWithoutInstalling)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openRenewalState(directory);
+
+        AgentConfiguration configuration;
+        configuration.certificateRenewBeforeDays     = 7;
+        configuration.certificateRenewalCheckSeconds = 3600;
+
+        AgentLoop         agentLoop;
+        std::atomic<bool> stop{false};
+        RenewalProbe      probe;
+
+        CertificateRenewalDependencies dependencies;
+        dependencies.expiresAt       = utcTextAt(std::chrono::system_clock::now() + std::chrono::days{1});
+        dependencies.generateRequest = [] { return std::expected<CertificateRequestMaterial, std::string>{CertificateRequestMaterial{"key-pem", "csr-pem"}}; };
+        dependencies.renew           = [&probe](std::int64_t, std::string) -> AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>
+        {
+            probe.renew.fetch_add(1, std::memory_order_acq_rel);
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期被服务端拒绝（HTTP 403）：节点证书已吊销，请重新入场注册", false, true, 403});
+        };
+        dependencies.install = [&probe](std::string_view)
+        {
+            probe.install.fetch_add(1, std::memory_order_acq_rel);
+            return std::expected<AgentIdentity, std::string>{std::unexpected("403 后不应安装证书")};
+        };
+        dependencies.waitObserver = [&probe](const std::chrono::milliseconds duration) { probe.recordWait(duration); };
+
+        const bool completed =
+                agentLoop.run(AgentApplication::runCertificateRenewal(agentLoop.loop(), state, 4242, configuration, dependencies, stop), std::chrono::seconds{10}, "续期循环");
+        ASSERT_TRUE(completed) << "403 应按终止收口";
+        EXPECT_EQ(1, probe.renew.load(std::memory_order_acquire));
+        EXPECT_EQ(0, probe.install.load(std::memory_order_acquire));
+        EXPECT_TRUE(probe.waitDurations().empty()) << "终止响应不应进入退避";
+        EXPECT_FALSE(stop.load(std::memory_order_acquire));
+    }
+
+    TEST(AgentApplication, RenewalKeepsStateWhenHttpReloadFails)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openRenewalState(directory);
+        state.set("cert_fingerprint", "old-fingerprint");
+        state.set("cert_expiry", "2026-10-01T00:00:00Z");
+
+        AgentConfiguration configuration;
+        configuration.certificateRenewBeforeDays     = 7;
+        configuration.certificateRenewalCheckSeconds = 3600;
+
+        AgentLoop         agentLoop;
+        std::atomic<bool> stop{false};
+        RenewalProbe      probe;
+
+        CertificateRenewalDependencies dependencies;
+        dependencies.expiresAt       = utcTextAt(std::chrono::system_clock::now() + std::chrono::days{1});
+        dependencies.generateRequest = [] { return std::expected<CertificateRequestMaterial, std::string>{CertificateRequestMaterial{"key-pem", "csr-pem"}}; };
+        dependencies.renew           = [&probe](std::int64_t, std::string) -> AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>
+        {
+            probe.renew.fetch_add(1, std::memory_order_acq_rel);
+            co_return RenewedCertificate{"cert-pem", std::string(64U, 'b'), "2026-10-25 08:00:00", "2027-10-25 08:00:00", "0a"};
+        };
+        dependencies.install = [&probe](std::string_view)
+        {
+            probe.install.fetch_add(1, std::memory_order_acq_rel);
+            return std::expected<AgentIdentity, std::string>{AgentIdentity{std::string(64U, 'b'), "2027-10-25T08:00:00Z"}};
+        };
+        dependencies.reloadHttpIdentity = [&probe, &stop]
+        {
+            probe.reloadHttp.fetch_add(1, std::memory_order_acq_rel);
+            stop.store(true, std::memory_order_release);
+            return false;
+        };
+        dependencies.reloadWebSocketIdentity = [&probe]
+        {
+            probe.reloadWebSocket.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        };
+
+        const bool completed =
+                agentLoop.run(AgentApplication::runCertificateRenewal(agentLoop.loop(), state, 4242, configuration, dependencies, stop), std::chrono::seconds{10}, "续期循环");
+        ASSERT_TRUE(completed);
+        EXPECT_EQ(1, probe.install.load(std::memory_order_acquire));
+        EXPECT_EQ(1, probe.reloadHttp.load(std::memory_order_acquire));
+        EXPECT_EQ(0, probe.reloadWebSocket.load(std::memory_order_acquire));
+        EXPECT_EQ("old-fingerprint", state.get("cert_fingerprint").value_or(""));
+        EXPECT_EQ("2026-10-01T00:00:00Z", state.get("cert_expiry").value_or(""));
+    }
+
+    TEST(AgentApplication, RenewalLoopExitsImmediatelyWhenStopWasRequested)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openRenewalState(directory);
+
+        AgentConfiguration configuration;
+        AgentLoop          agentLoop;
+        std::atomic<bool>  stop{true};
+        RenewalProbe       probe;
+
+        CertificateRenewalDependencies dependencies;
+        dependencies.expiresAt       = utcTextAt(std::chrono::system_clock::now());
+        dependencies.generateRequest = [&probe]
+        {
+            probe.generate.fetch_add(1, std::memory_order_acq_rel);
+            return std::expected<CertificateRequestMaterial, std::string>{std::unexpected("已请求停止，不应生成 CSR")};
+        };
+
+        const bool completed =
+                agentLoop.run(AgentApplication::runCertificateRenewal(agentLoop.loop(), state, 4242, configuration, dependencies, stop), std::chrono::seconds{5}, "续期循环");
+        ASSERT_TRUE(completed);
+        EXPECT_EQ(0, probe.generate.load(std::memory_order_acquire));
     }
 } // namespace EdgePulse::Agent

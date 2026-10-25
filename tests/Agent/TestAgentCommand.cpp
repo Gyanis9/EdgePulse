@@ -21,14 +21,19 @@
 #include "Net/WebSocket/WebSocketPeer.h"
 #include "Net/WebSocket/WebSocketUpgradePolicy.h"
 
+#include "Platform/FileSystem/AtomicFileWriter.h"
+
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -381,8 +386,8 @@ namespace EdgePulse::Agent
     {
         struct Capture
         {
-            std::mutex               mutex; ///< 保护 paths
-            std::vector<std::string> paths; ///< 收到的结果上报路径
+            std::mutex               mutex;    ///< 保护 paths
+            std::vector<std::string> paths;    ///< 收到的结果上报路径
             std::atomic<int>         posts{0}; ///< 已收到的上报次数
         };
         auto capture = std::make_shared<Capture>();
@@ -742,5 +747,68 @@ namespace EdgePulse::Agent
         EXPECT_TRUE(persisted) << "心跳下发的配置版本未写入状态库";
         EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
         EXPECT_FALSE(material.fingerprint.empty());
+    }
+
+    namespace
+    {
+        /**
+         * @brief 读取文件正文
+         * @param path 文件路径
+         * @return std::string 内容；打不开时为空
+         */
+        [[nodiscard]] std::string readIdentityFile(const std::filesystem::path &path)
+        {
+            std::ifstream stream(path, std::ios::binary);
+            return std::string{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+        }
+
+        /**
+         * @brief 原子覆盖身份文件，权限 0600
+         * @param path 目标路径
+         * @param text 正文
+         * @return bool 写入成功
+         */
+        [[nodiscard]] bool writeIdentityFile(const std::filesystem::path &path, const std::string &text)
+        {
+            std::string error;
+            return AsynGyanis::Platform::AtomicFileWriter::writeText(path, text, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, &error);
+        }
+    } // namespace
+
+    TEST(AgentCommand, WebSocketReloadIsNoOpOnPlaintextChannel)
+    {
+        AgentConfiguration configuration;
+        configuration.baseUrl                = "http://127.0.0.1:9";
+        configuration.allowPlaintextForTests = true;
+
+        AsynGyanis::Core::EventLoop loop;
+        AgentWebSocket              socket(loop, configuration);
+        EXPECT_TRUE(socket.reloadIdentityFromDisk());
+    }
+
+    TEST(AgentCommand, WebSocketReloadPicksUpNewCertificateFiles)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      initial = Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent");
+        const auto                      next    = Testing::writeSelfSignedCertificate(directory, 60L * 24L * 60L * 60L, "next");
+
+        AgentConfiguration configuration;
+        configuration.baseUrl               = "https://127.0.0.1:1";
+        configuration.caFile                = initial.certificateFile;
+        configuration.certificateFile       = initial.certificateFile;
+        configuration.privateKeyFile        = initial.privateKeyFile;
+        configuration.name                  = "edge-01";
+        configuration.requestTimeoutSeconds = 5;
+
+        AsynGyanis::Core::EventLoop loop;
+        AgentWebSocket              socket(loop, configuration);
+
+        ASSERT_TRUE(writeIdentityFile(configuration.certificateFile, readIdentityFile(next.certificateFile)));
+        ASSERT_TRUE(writeIdentityFile(configuration.privateKeyFile, readIdentityFile(next.privateKeyFile)));
+        EXPECT_TRUE(socket.reloadIdentityFromDisk());
+
+        // 新私钥坏了，换代必须失败并保留旧上下文
+        ASSERT_TRUE(writeIdentityFile(configuration.privateKeyFile, "not-a-private-key"));
+        EXPECT_FALSE(socket.reloadIdentityFromDisk());
     }
 } // namespace EdgePulse::Agent

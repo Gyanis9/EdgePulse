@@ -22,13 +22,17 @@ namespace EdgePulse::Agent
 {
     namespace
     {
-        constexpr int kMinimumHeartbeatSeconds = 5;   ///< 心跳间隔下限
-        constexpr int kMaximumHeartbeatSeconds = 600; ///< 心跳间隔上限
-        constexpr int kMinimumPollSeconds      = 5;   ///< 命令轮询间隔下限
-        constexpr int kMaximumPollSeconds      = 600; ///< 命令轮询间隔上限
-        constexpr int kMinimumTelemetrySeconds = 5;   ///< 遥测间隔下限
-        constexpr int kMaximumTelemetrySeconds = 3600; ///< 遥测间隔上限
-        constexpr int kMaximumBackupCount      = 4096; ///< 日志备份份数上限，与滚动 Sink 的钳制口径一致
+        constexpr int kMinimumHeartbeatSeconds    = 5;     ///< 心跳间隔下限
+        constexpr int kMaximumHeartbeatSeconds    = 600;   ///< 心跳间隔上限
+        constexpr int kMinimumPollSeconds         = 5;     ///< 命令轮询间隔下限
+        constexpr int kMaximumPollSeconds         = 600;   ///< 命令轮询间隔上限
+        constexpr int kMinimumTelemetrySeconds    = 5;     ///< 遥测间隔下限
+        constexpr int kMaximumTelemetrySeconds    = 3600;  ///< 遥测间隔上限
+        constexpr int kMinimumRenewBeforeDays     = 1;     ///< 续期提前天数下限
+        constexpr int kMaximumRenewBeforeDays     = 90;    ///< 续期提前天数上限
+        constexpr int kMinimumRenewalCheckSeconds = 60;    ///< 续期检查间隔下限
+        constexpr int kMaximumRenewalCheckSeconds = 86400; ///< 续期检查间隔上限
+        constexpr int kMaximumBackupCount         = 4096;  ///< 日志备份份数上限，与滚动 Sink 的钳制口径一致
 
         /**
          * @brief 去掉首尾空白
@@ -72,8 +76,8 @@ namespace EdgePulse::Agent
                 return fallback;
             }
             const std::optional<AsynGyanis::Base::ConfigValue> stored = manager.getOptional(key);
-            const std::string                                   text   = trimCopy(manager.getText(key));
-            const auto reject = [&]()
+            const std::string                                  text   = trimCopy(manager.getText(key));
+            const auto                                         reject = [&]()
             {
                 const std::string display = text.empty() ? "空值" : "“" + text + "”";
                 return std::unexpected("配置项 " + std::string{key} + " 必须是十进制整数，不能加引号、写成小数或带单位，当前值不是整数：" + display);
@@ -82,7 +86,7 @@ namespace EdgePulse::Agent
             {
                 return reject();
             }
-            std::int64_t value = 0;
+            std::int64_t value                 = 0;
             const auto [parsedEnd, parseError] = std::from_chars(text.data(), text.data() + text.size(), value);
             if (parseError != std::errc{} || parsedEnd != text.data() + text.size())
             {
@@ -125,8 +129,7 @@ namespace EdgePulse::Agent
         {
             if (value < minimum || value > maximum)
             {
-                return "配置项 " + std::string{key} + " 必须在 " + std::to_string(minimum) + " 到 " + std::to_string(maximum) + " 之间，当前值：" +
-                       std::to_string(value);
+                return "配置项 " + std::string{key} + " 必须在 " + std::to_string(minimum) + " 到 " + std::to_string(maximum) + " 之间，当前值：" + std::to_string(value);
             }
             return std::nullopt;
         }
@@ -141,8 +144,8 @@ namespace EdgePulse::Agent
             return std::unexpected("配置文件不存在：" + path.string());
         }
 
-        AsynGyanis::Base::ConfigManager         &manager        = AsynGyanis::Base::ConfigManager::instance();
-        const AsynGyanis::Base::ConfigLoadResult loadResult     = manager.loadFiles({absoluteConfigurationPath});
+        AsynGyanis::Base::ConfigManager         &manager    = AsynGyanis::Base::ConfigManager::instance();
+        const AsynGyanis::Base::ConfigLoadResult loadResult = manager.loadFiles({absoluteConfigurationPath});
         if (!loadResult)
         {
             std::string message = "配置加载失败：";
@@ -155,24 +158,23 @@ namespace EdgePulse::Agent
 
         const std::filesystem::path baseDirectory = absoluteConfigurationPath.parent_path();
         AgentConfiguration          configuration;
-        configuration.configurationFile = absoluteConfigurationPath;
-        configuration.baseUrl           = trimCopy(manager.getString("agent.server.base_url", std::string{}));
+        configuration.configurationFile      = absoluteConfigurationPath;
+        configuration.baseUrl                = trimCopy(manager.getString("agent.server.base_url", std::string{}));
         configuration.allowPlaintextForTests = manager.getBool("agent.server.allow_plaintext_for_tests", false);
 
         // 明文地址必须先于其余校验被拦下：后面缺证书、缺名字的报错会把真正的原因盖掉
-        const bool schemeAllowed = configuration.baseUrl.starts_with("https://") ||
-                                   (configuration.allowPlaintextForTests && configuration.baseUrl.starts_with("http://"));
+        const bool schemeAllowed = configuration.baseUrl.starts_with("https://") || (configuration.allowPlaintextForTests && configuration.baseUrl.starts_with("http://"));
         if (!schemeAllowed)
         {
             return std::unexpected("agent.server.base_url 必须以 https:// 开头；测试环境确需明文时请显式设置 agent.server.allow_plaintext_for_tests: true，当前值：“" +
                                    configuration.baseUrl + "”");
         }
 
-        configuration.caFile           = resolvePath(baseDirectory, manager.getString("agent.server.ca_file", std::string{}));
-        configuration.certificateFile  = resolvePath(baseDirectory, manager.getString("agent.server.certificate_file", std::string{}));
-        configuration.privateKeyFile   = resolvePath(baseDirectory, manager.getString("agent.server.private_key_file", std::string{}));
-        configuration.tenantCode       = trimCopy(manager.getString("agent.server.tenant_code", configuration.tenantCode));
-        configuration.name             = trimCopy(manager.getString("agent.server.name", std::string{}));
+        configuration.caFile             = resolvePath(baseDirectory, manager.getString("agent.server.ca_file", std::string{}));
+        configuration.certificateFile    = resolvePath(baseDirectory, manager.getString("agent.server.certificate_file", std::string{}));
+        configuration.privateKeyFile     = resolvePath(baseDirectory, manager.getString("agent.server.private_key_file", std::string{}));
+        configuration.tenantCode         = trimCopy(manager.getString("agent.server.tenant_code", configuration.tenantCode));
+        configuration.name               = trimCopy(manager.getString("agent.server.name", std::string{}));
         configuration.enrollmentTokenEnv = trimCopy(manager.getString("agent.server.enrollment_token_env", configuration.enrollmentTokenEnv));
         configuration.rebindTokenEnv     = trimCopy(manager.getString("agent.server.rebind_token_env", configuration.rebindTokenEnv));
 
@@ -210,6 +212,28 @@ namespace EdgePulse::Agent
         configuration.requestTimeoutSeconds = static_cast<int>(*requestTimeout);
 
         configuration.websocketEnabled = manager.getBool("agent.server.websocket_enabled", configuration.websocketEnabled);
+
+        const auto renewBeforeDays = readInteger(manager, "agent.certificate.renew_before_days", configuration.certificateRenewBeforeDays);
+        if (!renewBeforeDays)
+        {
+            return std::unexpected(renewBeforeDays.error());
+        }
+        if (auto rangeError = checkRange(*renewBeforeDays, kMinimumRenewBeforeDays, kMaximumRenewBeforeDays, "agent.certificate.renew_before_days"))
+        {
+            return std::unexpected(std::move(*rangeError));
+        }
+        configuration.certificateRenewBeforeDays = static_cast<int>(*renewBeforeDays);
+
+        const auto renewalCheckSeconds = readInteger(manager, "agent.certificate.renewal_check_seconds", configuration.certificateRenewalCheckSeconds);
+        if (!renewalCheckSeconds)
+        {
+            return std::unexpected(renewalCheckSeconds.error());
+        }
+        if (auto rangeError = checkRange(*renewalCheckSeconds, kMinimumRenewalCheckSeconds, kMaximumRenewalCheckSeconds, "agent.certificate.renewal_check_seconds"))
+        {
+            return std::unexpected(std::move(*rangeError));
+        }
+        configuration.certificateRenewalCheckSeconds = static_cast<int>(*renewalCheckSeconds);
 
         const auto telemetryInterval = readInteger(manager, "agent.telemetry.interval_seconds", configuration.telemetryIntervalSeconds);
         if (!telemetryInterval)
@@ -249,9 +273,9 @@ namespace EdgePulse::Agent
         }
         configuration.logMaxBackup = static_cast<int>(*logMaxBackup);
 
-        configuration.configPath           = resolvePath(baseDirectory, manager.getString("agent.executors.config.path", std::string{}));
-        configuration.configApplyHook      = resolvePath(baseDirectory, manager.getString("agent.executors.config.apply_hook", std::string{}));
-        configuration.firmwareInstallHook  = resolvePath(baseDirectory, manager.getString("agent.executors.firmware.install_hook", std::string{}));
+        configuration.configPath                   = resolvePath(baseDirectory, manager.getString("agent.executors.config.path", std::string{}));
+        configuration.configApplyHook              = resolvePath(baseDirectory, manager.getString("agent.executors.config.apply_hook", std::string{}));
+        configuration.firmwareInstallHook          = resolvePath(baseDirectory, manager.getString("agent.executors.firmware.install_hook", std::string{}));
         configuration.firmwareTrustedKeysDirectory = resolvePath(baseDirectory, manager.getString("agent.executors.firmware.trusted_keys_dir", std::string{}));
         configuration.firmwareStagingDirectory     = resolvePath(baseDirectory, manager.getString("agent.executors.firmware.staging_directory", std::string{}));
 

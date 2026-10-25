@@ -127,6 +127,15 @@ namespace EdgePulse::Agent
         AsynGyanis::Core::Task<std::expected<void, std::string>> serve(CommandDispatcher &dispatcher, std::int64_t nodeId, std::string agentVersion,
                                                                        const ConnectionObserver &onConnectionChanged);
 
+        /**
+         * @brief 用磁盘上的新证书替换 wss 客户端身份
+         * @return 明文通道没有 TLS 身份，返回 true；wss 下返回 TlsContext::reloadCertificate() 的结论
+         * @details 新一代 SSL_CTX 与 createSSL 互斥，已建立的连接仍绑在旧上下文上继续收命令（服务端在重叠窗口内
+         *          同时接受新旧证书），下一次 serve() 重连自动使用新证书。装载失败时旧上下文原样继续服务。
+         * @note 与 serve() 一样只在所属事件循环线程上调用
+         */
+        bool reloadIdentityFromDisk();
+
     private:
         /**
          * @brief 从 base_url 拆出的连接参数

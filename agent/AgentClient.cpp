@@ -3,6 +3,7 @@
 #include "TelemetryCollector.h"
 
 #include "Base/Config/ConfigValue.h"
+#include "Base/Log/LogMacros.h"
 
 #include "Core/Tls/TlsPolicy.h"
 #include "Net/Http/Client/HttpClient.h"
@@ -185,12 +186,13 @@ namespace EdgePulse::Agent
         {
             m_baseUrl.pop_back();
         }
-        m_registerUrl  = m_baseUrl + "/api/agent/register";
-        m_heartbeatUrl = m_baseUrl + "/api/agent/heartbeat";
-        m_telemetryUrl = m_baseUrl + "/api/agent/telemetry";
-        m_commandsUrl  = m_baseUrl + "/api/agent/commands";
+        m_registerUrl   = m_baseUrl + "/api/agent/register";
+        m_heartbeatUrl  = m_baseUrl + "/api/agent/heartbeat";
+        m_telemetryUrl  = m_baseUrl + "/api/agent/telemetry";
+        m_commandsUrl   = m_baseUrl + "/api/agent/commands";
         m_agentNodesUrl = m_baseUrl + "/api/agent/nodes";
         m_firmwareUrl   = m_baseUrl + "/api/agent/firmware";
+        m_renewalUrl    = m_baseUrl + "/api/agent/certificate/renew";
 
         try
         {
@@ -214,6 +216,9 @@ namespace EdgePulse::Agent
                 m_initializationError = "加载客户端证书与私钥失败：请确认两个文件都是 PEM 编码且相互配对（证书：" + configuration.certificateFile.string() + "，私钥：" +
                                         configuration.privateKeyFile.string() + "）";
                 m_client.reset();
+            } else
+            {
+                m_tlsIdentityLoaded = m_client != nullptr && configuration.baseUrl.starts_with("https://");
             }
         } catch (const std::exception &failure)
         {
@@ -307,8 +312,8 @@ namespace EdgePulse::Agent
         const AsynGyanis::Base::ConfigValue requestBody = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"agentVersion", std::move(agentVersion)}});
         // HttpClientRequest::body 是 string_view：序列化结果必须落在协程帧里的具名局部量，
         // 直接绑定 dump() 的临时串会在 send 读取前释放
-        const std::string                   bodyText = requestBody.dump();
-        AsynGyanis::Net::HttpClientRequest  request;
+        const std::string                  bodyText = requestBody.dump();
+        AsynGyanis::Net::HttpClientRequest request;
         request.method      = "POST";
         request.body        = bodyText;
         request.contentType = "application/json";
@@ -445,8 +450,7 @@ namespace EdgePulse::Agent
         co_return ResultPostOutcome{disposition, httpStatus, failure};
     }
 
-    AsynGyanis::Core::Task<std::expected<void, TelemetryFailure>> AgentClient::sendTelemetry(const std::int64_t nodeId,
-                                                                                              const AsynGyanis::Base::ConfigValue &samples)
+    AsynGyanis::Core::Task<std::expected<void, TelemetryFailure>> AgentClient::sendTelemetry(const std::int64_t nodeId, const AsynGyanis::Base::ConfigValue &samples)
     {
         if (!m_initializationError.empty() || m_client == nullptr)
         {
@@ -630,8 +634,7 @@ namespace EdgePulse::Agent
         co_return std::expected<void, std::string>{};
     }
 
-    AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> AgentClient::downloadFile(std::string downloadPath,
-                                                                                                AsynGyanis::Net::HttpResponseBodyReceiver receiver)
+    AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> AgentClient::downloadFile(std::string downloadPath, AsynGyanis::Net::HttpResponseBodyReceiver receiver)
     {
         if (!m_initializationError.empty() || m_client == nullptr)
         {
@@ -731,5 +734,139 @@ namespace EdgePulse::Agent
             co_return std::unexpected("上报固件状态" + checked.error());
         }
         co_return std::expected<void, std::string>{};
+    }
+
+    AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>> AgentClient::renewCertificate(const std::int64_t nodeId, std::string csrPem)
+    {
+        if (!m_initializationError.empty() || m_client == nullptr)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期不可用：" + m_initializationError, false, false, 0});
+        }
+        if (nodeId <= 0)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"节点标识无效，无法续期证书", false, false, 0});
+        }
+        if (csrPem.empty())
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书签名请求为空，无法续期证书", false, false, 0});
+        }
+
+        const AsynGyanis::Base::ConfigValue requestBody = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"csrPem", std::move(csrPem)}});
+        // HttpClientRequest::body 是 string_view：序列化结果必须落在协程帧里的具名局部量
+        const std::string bodyText = requestBody.dump();
+
+        AsynGyanis::Net::HttpClientRequest request;
+        request.method      = "POST";
+        request.body        = bodyText;
+        request.contentType = "application/json";
+
+        std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
+        try
+        {
+            response = co_await m_client->send(m_renewalUrl, request, m_requestTimeout);
+        } catch (const std::exception &failure)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期请求异常：" + std::string{failure.what()}, true, false, 0});
+        }
+        if (response == nullptr)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期请求发送失败：连接、TLS 握手或超时，详细原因见引擎日志", true, false, 0});
+        }
+
+        const int status = response->statusCode;
+        // 403 表示节点证书已吊销或租户停用：错误文本固定生成，不回显服务端正文
+        if (status == 403)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期被服务端拒绝（HTTP 403）：节点证书已吊销或租户已停用，请重新入场注册后再启动 Agent", false, true, 403});
+        }
+        if (status < 200 || status >= 300)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{httpFailure("证书续期", status, response->body), isRetryableStatus(status), false, status});
+        }
+
+        const auto data = successData(response->body);
+        if (!data)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期" + data.error(), false, false, status});
+        }
+
+        const auto stringFieldOf = [&data](const std::string_view key) -> std::string
+        {
+            const auto iterator = data->find(std::string{key});
+            return iterator != data->end() && iterator->is_string() ? iterator->get<std::string>() : std::string{};
+        };
+
+        RenewedCertificate renewed;
+        renewed.certificatePem = stringFieldOf("certificatePem");
+        renewed.fingerprint    = asciiLower(stringFieldOf("fingerprint"));
+        renewed.notBefore      = stringFieldOf("notBefore");
+        renewed.notAfter       = stringFieldOf("notAfter");
+        renewed.serial         = stringFieldOf("serial");
+        if (renewed.certificatePem.empty())
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应缺少非空 certificatePem", false, false, status});
+        }
+        if (renewed.fingerprint.size() != 64U || renewed.fingerprint.find_first_not_of("0123456789abcdef") != std::string::npos)
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应的 fingerprint 不是 64 位小写十六进制", false, false, status});
+        }
+        if (renewed.notAfter.empty())
+        {
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应缺少 notAfter", false, false, status});
+        }
+        co_return renewed;
+    }
+
+    bool AgentClient::reloadIdentityFromDisk(const std::function<bool()> &restoreBackups)
+    {
+        if (!m_initializationError.empty() || m_client == nullptr)
+        {
+            return false;
+        }
+        // 明文测试配置没有客户端身份，磁盘上的证书与本次连接无关
+        if (!m_tlsIdentityLoaded)
+        {
+            return true;
+        }
+
+        const auto loadCurrent = [this]() -> std::expected<AgentIdentity, std::string>
+        {
+            auto identity = AgentIdentity::load(m_configuration);
+            if (!identity)
+            {
+                return std::unexpected(identity.error());
+            }
+            if (!m_client->setClientCertificate(m_configuration.certificateFile.string(), m_configuration.privateKeyFile.string()))
+            {
+                return std::unexpected("装载客户端证书与私钥失败：请确认两个文件都是 PEM 编码且相互配对（证书：" + m_configuration.certificateFile.string() + "，私钥：" +
+                                       m_configuration.privateKeyFile.string() + "）");
+            }
+            return identity;
+        };
+
+        const auto loaded = loadCurrent();
+        if (loaded)
+        {
+            // 旧连接可能仍带旧证书；收掉空闲连接，让后续请求按新身份重新握手
+            m_client->closeIdleConnections();
+            m_identity = *loaded;
+            return true;
+        }
+
+        LOG_WARN_FMT("重载客户端证书失败：{}", loaded.error());
+        if (restoreBackups && restoreBackups())
+        {
+            const auto restored = loadCurrent();
+            if (restored)
+            {
+                m_client->closeIdleConnections();
+                m_identity = *restored;
+                LOG_WARN("已回退到上一份客户端证书，HTTP 通道继续使用旧身份");
+            } else
+            {
+                LOG_ERROR_FMT("恢复备份证书后仍无法装载客户端证书：{}；HTTP 通道继续使用内存中的旧身份，请重启 Agent", restored.error());
+            }
+        }
+        return false;
     }
 } // namespace EdgePulse::Agent

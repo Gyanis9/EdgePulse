@@ -23,6 +23,7 @@ namespace EdgePulse::Agent::Testing
         using BioHandle       = std::unique_ptr<BIO, decltype(&BIO_free)>;
         using KeyHandle       = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
         using CertHandle      = std::unique_ptr<X509, decltype(&X509_free)>;
+        using RequestHandle   = std::unique_ptr<X509_REQ, decltype(&X509_REQ_free)>;
         using ExtensionHandle = std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)>;
 
         constexpr char kHexDigits[] = "0123456789abcdef";
@@ -42,7 +43,7 @@ namespace EdgePulse::Agent::Testing
         }
 
         /**
-         * @brief 把内存 BIO 里的 PEM 文本取成字符串
+         * @brief 把内部 BIO 里的 PEM 文本取成字符串
          * @param bio 内存 BIO
          * @return std::string PEM 文本
          */
@@ -55,6 +56,20 @@ namespace EdgePulse::Agent::Testing
                 throw std::runtime_error("生成测试证书失败：PEM 文本为空");
             }
             return std::string{buffer, static_cast<std::size_t>(length)};
+        }
+
+        /**
+         * @brief 在证书上追加一条扩展
+         * @param certificate 目标证书
+         * @param name NID
+         * @param value 扩展配置文本
+         * @throws std::runtime_error 扩展创建或写入失败
+         */
+        void addExtension(X509 &certificate, const int name, const char *value)
+        {
+            ExtensionHandle extension(X509V3_EXT_nconf_nid(nullptr, nullptr, name, value), &X509_EXTENSION_free);
+            requireStep(extension != nullptr, "创建扩展");
+            requireStep(X509_add_ext(&certificate, extension.get(), -1) == 1, "写入扩展");
         }
 
         /**
@@ -138,6 +153,94 @@ namespace EdgePulse::Agent::Testing
 #ifndef _WIN32
         requireStep(::chmod(material.privateKeyFile.c_str(), S_IRUSR | S_IWUSR) == 0, "设置私钥权限");
 #endif
+        return material;
+    }
+
+    CertificateAuthorityMaterial writeCertificateAuthority(const TestSupport::TemporaryDirectory &directory, const std::string &prefix)
+    {
+        KeyHandle key(EVP_RSA_gen(2048U), &EVP_PKEY_free);
+        requireStep(key != nullptr, "生成 CA 私钥");
+
+        CertHandle certificate(X509_new(), &X509_free);
+        requireStep(certificate != nullptr, "创建 CA 证书对象");
+        X509_set_version(certificate.get(), 2);
+        ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1);
+        X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60);
+        X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 10L * 365L * 24L * 60L * 60L);
+        requireStep(X509_set_pubkey(certificate.get(), key.get()) == 1, "写入 CA 公钥");
+
+        X509_NAME        *subject    = X509_get_subject_name(certificate.get());
+        const std::string commonName = prefix + "-edgepulse-test-ca";
+        requireStep(X509_NAME_add_entry_by_txt(subject, SN_commonName, MBSTRING_ASC, reinterpret_cast<const unsigned char *>(commonName.c_str()), -1, -1, 0) == 1, "写入 CA 主题");
+        requireStep(X509_set_issuer_name(certificate.get(), subject) == 1, "写入 CA 签发者");
+        addExtension(*certificate, NID_basic_constraints, "critical,CA:TRUE");
+        addExtension(*certificate, NID_key_usage, "critical,keyCertSign,cRLSign");
+        requireStep(X509_sign(certificate.get(), key.get(), EVP_sha256()) != 0, "签名 CA 证书");
+
+        BioHandle certificateBio(BIO_new(BIO_s_mem()), &BIO_free);
+        requireStep(certificateBio != nullptr, "创建 CA 证书内存缓冲");
+        requireStep(PEM_write_bio_X509(certificateBio.get(), certificate.get()) == 1, "输出 CA 证书 PEM");
+        const std::string certificateText = pemText(*certificateBio);
+
+        BioHandle keyBio(BIO_new(BIO_s_mem()), &BIO_free);
+        requireStep(keyBio != nullptr, "创建 CA 私钥内存缓冲");
+        requireStep(PEM_write_bio_PrivateKey(keyBio.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1, "输出 CA 私钥 PEM");
+        const std::string keyText = pemText(*keyBio);
+
+        CertificateAuthorityMaterial material;
+        material.certificateFile = directory.write(prefix + "-ca.pem", certificateText);
+        material.privateKeyFile  = directory.write(prefix + "-ca-key.pem", keyText);
+        material.fingerprint     = fingerprintOf(*certificate);
+#ifndef _WIN32
+        requireStep(::chmod(material.privateKeyFile.c_str(), S_IRUSR | S_IWUSR) == 0, "设置 CA 私钥权限");
+#endif
+        return material;
+    }
+
+    SignedCertificateMaterial signCertificateRequest(const CertificateAuthorityMaterial &authority, const std::string_view csrPem, const long validitySeconds)
+    {
+        BioHandle csrBio(BIO_new_mem_buf(csrPem.data(), static_cast<int>(csrPem.size())), &BIO_free);
+        requireStep(csrBio != nullptr, "创建 CSR 内存缓冲");
+        RequestHandle request(PEM_read_bio_X509_REQ(csrBio.get(), nullptr, nullptr, nullptr), &X509_REQ_free);
+        requireStep(request != nullptr, "解析 CSR");
+
+        KeyHandle csrKey(X509_REQ_get_pubkey(request.get()), &EVP_PKEY_free);
+        requireStep(csrKey != nullptr, "读取 CSR 公钥");
+        requireStep(X509_REQ_verify(request.get(), csrKey.get()) == 1, "校验 CSR 自签");
+
+        BioHandle caCertificateBio(BIO_new_file(authority.certificateFile.string().c_str(), "rb"), &BIO_free);
+        requireStep(caCertificateBio != nullptr, "打开 CA 证书");
+        CertHandle caCertificate(PEM_read_bio_X509(caCertificateBio.get(), nullptr, nullptr, nullptr), &X509_free);
+        requireStep(caCertificate != nullptr, "解析 CA 证书");
+
+        BioHandle caKeyBio(BIO_new_file(authority.privateKeyFile.string().c_str(), "rb"), &BIO_free);
+        requireStep(caKeyBio != nullptr, "打开 CA 私钥");
+        KeyHandle caKey(PEM_read_bio_PrivateKey(caKeyBio.get(), nullptr, nullptr, nullptr), &EVP_PKEY_free);
+        requireStep(caKey != nullptr, "解析 CA 私钥");
+
+        CertHandle certificate(X509_new(), &X509_free);
+        requireStep(certificate != nullptr, "创建叶证书对象");
+        X509_set_version(certificate.get(), 2);
+        ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 2);
+        const long notBeforeOffset = validitySeconds < 0 ? validitySeconds - 60 : -60;
+        X509_gmtime_adj(X509_getm_notBefore(certificate.get()), notBeforeOffset);
+        X509_gmtime_adj(X509_getm_notAfter(certificate.get()), validitySeconds);
+        requireStep(X509_set_subject_name(certificate.get(), X509_REQ_get_subject_name(request.get())) == 1, "写入叶证书主题");
+        requireStep(X509_set_issuer_name(certificate.get(), X509_get_subject_name(caCertificate.get())) == 1, "写入叶证书签发者");
+        requireStep(X509_set_pubkey(certificate.get(), csrKey.get()) == 1, "写入叶证书公钥");
+        addExtension(*certificate, NID_basic_constraints, "critical,CA:FALSE");
+        addExtension(*certificate, NID_key_usage, "critical,digitalSignature,keyEncipherment");
+        addExtension(*certificate, NID_ext_key_usage, "clientAuth");
+        requireStep(X509_sign(certificate.get(), caKey.get(), EVP_sha256()) != 0, "签名叶证书");
+
+        BioHandle certificateBio(BIO_new(BIO_s_mem()), &BIO_free);
+        requireStep(certificateBio != nullptr, "创建叶证书内存缓冲");
+        requireStep(PEM_write_bio_X509(certificateBio.get(), certificate.get()) == 1, "输出叶证书 PEM");
+
+        SignedCertificateMaterial material;
+        material.certificatePem = pemText(*certificateBio);
+        material.fingerprint    = fingerprintOf(*certificate);
+        material.expiresAt      = expiryOf(*certificate);
         return material;
     }
 } // namespace EdgePulse::Agent::Testing

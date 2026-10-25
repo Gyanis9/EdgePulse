@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -73,8 +74,8 @@ namespace EdgePulse::Agent
     struct ResultPostOutcome
     {
         ResultPostDisposition disposition{ResultPostDisposition::Retryable}; ///< 处置分类
-        int                   httpStatus{0};                                ///< HTTP 状态码；0 表示没有拿到响应
-        std::string           message;                                      ///< 中文原因，供日志使用
+        int                   httpStatus{0};                                 ///< HTTP 状态码；0 表示没有拿到响应
+        std::string           message;                                       ///< 中文原因，供日志使用
     };
 
     /**
@@ -104,6 +105,29 @@ namespace EdgePulse::Agent
         std::int64_t                  version{0}; ///< 期望配置版本；0 表示从未下发
         AsynGyanis::Base::ConfigValue content;    ///< 配置正文，JSON 对象
         std::string                   hash;       ///< 服务端给出的摘要
+    };
+
+    /**
+     * @brief 服务端签发的一张新证书
+     */
+    struct RenewedCertificate
+    {
+        std::string certificatePem; ///< 证书 PEM，可能含中间证书
+        std::string fingerprint;    ///< 叶证书 SHA-256 指纹，64 位小写十六进制
+        std::string notBefore;      ///< 生效时间，服务端给出的 UTC 文本
+        std::string notAfter;       ///< 到期时间，服务端给出的 UTC 文本
+        std::string serial;         ///< 序列号，小写十六进制
+    };
+
+    /**
+     * @brief 一次证书续期请求的失败，带重试与授权分类
+     */
+    struct CertificateRenewalFailure
+    {
+        std::string message;                      ///< 面向运维的中文原因，不含 CSR 与私钥
+        bool        retryable{false};             ///< 是否值得按退避重试
+        bool        authorizationRejected{false}; ///< 服务端 403，表示节点证书或租户被拒
+        int         httpStatus{0};                ///< 失败响应的 HTTP 状态码；0 表示未拿到响应
     };
 
     /**
@@ -201,8 +225,7 @@ namespace EdgePulse::Agent
          * @note 绝对地址只接受 https；明文 http 仅在配置开启 allow_plaintext_for_tests 时放行
          * @note 非 200 响应同样按成功返回并带上状态码，由调用方决定是否继续；接收口应自行拒绝非 200 正文
          */
-        AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> downloadFile(std::string downloadPath,
-                                                                                        AsynGyanis::Net::HttpResponseBodyReceiver receiver);
+        AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> downloadFile(std::string downloadPath, AsynGyanis::Net::HttpResponseBodyReceiver receiver);
 
         /**
          * @brief 上报一次固件任务状态
@@ -217,19 +240,50 @@ namespace EdgePulse::Agent
         AsynGyanis::Core::Task<std::expected<void, std::string>> reportFirmwareStatus(std::int64_t firmwareId, std::int64_t nodeId, std::string_view status, int progress,
                                                                                       std::string_view message);
 
+        /**
+         * @brief 提交一份 CSR 换取新证书
+         * @param nodeId 服务端分配的节点 ID
+         * @param csrPem 本次生成的证书签名请求 PEM
+         * @return 成功返回新证书与元数据；失败带中文原因与重试分类
+         * @note 403 表示节点证书已吊销或租户停用，按终止处理；400 表示 CSR 不合法，重试同一份材料不会改变结论；
+         *       408、425、429 与 5xx 可重试。请求与响应正文都不写入日志
+         */
+        AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>> renewCertificate(std::int64_t nodeId, std::string csrPem);
+
+        /**
+         * @brief 在事件循环线程上重新装载磁盘上的客户端证书与私钥
+         * @param restoreBackups 装载失败时的回退动作；返回 true 表示已把旧文件写回
+         * @return 装载成功返回 true；失败返回 false，调用方应稍后再试
+         * @details 新材料先按配置路径装载到内置 TLS 上下文，成功后关闭空闲连接，让后续请求重新握手；
+         *          失败时（可选）执行回退动作并再次装载旧材料。明文测试配置没有客户端身份，直接返回 true。
+         * @note 必须在客户端所属事件循环线程上调用：setClientCertificate 会改写共用的 TLS 上下文
+         */
+        bool reloadIdentityFromDisk(const std::function<bool()> &restoreBackups = {});
+
+        /**
+         * @brief 取当前生效的证书身份
+         * @return const AgentIdentity & 指纹与到期时间；重载成功后随之更新
+         */
+        [[nodiscard]] const AgentIdentity &identity() const noexcept
+        {
+            return m_identity;
+        }
+
     private:
-        AsynGyanis::Core::EventLoop                 &m_loop;                ///< 请求所属事件循环
-        AgentConfiguration                           m_configuration;       ///< 本次进程使用的配置副本
-        AgentIdentity                                m_identity;            ///< 证书指纹与到期时间
-        std::unique_ptr<AsynGyanis::Net::HttpClient> m_client;              ///< 带连接池的 HTTP 客户端
-        std::string                                  m_baseUrl;             ///< 去掉结尾斜杠的服务端基地址
-        std::string                                  m_registerUrl;         ///< 注册接口的绝对地址
-        std::string                                  m_heartbeatUrl;        ///< 心跳接口的绝对地址
-        std::string                                  m_telemetryUrl;        ///< 遥测接口的绝对地址
-        std::string                                  m_commandsUrl;         ///< 命令接口的绝对地址前缀
-        std::string                                  m_agentNodesUrl;       ///< Agent 节点接口的绝对地址前缀
-        std::string                                  m_firmwareUrl;         ///< 固件任务接口的绝对地址前缀
-        std::string                                  m_initializationError; ///< 客户端装配失败原因，空表示可用
-        std::chrono::milliseconds                    m_requestTimeout;      ///< 单次注册请求的整体时限
+        AsynGyanis::Core::EventLoop                 &m_loop;                     ///< 请求所属事件循环
+        AgentConfiguration                           m_configuration;            ///< 本次进程使用的配置副本
+        AgentIdentity                                m_identity;                 ///< 证书指纹与到期时间
+        std::unique_ptr<AsynGyanis::Net::HttpClient> m_client;                   ///< 带连接池的 HTTP 客户端
+        std::string                                  m_baseUrl;                  ///< 去掉结尾斜杠的服务端基地址
+        std::string                                  m_registerUrl;              ///< 注册接口的绝对地址
+        std::string                                  m_heartbeatUrl;             ///< 心跳接口的绝对地址
+        std::string                                  m_telemetryUrl;             ///< 遥测接口的绝对地址
+        std::string                                  m_commandsUrl;              ///< 命令接口的绝对地址前缀
+        std::string                                  m_agentNodesUrl;            ///< Agent 节点接口的绝对地址前缀
+        std::string                                  m_firmwareUrl;              ///< 固件任务接口的绝对地址前缀
+        std::string                                  m_renewalUrl;               ///< 证书续期接口的绝对地址
+        std::string                                  m_initializationError;      ///< 客户端装配失败原因，空表示可用
+        bool                                         m_tlsIdentityLoaded{false}; ///< 是否在 TLS 上下文上装载了客户端证书
+        std::chrono::milliseconds                    m_requestTimeout;           ///< 单次注册请求的整体时限
     };
 } // namespace EdgePulse::Agent
