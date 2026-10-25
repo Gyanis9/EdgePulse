@@ -81,6 +81,7 @@ test('fleet api maps firmware rollout create list get and actions', async () => 
   await api.firmware.forcePromoteRollout(31, '现场确认')
   await api.firmware.abortRollout(31)
   await api.firmware.rollbackRollout(31)
+  await api.firmware.pauseRollout(31)
 
   assert.equal(calls[0].url, '/api/firmware/5/rollouts?pageNum=1&pageSize=20')
   assert.equal(calls[0].method, 'GET')
@@ -100,4 +101,7 @@ test('fleet api maps firmware rollout create list get and actions', async () => 
     ['/api/firmware/rollouts/31/rollback', 'POST'],
   ])
   assert.deepEqual(calls.slice(4, 9).map(call => JSON.parse(call.body ?? '{}')), [{}, {}, { reason: '现场确认' }, {}, {}])
+  assert.equal(calls[9].url, '/api/firmware/rollouts/31/pause')
+  assert.equal(calls[9].method, 'POST')
+  assert.deepEqual(JSON.parse(calls[9].body ?? '{}'), {})
 })

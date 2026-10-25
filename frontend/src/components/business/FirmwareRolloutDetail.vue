@@ -73,6 +73,7 @@ const GATE_LABEL: Record<string, string> = {
   healthy: '健康',
   failed: '失败',
   rolled_back: '已回滚',
+  rollback_pending: '回滚已派发',
   rollback_failed: '回滚失败',
   rollback_unavailable: '无法回滚',
 }
@@ -111,11 +112,13 @@ let metaLoaded = false
 
 const status = computed(() => rollout.value?.status ?? '')
 const terminal = computed(() => ['completed', 'rolled_back', 'aborted', 'failed', 'rollback_unavailable'].includes(status.value))
-const canPause = computed(() => !terminal.value && ['scheduled', 'preparing', 'running', 'observing'].includes(status.value))
+/* 后端暂停还接受 paused，但该状态界面已给出恢复入口，不重复展示暂停；observing 不在后端暂停允许列表内 */
+const canPause = computed(() => ['scheduled', 'preparing', 'running'].includes(status.value))
 const canResume = computed(() => status.value === 'paused')
 const canPromote = computed(() => ['running', 'paused'].includes(status.value))
-const canAbort = computed(() => !terminal.value && ['scheduled', 'preparing', 'running', 'observing', 'paused'].includes(status.value))
-const canRollback = computed(() => ['running', 'paused', 'failed'].includes(status.value))
+/* 后端中止只拒绝终态，回滚允许 running/paused/failed/rolling_back */
+const canAbort = computed(() => !terminal.value)
+const canRollback = computed(() => ['running', 'paused', 'failed', 'rolling_back'].includes(status.value))
 
 const nodeMap = computed(() => new Map(nodeRows.value.map(node => [node.id, node])))
 const firmwareMap = computed(() => new Map(firmwareRows.value.map(row => [row.id, row])))
@@ -132,8 +135,13 @@ function waveStatus(value: string) {
   return WAVE_STATUS[value] ?? { label: value || '未知', tone: 'neutral' }
 }
 
-function targetStatus(value: string) {
-  return TARGET_STATUS[value] ?? { label: value || '未知', tone: 'neutral' }
+function targetStatus(target: FirmwareRolloutTarget) {
+  if (target.status === 'failed') {
+    const gate = target.health?.gate
+    if (gate === 'rollback_failed') return { label: '回滚失败', tone: 'danger' }
+    if (gate === 'rollback_unavailable') return { label: '回滚不可用', tone: 'danger' }
+  }
+  return TARGET_STATUS[target.status] ?? { label: target.status || '未知', tone: 'neutral' }
 }
 
 function firmwareLabel(id: number) {
@@ -162,6 +170,11 @@ function waveGateText(wave: FirmwareRolloutWave) {
   if (!gates.length) return '—'
   const latest = gates[gates.length - 1]
   if (latest.forced) return `强制通过${latest.reason ? `：${latest.reason}` : ''}`
+  if (latest.rollback) {
+    const issued = typeof latest.issued === 'number' ? latest.issued : 0
+    const unavailable = typeof latest.unavailable === 'number' ? latest.unavailable : 0
+    return `回滚已派发 ${issued} 台${unavailable ? `，${unavailable} 台无法回滚` : ''}`
+  }
   if (latest.timeout) return '超时'
   if (latest.passed) return `通过${typeof latest.healthy === 'number' ? `（健康 ${latest.healthy}/${latest.total ?? '—'}）` : ''}`
   if (latest.reason) return latest.reason
@@ -204,7 +217,11 @@ function stopPolling() {
 
 async function load(silent = false) {
   const targetId = props.rolloutId
-  if (!props.open || !targetId || requestInFlight) return
+  if (!props.open || !targetId) return
+  if (requestInFlight) {
+    if (!silent) pushToast('刷新正在进行，请稍候', 'info')
+    return
+  }
   requestInFlight = true
   if (!silent) loading.value = true
   try {
@@ -215,7 +232,11 @@ async function load(silent = false) {
     rollout.value = data
     loadError.value = ''
   } catch (error) {
-    if (!silent) loadError.value = error instanceof Error ? error.message : '灰度发布加载失败'
+    if (!silent) {
+      loadError.value = error instanceof Error ? error.message : '灰度发布加载失败'
+      // 已有快照时页面不会切到空态，必须再给出可见提示，避免刷新失败被静默吞掉
+      toastError(error, '灰度发布刷新失败')
+    }
   } finally {
     requestInFlight = false
     if (!silent) loading.value = false
@@ -331,7 +352,7 @@ async function rollback() {
 <template>
   <Drawer :open="open" title="灰度发布详情" :sub="sub" :width="1040" @close="emit('close')">
     <div class="stack">
-      <p v-if="loadError && !rollout" class="form-error" role="alert">{{ loadError }}</p>
+      <p v-if="loadError" class="form-error" role="alert">{{ loadError }}</p>
       <div v-if="!rollout && loading" class="faint">正在加载灰度发布…</div>
       <template v-if="rollout">
         <div class="kv-grid">
@@ -382,7 +403,7 @@ async function rollback() {
             </template>
             <template #cell-wave="{ row }">{{ waveNumber(row.waveId) }}</template>
             <template #cell-status="{ row }">
-              <Tag :tone="targetStatus(row.status).tone" dot>{{ targetStatus(row.status).label }}</Tag>
+              <Tag :tone="targetStatus(row).tone" dot>{{ targetStatus(row).label }}</Tag>
             </template>
             <template #cell-installedVersion="{ row }"><span class="mono soft">{{ installedVersion(row) }}</span></template>
             <template #cell-previousVersion="{ row }">

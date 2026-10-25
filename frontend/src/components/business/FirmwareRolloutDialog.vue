@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { Button, Checkbox, Field, Select, Switch, TextInput } from '@/components/ui'
 import FormDialog from './FormDialog.vue'
 import { fleetApi, type FirmwareRolloutAggregate, type FirmwareRolloutPolicy, type FirmwareRow, type NodeRow } from '@/api'
-import { pushToast, toastError } from '@/composables/toast'
+import { pushToast } from '@/composables/toast'
 
 const props = withDefaults(defineProps<{
   open: boolean
@@ -100,9 +100,17 @@ function checkInteger(label: string, value: unknown, min: number, max: number): 
 }
 
 function checkRatio(label: string, value: unknown): string {
+  if (value === null || value === undefined || String(value).trim() === '') return `${label}不能为空`
   const number = Number(value)
   if (!Number.isFinite(number) || number < 0 || number > 100) return `${label}必须是 0 到 100 的百分比`
   return ''
+}
+
+/* 空值不能落成 0，否则会被当成 0% 绕过健康门控；返回 NaN 交给校验拦截 */
+function ratioOf(value: unknown): number {
+  if (value === null || value === undefined || String(value).trim() === '') return Number.NaN
+  const number = Number(value)
+  return Number.isFinite(number) ? number / 100 : Number.NaN
 }
 
 function validate(): string {
@@ -150,8 +158,8 @@ function policyPayload(): FirmwareRolloutPolicy {
     settleSeconds: integerOf(form.settleSeconds),
     observeSeconds: integerOf(form.observeSeconds),
     maxWaveSeconds: integerOf(form.maxWaveSeconds),
-    minWaveSuccessRatio: Number(form.minWaveSuccessRatio) / 100,
-    minCumulativeSuccessRatio: Number(form.minCumulativeSuccessRatio) / 100,
+    minWaveSuccessRatio: ratioOf(form.minWaveSuccessRatio),
+    minCumulativeSuccessRatio: ratioOf(form.minCumulativeSuccessRatio),
     maxFailures: integerOf(form.maxFailures),
     autoRollback: form.autoRollback,
     onTimeout: form.onTimeout === 'fail' ? 'fail' : 'pause',
@@ -160,6 +168,21 @@ function policyPayload(): FirmwareRolloutPolicy {
     requireInstalledVersion: form.requireInstalledVersion,
   }
 }
+
+function summaryWave(value: unknown) {
+  const text = String(value ?? '').trim()
+  return text === '' ? '—' : `${text}%`
+}
+
+function summaryRatio(value: unknown) {
+  const text = String(value ?? '').trim()
+  return text === '' ? '未填写' : `${text}%`
+}
+
+const summaryNodes = computed(() => form.nodeIds
+  .map(id => props.nodes.find(node => node.id === id)?.name ?? `节点 #${id}`)
+  .join(' → ') || '未选择')
+const summaryWaves = computed(() => form.waves.map(summaryWave).join(' → '))
 
 async function submit() {
   if (saving.value || !props.firmware) return
@@ -271,6 +294,28 @@ function nodeVersion(node: NodeRow) {
     <Field label="已安装版本校验" group>
       <Switch v-model="form.requireInstalledVersion" label="要求节点上报已安装版本并与目标版本一致" />
     </Field>
+    <div class="rollout-summary" aria-label="创建摘要">
+      <div class="summary-row">
+        <span class="summary-label">固件</span>
+        <span class="summary-value" :title="firmware ? `${firmware.name} ${firmware.version}` : ''">{{ firmware ? `${firmware.name} ${firmware.version}` : '未选择' }}</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-label">目标节点</span>
+        <span class="summary-value" :title="summaryNodes">{{ form.nodeIds.length }} 个 · {{ summaryNodes }}</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-label">波次</span>
+        <span class="summary-value">{{ summaryWaves }}（累计覆盖）</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-label">成功率</span>
+        <span class="summary-value">单波 {{ summaryRatio(form.minWaveSuccessRatio) }} / 累计 {{ summaryRatio(form.minCumulativeSuccessRatio) }}</span>
+      </div>
+      <div class="summary-row">
+        <span class="summary-label">超时 / 回滚</span>
+        <span class="summary-value">单波最长 {{ form.maxWaveSeconds }} 秒 · {{ form.onTimeout === 'fail' ? '超时判失败' : '超时暂停' }} · {{ form.autoRollback ? '自动回滚' : '不自动回滚' }}</span>
+      </div>
+    </div>
     <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
   </FormDialog>
 </template>
@@ -347,5 +392,35 @@ function nodeVersion(node: NodeRow) {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.rollout-summary {
+  display: grid;
+  gap: 6px;
+  grid-column: 1 / -1;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-solid);
+}
+
+.summary-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.summary-label {
+  flex: none;
+  width: 84px;
+  color: var(--ink-soft);
+}
+
+.summary-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

@@ -19,11 +19,11 @@ async function login(page: Page) {
   await page.waitForURL(url => !url.pathname.includes('/login'), { timeout: 20_000 })
 }
 
-async function fulfill(route: Route, data: unknown, status = 200) {
+async function fulfill(route: Route, data: unknown, status = 200, message = 'ok') {
   await route.fulfill({
     status,
     contentType: 'application/json',
-    body: JSON.stringify({ code: status, message: 'ok', data, traceId: 'e2e-rollout' }),
+    body: JSON.stringify({ code: status, message, data, traceId: 'e2e-rollout' }),
   })
 }
 
@@ -225,6 +225,109 @@ function makeRollout(status: 'running' | 'paused' | 'completed', version: number
   }
 }
 
+function makeRollbackRollout() {
+  return {
+    id: 31,
+    tenantId: 1,
+    firmwareId: 5,
+    name: '回滚演练',
+    policy,
+    status: 'rolling_back',
+    currentWave: 1,
+    totalWaves: 3,
+    createdBy: 1,
+    createdAt: '2026-10-26 09:00:00',
+    startedAt: '2026-10-26 09:01:00',
+    finishedAt: '',
+    pausedAt: '',
+    pauseReason: '',
+    lastError: '回滚失败：节点 102 回滚任务失败',
+    version: 4,
+    waves: [
+      {
+        id: 1,
+        rolloutId: 31,
+        waveIndex: 0,
+        status: 'passed',
+        targetCount: 1,
+        dispatchedAt: '2026-10-26 09:01:00',
+        deadlineAt: '2026-10-26 09:31:00',
+        settledAt: '2026-10-26 09:05:00',
+        gate: [{ passed: true, healthy: 1, failed: 0, total: 1, at: '2026-10-26 09:05:00' }],
+        createdAt: '2026-10-26 09:00:00',
+        updatedAt: '2026-10-26 09:05:00',
+      },
+      {
+        id: 2,
+        rolloutId: 31,
+        waveIndex: 1,
+        status: 'rolling_back',
+        targetCount: 1,
+        dispatchedAt: '2026-10-26 09:06:00',
+        deadlineAt: '2026-10-26 09:36:00',
+        settledAt: '2026-10-26 09:20:00',
+        gate: [{ rollback: true, issued: 1, unavailable: 1, at: '2026-10-26 09:21:00' }],
+        createdAt: '2026-10-26 09:00:00',
+        updatedAt: '2026-10-26 09:21:00',
+      },
+      {
+        id: 3,
+        rolloutId: 31,
+        waveIndex: 2,
+        status: 'pending',
+        targetCount: 1,
+        dispatchedAt: '',
+        deadlineAt: '',
+        settledAt: '',
+        gate: [],
+        createdAt: '2026-10-26 09:00:00',
+        updatedAt: '2026-10-26 09:20:00',
+      },
+    ],
+    targets: [
+      {
+        id: 11,
+        rolloutId: 31,
+        waveId: 1,
+        tenantId: 1,
+        nodeId: 101,
+        previousFirmwareId: 4,
+        taskId: 201,
+        commandId: 301,
+        status: 'healthy',
+        health: { gate: 'healthy', reason: '心跳与遥测覆盖观察窗口', installedVersion: '2.0.0' },
+        updatedAt: '2026-10-26 09:05:00',
+      },
+      {
+        id: 12,
+        rolloutId: 31,
+        waveId: 2,
+        tenantId: 1,
+        nodeId: 102,
+        previousFirmwareId: 4,
+        taskId: 202,
+        commandId: 302,
+        status: 'failed',
+        health: { gate: 'rollback_failed', reason: '节点 102 回滚任务失败', installedVersion: '1.0.0' },
+        updatedAt: '2026-10-26 09:21:00',
+      },
+      {
+        id: 13,
+        rolloutId: 31,
+        waveId: 2,
+        tenantId: 1,
+        nodeId: 103,
+        previousFirmwareId: 4,
+        taskId: 203,
+        commandId: 303,
+        status: 'rolling_back',
+        health: { gate: 'rollback_pending', installedVersion: '1.0.0' },
+        updatedAt: '2026-10-26 09:21:00',
+      },
+    ],
+  }
+}
+
 test('firmware rollout wizard defaults, create request, detail statuses and force promote', async ({ page }) => {
   await login(page)
 
@@ -404,4 +507,107 @@ test('firmware rollout wizard defaults, create request, detail statuses and forc
   await expect(detail.getByRole('button', { name: '强制提升', exact: true })).toHaveCount(0)
   await expect(detail.getByRole('button', { name: '中止', exact: true })).toHaveCount(0)
   await expect(detail.getByRole('button', { name: '回滚', exact: true })).toHaveCount(0)
+})
+
+test('firmware rollout rejects cleared ratios, shows create summary and rollback statuses', async ({ page }) => {
+  await login(page)
+
+  let createPosts = 0
+  let refreshFails = false
+  const rollbackState = makeRollbackRollout()
+
+  await page.route('**/api/nodes**', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue()
+    await fulfill(route, { rows: nodeRows, total: nodeRows.length, pageNum: 1, pageSize: 100 })
+  })
+
+  await page.route('**/api/firmware**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    const method = route.request().method()
+
+    if (path === '/api/firmware' && method === 'GET') {
+      await fulfill(route, { rows: firmwareRows, total: firmwareRows.length, pageNum: 1, pageSize: 10 })
+      return
+    }
+    if (path === '/api/firmware/policy' && method === 'GET') {
+      await fulfill(route, { requireSignature: false, trustedKeyIds: [] })
+      return
+    }
+    if (path === '/api/firmware/5/rollouts' && method === 'POST') {
+      createPosts += 1
+      await fulfill(route, rollbackState)
+      return
+    }
+    if (path === '/api/firmware/rollouts/31' && method === 'GET') {
+      if (refreshFails) {
+        await fulfill(route, null, 500, '注入的刷新失败')
+        return
+      }
+      await fulfill(route, rollbackState)
+      return
+    }
+    await route.continue()
+  })
+
+  await page.goto('/device/firmware')
+  const firmwareRow = page.getByRole('row', { name: /EdgePulse OS/ }).filter({ hasText: '2.0.0' })
+  await expect(firmwareRow).toBeVisible()
+  await firmwareRow.getByRole('button', { name: '灰度发布' }).click()
+
+  const wizard = page.getByRole('dialog', { name: '新建灰度发布' })
+  await expect(wizard).toBeVisible()
+  await wizard.getByPlaceholder('例如 生产环境灰度').fill('回滚演练')
+  await wizard.locator('.node-picker-row').filter({ hasText: 'edge-sh-01' }).click()
+
+  const summary = wizard.locator('.rollout-summary')
+  await expect(summary).toContainText('EdgePulse OS 2.0.0')
+  await expect(summary).toContainText('1 个 · edge-sh-01')
+  await expect(summary).toContainText('5% → 25% → 100%')
+  await expect(summary).toContainText('单波 100% / 累计 100%')
+  await expect(summary).toContainText('单波最长 1800 秒 · 超时暂停 · 不自动回滚')
+
+  const waveRatio = wizard.getByLabel('单波最低成功率（%）')
+  const cumulativeRatio = wizard.getByLabel('累计最低成功率（%）')
+  await waveRatio.fill('')
+  await cumulativeRatio.fill('')
+  await expect(summary).toContainText('单波 未填写 / 累计 未填写')
+
+  await wizard.getByRole('button', { name: '创建并查看' }).click()
+  await expect(wizard.getByText('单波最低成功率不能为空')).toBeVisible()
+  expect(createPosts, '必填成功率为空时不应发起创建请求').toBe(0)
+
+  await waveRatio.fill('100')
+  await cumulativeRatio.fill('100')
+  const createRequestPromise = page.waitForRequest(
+    request => request.method() === 'POST' && new URL(request.url()).pathname === '/api/firmware/5/rollouts',
+  )
+  await wizard.getByRole('button', { name: '创建并查看' }).click()
+  await createRequestPromise
+  expect(createPosts).toBe(1)
+
+  const detail = page.getByRole('dialog', { name: '灰度发布详情' })
+  await expect(detail).toBeVisible({ timeout: 10_000 })
+  await expect(detail.locator('.kv-grid').first()).toContainText('回滚中')
+  await expect(detail.locator('.kv-grid').first()).toContainText('回滚失败：节点 102 回滚任务失败')
+
+  const wavePanel = detail.locator('.panel').nth(0)
+  await expect(wavePanel.getByRole('row', { name: /第 2 波/ })).toContainText('回滚已派发 1 台，1 台无法回滚')
+
+  const targetPanel = detail.locator('.panel').nth(1)
+  await expect(targetPanel.getByRole('row', { name: /edge-sh-02/ })).toContainText('回滚失败')
+  await expect(targetPanel.getByRole('row', { name: /edge-sh-03/ })).toContainText('回滚已派发')
+
+  await expect(detail.getByRole('button', { name: '暂停', exact: true })).toHaveCount(0)
+  await expect(detail.getByRole('button', { name: '提升', exact: true })).toHaveCount(0)
+  await expect(detail.getByRole('button', { name: '中止', exact: true })).toBeVisible()
+  await expect(detail.getByRole('button', { name: '回滚', exact: true })).toBeVisible()
+
+  refreshFails = true
+  const refreshPromise = page.waitForResponse(
+    response => new URL(response.url()).pathname === '/api/firmware/rollouts/31' && response.status() === 500,
+  )
+  await detail.getByRole('button', { name: '刷新', exact: true }).click()
+  await refreshPromise
+  await expect(detail.getByRole('alert').filter({ hasText: '注入的刷新失败' })).toBeVisible()
+  await expect(detail.locator('.kv-grid').first()).toContainText('回滚中')
 })
