@@ -17,6 +17,8 @@ export interface NodeRow {
 export interface NodeDetailRow extends NodeRow {
   certNotAfter: string
   certRevokedAt: string
+  previousCertFingerprint?: string
+  previousCertNotAfter?: string
   desiredConfigVersion: number
   reportedConfigVersion: number
   configInSync: boolean

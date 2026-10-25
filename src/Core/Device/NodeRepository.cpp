@@ -546,26 +546,44 @@ namespace EdgePulse::Device
                 loop,
                 [nodeId, tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<NodeRecord>
                 {
-                    const std::string                                now = Common::nowDateTimeUtc();
-                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{now, now, nodeId};
-                    std::string                                      clause;
-                    if (!tenant.allTenants)
+                    const std::string now = Common::nowDateTimeUtc();
+                    try
                     {
-                        clause = " AND tenant_id = ?";
-                        parameters.emplace_back(tenant.tenantId);
-                    }
-                    // 清空指纹是吊销的核心：之后 requireAgentNode 与 WebSocket hello 都无法再绑定成功
-                    const auto result =
-                            Sql::executeOrThrow(connection,
-                                                "UPDATE biz_node SET cert_fingerprint = '', cert_revoked_at = ?, status = 'offline', version = version + 1, updated_at = ? "
-                                                "WHERE id = ? AND deleted = 0" +
-                                                        clause,
-                                                parameters);
-                    if (result->affectedRowCount() == 0)
+                        Sql::executeOrThrowVoid(connection, "BEGIN");
+                        const std::optional<NodeRecord> current = findByIdOnConnection(connection, nodeId, tenant);
+                        if (!current.has_value())
+                        {
+                            rollbackQuietly(connection);
+                            return std::nullopt;
+                        }
+                        // 清空 active 与 previous 两套指纹是吊销的核心：之后 requireAgentNode 与 WebSocket hello 都无法再绑定成功
+                        const auto result = Sql::executeOrThrow(connection,
+                                                                "UPDATE biz_node SET cert_fingerprint = '', previous_cert_fingerprint = '', previous_cert_not_after = NULL, "
+                                                                "cert_revoked_at = ?, status = 'offline', version = version + 1, updated_at = ? "
+                                                                "WHERE id = ? AND tenant_id = ? AND deleted = 0",
+                                                                std::vector<AsynGyanis::Database::DatabaseValue>{now, now, nodeId, current->tenantId});
+                        if (result->affectedRowCount() == 0)
+                        {
+                            rollbackQuietly(connection);
+                            return std::nullopt;
+                        }
+                        // 历史里的 active 与 previous 都退出可用状态，留下吊销时刻供审计
+                        Sql::executeOrThrowVoid(connection,
+                                                "UPDATE biz_agent_certificate SET status = 'revoked', revoked_at = ? "
+                                                "WHERE tenant_id = ? AND node_id = ? AND status IN ('active', 'previous') AND revoked_at IS NULL",
+                                                std::vector<AsynGyanis::Database::DatabaseValue>{now, current->tenantId, nodeId});
+                        const std::optional<NodeRecord> revoked = findByIdOnConnection(connection, nodeId, tenant);
+                        Sql::executeOrThrowVoid(connection, "COMMIT");
+                        return revoked;
+                    } catch (const Common::DatabaseException &)
                     {
-                        return std::nullopt;
+                        rollbackQuietly(connection);
+                        throw;
+                    } catch (...)
+                    {
+                        rollbackQuietly(connection);
+                        throw;
                     }
-                    return findByIdOnConnection(connection, nodeId, tenant);
                 });
     }
 

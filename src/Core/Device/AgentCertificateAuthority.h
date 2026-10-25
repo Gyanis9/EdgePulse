@@ -83,6 +83,12 @@ namespace EdgePulse::Device
          */
         [[nodiscard]] bool enabled() const noexcept;
 
+        /**
+         * @brief 新旧证书的重叠窗口小时数
+         * @return int 配置的重叠小时数；禁用或已移动时返回 0
+         */
+        [[nodiscard]] int overlapHours() const noexcept;
+
     private:
         struct Implementation;
 

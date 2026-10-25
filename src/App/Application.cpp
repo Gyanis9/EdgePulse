@@ -552,7 +552,7 @@ namespace EdgePulse::App
                 m_agentServer->setClientCertificateRequired(true);
                 Web::applySecurityHeaders(m_agentServer->router());
                 Device::registerRoutes(m_agentServer->router(), loop, *m_agentRegistry, *m_nodeRepository, *m_tenantRepository, m_configuration.heartbeatIntervalSeconds,
-                                       m_nodeConfigRepository.get());
+                                       m_nodeConfigRepository.get(), m_agentCa.get());
                 Device::NodeConfigDependencies nodeConfigAgentDependencies;
                 nodeConfigAgentDependencies.nodes   = m_nodeRepository.get();
                 nodeConfigAgentDependencies.configs = m_nodeConfigRepository.get();

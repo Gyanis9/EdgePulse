@@ -81,4 +81,31 @@ namespace EdgePulse::Device
                       expires.tm_sec);
         return std::string{buffer};
     }
+
+    bool certificateMatchesNode(const AsynGyanis::Core::TlsPeerIdentityPtr &connectionIdentity, const NodeRecord &node, const std::string_view now)
+    {
+        if (!connectionIdentity || !connectionIdentity->isVerified())
+        {
+            return false;
+        }
+        if (!node.certRevokedAt.empty())
+        {
+            return false;
+        }
+        const std::optional<std::string> observed = normalizeCertificateFingerprint(connectionIdentity->sha256FingerprintHex());
+        if (!observed.has_value())
+        {
+            return false;
+        }
+        if (const std::optional<std::string> active = normalizeCertificateFingerprint(node.certFingerprint); active.has_value() && *active == *observed)
+        {
+            return true;
+        }
+        if (node.previousCertFingerprint.empty() || node.previousCertNotAfter.empty() || now.empty() || node.previousCertNotAfter <= now)
+        {
+            return false;
+        }
+        const std::optional<std::string> previous = normalizeCertificateFingerprint(node.previousCertFingerprint);
+        return previous.has_value() && *previous == *observed;
+    }
 } // namespace EdgePulse::Device

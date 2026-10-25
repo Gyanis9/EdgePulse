@@ -1,5 +1,6 @@
 #include "Core/Device/AgentAuthorization.h"
 
+#include "Base/Runtime/TimeFormat.h"
 #include "Core/Device/CertificateBinding.h"
 #include "Core/Metrics/BusinessMetrics.h"
 #include "Core/System/TenantScope.h"
@@ -36,23 +37,18 @@ namespace EdgePulse::Device
             co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::Unauthenticated, 403, "Agent 通道必须出示通过校验的客户端证书"});
         }
 
-        // 复用注册路径的指纹归一化：登记值在这里先折成小写再比较，空登记值与非法格式按同一条规则拒绝
-        if (const std::optional<std::string> bindingFailure = certificateBindingFailure(identity, node->certFingerprint); bindingFailure.has_value())
-        {
-            Metrics::BusinessMetrics::instance().incrementIdentityRejections();
-            if (!node->certRevokedAt.empty())
-            {
-                // 吊销会清空指纹，绑定失败先归因到吊销，给出可操作的重新注册指引
-                co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::Forbidden, 403, "节点证书已吊销，请重新申请注册令牌并完成注册"});
-            }
-            co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::Forbidden, 403, "连接证书与节点登记指纹不一致，请使用管理员签发的证书或改绑令牌"});
-        }
-
+        // 吊销先于指纹：无论 active 还是 previous 命中，吊销后都不能再代表节点
         if (!node->certRevokedAt.empty())
         {
-            // 指纹仍匹配但吊销时间已写入：同样不能靠旧证书继续发请求
             Metrics::BusinessMetrics::instance().incrementIdentityRejections();
             co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::Forbidden, 403, "节点证书已吊销，请重新申请注册令牌并完成注册"});
+        }
+
+        // 复用注册路径的指纹归一化，并接受重叠窗口内的上一枚证书；空登记值与非法格式同样拒绝
+        if (!certificateMatchesNode(identity, *node, Common::nowDateTimeUtc()))
+        {
+            Metrics::BusinessMetrics::instance().incrementIdentityRejections();
+            co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::Forbidden, 403, "连接证书与节点登记指纹不一致，请使用管理员签发的证书或改绑令牌"});
         }
 
         co_return *node;

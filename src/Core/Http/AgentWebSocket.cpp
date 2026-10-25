@@ -2,6 +2,7 @@
 
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogMacros.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/CertificateBinding.h"
@@ -100,11 +101,12 @@ namespace EdgePulse::Web
                                            co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
                                            co_return;
                                        }
-                                       // mTLS 只证明对端持有 CA 签发的证书；节点身份还必须与登记的叶证书指纹一致
-                                       if (const std::optional<std::string> bindingFailure = Device::certificateBindingFailure(peer.peerIdentity(), node->certFingerprint);
-                                           bindingFailure.has_value())
+                                       // mTLS 只证明对端持有 CA 签发的证书；节点身份还必须与登记的叶证书指纹一致。
+                                       // 明文连接没有对端身份，沿用测试与开发链路的放行口径；TLS 连接则接受 active 或未过期的 previous。
+                                       const auto &peerIdentity = peer.peerIdentity();
+                                       if (peerIdentity && !Device::certificateMatchesNode(peerIdentity, *node, Common::nowDateTimeUtc()))
                                        {
-                                           LOG_WARN_FMT("Agent WebSocket 证书绑定失败：node={} reason={}", *id, *bindingFailure);
+                                           LOG_WARN_FMT("Agent WebSocket 证书绑定失败：node={} reason=证书与节点登记指纹不一致", *id);
                                            co_await peer.close(AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate mismatch");
                                            co_return;
                                        }

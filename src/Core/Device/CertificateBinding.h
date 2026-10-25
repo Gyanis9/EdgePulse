@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "Core/Device/NodeRepository.h"
+
 #include <Core/Tls/TlsPeerIdentity.h>
 
 #include <optional>
@@ -34,6 +36,19 @@ namespace EdgePulse::Device
      * @return 不通过时的中文原因；通过为空
      */
     [[nodiscard]] std::optional<std::string> certificateBindingFailure(const AsynGyanis::Core::TlsPeerIdentityPtr &connectionIdentity, std::string_view registeredFingerprint);
+
+    /**
+     * @brief 判定连接证书能否代表节点，含新旧证书重叠窗口
+     * @details 连接证书必须已通过校验，节点也未被吊销。指纹与当前证书逐字一致时直接命中；
+     *          否则在 previous_cert_not_after 晚于 now 时与上一枚证书比较。上一枚证书的
+     *          截止时间为空或已经到达（相等即失效）都不再接受。now 为空时只接受当前证书，
+     *          避免把缺失的比较基准当成永久有效。
+     * @param connectionIdentity 连接的对端身份
+     * @param node 节点记录
+     * @param now 当前 UTC 时间，形如 2026-10-25 12:00:00
+     * @return bool 连接证书可代表该节点
+     */
+    [[nodiscard]] bool certificateMatchesNode(const AsynGyanis::Core::TlsPeerIdentityPtr &connectionIdentity, const NodeRecord &node, std::string_view now);
 
     /**
      * @brief 解析连接证书的到期时间

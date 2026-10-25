@@ -737,4 +737,9 @@ namespace EdgePulse::Device
     {
         return m_implementation && m_implementation->options.enabled;
     }
+
+    int AgentCertificateAuthority::overlapHours() const noexcept
+    {
+        return m_implementation && m_implementation->options.enabled ? m_implementation->options.overlapHours : 0;
+    }
 } // namespace EdgePulse::Device

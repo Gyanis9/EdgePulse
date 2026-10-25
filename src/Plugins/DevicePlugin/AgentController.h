@@ -9,6 +9,9 @@
 
 #pragma once
 
+#include <cstdint>
+#include <functional>
+
 namespace AsynGyanis::Core
 {
     class EventLoop;
@@ -20,6 +23,7 @@ namespace AsynGyanis::Net
 
 namespace EdgePulse::Device
 {
+    class AgentCertificateAuthority;
     class AgentRegistry;
     class NodeConfigRepository;
     class NodeRepository;
@@ -41,7 +45,10 @@ namespace EdgePulse::Device
      * @param tenants 租户仓储，用于解析注册请求的租户编码
      * @param heartbeatIntervalSeconds 期望的心跳间隔，随心跳响应下发
      * @param nodeConfig 配置影子仓储，心跳响应据此带回期望配置版本；可空
+     * @param certificateAuthority 内部 CA；空或未启用时续期返回 503
+     * @param beforeCertificateRotation 每次写入轮换前的测试钩子，可空
      */
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants,
-                        int heartbeatIntervalSeconds, NodeConfigRepository *nodeConfig = nullptr);
+                        int heartbeatIntervalSeconds, NodeConfigRepository *nodeConfig = nullptr, AgentCertificateAuthority *certificateAuthority = nullptr,
+                        std::function<void(std::int64_t)> beforeCertificateRotation = {});
 } // namespace EdgePulse::Device

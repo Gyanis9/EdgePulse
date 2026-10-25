@@ -2,7 +2,9 @@
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Core/Device/AgentAuthorization.h"
+#include "Core/Device/AgentCertificateAuthority.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/NodeConfigRepository.h"
 #include "Core/System/TenantRepository.h"
@@ -14,7 +16,10 @@
 
 #include <Core/EventLoop/EventLoop.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -78,10 +83,82 @@ namespace EdgePulse::Device
                     break;
             }
         }
+
+        /**
+         * @brief 取指纹前 12 位，供日志定位而不回显完整凭据
+         * @param fingerprint 证书指纹
+         * @return std::string 前缀；空指纹返回 none
+         */
+        [[nodiscard]] std::string fingerprintPrefix(const std::string_view fingerprint)
+        {
+            if (fingerprint.empty())
+            {
+                return "none";
+            }
+            return std::string{fingerprint.substr(0, std::min<std::size_t>(12, fingerprint.size()))};
+        }
+
+        /**
+         * @brief 计算旧证书退出重叠窗口的时间
+         * @param node 轮换前的节点
+         * @param overlapHours 重叠窗口小时数
+         * @return std::string 旧证书到期时间与 now 加窗口两者中较早的一个
+         */
+        [[nodiscard]] std::string overlapDeadline(const NodeRecord &node, const int overlapHours)
+        {
+            const std::string cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() + std::chrono::hours{overlapHours});
+            // 旧证书自身到期更早时不能借重叠窗口续命
+            return node.certNotAfter.empty() || node.certNotAfter > cutoff ? cutoff : node.certNotAfter;
+        }
+
+        /**
+         * @brief 把一次签发结果拼成仓储的轮换输入
+         * @param node 轮换前的节点
+         * @param issued 新签发的证书
+         * @param overlapHours 重叠窗口小时数
+         * @return AgentCertificateRotation 轮换字段
+         */
+        [[nodiscard]] AgentCertificateRotation rotationFor(const NodeRecord &node, const IssuedAgentCertificate &issued, const int overlapHours)
+        {
+            AgentCertificateRotation rotation;
+            rotation.fingerprint         = issued.fingerprint;
+            rotation.notAfter            = issued.notAfter;
+            rotation.previousFingerprint = node.certFingerprint;
+            rotation.previousNotAfter    = overlapDeadline(node, overlapHours);
+            rotation.serial              = issued.serial;
+            rotation.subject             = issued.subject;
+            rotation.notBefore           = issued.notBefore;
+            return rotation;
+        }
+
+        /**
+         * @brief 判断签发失败是否由请求方材料引起
+         * @param message 签发器返回的中文原因
+         * @return bool CSR 相关失败按 400，其余按 500
+         */
+        [[nodiscard]] bool clientCertificateError(const std::string &message)
+        {
+            return message.find("CSR") != std::string::npos;
+        }
+
+        /**
+         * @brief 以节点快照的版本为条件写入一次证书轮换
+         * @param loop 恢复协程用的事件循环
+         * @param nodes 节点仓储
+         * @param snapshot 读取到的节点快照
+         * @param rotation 轮换字段
+         * @return 成功为 true；版本冲突、吊销或删除为 false
+         */
+        AsynGyanis::Core::Task<std::expected<bool, std::string>> rotateNodeCertificate(AsynGyanis::Core::EventLoop &loop, NodeRepository &nodes, const NodeRecord &snapshot,
+                                                                                       AgentCertificateRotation rotation)
+        {
+            co_return co_await nodes.rotateCertificate(loop, System::TenantScope{snapshot.tenantId, false}, snapshot.id, snapshot.version, std::move(rotation));
+        }
     } // namespace
 
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, AgentRegistry &registry, NodeRepository &nodes, System::TenantRepository &tenants,
-                        const int heartbeatIntervalSeconds, NodeConfigRepository *nodeConfig)
+                        const int heartbeatIntervalSeconds, NodeConfigRepository *nodeConfig, AgentCertificateAuthority *certificateAuthority,
+                        std::function<void(std::int64_t)> beforeCertificateRotation)
     {
         router.post("/api/agent/register",
                     [&loop, &registry, &tenants](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
@@ -138,6 +215,128 @@ namespace EdgePulse::Device
                             co_return;
                         }
                         Common::writeSuccess(response, nodeToJson(*result), traceId);
+                        co_return;
+                    });
+
+        router.post("/api/agent/certificate/renew",
+                    [&loop, &nodes, &tenants, certificateAuthority, beforeCertificateRotation = std::move(beforeCertificateRotation)](
+                            AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    {
+                        const std::string traceId = Web::resolveRequestId(request);
+                        // 续期响应含一次性证书 PEM，失败响应也可能带节点信息，统一禁止缓存
+                        static_cast<void>(response.setHeader("Cache-Control", "no-store"));
+                        const std::optional<AsynGyanis::Base::ConfigValue> body = request.jsonBody();
+                        if (!body.has_value() || !body->is_object())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "请求正文必须是 JSON 对象", traceId);
+                            co_return;
+                        }
+                        const auto                       nodeIdIterator = body->find("nodeId");
+                        const std::optional<std::string> csrPem         = stringField(*body, "csrPem");
+                        if (nodeIdIterator == body->end() || !nodeIdIterator->is_number_integer() || !csrPem.has_value() || csrPem->empty())
+                        {
+                            Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少整数 nodeId 或非空 csrPem", traceId);
+                            co_return;
+                        }
+                        const std::int64_t nodeId   = nodeIdIterator->get<std::int64_t>();
+                        const auto         identity = co_await requireAgentNode(loop, nodes, request, nodeId);
+                        if (!identity.has_value())
+                        {
+                            Common::writeFailure(response, identity.error().httpStatus, identity.error().httpStatus, identity.error().message, traceId);
+                            co_return;
+                        }
+                        // 停用租户不能借续期继续维持 Agent 通道
+                        const auto tenant = co_await tenants.findById(loop, identity->tenantId);
+                        if (!tenant.has_value() || tenant->status != 1)
+                        {
+                            Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "租户已停用，无法续期证书", traceId);
+                            co_return;
+                        }
+                        if (certificateAuthority == nullptr || !certificateAuthority->enabled())
+                        {
+                            Common::writeFailure(response, Common::kCodeServiceUnavailable, Common::kCodeServiceUnavailable, "Agent 内部 CA 未启用，无法续期证书", traceId);
+                            co_return;
+                        }
+
+                        auto issued = certificateAuthority->issue(*csrPem, identity->id, identity->name);
+                        if (!issued.has_value())
+                        {
+                            if (clientCertificateError(issued.error()))
+                            {
+                                Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, issued.error(), traceId);
+                                co_return;
+                            }
+                            LOG_ERROR_FMT("Agent 证书签发失败：node={} reason={}", nodeId, issued.error());
+                            Common::writeFailure(response, Common::kCodeInternalServerError, Common::kCodeInternalServerError, "证书签发失败，请稍后重试", traceId);
+                            co_return;
+                        }
+
+                        NodeRecord current = *identity;
+                        if (beforeCertificateRotation)
+                        {
+                            beforeCertificateRotation(current.id);
+                        }
+                        auto rotated = co_await rotateNodeCertificate(loop, nodes, current, rotationFor(current, *issued, certificateAuthority->overlapHours()));
+                        if (!rotated.has_value())
+                        {
+                            LOG_ERROR_FMT("Agent 证书续期写入失败：node={} reason={}", nodeId, rotated.error());
+                            Common::writeFailure(response, Common::kCodeInternalServerError, Common::kCodeInternalServerError, "证书续期写入失败，请稍后重试", traceId);
+                            co_return;
+                        }
+                        if (!*rotated)
+                        {
+                            // 版本条件落空：重读一次，区分并发更新、吊销与删除，再给一次重试机会
+                            const auto refreshed = co_await nodes.scoped(System::TenantScope{0, true})->findById(loop, nodeId);
+                            if (!refreshed.has_value())
+                            {
+                                Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除，请先完成注册", traceId);
+                                co_return;
+                            }
+                            if (!refreshed->certRevokedAt.empty())
+                            {
+                                Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "节点证书已吊销，请重新申请注册令牌并完成注册", traceId);
+                                co_return;
+                            }
+                            current = *refreshed;
+                            if (beforeCertificateRotation)
+                            {
+                                beforeCertificateRotation(current.id);
+                            }
+                            rotated = co_await rotateNodeCertificate(loop, nodes, current, rotationFor(current, *issued, certificateAuthority->overlapHours()));
+                            if (!rotated.has_value())
+                            {
+                                LOG_ERROR_FMT("Agent 证书续期写入失败：node={} reason={}", nodeId, rotated.error());
+                                Common::writeFailure(response, Common::kCodeInternalServerError, Common::kCodeInternalServerError, "证书续期写入失败，请稍后重试", traceId);
+                                co_return;
+                            }
+                            if (!*rotated)
+                            {
+                                // 第二次仍撞版本：收手，让 Agent 重新读取后再发起，避免无限重试与互相覆盖
+                                const auto latest = co_await nodes.scoped(System::TenantScope{0, true})->findById(loop, nodeId);
+                                if (!latest.has_value())
+                                {
+                                    Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除，请先完成注册", traceId);
+                                    co_return;
+                                }
+                                if (!latest->certRevokedAt.empty())
+                                {
+                                    Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "节点证书已吊销，请重新申请注册令牌并完成注册", traceId);
+                                    co_return;
+                                }
+                                Common::writeFailure(response, Common::kCodeConflict, Common::kCodeConflict, "节点证书已被并发更新，请重试", traceId);
+                                co_return;
+                            }
+                        }
+
+                        LOG_INFO_FMT("Agent 证书续期：node={} old={} new={} serial={} notAfter={}", current.id, fingerprintPrefix(current.certFingerprint),
+                                     fingerprintPrefix(issued->fingerprint), issued->serial, issued->notAfter);
+                        Common::writeSuccess(response,
+                                             AsynGyanis::Base::ConfigValue::object({{"certificatePem", issued->certificatePem},
+                                                                                    {"fingerprint", issued->fingerprint},
+                                                                                    {"notBefore", issued->notBefore},
+                                                                                    {"notAfter", issued->notAfter},
+                                                                                    {"serial", issued->serial}}),
+                                             traceId);
                         co_return;
                     });
 

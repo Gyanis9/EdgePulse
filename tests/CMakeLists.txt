@@ -68,6 +68,7 @@ set_target_properties(edgepulse-integration-tests PROPERTIES RUNTIME_OUTPUT_DIRE
 gtest_discover_tests(edgepulse-integration-tests DISCOVERY_MODE PRE_TEST)
 
 add_executable(edgepulse-protocol-tests
+        Protocol/TestAgentCertificateRenewal.cpp
         Protocol/TestApiResponse.cpp
         Protocol/TestApiTokenEndpoints.cpp
         Protocol/TestApplicationConfiguration.cpp
