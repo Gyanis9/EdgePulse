@@ -107,7 +107,7 @@ namespace EdgePulse::TestSupport
                 });
     }
 
-    ServerHarness::ServerHarness(const std::function<void(AsynGyanis::Net::Router &, AsynGyanis::Core::EventLoop &)> &configure)
+    ServerHarness::ServerHarness(const std::function<void(AsynGyanis::Net::Router &, AsynGyanis::Core::EventLoop &)> &configure, AsynGyanis::Net::ReadinessCheck readiness)
     {
         // 端口 0 让内核分配，多个用例并行时不会撞固定端口
         const std::optional<AsynGyanis::Core::InetAddress> address = AsynGyanis::Core::InetAddress::resolve("127.0.0.1", 0);
@@ -117,6 +117,10 @@ namespace EdgePulse::TestSupport
         }
         m_server = std::make_unique<AsynGyanis::Net::HttpServer>(m_loop, *address);
         configure(m_server->router(), m_loop);
+        if (readiness)
+        {
+            m_server->enableReadinessEndpoint("/readyz", std::move(readiness));
+        }
         m_acceptTask.emplace(m_server->start());
         // 循环尚未开始运行，本线程可安全入本地队列
         m_loop.scheduler().schedule(m_acceptTask->handle());

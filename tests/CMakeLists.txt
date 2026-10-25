@@ -55,6 +55,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestNodeLifecycle.cpp
         Integration/TestNotificationChannels.cpp
         Integration/TestOutboundUrlGuard.cpp
+        Integration/TestReadiness.cpp
         Integration/TestRealtimeBus.cpp
         Integration/TestFleetServices.cpp
         Integration/TestMfaService.cpp

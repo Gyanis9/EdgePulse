@@ -1,6 +1,7 @@
 #include "App/ListenerAssembly.h"
 #include "TestSupport/HttpClientHarness.h"
 #include "Core/Http/MiddlewareSetup.h"
+#include "Core/Http/ReadinessState.h"
 
 #include <gtest/gtest.h>
 
@@ -12,7 +13,7 @@ using EdgePulse::TestSupport::ServerHarness;
 
 namespace
 {
-    ServerHarness makeServer()
+    ServerHarness makeServer(AsynGyanis::Net::ReadinessCheck readiness = {})
     {
         return ServerHarness(
                 [](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
@@ -20,7 +21,8 @@ namespace
                     EdgePulse::Web::applySecurityHeaders(router);
                     EdgePulse::App::registerHealthRoutes(router);
                     EdgePulse::App::registerSiteFallback(router, std::filesystem::path{"build/gate/no-such-web"});
-                });
+                },
+                std::move(readiness));
     }
 } // namespace
 
@@ -83,4 +85,45 @@ TEST(HealthServer, ServesSpaFallbackAndKeepsApi404)
     EXPECT_TRUE(apiMissing.json().has_value());
     std::error_code error;
     std::filesystem::remove_all(root, error);
+}
+
+// 钉住：/readyz 依赖全绿回 200，任一依赖掉线回 503 且 reason 点名该依赖
+TEST(HealthServer, ReadinessReportsDependencyState)
+{
+    EdgePulse::Web::ReadinessState state;
+    state.setDatabaseReady(true);
+    state.setServiceReady(true);
+    state.setCacheReady(true);
+    state.setRealtimeHealthy(true);
+    state.setFirmwareDirectoryReady(true);
+
+    ServerHarness server = makeServer([&state] { return state.check(); });
+
+    const auto ready = server.get("/readyz");
+    ASSERT_TRUE(ready.transportOk) << ready.error;
+    EXPECT_EQ(200, ready.status);
+
+    state.setCacheReady(false);
+    const auto unready = server.get("/readyz");
+    ASSERT_TRUE(unready.transportOk) << unready.error;
+    EXPECT_EQ(503, unready.status);
+    EXPECT_EQ("1", unready.header("retry-after").value_or(""));
+    const auto json = unready.json();
+    ASSERT_TRUE(json.has_value()) << unready.body;
+    EXPECT_EQ("not_ready", (*json)["status"].get<std::string>());
+    EXPECT_EQ("缓存探针失败", (*json)["reason"].get<std::string>());
+
+    // 存活性不受依赖影响：/api/health 仍回答 200，只有 /readyz 变 503
+    const auto alive = server.get("/api/health");
+    ASSERT_TRUE(alive.transportOk) << alive.error;
+    EXPECT_EQ(200, alive.status);
+
+    state.setCacheReady(true);
+    state.setFirmwareDirectoryReady(false);
+    const auto firmware = server.get("/readyz");
+    ASSERT_TRUE(firmware.transportOk) << firmware.error;
+    EXPECT_EQ(503, firmware.status);
+    const auto firmwareJson = firmware.json();
+    ASSERT_TRUE(firmwareJson.has_value()) << firmware.body;
+    EXPECT_EQ("固件目录不可写", (*firmwareJson)["reason"].get<std::string>());
 }

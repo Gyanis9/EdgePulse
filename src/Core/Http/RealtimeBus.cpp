@@ -38,10 +38,20 @@ namespace EdgePulse::Web
         {
             return AsynGyanis::Base::ConfigValue::object({{"instance", instanceId}, {"base", base}, {"tenantId", tenantId}, {"payload", payload}}).dump();
         }
+
+        /**
+         * @brief 从选项解析实例标识；空值退回随机值，不把空串写进信封
+         * @param options 已构造完成的总线选项
+         * @return std::string 非空实例标识
+         */
+        [[nodiscard]] std::string resolveInstanceId(const RealtimeBusOptions &options)
+        {
+            return options.instanceId.empty() ? Common::randomTokenHex(8) : options.instanceId;
+        }
     } // namespace
 
     RealtimeBus::RealtimeBus(AsynGyanis::Core::EventLoop &loop, BrowserWebSocket &webSocket, SseBroadcaster &sse, RealtimeBusOptions options) :
-        m_loop(loop), m_webSocket(webSocket), m_sse(sse), m_options(std::move(options)), m_instanceId(Common::randomTokenHex(8))
+        m_loop(loop), m_webSocket(webSocket), m_sse(sse), m_options(std::move(options)), m_instanceId(resolveInstanceId(m_options))
     {
     }
 
@@ -58,6 +68,8 @@ namespace EdgePulse::Web
         {
             m_publisher->disconnect();
         }
+        m_publisherHealthy.store(false);
+        m_subscriberConnected.store(false);
     }
 
     void RealtimeBus::start()
@@ -71,11 +83,25 @@ namespace EdgePulse::Web
             m_publisher = std::make_unique<AsynGyanis::Database::RedisConnection>(redisConfig(m_options));
             if (!m_publisher->connect())
             {
-                LOG_WARN_FMT("实时事件跨实例转发不可用：{}", m_publisher->lastError());
+                m_publisherHealthy.store(false);
+                LOG_WARN_FMT("实时事件发布连接不可用：instance={} error={}", m_instanceId, m_publisher->lastError());
                 m_publisher.reset();
+            } else
+            {
+                m_publisherHealthy.store(true);
             }
         }
+        LOG_INFO_FMT("实时事件跨实例转发已启用：instance={} channel={}", m_instanceId, m_options.channel);
         m_thread = std::jthread([this](const std::stop_token token) { subscribeLoop(token); });
+    }
+
+    bool RealtimeBus::isHealthy() const noexcept
+    {
+        if (!m_options.enabled)
+        {
+            return true;
+        }
+        return m_publisherHealthy.load(std::memory_order_acquire) && m_subscriberConnected.load(std::memory_order_acquire);
     }
 
     AsynGyanis::Core::Task<> RealtimeBus::publish(const std::string_view base, const std::int64_t tenantId, const std::string &payload)
@@ -88,13 +114,18 @@ namespace EdgePulse::Web
         std::lock_guard<std::mutex> lock(m_publisherMutex);
         if (!m_publisher || !m_publisher->isConnected())
         {
+            m_publisherHealthy.store(false);
             co_return;
         }
         const std::string                   envelope = envelopeOf(m_instanceId, base, tenantId, payload);
         const std::vector<std::string_view> command{"PUBLISH", m_options.channel, envelope};
         if (!m_publisher->executeCommand(command))
         {
-            LOG_WARN_FMT("实时事件发布到 Redis 失败：{}", m_publisher->lastError());
+            m_publisherHealthy.store(false);
+            LOG_WARN_FMT("实时事件发布到 Redis 失败：instance={} error={}", m_instanceId, m_publisher->lastError());
+        } else
+        {
+            m_publisherHealthy.store(true);
         }
         co_return;
     }
@@ -152,18 +183,21 @@ namespace EdgePulse::Web
         {
             if (!connection.isConnected() && !connection.connect())
             {
-                LOG_WARN_FMT("实时事件订阅连接失败：{}", connection.lastError());
+                m_subscriberConnected.store(false);
+                LOG_WARN_FMT("实时事件订阅连接失败：instance={} error={}", m_instanceId, connection.lastError());
                 std::this_thread::sleep_for(std::chrono::seconds{1});
                 continue;
             }
             const std::array<std::string_view, 1> channels{m_options.channel};
             if (!connection.subscribe(channels))
             {
-                LOG_WARN_FMT("实时事件订阅失败：{}", connection.lastError());
+                m_subscriberConnected.store(false);
+                LOG_WARN_FMT("实时事件订阅失败：instance={} error={}", m_instanceId, connection.lastError());
                 connection.disconnect();
                 std::this_thread::sleep_for(std::chrono::seconds{1});
                 continue;
             }
+            m_subscriberConnected.store(true);
             while (!stopToken.stop_requested() && !m_stopping.load())
             {
                 const auto reply = connection.readPushReply(std::chrono::milliseconds{500});
@@ -171,6 +205,7 @@ namespace EdgePulse::Web
                 {
                     if (!connection.lastError().empty())
                     {
+                        m_subscriberConnected.store(false);
                         connection.disconnect();
                         break;
                     }
@@ -207,6 +242,7 @@ namespace EdgePulse::Web
                         });
             }
         }
+        m_subscriberConnected.store(false);
         connection.disconnect();
     }
 } // namespace EdgePulse::Web

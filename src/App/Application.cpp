@@ -42,6 +42,7 @@
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Metrics/BusinessMetrics.h"
+#include "Core/System/LeaderGate.h"
 #include "Core/System/LeaderLease.h"
 #include "Core/System/MigrationLock.h"
 #include "Core/System/MigrationRunner.h"
@@ -147,7 +148,7 @@ namespace EdgePulse::App
 
     Application::~Application()
     {
-        m_ready.store(false);
+        m_readiness.setServiceReady(false);
         // 先释放控制面租约，其他实例不必等 TTL 过期；循环已经停止，这里只做一次直连清理
         if (m_leaderLease)
         {
@@ -229,12 +230,13 @@ namespace EdgePulse::App
             m_browserWebSocket = std::make_shared<Web::BrowserWebSocket>();
             m_sseBroadcaster   = std::make_shared<Web::SseBroadcaster>();
             Web::RealtimeBusOptions realtimeOptions;
-            realtimeOptions.enabled  = m_configuration.redisEnabled;
-            realtimeOptions.host     = m_configuration.redisHost;
-            realtimeOptions.port     = m_configuration.redisPort;
-            realtimeOptions.password = m_configuration.redisPassword;
-            realtimeOptions.database = m_configuration.redisDatabase;
-            m_realtimeBus            = std::make_unique<Web::RealtimeBus>(loop, *m_browserWebSocket, *m_sseBroadcaster, std::move(realtimeOptions));
+            realtimeOptions.enabled    = m_configuration.redisEnabled;
+            realtimeOptions.instanceId = m_configuration.instanceId;
+            realtimeOptions.host       = m_configuration.redisHost;
+            realtimeOptions.port       = m_configuration.redisPort;
+            realtimeOptions.password   = m_configuration.redisPassword;
+            realtimeOptions.database   = m_configuration.redisDatabase;
+            m_realtimeBus              = std::make_unique<Web::RealtimeBus>(loop, *m_browserWebSocket, *m_sseBroadcaster, std::move(realtimeOptions));
             m_realtimeBus->start();
             m_nodeRepository = std::make_shared<Device::NodeRepository>(m_database);
             // 离线判定按进程汇总；仓储默认只看默认租户，周期扫描必须显式取全租户视图
@@ -369,14 +371,33 @@ namespace EdgePulse::App
                 LOG_INFO_FMT("UDP 遥测监听已排入事件循环：{}:{}", m_configuration.udpTelemetryAddress, m_configuration.udpTelemetryPort);
             }
 
-            m_databaseReady.store(m_database->probe(), std::memory_order_release);
+            m_readiness.setDatabaseReady(m_database->probe());
+            // 固件目录在首次上传前可能不存在；启动时补建一次，失败留给就绪探针持续报告
+            std::error_code firmwareDirectoryError;
+            std::filesystem::create_directories(m_configuration.firmwareDirectory, firmwareDirectoryError);
+            if (firmwareDirectoryError)
+            {
+                LOG_WARN_FMT("创建固件目录失败：{}：{}", m_configuration.firmwareDirectory, firmwareDirectoryError.message());
+            }
+            m_readiness.setFirmwareDirectoryReady(Web::probeDirectoryWritable(m_configuration.firmwareDirectory));
+            if (!m_readiness.snapshot().firmwareDirectoryReady)
+            {
+                LOG_WARN_FMT("固件目录不可写：{}；/readyz 将在目录恢复前返回 503", m_configuration.firmwareDirectory);
+            }
             m_healthProbe = std::jthread(
                     [this](const std::stop_token stopToken)
                     {
+                        std::uint64_t tick = 0;
                         while (!stopToken.stop_requested())
                         {
-                            m_databaseReady.store(m_database->probe(), std::memory_order_release);
-                            for (int tick = 0; tick < 20 && !stopToken.stop_requested(); ++tick)
+                            m_readiness.setDatabaseReady(m_database->probe());
+                            // 目录探针涉及一次磁盘写入，每十秒做一次即可，不能跟着 /readyz 的抓取频率跑
+                            if (tick % 5 == 0)
+                            {
+                                m_readiness.setFirmwareDirectoryReady(Web::probeDirectoryWritable(m_configuration.firmwareDirectory));
+                            }
+                            ++tick;
+                            for (int slice = 0; slice < 20 && !stopToken.stop_requested(); ++slice)
                             {
                                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
                             }
@@ -612,15 +633,12 @@ namespace EdgePulse::App
                 opsConfiguration.opsBearerToken                 = opsToken;
                 const AsynGyanis::Net::ReadinessCheck readiness = [this]() -> AsynGyanis::Net::ReadinessCheckResult
                 {
-                    if (!m_databaseReady.load(std::memory_order_acquire))
+                    if (m_realtimeBus)
                     {
-                        return {false, "数据库探针失败"};
+                        m_readiness.setRealtimeHealthy(m_realtimeBus->isHealthy());
                     }
-                    if (!m_ready.load(std::memory_order_acquire))
-                    {
-                        return {false, "服务正在停机或尚未就绪"};
-                    }
-                    return {true, ""};
+                    // 只读上一轮探针结论与原子量；真正的数据库、缓存、目录探测都在后台跑
+                    return m_readiness.check();
                 };
                 m_opsServer = std::make_unique<AsynGyanis::Net::HttpServer>(loop, *opsAddress);
                 m_opsServer->setLimits(limits);
@@ -641,14 +659,16 @@ namespace EdgePulse::App
         loop.scheduler().schedule(m_commandScheduler->handle());
         m_fleetLifecycle = runFleetLifecycle(loop);
         loop.scheduler().schedule(m_fleetLifecycle->handle());
-        // 幂等记录固定 24 小时 TTL，清理协程总要跑；遥测、日志与投递记录仍按各自保留天数决定是否删除
+        // 幂等记录固定 24 小时 TTL；清理与其它保留期任务一样只在 leader 上执行
         m_dataRetention = runDataRetention(loop);
         loop.scheduler().schedule(m_dataRetention->handle());
+        m_readinessProbe = runReadinessProbe(loop);
+        loop.scheduler().schedule(m_readinessProbe->handle());
         if (m_configuration.telemetryRetentionDays <= 0 && m_configuration.logRetentionDays <= 0 && m_configuration.deliveryRetentionDays <= 0)
         {
             LOG_WARN("遥测、日志与投递记录的保留天数都不是正数，三类记录不做过期清理；幂等记录仍按 TTL 清理");
         }
-        m_ready.store(true, std::memory_order_release);
+        m_readiness.setServiceReady(true);
         return true;
     }
 
@@ -656,9 +676,17 @@ namespace EdgePulse::App
     {
         AsynGyanis::Core::Timer                           ticker(loop);
         const std::shared_ptr<Command::CommandRepository> allCommands = m_commandRepository->scoped({0, true});
+        System::LeaderGate                                leaderGate(
+                "计划命令调度", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
+                [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
         while (true)
         {
             co_await ticker.waitFor(std::chrono::seconds{2});
+            // follower 只等待：计划命令是控制面单飞工作，多实例同时推进会把同一条命令重复下发
+            if (!leaderGate.allowsWork())
+            {
+                continue;
+            }
             std::vector<Command::CommandRecord> due;
             try
             {
@@ -713,11 +741,18 @@ namespace EdgePulse::App
         AsynGyanis::Core::Timer                                     ticker(loop);
         const std::shared_ptr<Telemetry::TelemetryRepository>       allTelemetry  = m_telemetryRepository->scoped({0, true});
         const std::shared_ptr<Notification::NotificationRepository> allDeliveries = m_notificationRepository->scoped({0, true});
-        bool                                                        firstRun      = true;
+        System::LeaderGate                                          leaderGate(
+                "数据保留期清理", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
+                [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
+        bool firstRun = true;
         while (true)
         {
-            // 重启后先尽快清一次，避免积压等到首个六小时周期
+            // 重启后先尽快清一次，避免积压等到首个六小时周期；尚未当选时保持首轮标记，当选后一分钟内补跑
             co_await ticker.waitFor(firstRun ? std::chrono::minutes{1} : std::chrono::hours{6});
+            if (!leaderGate.allowsWork())
+            {
+                continue;
+            }
             firstRun = false;
             // 三张表各自兜底，一张失败不拖住其余清理
             try
@@ -757,22 +792,68 @@ namespace EdgePulse::App
         }
     }
 
+    AsynGyanis::Core::Task<> Application::runReadinessProbe(AsynGyanis::Core::EventLoop &loop)
+    {
+        AsynGyanis::Core::Timer ticker(loop);
+        bool                    lastReady = true;
+        while (true)
+        {
+            bool ready = false;
+            try
+            {
+                ready = co_await m_cache->probe(loop);
+            } catch (const std::exception &failure)
+            {
+                LOG_WARN_FMT("缓存探针异常：backend={} error={}", m_cache->backendName(), failure.what());
+            }
+            // 只在状态翻转时记录，Redis 持续不可用期间不刷屏
+            if (ready != lastReady)
+            {
+                if (ready)
+                {
+                    LOG_INFO_FMT("缓存探针恢复：backend={}", m_cache->backendName());
+                } else
+                {
+                    LOG_WARN_FMT("缓存探针失败：backend={}；/readyz 将返回 503", m_cache->backendName());
+                }
+                lastReady = ready;
+            }
+            m_readiness.setCacheReady(ready);
+            // 每个实例都探测自己的缓存；Redis 启用时这是一次轻量 PING
+            co_await ticker.waitFor(std::chrono::seconds{10});
+        }
+    }
+
     AsynGyanis::Core::Task<> Application::runFleetLifecycle(AsynGyanis::Core::EventLoop &loop)
     {
         AsynGyanis::Core::Timer ticker(loop);
         const auto              allAlarms   = m_alarmRepository->scoped({0, true});
         const auto              allCommands = m_commandRepository->scoped({0, true});
         const auto              allFirmware = m_firmwareRepository->scoped({0, true});
-        bool                    firstRun    = true;
+        System::LeaderGate      sweepGate(
+                "离线扫描与告警评估", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
+                [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
+        bool firstRun = true;
         while (true)
         {
             // 首次延后十秒：给启动中的 Agent 留出重连窗口，避免把正在恢复的节点误判离线
             co_await ticker.waitFor(firstRun ? std::chrono::seconds{10} : std::chrono::seconds{m_configuration.offlineSweepSeconds});
             firstRun = false;
+            // 离线判定与离线告警只由 leader 执行；指标读数便宜，follower 也刷新，面板能看到每台实例的最新视图
+            if (sweepGate.allowsWork())
+            {
+                try
+                {
+                    const std::string cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{m_configuration.heartbeatTimeoutSeconds});
+                    co_await m_lifecycle->sweep(loop, cutoff);
+                } catch (const std::exception &failure)
+                {
+                    // 单轮失败（数据库抖动、临时锁冲突）不能终止周期任务，否则服务会永久停止判离线
+                    LOG_WARN_FMT("离线扫描失败：{}", failure.what());
+                }
+            }
             try
             {
-                const std::string cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{m_configuration.heartbeatTimeoutSeconds});
-                co_await m_lifecycle->sweep(loop, cutoff);
                 const Device::NodeStatusCounts counts = co_await m_fleetNodes->countByStatus(loop);
                 Metrics::BusinessMetrics::instance().setNodeCounts(counts.online, counts.offline);
                 Metrics::BusinessMetrics::instance().setAgentCertificatesExpiring(co_await m_fleetNodes->countExpiringCertificates(loop, 7));
@@ -781,8 +862,7 @@ namespace EdgePulse::App
                 Metrics::BusinessMetrics::instance().setUnsignedFirmware(co_await allFirmware->unsignedCount(loop));
             } catch (const std::exception &failure)
             {
-                // 单轮失败（数据库抖动、临时锁冲突）不能终止周期任务，否则服务会永久停止判离线
-                LOG_WARN_FMT("离线扫描或指标刷新失败：{}", failure.what());
+                LOG_WARN_FMT("业务指标刷新失败：{}", failure.what());
             }
         }
     }
@@ -974,7 +1054,7 @@ namespace EdgePulse::App
             return;
         }
         // 先让 /readyz 变 503，再停止接新连接并排空在途请求
-        m_ready.store(false, std::memory_order_release);
+        m_readiness.setServiceReady(false);
         // 停止请求一到达就释放租约；stop 幂等，析构时再调不会重复清库
         if (m_leaderLease)
         {

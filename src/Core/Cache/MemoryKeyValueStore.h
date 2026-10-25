@@ -83,6 +83,13 @@ namespace EdgePulse::Cache
         AsynGyanis::Core::Task<std::int64_t> increment(AsynGyanis::Core::EventLoop &loop, std::string key, std::chrono::seconds ttl) override;
 
         /**
+         * @brief 探针
+         * @param loop 恢复协程用的事件循环
+         * @return bool 恒为 true
+         */
+        AsynGyanis::Core::Task<bool> probe(AsynGyanis::Core::EventLoop &loop) override;
+
+        /**
          * @brief 后端名称
          * @return std::string_view memory
          */

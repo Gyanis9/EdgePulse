@@ -12,6 +12,7 @@
 #include "Base/Config/ConfigValue.h"
 #include "Core/Coroutine/Task.h"
 #include "Core/EventLoop/EventLoop.h"
+#include "Net/Http/Server/ReadinessCheck.h"
 
 #include <cstdint>
 #include <functional>
@@ -72,9 +73,10 @@ namespace EdgePulse::TestSupport
         /**
          * @brief 起一台监听 127.0.0.1:0 的服务器
          * @param configure 路由注册回调，在 start() 之前执行
+         * @param readiness 可选的 /readyz 依赖检查；留空时不注册就绪端点
          * @throws std::runtime_error 端口未能在时限内就绪
          */
-        explicit ServerHarness(const std::function<void(AsynGyanis::Net::Router &, AsynGyanis::Core::EventLoop &)> &configure);
+        explicit ServerHarness(const std::function<void(AsynGyanis::Net::Router &, AsynGyanis::Core::EventLoop &)> &configure, AsynGyanis::Net::ReadinessCheck readiness = {});
 
         ~ServerHarness();
 

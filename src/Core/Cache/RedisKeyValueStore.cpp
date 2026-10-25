@@ -154,6 +154,24 @@ namespace EdgePulse::Cache
                               }));
     }
 
+    AsynGyanis::Core::Task<bool> RedisKeyValueStore::probe(AsynGyanis::Core::EventLoop &loop)
+    {
+        co_return co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop, std::function<bool()>(
+                                                                                                [this]() -> bool
+                                                                                                {
+                                                                                                    try
+                                                                                                    {
+                                                                                                        std::lock_guard<std::mutex> lock(m_mutex);
+                                                                                                        const auto                  result = executeLocked("PING", {});
+                                                                                                        return result->next();
+                                                                                                    } catch (const std::exception &)
+                                                                                                    {
+                                                                                                        // 探针只回答可用性；具体错误由常规缓存操作记录，避免就绪探针刷屏
+                                                                                                        return false;
+                                                                                                    }
+                                                                                                }));
+    }
+
     std::string_view RedisKeyValueStore::backendName() const noexcept
     {
         return "redis";

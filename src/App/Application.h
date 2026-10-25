@@ -10,6 +10,7 @@
 #pragma once
 
 #include "App/ApplicationConfiguration.h"
+#include "Core/Http/ReadinessState.h"
 #include "Core/Metrics/ProcessMetricsRegistry.h"
 
 #include <atomic>
@@ -200,6 +201,13 @@ namespace EdgePulse::App
         AsynGyanis::Core::Task<> runDataRetention(AsynGyanis::Core::EventLoop &loop);
 
         /**
+         * @brief 周期探测缓存后端并更新就绪状态
+         * @param loop 服务器所属事件循环
+         * @return AsynGyanis::Core::Task<> 周期协程，活到应用析构
+         */
+        AsynGyanis::Core::Task<> runReadinessProbe(AsynGyanis::Core::EventLoop &loop);
+
+        /**
          * @brief 周期扫描心跳超时的节点并刷新业务指标
          * @param loop 服务器所属事件循环
          * @return AsynGyanis::Core::Task<> 周期协程，活到应用析构
@@ -270,6 +278,7 @@ namespace EdgePulse::App
         std::optional<AsynGyanis::Core::Task<>>                   m_commandScheduler;       ///< 计划命令推进协程
         std::optional<AsynGyanis::Core::Task<>>                   m_fleetLifecycle;         ///< 离线扫描与指标刷新协程
         std::optional<AsynGyanis::Core::Task<>>                   m_dataRetention;          ///< 数据保留期清理协程
+        std::optional<AsynGyanis::Core::Task<>>                   m_readinessProbe;         ///< 缓存探针协程
         std::shared_ptr<Command::AgentChannelRegistry>            m_agentChannels;          ///< Agent 长连接
         std::shared_ptr<Ops::OpsRepository>                       m_opsRepository;          ///< 运维总览
         std::shared_ptr<Web::SseBroadcaster>                      m_sseBroadcaster;         ///< 告警 SSE
@@ -292,8 +301,7 @@ namespace EdgePulse::App
         std::jthread                                              m_healthProbe;            ///< 数据库健康探针
         std::unique_ptr<AsynGyanis::Net::OtlpHttpMetricsExporter> m_metricsExporter;        ///< OTLP 读数出口
         std::optional<AsynGyanis::Core::ProcessMetricHandle>      m_buildInfoMetric;        ///< 构建信息读数
-        std::atomic<bool>                                         m_ready{false};           ///< 就绪探针的对外状态
-        std::atomic<bool>                                         m_databaseReady{true};    ///< 最近一轮数据库探针
+        Web::ReadinessState                                       m_readiness;              ///< /readyz 的依赖快照
         std::atomic<bool>                                         m_stopRequested{false};
     };
 } // namespace EdgePulse::App

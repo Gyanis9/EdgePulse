@@ -91,6 +91,12 @@ namespace EdgePulse::Cache
         return "memory";
     }
 
+    AsynGyanis::Core::Task<bool> MemoryKeyValueStore::probe(AsynGyanis::Core::EventLoop &)
+    {
+        // 进程内存储没有外部依赖，能调度到本协程即代表可用
+        co_return true;
+    }
+
     std::size_t MemoryKeyValueStore::size() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);

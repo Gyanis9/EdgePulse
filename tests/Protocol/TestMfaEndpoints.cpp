@@ -138,6 +138,11 @@ namespace
             return m_inner->backendName();
         }
 
+        AsynGyanis::Core::Task<bool> probe(AsynGyanis::Core::EventLoop &loop) override
+        {
+            co_return co_await m_inner->probe(loop);
+        }
+
     private:
         std::shared_ptr<EdgePulse::Cache::KeyValueStore> m_inner; ///< 实际存储
     };

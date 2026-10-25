@@ -209,6 +209,7 @@ TEST(ExternalStores, RedisKeyValueStoreRoundTrip)
 
     EdgePulse::Cache::RedisKeyValueStore    store(*host, environmentPort("EDGEPULSE_TEST_REDIS_PORT", 6379), password.value_or(""), 15);
     EdgePulse::TestSupport::EventLoopRunner runner;
+    EXPECT_TRUE(runner.run(store.probe(runner.loop())));
 
     const std::string base = "edgepulse:acceptance:" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     EXPECT_FALSE(runner.run(store.get(runner.loop(), base)).has_value());

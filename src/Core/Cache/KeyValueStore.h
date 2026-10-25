@@ -82,6 +82,14 @@ namespace EdgePulse::Cache
         virtual AsynGyanis::Core::Task<std::int64_t> increment(AsynGyanis::Core::EventLoop &loop, std::string key, std::chrono::seconds ttl) = 0;
 
         /**
+         * @brief 探测后端是否可用，供就绪探针使用
+         * @param loop 恢复协程用的事件循环
+         * @return bool 后端应答正常时为 true；连接失败或命令失败时为 false，不抛异常
+         * @note 只做一次轻量往返，不读写业务键；调用方按周期调用并缓存结果
+         */
+        virtual AsynGyanis::Core::Task<bool> probe(AsynGyanis::Core::EventLoop &loop) = 0;
+
+        /**
          * @brief 后端名称，用于日志与诊断
          * @return std::string_view memory 或 redis
          */

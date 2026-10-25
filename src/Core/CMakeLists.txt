@@ -42,6 +42,7 @@ add_library(edgepulse-core STATIC
         Http/IdempotencyRepository.cpp
         Http/MiddlewareSetup.cpp
         Http/RealtimeBus.cpp
+        Http/ReadinessState.cpp
         Http/ReverseProxy.cpp
         Http/RequestId.cpp
         Http/SseBroadcaster.cpp
@@ -53,6 +54,7 @@ add_library(edgepulse-core STATIC
         Notification/SmtpMailer.cpp
         Ops/OpsRepository.cpp
         System/DictionaryRepository.cpp
+        System/LeaderGate.cpp
         System/LeaderLease.cpp
         System/LogRepository.cpp
         System/MenuRepository.cpp
