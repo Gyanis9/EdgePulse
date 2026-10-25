@@ -3,7 +3,6 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
-#include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/AgentCertificateAuthority.h"
 #include "Core/Device/AgentCertificateRepository.h"
@@ -280,7 +279,6 @@ protected:
         m_enrollments = std::make_shared<EdgePulse::Device::EnrollmentService>(m_enrollRepo);
         m_registry    = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, EdgePulse::Device::AgentRegistry::Options{});
         m_commands    = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
-        m_channels    = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
         m_telemetry   = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
         m_alarmRepo   = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
         m_alarms      = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
@@ -292,7 +290,6 @@ protected:
         m_alarms.reset();
         m_alarmRepo.reset();
         m_telemetry.reset();
-        m_channels.reset();
         m_commands.reset();
         m_registry.reset();
         m_enrollments.reset();
@@ -516,7 +513,6 @@ protected:
     std::shared_ptr<EdgePulse::Device::EnrollmentService>       m_enrollments;
     std::shared_ptr<EdgePulse::Device::AgentRegistry>           m_registry;
     std::shared_ptr<EdgePulse::Command::CommandRepository>      m_commands;
-    std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>   m_channels;
     std::shared_ptr<EdgePulse::Telemetry::TelemetryRepository>  m_telemetry;
     std::shared_ptr<EdgePulse::Alarm::AlarmRepository>          m_alarmRepo;
     std::shared_ptr<EdgePulse::Alarm::AlarmService>             m_alarms;

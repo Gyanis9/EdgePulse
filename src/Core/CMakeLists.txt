@@ -19,6 +19,7 @@ add_library(edgepulse-core STATIC
         Alarm/AlarmService.cpp
         Command/AgentChannelRegistry.cpp
         Command/AgentCommandDelivery.cpp
+        Command/CommandPublishThrottle.cpp
         Command/CommandRepository.cpp
         Device/AgentAuthorization.cpp
         Device/AgentCertificateAuthority.cpp

@@ -131,7 +131,16 @@ namespace EdgePulse::Agent
 
     bool CommandDispatcher::alreadyHandled(const std::int64_t commandId) const
     {
-        return m_inFlight.contains(commandId) || m_completed.contains(commandId) || m_state.hasResult(commandId);
+        if (m_inFlight.contains(commandId) || m_completed.contains(commandId) || m_state.hasResult(commandId))
+        {
+            return true;
+        }
+        return std::any_of(m_pending.begin(), m_pending.end(), [commandId](const AgentCommand &pending) { return pending.id == commandId; });
+    }
+
+    bool CommandDispatcher::hasInFlight() const
+    {
+        return m_executing || !m_inFlight.empty() || !m_pending.empty();
     }
 
     void CommandDispatcher::rememberCompleted(const std::int64_t commandId)
@@ -215,6 +224,44 @@ namespace EdgePulse::Agent
         co_return;
     }
 
+    AsynGyanis::Core::Task<> CommandDispatcher::runExclusive(AgentCommand command)
+    {
+        m_executing = true;
+        struct ExecutingReset
+        {
+            bool &executing; ///< 分发器的串行执行标记
+
+            ~ExecutingReset()
+            {
+                executing = false;
+            }
+        } reset{m_executing};
+
+        for (;;)
+        {
+            const bool        restartAfterResult = co_await execute(std::move(command));
+            const ResultFlush flushed            = co_await flushResults();
+            if (flushed.failed)
+            {
+                LOG_WARN("命令结果未获服务端确认，已留在本地队列等待重试");
+            }
+            if (restartAfterResult)
+            {
+                // 结果行已入队并尝试上报；即使上报失败也重启，队列会在新进程里继续补报。
+                // 进程即将重启，等待队列里的命令不再执行
+                co_await triggerRestart();
+                co_return;
+            }
+            if (m_pending.empty())
+            {
+                co_return;
+            }
+            command = std::move(m_pending.front());
+            m_pending.pop_front();
+            LOG_INFO_FMT("开始执行排队命令：command={} type={}", command.id, command.type);
+        }
+    }
+
     AsynGyanis::Core::Task<> CommandDispatcher::onWebSocketCommand(AgentCommand command)
     {
         if (command.id <= 0)
@@ -224,21 +271,18 @@ namespace EdgePulse::Agent
         }
         if (alreadyHandled(command.id))
         {
-            LOG_WARN_FMT("命令 {} 正在执行、已有结果或已执行完成，忽略重复投递", command.id);
+            LOG_WARN_FMT("命令 {} 正在执行、排队中、已有结果或已执行完成，忽略重复投递", command.id);
+            co_return;
+        }
+        if (m_executing)
+        {
+            // 执行器可能已经挂起等待网络或外部进程；新命令只排队，不能在同一循环上并发跑第二个
+            LOG_INFO_FMT("命令正在执行，命令 {} 进入等待队列", command.id);
+            m_pending.push_back(std::move(command));
             co_return;
         }
 
-        const bool        restartAfterResult = co_await execute(std::move(command));
-        const ResultFlush flushed            = co_await flushResults();
-        if (flushed.failed)
-        {
-            LOG_WARN("命令结果未获服务端确认，已留在本地队列等待重试");
-        }
-        if (restartAfterResult)
-        {
-            // 结果行已入队并尝试上报；即使上报失败也重启，队列会在新进程里继续补报
-            co_await triggerRestart();
-        }
+        co_await runExclusive(std::move(command));
         co_return;
     }
 
@@ -249,9 +293,9 @@ namespace EdgePulse::Agent
             LOG_WARN_FMT("命令正文无效且没有可用的标识，无法上报失败结果：{}", message);
             co_return;
         }
-        if (m_inFlight.contains(commandId) || m_completed.contains(commandId) || m_state.hasResult(commandId))
+        if (alreadyHandled(commandId))
         {
-            LOG_WARN_FMT("命令 {} 正在执行、已执行完成或已有结果，忽略失败上报", commandId);
+            LOG_WARN_FMT("命令 {} 正在执行、排队中、已执行完成或已有结果，忽略失败上报", commandId);
             co_return;
         }
 

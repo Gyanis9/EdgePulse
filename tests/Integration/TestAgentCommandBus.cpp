@@ -35,10 +35,11 @@ namespace
      */
     struct EnvelopeCapture
     {
-        std::mutex               mutex;       ///< 保护 envelopes
-        std::vector<std::string> envelopes;   ///< 已发出的信封，按发送顺序
-        std::atomic<int>         calls{0};    ///< PUBLISH 调用次数
-        std::atomic<int>         connects{0}; ///< connect 调用次数
+        std::mutex               mutex;                ///< 保护 envelopes
+        std::vector<std::string> envelopes;            ///< 已发出的信封，按发送顺序
+        std::atomic<int>         calls{0};             ///< PUBLISH 调用次数
+        std::atomic<int>         connects{0};          ///< connect 调用次数
+        std::atomic<int>         failuresRemaining{0}; ///< 接下来多少次 PUBLISH 返回失败
     };
 
     /**
@@ -77,11 +78,16 @@ namespace
 
         [[nodiscard]] bool publish(std::string_view, std::string_view envelope) override
         {
+            m_capture->calls.fetch_add(1, std::memory_order_release);
+            if (m_capture->failuresRemaining.load(std::memory_order_acquire) > 0)
+            {
+                m_capture->failuresRemaining.fetch_sub(1, std::memory_order_acq_rel);
+                return false;
+            }
             {
                 const std::lock_guard lock(m_capture->mutex);
                 m_capture->envelopes.emplace_back(envelope);
             }
-            m_capture->calls.fetch_add(1, std::memory_order_release);
             return true;
         }
 
@@ -290,13 +296,27 @@ TEST(AgentCommandBus, MarksDispatchedOnlyAfterSuccessfulSend)
     auto first = runner.run(commands->create(runner.loop(), node.id, "reboot", "{}", 1, 60));
     ASSERT_TRUE(first.has_value());
 
-    EdgePulse::Command::AgentChannelRegistry channels;
-    EdgePulse::Command::AgentCommandDelivery delivery(channels, commands->scoped({0, true}));
+    EdgePulse::Command::AgentChannelRegistry       channels;
+    std::mutex                                     notifiedMutex;
+    std::vector<EdgePulse::Command::CommandRecord> notified;
+    EdgePulse::Command::AgentCommandDelivery       delivery(channels, commands->scoped({0, true}),
+                                                            [&notified, &notifiedMutex](const EdgePulse::Command::CommandRecord &command) -> Task<>
+                                                            {
+                                                          {
+                                                              const std::lock_guard lock(notifiedMutex);
+                                                              notified.push_back(command);
+                                                          }
+                                                          co_return;
+                                                            });
 
     runner.run(delivery.deliver(runner.loop(), EdgePulse::Command::makeAgentCommandMessage(*first)));
     auto stored = runner.run(commands->find(runner.loop(), first->id));
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ("pending", stored->status) << "没有连接时命令必须保持待执行";
+    {
+        const std::lock_guard lock(notifiedMutex);
+        EXPECT_TRUE(notified.empty()) << "没有写出时不能通知浏览器";
+    }
 
     auto capture = std::make_shared<PeerCapture>();
     auto peer    = makePeer(capture);
@@ -306,6 +326,13 @@ TEST(AgentCommandBus, MarksDispatchedOnlyAfterSuccessfulSend)
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ("running", stored->status);
     ASSERT_FALSE(stored->dispatchedAt.empty());
+    {
+        const std::lock_guard lock(notifiedMutex);
+        ASSERT_EQ(1U, notified.size()) << "写出并推进成功后应补发一次 command.status";
+        EXPECT_EQ(first->id, notified[0].id);
+        EXPECT_EQ("running", notified[0].status);
+        EXPECT_EQ("reboot", notified[0].type);
+    }
     {
         const std::string frame = lastFrame(capture);
         ASSERT_FALSE(frame.empty());
@@ -323,6 +350,10 @@ TEST(AgentCommandBus, MarksDispatchedOnlyAfterSuccessfulSend)
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ("pending", stored->status) << "写出失败不能把命令标成已下发";
     EXPECT_FALSE(failingPeer->isOpen());
+    {
+        const std::lock_guard lock(notifiedMutex);
+        EXPECT_EQ(1U, notified.size()) << "写出失败不能通知浏览器";
+    }
 }
 
 // 钉住：close 消息关闭本地连接并摘表，状态码与原因随帧带到对端
@@ -351,6 +382,53 @@ TEST(AgentCommandBus, CloseMessageClosesAndUnregistersPeer)
     EXPECT_EQ(static_cast<unsigned char>(0x88), static_cast<unsigned char>(frame[0])) << "最后一帧必须是 Close";
     EXPECT_EQ(1008, (static_cast<int>(static_cast<unsigned char>(frame[2])) << 8) | static_cast<int>(static_cast<unsigned char>(frame[3])));
     EXPECT_NE(std::string::npos, frame.find("certificate revoked"));
+}
+
+// 钉住：关闭消息发布失败时最多重试三次，命令消息只发布一次
+TEST(AgentCommandBus, ClosePublishRetriesBounded)
+{
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Web::BrowserWebSocket        webSocket;
+    EdgePulse::Web::SseBroadcaster          sse;
+
+    auto capture = std::make_shared<EnvelopeCapture>();
+
+    EdgePulse::Web::RealtimeBusOptions options;
+    options.enabled          = true;
+    options.instanceId       = "node-a";
+    options.startSubscriber  = false;
+    options.publisherFactory = [capture] { return std::make_unique<CapturingPublisher>(capture); };
+    options.localDelivery    = [](std::string_view, std::int64_t, std::string_view) -> Task<> { co_return; };
+
+    EdgePulse::Web::RealtimeBus bus(runner.loop(), webSocket, sse, std::move(options));
+    bus.start();
+
+    capture->failuresRemaining.store(1, std::memory_order_release);
+    runner.run(bus.publishAgent(runner.loop(), AgentMessage{.nodeId = 9, .payload = R"({"type":"command"})", .commandId = 5}));
+    EXPECT_EQ(1, capture->calls.load(std::memory_order_acquire)) << "命令消息不能重试";
+    // 发布连接已被标成不健康：后续命令直接跳过，不再产生 PUBLISH 调用
+    runner.run(bus.publishAgent(runner.loop(), AgentMessage{.nodeId = 9, .payload = R"({"type":"command"})", .commandId = 6}));
+    EXPECT_EQ(1, capture->calls.load(std::memory_order_acquire));
+
+    // start() 重建连接并把健康标记拉回来；下面单独验证关闭消息的重试次数
+    bus.start();
+    capture->failuresRemaining.store(2, std::memory_order_release);
+    runner.run(bus.publishAgent(runner.loop(), AgentMessage{.nodeId = 9, .close = true, .closeCode = 1008, .closeReason = "certificate revoked"}));
+    EXPECT_EQ(4, capture->calls.load(std::memory_order_acquire)) << "关闭消息第三次尝试应成功";
+    {
+        const std::lock_guard lock(capture->mutex);
+        ASSERT_EQ(1U, capture->envelopes.size());
+        const auto envelope = AsynGyanis::Base::parseConfigValue(capture->envelopes[0]);
+        ASSERT_TRUE(envelope.has_value());
+        EXPECT_TRUE((envelope->value("close", false)));
+    }
+
+    capture->failuresRemaining.store(5, std::memory_order_release);
+    runner.run(bus.publishAgent(runner.loop(), AgentMessage{.nodeId = 9, .close = true, .closeCode = 1008, .closeReason = "node deleted"}));
+    EXPECT_EQ(7, capture->calls.load(std::memory_order_acquire)) << "关闭消息最多尝试三次，不能无限重试";
+    // 三次都失败后连接被标成不健康，再投一条关闭消息不会继续尝试
+    runner.run(bus.publishAgent(runner.loop(), AgentMessage{.nodeId = 9, .close = true, .closeCode = 1008, .closeReason = "node deleted"}));
+    EXPECT_EQ(7, capture->calls.load(std::memory_order_acquire));
 }
 
 // 钉住：两个实例共享 Redis 时，Agent 消息由远端 handler 收到，本地 handler 也收到，浏览器扇出两侧都不碰（真实 Redis，缺环境变量即跳过）
@@ -396,6 +474,9 @@ TEST(AgentCommandBus, RedisFanoutReachesAgentHandlerOnSecondInstance)
         browserB.fetch_add(1, std::memory_order_release);
         co_return;
     };
+    // 远端实例的发布连接换成计数器：订阅线程收到消息后若二次发布，这个计数会变
+    auto republishCapture     = std::make_shared<EnvelopeCapture>();
+    optionsB.publisherFactory = [republishCapture] { return std::make_unique<CapturingPublisher>(republishCapture); };
 
     EdgePulse::Web::RealtimeBus busA(runnerA.loop(), webSocketA, sseA, std::move(optionsA));
     EdgePulse::Web::RealtimeBus busB(runnerB.loop(), webSocketB, sseB, std::move(optionsB));
@@ -437,4 +518,7 @@ TEST(AgentCommandBus, RedisFanoutReachesAgentHandlerOnSecondInstance)
     EXPECT_EQ(1, localAgentDeliveries.load(std::memory_order_acquire)) << "发布实例也必须本地投递一次";
     EXPECT_EQ(0, browserA.load(std::memory_order_acquire));
     EXPECT_EQ(0, browserB.load(std::memory_order_acquire)) << "agent 消息不能进入远端浏览器扇出";
+    // 静默窗口：远端 handler 已收到，订阅路径没有二次发布，计数在窗口内必须保持 0
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    EXPECT_EQ(0, republishCapture->calls.load(std::memory_order_acquire)) << "远端订阅线程不能把收到的 Agent 消息重新发布";
 }

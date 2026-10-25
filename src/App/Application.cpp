@@ -63,6 +63,7 @@
 #include "Core/Firmware/FirmwareSignatureVerifier.h"
 #include "Core/Firmware/FirmwareSigningPolicy.h"
 #include "Core/Command/CommandRepository.h"
+#include "Core/Command/CommandPublishThrottle.h"
 #include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Ops/OpsRepository.h"
@@ -112,6 +113,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 
 namespace EdgePulse::App
 {
@@ -361,8 +363,11 @@ namespace EdgePulse::App
             m_commandRepository = std::make_shared<Command::CommandRepository>(m_database);
             m_agentChannels     = std::make_shared<Command::AgentChannelRegistry>();
             // Agent 消息的本地投递口：通道写出成功后才把命令从 pending 推进到 running；
-            // 本实例没有连接时保持待执行，跨实例转发由总线继续完成
-            auto agentCommandDelivery = std::make_shared<Command::AgentCommandDelivery>(*m_agentChannels, m_commandRepository->scoped({0, true}));
+            // 本实例没有连接时保持待执行，跨实例转发由总线继续完成。推进成功后补发一次
+            // command.status，浏览器不必等下一次列表刷新才能看到 running
+            auto agentCommandDelivery = std::make_shared<Command::AgentCommandDelivery>(*m_agentChannels, m_commandRepository->scoped({0, true}),
+                                                                                        [this](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
+                                                                                        { co_await publishCommandStatus(command); });
             m_realtimeBus->setAgentMessageHandler([agentCommandDelivery, &loop](const Web::AgentMessage &message) -> AsynGyanis::Core::Task<>
                                                   { co_await agentCommandDelivery->deliver(loop, message); });
             // 投递口先就位再开订阅：启动窗口里到达的远端 Agent 命令不会因 handler 为空被丢弃
@@ -700,9 +705,12 @@ namespace EdgePulse::App
         System::LeaderGate                                leaderGate(
                 "计划命令调度", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
                 [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
+        // 没有 Agent 连接时到期命令会一直留在 pending；同一命令每 2 秒重发一次只会制造无意义的
+        // 跨实例扇出，因此 leader 在内存里按命令标识节流。领导权切换后新 leader 从空表开始
+        Command::CommandPublishThrottle dueThrottle;
         // follower 只等待：计划命令是控制面单飞工作，多实例同时推进会把同一条命令重复下发
         System::LeaderTick leaderTick(leaderGate,
-                                      [this, &loop, allCommands]() -> AsynGyanis::Core::Task<>
+                                      [this, &loop, allCommands, &dueThrottle]() -> AsynGyanis::Core::Task<>
                                       {
                                           std::vector<Command::CommandRecord> due;
                                           try
@@ -713,11 +721,24 @@ namespace EdgePulse::App
                                               LOG_WARN_FMT("计划命令扫描失败：{}", failure.what());
                                               co_return;
                                           }
+                                          std::unordered_set<std::int64_t> dueIds;
+                                          dueIds.reserve(due.size());
+                                          for (const Command::CommandRecord &command: due)
+                                          {
+                                              dueIds.insert(command.id);
+                                          }
+                                          // 已执行、已取消或计划时间未到的命令不会再出现在 due 里，
+                                          // 对应节流记录随之清掉，标识表不会无限增长
+                                          dueThrottle.prune(dueIds);
                                           for (const Command::CommandRecord &command: due)
                                           {
                                               try
                                               {
                                                   if (m_realtimeBus == nullptr)
+                                                  {
+                                                      continue;
+                                                  }
+                                                  if (!dueThrottle.shouldPublish(command.id))
                                                   {
                                                       continue;
                                                   }

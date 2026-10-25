@@ -137,9 +137,11 @@ namespace EdgePulse::Web
     /**
      * @brief 实时事件总线
      * @details publish() 先在本进程扇出（WebSocket 与告警 SSE），再把同一事件以带实例标识的信封发到 Redis；
-     *          订阅线程收到其他实例的信封后投回本循环，只做本地扇出，不再二次发布。
-     * @note publish() 在服务器循环上调用，只做本地扇出与一次不等待的 PUBLISH 尝试，不重连也不 PING；
-     *       发布连接的恢复只由订阅线程在后台完成
+     *          publishAgent() 走同一条频道，但只投给本实例登记的 Agent 投递口，不进入浏览器扇出。
+     *          订阅线程按信封的 target 字段分流：agent 投回本循环的 Agent handler，browser（含缺省
+     *          target 的旧信封）走本地浏览器扇出；两条路径都不再二次发布。
+     * @note publish() 与 publishAgent() 都在服务器循环上调用，只做本地投递与不等待的 PUBLISH 尝试，
+     *       不重连也不 PING；发布连接的恢复只由订阅线程在后台完成
      */
     class RealtimeBus
     {
@@ -197,11 +199,15 @@ namespace EdgePulse::Web
 
         /**
          * @brief 把一条 Agent 消息投给本地连接并转发给其它实例
-         * @param loop 调用方循环；本地 handler 直接在该循环上运行
+         * @param loop 调用方所在的循环；本地 handler 在该循环上就地执行
          * @param message 目标节点、命令正文或关闭指令
-         * @return AsynGyanis::Core::Task<> 本地投递与一次 PUBLISH 尝试完成即返回
-         * @note 本地 handler 先执行；本地失败不影响跨实例转发。未启用 Redis 时只做本地投递，
-         *       没有本地连接时是空操作，命令行保持待执行，等待 Agent 轮询
+         * @return AsynGyanis::Core::Task<> 本地投递与 PUBLISH 尝试完成即返回
+         * @throws std::logic_error 当前协程不在 loop 指定的循环上：本地 handler 会就地写出
+         *         Agent 连接，跨线程执行会把连接访问放到错误的线程
+         * @note 本地 handler 先执行；本地失败不影响跨实例转发。远端消息由总线订阅线程投回
+         *       总线自身的服务器循环。未启用 Redis 时只做本地投递，没有本地连接时是空操作，
+         *       命令行保持待执行。关闭消息的 PUBLISH 失败时最多重试三次（同一条连接上立即重试），
+         *       命令消息只尝试一次。
          */
         AsynGyanis::Core::Task<> publishAgent(AsynGyanis::Core::EventLoop &loop, AgentMessage message);
 

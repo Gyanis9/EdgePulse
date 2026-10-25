@@ -401,8 +401,12 @@ namespace EdgePulse::Agent
                         }
                     }
                     // hello 与通道登记之间存在空窗：即使 WebSocket 已连接，也每轮心跳补拉一次，
-                    // 让空窗里创建的命令最迟在一个心跳周期内被执行；重复投递由分发器去重
-                    co_await dispatcher.pollOnce();
+                    // 让空窗里创建的命令最迟在一个心跳周期内被执行；重复投递由分发器去重。
+                    // 已有命令在执行时不拉新命令，避免把更多命令提前标成 running 后堆在本地队列
+                    if (!dispatcher.hasInFlight())
+                    {
+                        co_await dispatcher.pollOnce();
+                    }
                     const ResultFlush flushed = co_await dispatcher.flushResults();
                     if (flushed.failed)
                     {
@@ -502,11 +506,19 @@ namespace EdgePulse::Agent
                 }
                 if (flags.fallback.shouldPoll())
                 {
-                    co_await dispatcher.pollOnce();
-                    const ResultFlush flushed = co_await dispatcher.flushResults();
-                    if (flushed.failed)
+                    // 命令执行可能跨越多个轮询节拍；已有命令在跑时不拉新命令，WS 与心跳补拉
+                    // 若在拉取途中撞上执行中的命令，分发器会把取回的命令排队
+                    if (dispatcher.hasInFlight())
                     {
-                        LOG_WARN("命令结果上报未完成，将在下一轮轮询后重试");
+                        LOG_DEBUG("命令仍在执行，本轮轮询跳过");
+                    } else
+                    {
+                        co_await dispatcher.pollOnce();
+                        const ResultFlush flushed = co_await dispatcher.flushResults();
+                        if (flushed.failed)
+                        {
+                            LOG_WARN("命令结果上报未完成，将在下一轮轮询后重试");
+                        }
                     }
                 }
                 std::chrono::seconds delay = flags.fallback.nextPollDelay(disconnectedInterval);

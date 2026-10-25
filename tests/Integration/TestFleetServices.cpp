@@ -2,6 +2,7 @@
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Command/CommandRepository.h"
+#include "Core/Command/CommandPublishThrottle.h"
 #include "Core/Device/NodeGroupRepository.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareRepository.h"
@@ -191,6 +192,32 @@ TEST(FleetServices, ScheduledCommandsWaitForDueTime)
     const auto next = runner.run(repository.takeNext(runner.loop(), nodeId));
     ASSERT_TRUE(next.has_value());
     EXPECT_EQ(due->id, next->id);
+}
+
+// 钉住：同一计划命令在节流间隔内不重复发布，间隔到点后允许重试；离开到期集合后清掉记录
+TEST(FleetServices, CommandPublishThrottleSeparatesRetries)
+{
+    std::chrono::steady_clock::time_point      now{};
+    EdgePulse::Command::CommandPublishThrottle throttle(EdgePulse::Command::CommandPublishThrottle::kDefaultInterval, [&now] { return now; });
+
+    EXPECT_TRUE(throttle.shouldPublish(42)) << "首次到期必须发布";
+    EXPECT_FALSE(throttle.shouldPublish(42)) << "同一命令在同一时刻不能重复发布";
+    EXPECT_TRUE(throttle.shouldPublish(43)) << "不同命令各自计时";
+    EXPECT_EQ(2U, throttle.trackedCount());
+
+    now += std::chrono::seconds{29};
+    EXPECT_FALSE(throttle.shouldPublish(42)) << "未满 30 秒不得重试";
+    now += std::chrono::seconds{1};
+    EXPECT_TRUE(throttle.shouldPublish(42)) << "满 30 秒后允许重试一次";
+    EXPECT_FALSE(throttle.shouldPublish(42)) << "重试之后重新计时";
+
+    // 42 已离开到期集合（执行完/取消），43 仍在：只清掉 42
+    throttle.prune({43});
+    EXPECT_EQ(1U, throttle.trackedCount());
+    EXPECT_TRUE(throttle.shouldPublish(42)) << "清掉记录后同标识再次到期要重新发布";
+
+    throttle.prune({});
+    EXPECT_EQ(0U, throttle.trackedCount());
 }
 
 // 钉住：任务记录下发前版本，回滚目标与节点上一版本都能取回

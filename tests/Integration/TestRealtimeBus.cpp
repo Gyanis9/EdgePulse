@@ -7,15 +7,19 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -454,4 +458,98 @@ TEST(RealtimeBus, BusyPublisherLockSkipsWithoutBlockingLoop)
     // 锁释放后同一条发布路径仍能正常转发
     runner.run(bus.publish("alarms", 7, payload));
     EXPECT_EQ(2, state->publishCalls.load(std::memory_order_relaxed));
+}
+
+// 钉住：instance / target / payload 类型不合法的信封只丢弃该条，订阅线程不能退出；
+// 缺省 target 的旧信封按 browser 处理，后续合法事件仍能送达（真实 Redis，缺环境变量即跳过）
+TEST(RealtimeBus, RedisSubscriberSurvivesMalformedEnvelopes)
+{
+    const std::optional<std::string> host = environmentText("EDGEPULSE_TEST_REDIS_HOST");
+    if (!host.has_value())
+    {
+        GTEST_SKIP() << "缺少 EDGEPULSE_TEST_REDIS_HOST，跳过真实 Redis 用例";
+    }
+    const std::string password = environmentText("EDGEPULSE_TEST_REDIS_PASSWORD").value_or("");
+    const std::string channel  = "edgepulse:test:malformed:" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+
+    struct DeliveryCapture
+    {
+        std::mutex               mutex;    ///< 保护 payloads
+        std::condition_variable  changed;  ///< 新事件到达时唤醒等待方
+        std::vector<std::string> payloads; ///< 已本地投递的事件正文
+
+        void add(std::string payload)
+        {
+            {
+                const std::lock_guard lock(mutex);
+                payloads.push_back(std::move(payload));
+            }
+            changed.notify_all();
+        }
+
+        [[nodiscard]] bool waitFor(const std::size_t count, const std::chrono::seconds timeout)
+        {
+            std::unique_lock lock(mutex);
+            return changed.wait_for(lock, timeout, [this, count] { return payloads.size() >= count; });
+        }
+    } capture;
+
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Web::BrowserWebSocket        webSocket;
+    EdgePulse::Web::SseBroadcaster          sse;
+    EdgePulse::Web::RealtimeBusOptions      options;
+    options.enabled       = true;
+    options.host          = *host;
+    options.port          = environmentPort("EDGEPULSE_TEST_REDIS_PORT", 6379);
+    options.password      = password;
+    options.database      = 15;
+    options.channel       = channel;
+    options.instanceId    = "node-subscriber";
+    options.localDelivery = [&capture](std::string_view, std::int64_t, std::string_view payload) -> AsynGyanis::Core::Task<>
+    {
+        capture.add(std::string{payload});
+        co_return;
+    };
+
+    EdgePulse::Web::RealtimeBus bus(runner.loop(), webSocket, sse, std::move(options));
+    bus.start();
+    for (int attempt = 0; attempt < 50 && !bus.isHealthy(); ++attempt)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    ASSERT_TRUE(bus.isHealthy()) << "订阅线程没有建立连接";
+
+    AsynGyanis::Database::ConnectionConfig adminConfig = AsynGyanis::Database::ConnectionConfig::redisDefault();
+    adminConfig.host                                   = *host;
+    adminConfig.port                                   = environmentPort("EDGEPULSE_TEST_REDIS_PORT", 6379);
+    adminConfig.password                               = password;
+    adminConfig.database                               = "15";
+    AsynGyanis::Database::RedisConnection admin(adminConfig);
+    ASSERT_TRUE(admin.connect()) << admin.lastError();
+
+    const auto publish = [&admin, &channel](const std::string &envelope)
+    {
+        const std::vector<std::string_view> command{"PUBLISH", channel, envelope};
+        ASSERT_NE(nullptr, admin.executeCommand(command)) << admin.lastError();
+    };
+    // 这些信封在旧实现里会让类型异常穿出订阅线程：instance 数字/null 在最外层读取，
+    // target 数字、payload 数字与 Agent 的 nodeId 字符串都在 try 内读取
+    publish(R"({"instance":123,"target":"browser","base":"alarms","tenantId":7,"payload":"{\"type\":\"bad-instance-number\"}"})");
+    publish(R"({"instance":null,"target":"browser","base":"alarms","tenantId":7,"payload":"{\"type\":\"bad-instance-null\"}"})");
+    publish(R"({"instance":"node-other","target":42,"base":"alarms","tenantId":7,"payload":"{\"type\":\"bad-target\"}"})");
+    publish(R"({"instance":"node-other","target":"browser","base":"alarms","tenantId":7,"payload":42})");
+    publish(R"({"instance":"node-other","target":"agent","nodeId":"nine","commandId":5,"payload":"{}"})");
+    // 旧版本实例没有 target 字段：按 browser 处理
+    publish(R"({"instance":"node-other","base":"alarms","tenantId":7,"payload":"{\"type\":\"legacy\"}"})");
+    publish(R"({"instance":"node-other","target":"browser","base":"alarms","tenantId":7,"payload":"{\"type\":\"current\"}"})");
+
+    ASSERT_TRUE(capture.waitFor(2, std::chrono::seconds{5})) << "畸形信封之后的合法事件没有送达，订阅线程可能已经退出";
+    std::vector<std::string> payloads;
+    {
+        const std::lock_guard lock(capture.mutex);
+        payloads = capture.payloads;
+    }
+    EXPECT_NE(payloads.end(), std::find(payloads.begin(), payloads.end(), R"({"type":"legacy"})")) << "缺省 target 的旧信封必须按 browser 投递";
+    EXPECT_NE(payloads.end(), std::find(payloads.begin(), payloads.end(), R"({"type":"current"})"));
+    EXPECT_EQ(2U, payloads.size()) << "畸形信封不能被投递";
 }

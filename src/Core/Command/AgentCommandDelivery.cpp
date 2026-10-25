@@ -70,7 +70,8 @@ namespace EdgePulse::Command
         return Web::AgentMessage{.nodeId = nodeId, .close = true, .closeCode = code, .closeReason = std::move(reason)};
     }
 
-    AgentCommandDelivery::AgentCommandDelivery(AgentChannelRegistry &channels, std::shared_ptr<CommandRepository> commands) : m_channels(channels), m_commands(std::move(commands))
+    AgentCommandDelivery::AgentCommandDelivery(AgentChannelRegistry &channels, std::shared_ptr<CommandRepository> commands, DispatchNotifier notifier) :
+        m_channels(channels), m_commands(std::move(commands)), m_notifier(std::move(notifier))
     {
     }
 
@@ -111,7 +112,23 @@ namespace EdgePulse::Command
         try
         {
             // 条件更新只命中 pending：别的实例已经推进过的命令不会被改写下发时间
-            static_cast<void>(co_await m_commands->markDispatched(loop, message.commandId));
+            const bool advanced = co_await m_commands->markDispatched(loop, message.commandId);
+            if (advanced && m_notifier)
+            {
+                try
+                {
+                    // 重新读库再通知：浏览器需要 type 与最新状态，不能只凭消息正文拼一条不完整的记录
+                    const auto updated = co_await m_commands->find(loop, message.commandId);
+                    if (updated.has_value())
+                    {
+                        co_await m_notifier(*updated);
+                    }
+                } catch (const std::exception &failure)
+                {
+                    // 状态已经推进；通知失败只影响界面刷新，不能回滚命令也不能抛回 HTTP 层
+                    LOG_WARN_FMT("命令已推进但浏览器通知失败：command={} error={}", message.commandId, failure.what());
+                }
+            }
         } catch (const std::exception &failure)
         {
             // 命令正文已经写出；状态推进失败只影响界面读数，命令行留在 pending 由轮询再取

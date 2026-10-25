@@ -915,6 +915,91 @@ TEST_F(FleetEndpointsTest, CertificateRevocationClosesAgentWebSocket)
     EXPECT_EQ(1008, result.closeCode);
 }
 
+// 钉住：吊销直接落库、跨实例关闭消息丢失时，服务端周期复核仍会以 1008 关闭已建立的 Agent WebSocket
+TEST_F(FleetEndpointsTest, PeriodicRevocationCheckClosesAgentWebSocket)
+{
+    const auto node = m_runner.run(m_nodes->create(m_runner.loop(), "ws-periodic-revoke-node", "{}"));
+    ASSERT_GT(node.id, 0);
+
+    // 200 毫秒复核周期：用例等的是复核窗口，不是真实 30 秒节拍
+    EdgePulse::TestSupport::ServerHarness server(
+            [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+            {
+                EdgePulse::TestSupport::installTestAgentIdentity(router);
+                EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels, m_lifecycle.get(), {}, std::chrono::milliseconds{200});
+            });
+
+    auto                               promise = std::make_shared<std::promise<AgentCloseProbeResult>>();
+    std::future<AgentCloseProbeResult> future  = promise->get_future();
+    AsynGyanis::Core::Task<>           probe   = probeAgentSocketUntilClosed(server.loop(), server.port(), node.id, promise);
+    server.loop().scheduler().scheduleRemote(probe.handle());
+    m_probeTasks.push_back(std::move(probe));
+
+    bool connected = false;
+    for (int attempt = 0; attempt < 500 && !connected; ++attempt)
+    {
+        connected = m_channels->isConnected(node.id);
+        if (!connected)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+    }
+    ASSERT_TRUE(connected) << "Agent WebSocket 未在时限内完成 hello 注册";
+
+    // 直接改库：不经过 DeviceController 的 publishAgent 关闭消息，模拟跨实例关闭丢失
+    const auto revoked = m_runner.run(m_nodes->scoped({0, true})->revokeCertificate(m_runner.loop(), node.id));
+    ASSERT_TRUE(revoked.has_value());
+    EXPECT_FALSE(revoked->certRevokedAt.empty());
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{10})) << "周期复核未关闭被吊销的通道";
+    const AgentCloseProbeResult result = future.get();
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.connected);
+    EXPECT_TRUE(result.closed);
+    EXPECT_EQ(1008, result.closeCode);
+    EXPECT_FALSE(m_channels->isConnected(node.id));
+}
+
+// 钉住：节点被删除、关闭消息丢失时，周期复核同样以 1008 收口在线通道
+TEST_F(FleetEndpointsTest, PeriodicRevocationCheckClosesAfterNodeDeletion)
+{
+    const auto node = m_runner.run(m_nodes->create(m_runner.loop(), "ws-periodic-delete-node", "{}"));
+    ASSERT_GT(node.id, 0);
+
+    EdgePulse::TestSupport::ServerHarness server(
+            [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+            {
+                EdgePulse::TestSupport::installTestAgentIdentity(router);
+                EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels, m_lifecycle.get(), {}, std::chrono::milliseconds{200});
+            });
+
+    auto                               promise = std::make_shared<std::promise<AgentCloseProbeResult>>();
+    std::future<AgentCloseProbeResult> future  = promise->get_future();
+    AsynGyanis::Core::Task<>           probe   = probeAgentSocketUntilClosed(server.loop(), server.port(), node.id, promise);
+    server.loop().scheduler().scheduleRemote(probe.handle());
+    m_probeTasks.push_back(std::move(probe));
+
+    bool connected = false;
+    for (int attempt = 0; attempt < 500 && !connected; ++attempt)
+    {
+        connected = m_channels->isConnected(node.id);
+        if (!connected)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+    }
+    ASSERT_TRUE(connected) << "Agent WebSocket 未在时限内完成 hello 注册";
+
+    ASSERT_TRUE(m_runner.run(m_nodes->scoped({0, true})->remove(m_runner.loop(), node.id)));
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{10})) << "周期复核未关闭已删除节点的通道";
+    const AgentCloseProbeResult result = future.get();
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.closed);
+    EXPECT_EQ(1008, result.closeCode);
+    EXPECT_FALSE(m_channels->isConnected(node.id));
+}
+
 // 钉住：删除节点和吊销一样要摘除在线通道并以 1008 关闭已建立的 Agent WebSocket
 TEST_F(FleetEndpointsTest, DeletingNodeClosesAgentWebSocket)
 {

@@ -3,7 +3,6 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Base/Security/PasswordHash.h"
 #include "Core/Auth/AuthService.h"
-#include "Core/Command/AgentChannelRegistry.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/NodeConfigRepository.h"
@@ -69,7 +68,6 @@ protected:
         m_nodeService = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
         m_configs     = std::make_shared<EdgePulse::Device::NodeConfigRepository>(m_context->database);
         m_commands    = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
-        m_channels    = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
         m_service     = std::make_shared<EdgePulse::Device::NodeConfigService>(m_configs, m_nodes, m_commands, nullptr, nullptr);
         m_registry    = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, EdgePulse::Device::AgentRegistry::Options{});
 
@@ -115,7 +113,6 @@ protected:
         m_server.reset();
         m_registry.reset();
         m_service.reset();
-        m_channels.reset();
         m_commands.reset();
         m_configs.reset();
         m_nodeService.reset();
@@ -172,16 +169,15 @@ protected:
         ASSERT_NE(nullptr, connection->execute(sql)) << connection->lastError();
     }
 
-    std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>  m_context;
-    EdgePulse::TestSupport::EventLoopRunner                   m_runner;
-    std::shared_ptr<EdgePulse::Device::NodeRepository>        m_nodes;
-    std::shared_ptr<EdgePulse::Device::NodeService>           m_nodeService;
-    std::shared_ptr<EdgePulse::Device::NodeConfigRepository>  m_configs;
-    std::shared_ptr<EdgePulse::Command::CommandRepository>    m_commands;
-    std::shared_ptr<EdgePulse::Command::AgentChannelRegistry> m_channels;
-    std::shared_ptr<EdgePulse::Device::NodeConfigService>     m_service;
-    std::shared_ptr<EdgePulse::Device::AgentRegistry>         m_registry;
-    std::unique_ptr<EdgePulse::TestSupport::ServerHarness>    m_server;
+    std::unique_ptr<EdgePulse::TestSupport::AuthTestContext> m_context;
+    EdgePulse::TestSupport::EventLoopRunner                  m_runner;
+    std::shared_ptr<EdgePulse::Device::NodeRepository>       m_nodes;
+    std::shared_ptr<EdgePulse::Device::NodeService>          m_nodeService;
+    std::shared_ptr<EdgePulse::Device::NodeConfigRepository> m_configs;
+    std::shared_ptr<EdgePulse::Command::CommandRepository>   m_commands;
+    std::shared_ptr<EdgePulse::Device::NodeConfigService>    m_service;
+    std::shared_ptr<EdgePulse::Device::AgentRegistry>        m_registry;
+    std::unique_ptr<EdgePulse::TestSupport::ServerHarness>   m_server;
 };
 
 // 钉住：管理端下发、Agent 拉取与回报、修订列表、回滚与详情摘要串成一条闭环

@@ -13,6 +13,7 @@
 
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LoggerRegistry.h"
+#include "Core/Coroutine/AsyncExecutor.h"
 #include "Core/Coroutine/Task.h"
 #include "Core/EventLoop/EventLoop.h"
 #include "Net/Http/Message/HttpRequest.h"
@@ -29,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -121,6 +123,122 @@ namespace EdgePulse::Agent
         private:
             std::string      m_type;          ///< 支持的命令类型
             std::atomic<int> m_executions{0}; ///< 执行次数
+        };
+
+        /**
+         * @brief 在阻塞执行器上等待一个承诺，避免占住事件循环
+         * @param loop 协程所属事件循环
+         * @param gate 待完成的闸门
+         * @return Task<> 闸门完成后返回
+         */
+        Task<> waitForGate(EventLoop &loop, std::shared_ptr<std::promise<void>> gate)
+        {
+            std::shared_future<void> future = gate->get_future().share();
+            static_cast<void>(co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop,
+                                                                                              [future = std::move(future)]() mutable
+                                                                                              {
+                                                                                                  future.wait();
+                                                                                                  return true;
+                                                                                              }));
+            co_return;
+        }
+
+        /**
+         * @brief 两条命令共用的执行器：慢命令在闸门处挂起，快命令记录是否与慢命令重叠
+         * @details 用原子计数观测「同一时刻有多少条命令在执行」。只要第二条在第一条释放前开始，
+         *          active 就会到 2，测试无需依赖睡眠时长来猜时序。
+         */
+        class GatedExecutor final : public CommandExecutor
+        {
+        public:
+            /**
+             * @brief 绑定慢命令闸门与启动信号
+             * @param slowGate 慢命令等待的闸门；测试完成承诺前一直挂起
+             * @param slowStarted 慢命令开始执行时完成
+             * @param fastDone 快命令执行完成时完成
+             */
+            GatedExecutor(std::shared_ptr<std::promise<void>> slowGate, std::shared_ptr<std::promise<void>> slowStarted, std::shared_ptr<std::promise<void>> fastDone) :
+                m_slowGate(std::move(slowGate)), m_slowStarted(std::move(slowStarted)), m_fastDone(std::move(fastDone))
+            {
+            }
+
+            bool supports(const std::string_view type) const override
+            {
+                return type == "fake.slow" || type == "fake.fast";
+            }
+
+            Task<CommandResult> execute(EventLoop &loop, const AgentCommand &command) override
+            {
+                const int active = m_active.fetch_add(1, std::memory_order_acq_rel) + 1;
+                int       peak   = m_peak.load(std::memory_order_acquire);
+                while (active > peak && !m_peak.compare_exchange_weak(peak, active, std::memory_order_acq_rel))
+                {
+                }
+                if (command.type == "fake.slow")
+                {
+                    m_slowStartOrder.store(m_sequence.fetch_add(1, std::memory_order_acq_rel), std::memory_order_release);
+                    m_slowStarted->set_value();
+                    // 闸门等在阻塞执行器上：慢命令挂起期间事件循环仍能推进轮询与 WebSocket 接收
+                    co_await waitForGate(loop, m_slowGate);
+                    m_slowFinished.store(true, std::memory_order_release);
+                    m_slowEndOrder.store(m_sequence.fetch_add(1, std::memory_order_acq_rel), std::memory_order_release);
+                } else
+                {
+                    m_fastStartedWhileSlow.store(!m_slowFinished.load(std::memory_order_acquire), std::memory_order_release);
+                    m_fastStartOrder.store(m_sequence.fetch_add(1, std::memory_order_acq_rel), std::memory_order_release);
+                    try
+                    {
+                        m_fastDone->set_value();
+                    } catch (...)
+                    {
+                    }
+                }
+                m_active.fetch_sub(1, std::memory_order_acq_rel);
+                co_return CommandResult{true, "{}", "执行完成"};
+            }
+
+            [[nodiscard]] int peakActive() const
+            {
+                return m_peak.load(std::memory_order_acquire);
+            }
+
+            [[nodiscard]] bool fastStarted() const
+            {
+                return m_fastStartOrder.load(std::memory_order_acquire) >= 0;
+            }
+
+            [[nodiscard]] bool fastStartedWhileSlow() const
+            {
+                return m_fastStartedWhileSlow.load(std::memory_order_acquire);
+            }
+
+            [[nodiscard]] int slowStartOrder() const
+            {
+                return m_slowStartOrder.load(std::memory_order_acquire);
+            }
+
+            [[nodiscard]] int slowEndOrder() const
+            {
+                return m_slowEndOrder.load(std::memory_order_acquire);
+            }
+
+            [[nodiscard]] int fastStartOrder() const
+            {
+                return m_fastStartOrder.load(std::memory_order_acquire);
+            }
+
+        private:
+            std::shared_ptr<std::promise<void>> m_slowGate;                    ///< 慢命令等待的闸门
+            std::shared_ptr<std::promise<void>> m_slowStarted;                 ///< 慢命令已开始
+            std::shared_ptr<std::promise<void>> m_fastDone;                    ///< 快命令已完成
+            std::atomic<int>                    m_active{0};                   ///< 当前执行中的命令数
+            std::atomic<int>                    m_peak{0};                     ///< 观测到的最大并发数
+            std::atomic<int>                    m_sequence{0};                 ///< 开始/结束事件的全局顺序
+            std::atomic<int>                    m_slowStartOrder{-1};          ///< 慢命令开始序号
+            std::atomic<int>                    m_slowEndOrder{-1};            ///< 慢命令结束序号
+            std::atomic<int>                    m_fastStartOrder{-1};          ///< 快命令开始序号
+            std::atomic<bool>                   m_slowFinished{false};         ///< 慢命令是否已结束
+            std::atomic<bool>                   m_fastStartedWhileSlow{false}; ///< 快命令开始时慢命令是否仍在执行
         };
 
         /**
@@ -636,6 +754,180 @@ namespace EdgePulse::Agent
 
         EXPECT_EQ(1, executor->executions()) << "同一命令标识只能执行一次";
         EXPECT_EQ(1, capture->posts.load(std::memory_order_acquire)) << "重复投递不能重复上报结果";
+    }
+
+    TEST(AgentCommand, PolledCommandWaitsForRunningWebSocketCommand)
+    {
+        auto capture = std::make_shared<ResultCapture>();
+
+        // 三个闸门分别卡住轮询响应、WebSocket 推送与关闭；慢命令的闸门在 Agent 循环上等
+        auto pushGate      = std::make_shared<std::promise<void>>();
+        auto nextGate      = std::make_shared<std::promise<void>>();
+        auto closeGate     = std::make_shared<std::promise<void>>();
+        auto slowGate      = std::make_shared<std::promise<void>>();
+        auto slowStarted   = std::make_shared<std::promise<void>>();
+        auto fastDone      = std::make_shared<std::promise<void>>();
+        auto nextRequested = std::make_shared<std::promise<void>>();
+        auto connected     = std::make_shared<std::promise<void>>();
+        auto pollDone      = std::make_shared<std::promise<void>>();
+
+        const AsynGyanis::Base::ConfigValue fastCommand =
+                AsynGyanis::Base::ConfigValue::object({{"id", 1602}, {"nodeId", 77}, {"type", "fake.fast"}, {"payload", "{}"}, {"timeoutSeconds", 30}});
+
+        TestSupport::ServerHarness server(
+                [capture, pushGate, nextGate, closeGate, nextRequested, fastCommand](AsynGyanis::Net::Router &router, EventLoop &loop)
+                {
+                    installResultRoute(router, capture);
+                    router.get("/api/agent/ws",
+                               [&loop, pushGate, closeGate](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> Task<>
+                               {
+                                   AsynGyanis::Net::WebSocketUpgradePolicy policy;
+                                   policy.originMode = AsynGyanis::Net::WebSocketOriginMode::AllowAny;
+                                   response.upgradeToWebSocket(
+                                           [&loop, pushGate, closeGate](AsynGyanis::Net::WebSocketPeer &peer) -> Task<>
+                                           {
+                                               const auto hello = co_await peer.receive();
+                                               if (!hello.has_value() || !co_await peer.sendText(R"({"type":"hello","ok":true})"))
+                                               {
+                                                   co_return;
+                                               }
+                                               // 轮询先拿到响应之前不推送慢命令，测试因此不需要靠 sleep 抢时序
+                                               co_await waitForGate(loop, pushGate);
+                                               if (!co_await peer.sendText(
+                                                           R"({"type":"command","command":{"id":1601,"nodeId":77,"type":"fake.slow","payload":"{}","timeoutSeconds":30}})"))
+                                               {
+                                                   co_return;
+                                               }
+                                               co_await waitForGate(loop, closeGate);
+                                               static_cast<void>(co_await peer.close(1000, "done"));
+                                               co_return;
+                                           },
+                                           std::move(policy));
+                                   co_return;
+                               });
+                    router.get("/api/agent/commands/next",
+                               [&loop, nextGate, nextRequested, fastCommand](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> Task<>
+                               {
+                                   try
+                                   {
+                                       nextRequested->set_value();
+                                   } catch (...)
+                                   {
+                                   }
+                                   co_await waitForGate(loop, nextGate);
+                                   const AsynGyanis::Base::ConfigValue envelope =
+                                           AsynGyanis::Base::ConfigValue::object({{"code", 200}, {"message", "ok"}, {"data", fastCommand}, {"traceId", "trace-next"}});
+                                   response.setStatus(200);
+                                   response.setBody(envelope.dump());
+                                   co_return;
+                               });
+                });
+
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openState(directory);
+        ASSERT_TRUE(state.has_value()) << state.error();
+
+        AgentLoop         loop;
+        AgentClient       client(loop.loop(), plaintextConfiguration(server.port()), testIdentity());
+        auto              executor = std::make_shared<GatedExecutor>(slowGate, slowStarted, fastDone);
+        CommandDispatcher dispatcher(client, *state, {executor});
+        AgentWebSocket    socket(loop.loop(), plaintextConfiguration(server.port()));
+        LoopStopGuard     stopGuard{loop};
+
+        struct GateReleaser
+        {
+            std::vector<std::shared_ptr<std::promise<void>>> gates; ///< 用例提前失败时也要放行的闸门
+
+            ~GateReleaser()
+            {
+                for (const auto &gate: gates)
+                {
+                    try
+                    {
+                        gate->set_value();
+                    } catch (...)
+                    {
+                    }
+                }
+            }
+        } releaser{{pushGate, nextGate, closeGate, slowGate}};
+
+        // 观察者必须是具名左值：serve 的形参是 const 引用，临时 lambda 活不过首次恢复
+        const AgentWebSocket::ConnectionObserver observer = [connected](const bool isConnected)
+        {
+            if (isConnected)
+            {
+                try
+                {
+                    connected->set_value();
+                } catch (...)
+                {
+                }
+            }
+        };
+        auto       serveDone  = std::make_shared<std::promise<void>>();
+        const auto serveFrame = std::make_shared<Task<>>(
+                [](Task<std::expected<void, std::string>> operation, std::shared_ptr<std::promise<void>> done) -> Task<>
+                {
+                    try
+                    {
+                        static_cast<void>(co_await std::move(operation));
+                    } catch (...)
+                    {
+                    }
+                    try
+                    {
+                        done->set_value();
+                    } catch (...)
+                    {
+                    }
+                    co_return;
+                }(socket.serve(dispatcher, 77, "1.2.3", observer), serveDone));
+        loop.loop().scheduler().scheduleRemote(serveFrame->handle());
+        ASSERT_EQ(std::future_status::ready, connected->get_future().wait_for(std::chrono::seconds{10})) << "WebSocket 未建立";
+
+        const auto pollFrame = std::make_shared<Task<>>(
+                [](Task<> operation, std::shared_ptr<std::promise<void>> done) -> Task<>
+                {
+                    try
+                    {
+                        co_await std::move(operation);
+                    } catch (...)
+                    {
+                    }
+                    try
+                    {
+                        done->set_value();
+                    } catch (...)
+                    {
+                    }
+                    co_return;
+                }(dispatcher.pollOnce(), pollDone));
+        loop.loop().scheduler().scheduleRemote(pollFrame->handle());
+        ASSERT_EQ(std::future_status::ready, nextRequested->get_future().wait_for(std::chrono::seconds{10})) << "轮询请求未到达服务端";
+
+        // 轮询响应还卡着时启动慢命令；随后放开轮询响应，取回的快命令必须排队
+        server.loop().scheduler().postRemote([pushGate] { pushGate->set_value(); });
+        ASSERT_EQ(std::future_status::ready, slowStarted->get_future().wait_for(std::chrono::seconds{10})) << "慢命令没有开始执行";
+        server.loop().scheduler().postRemote([nextGate] { nextGate->set_value(); });
+        ASSERT_EQ(std::future_status::ready, pollDone->get_future().wait_for(std::chrono::seconds{10})) << "轮询没有完成";
+
+        EXPECT_TRUE(dispatcher.hasInFlight());
+        EXPECT_FALSE(executor->fastStarted()) << "慢命令未结束时不能开始执行快命令";
+        EXPECT_EQ(1, executor->peakActive()) << "同一时刻只能有一条命令在执行";
+
+        loop.loop().scheduler().postRemote([slowGate] { slowGate->set_value(); });
+        ASSERT_EQ(std::future_status::ready, fastDone->get_future().wait_for(std::chrono::seconds{10})) << "排队命令没有在慢命令结束后执行";
+
+        EXPECT_TRUE(executor->fastStarted());
+        EXPECT_FALSE(executor->fastStartedWhileSlow()) << "快命令开始时慢命令必须已经结束";
+        EXPECT_EQ(1, executor->peakActive()) << "两条命令不能并发执行";
+        EXPECT_LT(executor->slowStartOrder(), executor->slowEndOrder());
+        EXPECT_LT(executor->slowEndOrder(), executor->fastStartOrder()) << "快命令必须在慢命令之后开始";
+
+        // 正常关闭 WebSocket，让 serve 帧在用例结束前收口，避免析构悬挂的客户端协程
+        server.loop().scheduler().postRemote([closeGate] { closeGate->set_value(); });
+        EXPECT_EQ(std::future_status::ready, serveDone->get_future().wait_for(std::chrono::seconds{5}));
     }
 
     TEST(AgentCommand, RestartRunsAfterResultAcknowledged)

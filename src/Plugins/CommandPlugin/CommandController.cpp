@@ -193,7 +193,6 @@ namespace EdgePulse::Command
                         }
                         const auto         commands        = deps->commands->scoped(session->tenantScope());
                         const std::int64_t batchId         = Common::nextIdentifier();
-                        const bool         due             = scheduledAt.empty() || scheduledAt <= Common::nowDateTimeUtc();
                         ConfigValue        createdCommands = ConfigValue::array();
                         for (const std::int64_t nodeId: nodeIds)
                         {
@@ -202,7 +201,9 @@ namespace EdgePulse::Command
                             {
                                 continue;
                             }
-                            if (due && deps->realtimeBus != nullptr)
+                            // 带计划时间的命令归 leader 的计划调度器：请求线程立即发布会让 follower
+                            // 抢先写出，也让到点前的取消/重排失去意义。立即命令仍在这里直接下发
+                            if (scheduledAt.empty() && deps->realtimeBus != nullptr)
                             {
                                 co_await deps->realtimeBus->publishAgent(loop, makeAgentCommandMessage(*created));
                                 const auto refreshed = co_await commands->find(loop, created->id);

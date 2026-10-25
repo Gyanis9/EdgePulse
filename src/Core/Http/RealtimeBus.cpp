@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <exception>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #include <string>
@@ -74,6 +75,9 @@ namespace EdgePulse::Web
 
         /// 发布连接重连的冷却窗口；健康检查本身由订阅线程按读推送周期触发
         constexpr std::chrono::seconds kPublisherProbeInterval{5};
+
+        /// 关闭消息在同一连接上的最多发布次数：关闭丢失会让被吊销的 Agent 继续持有长连接
+        constexpr int kClosePublishAttempts = 3;
 
         /**
          * @brief 从选项解析实例标识；空值退回随机值，不把空串写进信封
@@ -244,8 +248,13 @@ namespace EdgePulse::Web
 
     AsynGyanis::Core::Task<> RealtimeBus::publishAgent(AsynGyanis::Core::EventLoop &loop, AgentMessage message)
     {
-        // 本地 handler 在本协程恢复的循环上执行；远端消息也由总线自己的循环排水
-        static_cast<void>(loop);
+        // 本地 handler 会就地访问 Agent 连接，必须与调用方给出的循环同属一条线程；这里用形参核对
+        // 当前协程所在循环，错了就当场抛出，不能把连接操作留在别的线程上静默跑完
+        if (AsynGyanis::Core::EventLoop::currentEventLoop() != &loop)
+        {
+            LOG_ERROR_FMT("publishAgent 不在调用方给出的循环上：node={} command={}", message.nodeId, message.commandId);
+            throw std::logic_error("publishAgent 必须在调用方给出的循环上调用");
+        }
         try
         {
             co_await deliverAgent(message);
@@ -267,9 +276,20 @@ namespace EdgePulse::Web
         {
             co_return;
         }
-        if (m_publisher->publish(m_options.channel, agentEnvelopeOf(m_instanceId, message)))
+        const std::string envelope = agentEnvelopeOf(m_instanceId, message);
+        // 关闭消息丢失的代价是被吊销的 Agent 继续持有长连接，因此在同一条连接上多试两次；
+        // 命令消息有 Agent 轮询兜底，重复发布没有收益，仍然只试一次
+        const int attempts = message.close ? kClosePublishAttempts : 1;
+        for (int attempt = 0; attempt < attempts; ++attempt)
         {
-            co_return;
+            if (m_publisher->publish(m_options.channel, envelope))
+            {
+                co_return;
+            }
+            if (attempt + 1 < attempts)
+            {
+                LOG_WARN_FMT("Agent 关闭消息发布失败，准备重试：instance={} node={} attempt={} error={}", m_instanceId, message.nodeId, attempt + 1, m_publisher->lastError());
+            }
         }
         m_publisherHealth.markUnhealthy();
         LOG_WARN_FMT("Agent 消息发布到 Redis 失败：instance={} endpoint={} node={} error={}", m_instanceId, endpointOf(m_options), message.nodeId, m_publisher->lastError());
@@ -477,13 +497,15 @@ namespace EdgePulse::Web
                 {
                     continue;
                 }
-                const std::string instance = value->value("instance", std::string{});
-                if (instance == m_instanceId)
-                {
-                    continue;
-                }
                 try
                 {
+                    // instance 也必须放在 try 内：对端把字段写成数字或 null 时 value() 会抛类型异常，
+                    // 放在外面会让异常穿出订阅线程并终止整个进程
+                    const std::string instance = value->value("instance", std::string{});
+                    if (instance == m_instanceId)
+                    {
+                        continue;
+                    }
                     const std::string target = value->value("target", std::string{"browser"});
                     if (target == "agent")
                     {
