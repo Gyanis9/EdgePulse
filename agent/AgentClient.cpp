@@ -319,7 +319,7 @@ namespace EdgePulse::Agent
         co_return nodeId->get<std::int64_t>();
     }
 
-    AsynGyanis::Core::Task<std::expected<HeartbeatReply, std::string>> AgentClient::heartbeat(std::int64_t nodeId, std::string agentVersion)
+    AsynGyanis::Core::Task<std::expected<HeartbeatReply, std::string>> AgentClient::heartbeat(std::int64_t nodeId, std::string agentVersion, std::string installedFirmwareVersion)
     {
         const auto client = m_client;
         if (!m_initializationError.empty() || client == nullptr)
@@ -327,7 +327,8 @@ namespace EdgePulse::Agent
             co_return std::unexpected(m_initializationError);
         }
 
-        const AsynGyanis::Base::ConfigValue requestBody = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"agentVersion", std::move(agentVersion)}});
+        const AsynGyanis::Base::ConfigValue requestBody = AsynGyanis::Base::ConfigValue::object(
+                {{"nodeId", nodeId}, {"agentVersion", std::move(agentVersion)}, {"installedFirmwareVersion", std::move(installedFirmwareVersion)}});
         // HttpClientRequest::body 是 string_view：序列化结果必须落在协程帧里的具名局部量，
         // 直接绑定 dump() 的临时串会在 send 读取前释放
         const std::string                  bodyText = requestBody.dump();
@@ -703,7 +704,8 @@ namespace EdgePulse::Agent
     }
 
     AsynGyanis::Core::Task<std::expected<void, std::string>> AgentClient::reportFirmwareStatus(const std::int64_t firmwareId, const std::int64_t nodeId,
-                                                                                               const std::string_view status, const int progress, const std::string_view message)
+                                                                                               const std::string_view status, const int progress, const std::string_view message,
+                                                                                               const std::int64_t commandId)
     {
         const auto client = m_client;
         if (!m_initializationError.empty() || client == nullptr)
@@ -727,8 +729,8 @@ namespace EdgePulse::Agent
             co_return std::unexpected("固件进度必须在 0 到 100 之间");
         }
 
-        const AsynGyanis::Base::ConfigValue requestBody =
-                AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", std::string{status}}, {"progress", progress}, {"message", std::string{message}}});
+        const AsynGyanis::Base::ConfigValue requestBody = AsynGyanis::Base::ConfigValue::object(
+                {{"nodeId", nodeId}, {"status", std::string{status}}, {"progress", progress}, {"message", std::string{message}}, {"commandId", commandId}});
         // HttpClientRequest::body 是 string_view：序列化结果必须落在协程帧里的具名局部量
         const std::string bodyText = requestBody.dump();
 

@@ -801,6 +801,8 @@ namespace EdgePulse::Firmware
                         const std::string status   = Json::stringField(*body, "status");
                         const int         progress = static_cast<int>(std::clamp<std::int64_t>(Json::integerField(*body, "progress", 0), 0, 100));
                         const std::string message  = Json::stringField(*body, "message");
+                        // commandId 是新增的可选归因字段：旧 Agent 不发送时按 0 处理，维持原来按固件与节点更新
+                        const std::int64_t commandId = std::max<std::int64_t>(0, Json::optionalInteger(*body, "commandId").value_or(0));
                         if (!nodeId.has_value() || (status != "pending" && status != "downloading" && status != "installing" && status != "installed" && status != "failed"))
                         {
                             fail(response, Common::kCodeBadRequest, "nodeId 或状态不合法", traceId);
@@ -812,7 +814,7 @@ namespace EdgePulse::Firmware
                             fail(response, identity.error().httpStatus, identity.error().message, traceId);
                             co_return;
                         }
-                        const auto task = co_await allFirmware->updateTask(loop, *id, *nodeId, status, progress, message);
+                        const auto task = co_await allFirmware->updateTask(loop, *id, *nodeId, status, progress, message, commandId);
                         if (!task.has_value())
                         {
                             fail(response, Common::kCodeNotFound, "固件任务不存在", traceId);

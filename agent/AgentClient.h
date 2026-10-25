@@ -165,9 +165,11 @@ namespace EdgePulse::Agent
          * @brief 发送一次心跳
          * @param nodeId 服务端分配的节点 ID
          * @param agentVersion 当前 Agent 版本
+         * @param installedFirmwareVersion 当前已安装的固件版本；空串表示尚未安装或没有记录
          * @return 成功返回服务端下发的配置版本与心跳间隔；失败返回可重试的中文原因
+         * @note installedFirmwareVersion 总是随正文发送，服务端只在非空时推进节点字段
          */
-        AsynGyanis::Core::Task<std::expected<HeartbeatReply, std::string>> heartbeat(std::int64_t nodeId, std::string agentVersion);
+        AsynGyanis::Core::Task<std::expected<HeartbeatReply, std::string>> heartbeat(std::int64_t nodeId, std::string agentVersion, std::string installedFirmwareVersion = {});
 
         /**
          * @brief 拉取一条待执行命令
@@ -234,11 +236,12 @@ namespace EdgePulse::Agent
          * @param status 状态文本，取 pending、downloading、installing、installed 或 failed
          * @param progress 进度百分比，0 到 100
          * @param message 中文说明
+         * @param commandId 执行该固件更新的命令标识；0 表示不归因，服务端按旧行为处理
          * @return 成功为空；失败返回中文原因
          * @note 调用方按尽力而为处理：上报失败不影响下载与安装的结论
          */
         AsynGyanis::Core::Task<std::expected<void, std::string>> reportFirmwareStatus(std::int64_t firmwareId, std::int64_t nodeId, std::string_view status, int progress,
-                                                                                      std::string_view message);
+                                                                                      std::string_view message, std::int64_t commandId = 0);
 
         /**
          * @brief 提交一份 CSR 换取新证书

@@ -205,9 +205,10 @@ namespace EdgePulse::Agent
         return m_configuration.firmwareStagingDirectory / name;
     }
 
-    AsynGyanis::Core::Task<> FirmwareExecutor::reportStatus(const std::int64_t firmwareId, const std::string_view status, const int progress, std::string message)
+    AsynGyanis::Core::Task<> FirmwareExecutor::reportStatus(const std::int64_t firmwareId, const std::int64_t commandId, const std::string_view status, const int progress,
+                                                            std::string message)
     {
-        const auto reported = co_await m_client.reportFirmwareStatus(firmwareId, m_nodeId, status, progress, message);
+        const auto reported = co_await m_client.reportFirmwareStatus(firmwareId, m_nodeId, status, progress, message, commandId);
         if (!reported.has_value())
         {
             LOG_WARN_FMT("固件 {} 的状态 {} 上报失败，不影响命令结论：{}", firmwareId, status, reported.error());
@@ -216,9 +217,9 @@ namespace EdgePulse::Agent
     }
 
     AsynGyanis::Core::Task<CommandResult> FirmwareExecutor::fail(AsynGyanis::Core::EventLoop &loop, const FirmwarePayload &payload, const std::filesystem::path &staging,
-                                                                 std::string message)
+                                                                 const std::int64_t commandId, std::string message)
     {
-        co_await reportStatus(payload.firmwareId, "failed", 100, message);
+        co_await reportStatus(payload.firmwareId, commandId, "failed", 100, message);
         co_await removeStagingFile(loop, staging);
         co_return CommandResult{false, "{}", std::move(message)};
     }
@@ -231,7 +232,7 @@ namespace EdgePulse::Agent
             const PayloadFailure &failure = parsed.error();
             if (failure.firmwareId.has_value())
             {
-                co_await reportStatus(*failure.firmwareId, "failed", 100, failure.message);
+                co_await reportStatus(*failure.firmwareId, command.id, "failed", 100, failure.message);
             } else
             {
                 LOG_WARN_FMT("firmware.update 的 payload 没有可用的 firmwareId，无法上报 failed：{}", failure.message);
@@ -242,13 +243,13 @@ namespace EdgePulse::Agent
 
         if (m_configuration.firmwareInstallHook.empty())
         {
-            co_await reportStatus(payload.firmwareId, "failed", 100, "未配置 agent.executors.firmware.install_hook，拒绝执行固件更新");
+            co_await reportStatus(payload.firmwareId, command.id, "failed", 100, "未配置 agent.executors.firmware.install_hook，拒绝执行固件更新");
             co_return CommandResult{false, "{}", "未配置 agent.executors.firmware.install_hook，拒绝执行固件更新"};
         }
         const std::filesystem::path staging = stagingPath(payload);
         if (staging.empty())
         {
-            co_await reportStatus(payload.firmwareId, "failed", 100, "未配置 agent.executors.firmware.staging_directory，无法下载固件");
+            co_await reportStatus(payload.firmwareId, command.id, "failed", 100, "未配置 agent.executors.firmware.staging_directory，无法下载固件");
             co_return CommandResult{false, "{}", "未配置 agent.executors.firmware.staging_directory，无法下载固件"};
         }
 
@@ -278,11 +279,11 @@ namespace EdgePulse::Agent
         }
         if (!loadedVerifier.has_value())
         {
-            co_return co_await fail(loop, payload, {}, loadedVerifier.error());
+            co_return co_await fail(loop, payload, {}, command.id, loadedVerifier.error());
         }
         const std::shared_ptr<const Verifier> verifier = *loadedVerifier;
 
-        co_await reportStatus(payload.firmwareId, "downloading", 0, "开始下载固件 " + payload.version);
+        co_await reportStatus(payload.firmwareId, command.id, "downloading", 0, "开始下载固件 " + payload.version);
 
         const std::shared_ptr<DownloadSink> sink = std::make_shared<DownloadSink>();
         sink->path                          = staging;
@@ -330,11 +331,11 @@ namespace EdgePulse::Agent
 
         if (!downloaded.has_value())
         {
-            co_return co_await fail(loop, payload, staging, "固件下载失败：" + downloaded.error());
+            co_return co_await fail(loop, payload, staging, command.id, "固件下载失败：" + downloaded.error());
         }
         if (downloaded->httpStatus != 200)
         {
-            co_return co_await fail(loop, payload, staging, "固件下载返回 HTTP " + std::to_string(downloaded->httpStatus) + "：" + downloaded->message);
+            co_return co_await fail(loop, payload, staging, command.id, "固件下载返回 HTTP " + std::to_string(downloaded->httpStatus) + "：" + downloaded->message);
         }
 
         std::expected<std::pair<std::uint64_t, std::string>, std::string> finalized = std::unexpected("固件下载未完成");
@@ -348,27 +349,27 @@ namespace EdgePulse::Agent
         }
         if (!finalized.has_value())
         {
-            co_return co_await fail(loop, payload, staging, "固件下载未完成：" + finalized.error());
+            co_return co_await fail(loop, payload, staging, command.id, "固件下载未完成：" + finalized.error());
         }
 
         const auto [receivedBytes, receivedDigest] = *finalized;
         if (receivedBytes != payload.sizeBytes)
         {
-            co_return co_await fail(loop, payload, staging,
+            co_return co_await fail(loop, payload, staging, command.id,
                                     "固件大小不符：收到 " + std::to_string(receivedBytes) + " 字节，命令给出 " + std::to_string(payload.sizeBytes) + " 字节");
         }
         if (receivedDigest != payload.sha256)
         {
-            co_return co_await fail(loop, payload, staging, "固件 SHA-256 与命令不符：收到 " + receivedDigest);
+            co_return co_await fail(loop, payload, staging, command.id, "固件 SHA-256 与命令不符：收到 " + receivedDigest);
         }
 
         const auto verified = verifier->verify(payload.signingKeyId, receivedDigest, payload.signature);
         if (!verified.has_value())
         {
-            co_return co_await fail(loop, payload, staging, "固件签名校验失败：" + verified.error());
+            co_return co_await fail(loop, payload, staging, command.id, "固件签名校验失败：" + verified.error());
         }
 
-        co_await reportStatus(payload.firmwareId, "installing", 100, "固件 " + payload.version + " 校验通过，开始安装");
+        co_await reportStatus(payload.firmwareId, command.id, "installing", 100, "固件 " + payload.version + " 校验通过，开始安装");
 
         ProcessRunResult hook;
         try
@@ -384,11 +385,11 @@ namespace EdgePulse::Agent
         }
         if (!hook.succeeded())
         {
-            co_return co_await fail(loop, payload, staging, "固件安装钩子失败：" + hook.failure);
+            co_return co_await fail(loop, payload, staging, command.id, "固件安装钩子失败：" + hook.failure);
         }
 
         m_state.set("installed_firmware_version", payload.version);
-        co_await reportStatus(payload.firmwareId, "installed", 100, "固件 " + payload.version + " 已安装");
+        co_await reportStatus(payload.firmwareId, command.id, "installed", 100, "固件 " + payload.version + " 已安装");
         co_await removeStagingFile(loop, staging);
 
         const AsynGyanis::Base::ConfigValue result =

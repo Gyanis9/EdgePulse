@@ -902,6 +902,103 @@ agent:
         EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
     }
 
+    TEST(AgentApplication, HeartbeatReportsInstalledFirmwareVersionFromState)
+    {
+        TestSupport::TemporaryDirectory directory;
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        struct HeartbeatBodyCapture
+        {
+            std::mutex               mutex;  ///< 保护 bodies
+            std::vector<std::string> bodies; ///< 按到达顺序保存的心跳正文
+        };
+        auto                       capture    = std::make_shared<HeartbeatBodyCapture>();
+        auto                       heartbeats = std::make_shared<std::atomic<int>>(0);
+        TestSupport::ServerHarness server(
+                [capture, heartbeats](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                {
+                    router.post("/api/agent/register",
+                                [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77},"traceId":"trace-register"})");
+                                    co_return;
+                                });
+                    router.post("/api/agent/heartbeat",
+                                [capture, heartbeats](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                                {
+                                    {
+                                        const std::lock_guard lock(capture->mutex);
+                                        capture->bodies.push_back(std::string{request.body()});
+                                    }
+                                    heartbeats->fetch_add(1, std::memory_order_release);
+                                    response.setStatus(200);
+                                    response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":5},"traceId":"trace-heartbeat"})");
+                                    co_return;
+                                });
+                    router.get("/api/agent/commands/next",
+                               [](AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                               {
+                                   response.setStatus(200);
+                                   response.setBody(R"({"code":200,"message":"ok","data":null,"traceId":"trace-next"})");
+                                   co_return;
+                               });
+                });
+
+        const auto configurationPath = directory.write("agent.yaml", std::string{"agent:\n"
+                                                                                 "  server:\n"
+                                                                                 "    base_url: http://127.0.0.1:" +
+                                                                                 std::to_string(server.port()) +
+                                                                                 "\n"
+                                                                                 "    allow_plaintext_for_tests: true\n"
+                                                                                 "    ca_file: agent.pem\n"
+                                                                                 "    certificate_file: agent.pem\n"
+                                                                                 "    private_key_file: agent-key.pem\n"
+                                                                                 "    name: edge-01\n"
+                                                                                 "    websocket_enabled: false\n"
+                                                                                 "    heartbeat_interval_seconds: 5\n"
+                                                                                 "    command_poll_interval_seconds: 5\n"
+                                                                                 "    request_timeout_seconds: 5\n"
+                                                                                 "  state:\n"
+                                                                                 "    directory: state\n"
+                                                                                 "  logging:\n"
+                                                                                 "    file: state/agent.log\n"});
+        {
+            // 上一次进程成功安装后留下的版本；本次启动必须从状态库读回并随心跳上报
+            auto state = AgentState::open(directory.path() / "state" / "agent.db");
+            ASSERT_TRUE(state.has_value()) << state.error();
+            state->set("installed_firmware_version", "2.4.0");
+        }
+
+        LoggingSinkReset loggingReset;
+        const auto       configuration = AgentConfiguration::load(configurationPath);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+
+        AgentApplication application(*configuration);
+        std::atomic<int> exitCode{-1};
+        std::thread      runner([&application, &exitCode] { exitCode.store(application.run(), std::memory_order_release); });
+
+        const bool reported = waitFor(std::chrono::seconds{8}, [&heartbeats] { return heartbeats->load(std::memory_order_acquire) >= 1; });
+        EXPECT_TRUE(reported) << "Agent 未在时限内发出心跳";
+
+        application.requestStop();
+        const bool stopped = waitFor(std::chrono::seconds{5}, [&exitCode] { return exitCode.load(std::memory_order_acquire) != -1; });
+        runner.join();
+        EXPECT_TRUE(stopped) << "停止请求未在 5 秒内结束 run()";
+        EXPECT_EQ(0, exitCode.load(std::memory_order_acquire));
+
+        std::vector<std::string> bodies;
+        {
+            const std::lock_guard lock(capture->mutex);
+            bodies = capture->bodies;
+        }
+        ASSERT_FALSE(bodies.empty());
+        const auto heartbeat = AsynGyanis::Base::parseConfigValue(bodies.front());
+        ASSERT_TRUE(heartbeat.has_value()) << bodies.front();
+        EXPECT_EQ(77, heartbeat->value("nodeId", 0));
+        EXPECT_EQ("2.4.0", heartbeat->value("installedFirmwareVersion", std::string{}));
+    }
+
     TEST(AgentApplication, WritesHealthMarkerAndReportsUpdateAfterFirstHeartbeat)
     {
         TestSupport::TemporaryDirectory directory;

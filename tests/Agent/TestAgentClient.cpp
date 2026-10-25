@@ -147,7 +147,70 @@ namespace EdgePulse::Agent
                             co_return;
                         });
         }
+        /**
+         * @brief 服务端收到的心跳正文
+         */
+        struct HeartbeatCapture
+        {
+            std::mutex               mutex;  ///< 保护 bodies
+            std::vector<std::string> bodies; ///< 按到达顺序保存的请求正文
+        };
+
+        /**
+         * @brief 安装一条成功的心跳路由并记录请求正文
+         * @param router 目标路由器
+         * @param capture 请求正文捕获点
+         */
+        void installHeartbeatRoute(AsynGyanis::Net::Router &router, const std::shared_ptr<HeartbeatCapture> &capture)
+        {
+            router.post("/api/agent/heartbeat",
+                        [capture](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                        {
+                            {
+                                const std::lock_guard lock(capture->mutex);
+                                capture->bodies.push_back(std::string{request.body()});
+                            }
+                            response.setStatus(200);
+                            response.setBody(R"({"code":200,"message":"ok","data":{"id":77,"heartbeatIntervalSeconds":30},"traceId":"trace-heartbeat"})");
+                            co_return;
+                        });
+        }
     } // namespace
+
+    TEST(AgentClient, HeartbeatBodyCarriesInstalledFirmwareVersion)
+    {
+        auto                       capture = std::make_shared<HeartbeatCapture>();
+        TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &) { installHeartbeatRoute(router, capture); });
+
+        AgentLoop     agentLoop;
+        AgentClient   client(agentLoop.loop(), plaintextConfiguration(server.port()), testIdentity());
+        LoopStopGuard guard(agentLoop);
+
+        const auto reported = agentLoop.run(client.heartbeat(77, "1.2.3", "2.0.0"), std::chrono::seconds{10}, "心跳");
+        ASSERT_TRUE(reported.has_value());
+        ASSERT_TRUE(reported->has_value());
+        EXPECT_EQ(30, (*reported)->heartbeatIntervalSeconds);
+
+        const auto reportedWithoutFirmware = agentLoop.run(client.heartbeat(77, "1.2.3", {}), std::chrono::seconds{10}, "无固件版本心跳");
+        ASSERT_TRUE(reportedWithoutFirmware.has_value());
+        ASSERT_TRUE(reportedWithoutFirmware->has_value());
+
+        std::vector<std::string> bodies;
+        {
+            const std::lock_guard lock(capture->mutex);
+            bodies = capture->bodies;
+        }
+        ASSERT_EQ(2U, bodies.size());
+        const auto withFirmware = AsynGyanis::Base::parseConfigValue(bodies[0]);
+        ASSERT_TRUE(withFirmware.has_value()) << bodies[0];
+        EXPECT_EQ(77, withFirmware->value("nodeId", 0));
+        EXPECT_EQ("1.2.3", withFirmware->value("agentVersion", std::string{}));
+        EXPECT_EQ("2.0.0", withFirmware->value("installedFirmwareVersion", std::string{}));
+
+        const auto withoutFirmware = AsynGyanis::Base::parseConfigValue(bodies[1]);
+        ASSERT_TRUE(withoutFirmware.has_value()) << bodies[1];
+        EXPECT_EQ("", withoutFirmware->value("installedFirmwareVersion", std::string{"missing"}));
+    }
 
     TEST(AgentClient, RegistrationBodyCarriesIdentityAndOmitsEmptyToken)
     {

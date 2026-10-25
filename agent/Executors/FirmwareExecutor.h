@@ -101,21 +101,23 @@ namespace EdgePulse::Agent
         /**
          * @brief 上报一条状态，失败只记 WARN
          * @param firmwareId 固件标识
+         * @param commandId 执行该固件更新的命令标识
          * @param status 状态文本
          * @param progress 进度百分比
          * @param message 中文说明
          */
-        AsynGyanis::Core::Task<> reportStatus(std::int64_t firmwareId, std::string_view status, int progress, std::string message);
+        AsynGyanis::Core::Task<> reportStatus(std::int64_t firmwareId, std::int64_t commandId, std::string_view status, int progress, std::string message);
 
         /**
          * @brief 上报失败并删除暂存文件
          * @param loop 命令所属事件循环
          * @param payload 已校验的正文
          * @param staging 暂存文件路径；空路径表示尚未创建
+         * @param commandId 执行该固件更新的命令标识
          * @param message 中文原因
          * @return 失败的命令结果
          */
-        AsynGyanis::Core::Task<CommandResult> fail(AsynGyanis::Core::EventLoop &loop, const FirmwarePayload &payload, const std::filesystem::path &staging,
+        AsynGyanis::Core::Task<CommandResult> fail(AsynGyanis::Core::EventLoop &loop, const FirmwarePayload &payload, const std::filesystem::path &staging, std::int64_t commandId,
                                                    std::string message);
 
         AgentClient       &m_client;        ///< 服务端客户端

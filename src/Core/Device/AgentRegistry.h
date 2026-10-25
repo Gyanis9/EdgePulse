@@ -98,9 +98,11 @@ namespace EdgePulse::Device
          * @param loop 恢复协程用的事件循环
          * @param nodeId 节点标识
          * @param agentVersion Agent 版本
+         * @param installedFirmwareVersion Agent 上报的已安装固件版本；空表示未上报，保留节点原值
          * @return 成功返回更新后的节点与在线转换标记；失败返回可恢复错误
          */
-        AsynGyanis::Core::Task<std::expected<HeartbeatOutcome, AgentError>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion);
+        AsynGyanis::Core::Task<std::expected<HeartbeatOutcome, AgentError>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion,
+                                                                                      std::string installedFirmwareVersion = {});
 
     private:
         /**

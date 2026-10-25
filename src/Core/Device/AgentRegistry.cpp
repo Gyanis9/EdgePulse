@@ -132,14 +132,14 @@ namespace EdgePulse::Device
     }
 
     AsynGyanis::Core::Task<std::expected<HeartbeatOutcome, AgentError>> AgentRegistry::heartbeat(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
-                                                                                                 std::string agentVersion)
+                                                                                                 std::string agentVersion, std::string installedFirmwareVersion)
     {
         if (nodeId <= 0)
         {
             co_return std::unexpected(AgentError{AgentError::Reason::InvalidRequest, "nodeId 必须是正整数"});
         }
         // Agent 侧没有会话，节点标识全局唯一；按全租户视图查节点，避免只认默认租户
-        const auto outcome = co_await m_repository->scoped(System::TenantScope{0, true})->heartbeat(loop, nodeId, std::move(agentVersion));
+        const auto outcome = co_await m_repository->scoped(System::TenantScope{0, true})->heartbeat(loop, nodeId, std::move(agentVersion), std::move(installedFirmwareVersion));
         if (!outcome.has_value())
         {
             co_return std::unexpected(AgentError{AgentError::Reason::NotFound, "节点不存在或已删除"});

@@ -114,6 +114,7 @@ namespace EdgePulse::Agent
             std::string  status;             ///< 状态文本
             int          progress{-1};       ///< 进度百分比
             std::int64_t nodeId{0};          ///< 节点标识
+            std::int64_t commandId{0};       ///< 命令标识
             std::string  message;            ///< 中文说明
         };
 
@@ -319,6 +320,7 @@ namespace EdgePulse::Agent
                         report.status   = parsed->value("status", std::string{});
                         report.progress = parsed->value("progress", -1);
                         report.nodeId   = parsed->value("nodeId", static_cast<std::int64_t>(0));
+                        report.commandId = parsed->value("commandId", static_cast<std::int64_t>(0));
                         report.message  = parsed->value("message", std::string{});
                     }
                     reports.push_back(std::move(report));
@@ -334,6 +336,18 @@ namespace EdgePulse::Agent
             [[nodiscard]] std::optional<std::string> installedVersion() const
             {
                 return m_state == nullptr ? std::nullopt : m_state->get("installed_firmware_version");
+            }
+
+            /**
+             * @brief 预置状态库里的已安装固件版本
+             * @param version 版本文本
+             */
+            void setInstalledVersion(const std::string &version)
+            {
+                if (m_state != nullptr)
+                {
+                    m_state->set("installed_firmware_version", version);
+                }
             }
 
             [[nodiscard]] bool stagingEmpty() const
@@ -410,6 +424,7 @@ namespace EdgePulse::Agent
         for (const FirmwareStatusReport &report: reports)
         {
             EXPECT_EQ(77, report.nodeId);
+            EXPECT_EQ(1, report.commandId) << "每条状态都必须带上执行该命令的 commandId";
             EXPECT_FALSE(report.message.empty());
         }
 
@@ -479,6 +494,7 @@ namespace EdgePulse::Agent
         EXPECT_EQ("failed", unsignedReports[0].status);
         EXPECT_EQ(100, unsignedReports[0].progress);
         EXPECT_EQ(77, unsignedReports[0].nodeId);
+        EXPECT_EQ(1, unsignedReports[0].commandId) << "失败状态同样按命令归因";
         EXPECT_NE(std::string::npos, unsignedReports[0].message.find("signature")) << unsignedReports[0].message;
 
         const std::string algorithmPayload =
@@ -555,6 +571,32 @@ namespace EdgePulse::Agent
         ASSERT_FALSE(reports.empty());
         EXPECT_EQ("failed", reports.back().status);
         EXPECT_FALSE(harness.installedVersion().has_value());
+        EXPECT_TRUE(harness.stagingEmpty());
+    }
+
+    TEST(AgentFirmware, FailedInstallKeepsPreviousInstalledVersion)
+    {
+        const std::string firmwareBytes = "EDGEPULSE-FIRMWARE-" + std::string(1024, 'k');
+        FirmwareHarness   harness(firmwareBytes);
+        harness.setInstalledVersion("1.0.0");
+        const auto key = Testing::FirmwareKeyFixture::generate(harness.trustedKeysDirectory(), "prod-2026");
+        ASSERT_TRUE(key.has_value()) << key.error();
+
+        const std::string digest  = AsynGyanis::Core::Digest::sha256Hex(firmwareBytes);
+        const std::string payload = firmwarePayload(digest, static_cast<std::int64_t>(firmwareBytes.size()), key->signDigest(digest)).dump();
+
+        const ScopedEnvironmentVariable marker("EDGEPULSE_AGENT_TEST_HOOK_MARKER", harness.hookMarkerPath().string());
+        const ScopedEnvironmentVariable exitCode("EDGEPULSE_AGENT_TEST_HOOK_EXIT", "9");
+        const CommandResult             result = harness.execute(payload);
+        EXPECT_FALSE(result.succeeded);
+        EXPECT_NE(std::string::npos, result.message.find("安装钩子")) << result.message;
+
+        const std::vector<FirmwareStatusReport> reports = harness.statusReports();
+        ASSERT_FALSE(reports.empty());
+        EXPECT_EQ("failed", reports.back().status);
+        EXPECT_EQ(1, reports.back().commandId);
+        ASSERT_TRUE(harness.installedVersion().has_value()) << "安装失败不得清除上一次成功安装的版本";
+        EXPECT_EQ("1.0.0", *harness.installedVersion());
         EXPECT_TRUE(harness.stagingEmpty());
     }
 

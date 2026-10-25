@@ -401,13 +401,15 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, "缺少整数 nodeId 或字符串 agentVersion", traceId);
                             co_return;
                         }
-                        const auto identity = co_await requireAgentNode(loop, nodes, request, nodeIdIterator->get<std::int64_t>());
+                        // 已安装固件版本是新增字段：旧 Agent 不发送或类型不符时按未上报处理，仓储保留节点原值
+                        const std::string installedFirmwareVersion = stringField(*body, "installedFirmwareVersion").value_or("");
+                        const auto        identity                 = co_await requireAgentNode(loop, nodes, request, nodeIdIterator->get<std::int64_t>());
                         if (!identity.has_value())
                         {
                             Common::writeFailure(response, identity.error().httpStatus, identity.error().httpStatus, identity.error().message, traceId);
                             co_return;
                         }
-                        const auto result = co_await registry.heartbeat(loop, identity->id, *agentVersion);
+                        const auto result = co_await registry.heartbeat(loop, identity->id, *agentVersion, installedFirmwareVersion);
                         if (!result.has_value())
                         {
                             writeAgentError(response, result.error(), traceId);

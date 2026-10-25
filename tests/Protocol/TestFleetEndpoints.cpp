@@ -86,14 +86,15 @@ namespace
     }
 
     void insertFirmwareTask(const std::filesystem::path &databasePath, const std::int64_t taskId, const std::int64_t tenantId, const std::int64_t firmwareId,
-                            const std::int64_t nodeId)
+                            const std::int64_t nodeId, const std::int64_t commandId = 0)
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
         const std::string                                               now        = EdgePulse::Common::nowDateTimeUtc();
-        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result     = connection->execute(
-                "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, previous_firmware_id) VALUES (" +
-                std::to_string(taskId) + ", " + std::to_string(tenantId) + ", " + std::to_string(firmwareId) + ", " + std::to_string(nodeId) + ", 'pending', 0, '', '" + now +
-                "', '" + now + "', 0)");
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result =
+                connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, previous_firmware_id, "
+                                    "command_id) VALUES (" +
+                                    std::to_string(taskId) + ", " + std::to_string(tenantId) + ", " + std::to_string(firmwareId) + ", " + std::to_string(nodeId) +
+                                    ", 'pending', 0, '', '" + now + "', '" + now + "', 0, " + std::to_string(commandId) + ")");
         EXPECT_NE(nullptr, result) << connection->lastError();
     }
 
@@ -1105,6 +1106,130 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
     const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
     ASSERT_EQ(200, tasks.status);
     EXPECT_EQ("installed", (*tasks.json())["data"][0]["status"].get<std::string>());
+}
+
+// 钉住：状态回报带 commandId 时只推进该命令对应的任务行，同节点同固件的其他任务不受影响
+TEST_F(FleetEndpointsTest, FirmwareStatusScopesTaskByCommandId)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "firmware-command-node");
+    const std::string  fingerprint(64, '1');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name                   = "Command OS";
+    record.version                = "5.0.0";
+    record.fileName               = "command-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, 'a');
+    record.storagePath            = (m_storage / "command-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    const std::int64_t staleTask   = 900000000000000201;
+    const std::int64_t currentTask = 900000000000000202;
+    insertFirmwareTask(m_context->databasePath(), staleTask, 1, firmwareId, nodeId, 41);
+    insertFirmwareTask(m_context->databasePath(), currentTask, 1, firmwareId, nodeId, 42);
+
+    const auto status = m_server->post(
+            "/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "命令 42 完成"}, {"commandId", 42}}).dump(),
+            "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, status.status) << status.body;
+    EXPECT_EQ(currentTask, (*status.json())["data"]["id"].get<std::int64_t>()) << "必须返回命中的那一行";
+
+    const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
+    ASSERT_EQ(200, tasks.status) << tasks.body;
+    const auto json = tasks.json();
+    ASSERT_TRUE(json.has_value());
+    ASSERT_EQ(2, (*json)["data"].size());
+    for (const auto &task: (*json)["data"])
+    {
+        const std::int64_t taskId = task["id"].get<std::int64_t>();
+        if (taskId == currentTask)
+        {
+            EXPECT_EQ("installed", task["status"].get<std::string>());
+            EXPECT_EQ("命令 42 完成", task["message"].get<std::string>());
+        } else
+        {
+            EXPECT_EQ(staleTask, taskId);
+            EXPECT_EQ("pending", task["status"].get<std::string>()) << "其他命令的任务不能被改写";
+            EXPECT_EQ("", task["message"].get<std::string>());
+        }
+    }
+}
+
+// 钉住：旧 Agent 不带 commandId 的状态回报保持原行为，按固件与节点更新全部任务
+TEST_F(FleetEndpointsTest, FirmwareStatusWithoutCommandIdKeepsLegacyTaskUpdate)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "firmware-legacy-status-node");
+    const std::string  fingerprint(64, '2');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name                   = "Legacy Status OS";
+    record.version                = "5.1.0";
+    record.fileName               = "legacy-status-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, 'b');
+    record.storagePath            = (m_storage / "legacy-status-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    const std::int64_t firstTask  = 900000000000000203;
+    const std::int64_t secondTask = 900000000000000204;
+    insertFirmwareTask(m_context->databasePath(), firstTask, 1, firmwareId, nodeId, 51);
+    insertFirmwareTask(m_context->databasePath(), secondTask, 1, firmwareId, nodeId, 52);
+
+    const auto status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "旧 Agent 完成"}}).dump(),
+                                       "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, status.status) << status.body;
+    EXPECT_EQ(secondTask, (*status.json())["data"]["id"].get<std::int64_t>()) << "旧行为返回最新一行";
+
+    const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
+    ASSERT_EQ(200, tasks.status) << tasks.body;
+    const auto json = tasks.json();
+    ASSERT_TRUE(json.has_value());
+    ASSERT_EQ(2, (*json)["data"].size());
+    for (const auto &task: (*json)["data"])
+    {
+        EXPECT_EQ("installed", task["status"].get<std::string>());
+        EXPECT_EQ("旧 Agent 完成", task["message"].get<std::string>());
+    }
+}
+
+// 钉住：心跳上报的已安装固件版本落到节点并随节点 JSON 返回；旧 Agent 不传或传空时保留原值
+TEST_F(FleetEndpointsTest, HeartbeatPersistsInstalledFirmwareVersion)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "firmware-heartbeat-node");
+    const std::string  fingerprint(64, '3');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    const auto withVersion = m_server->post("/api/agent/heartbeat",
+                                            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"agentVersion", "1.0.0"}, {"installedFirmwareVersion", "2.1.0"}}).dump(),
+                                            "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, withVersion.status) << withVersion.body;
+    EXPECT_EQ("2.1.0", (*withVersion.json())["data"]["installedFirmwareVersion"].get<std::string>());
+
+    const auto detail = m_server->get("/api/nodes/" + std::to_string(nodeId), bearer(token));
+    ASSERT_EQ(200, detail.status) << detail.body;
+    EXPECT_EQ("2.1.0", (*detail.json())["data"]["installedFirmwareVersion"].get<std::string>());
+
+    // 旧 Agent 不带字段与显式空串都不得清掉已记录版本
+    for (const std::string &legacyBody: {AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"agentVersion", "1.0.1"}}).dump(),
+                                         AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"agentVersion", "1.0.2"}, {"installedFirmwareVersion", ""}}).dump()})
+    {
+        const auto legacy = m_server->post("/api/agent/heartbeat", legacyBody, "application/json", agentHeaders(fingerprint));
+        ASSERT_EQ(200, legacy.status) << legacy.body;
+        EXPECT_EQ("2.1.0", (*legacy.json())["data"]["installedFirmwareVersion"].get<std::string>());
+    }
+
+    const auto afterLegacy = m_server->get("/api/nodes/" + std::to_string(nodeId), bearer(token));
+    ASSERT_EQ(200, afterLegacy.status) << afterLegacy.body;
+    EXPECT_EQ("2.1.0", (*afterLegacy.json())["data"]["installedFirmwareVersion"].get<std::string>());
 }
 
 // 钉住：签名上传落库、下载下发签名头，策略端点读回信任键，篡改或缺 key id 都拒绝

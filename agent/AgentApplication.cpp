@@ -359,7 +359,9 @@ namespace EdgePulse::Agent
             bool healthCheckDone     = false;
             for (;;)
             {
-                const auto reply = co_await client.heartbeat(nodeId, agentVersion);
+                // 安装成功后执行器会更新状态库；每轮重新读取，升级完成后的下一次心跳即带上新版本
+                const std::string installedFirmwareVersion = state.get("installed_firmware_version").value_or("");
+                const auto        reply                    = co_await client.heartbeat(nodeId, agentVersion, installedFirmwareVersion);
                 if (!reply.has_value())
                 {
                     ++consecutiveFailures;
