@@ -108,7 +108,7 @@ def main() -> int:
             password,
             database,
             "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY);"
-            "INSERT INTO schema_migrations VALUES (19);"
+            "INSERT INTO schema_migrations VALUES (19), (20);"
             "CREATE TABLE probe (id BIGINT PRIMARY KEY, value VARCHAR(64));"
             "INSERT INTO probe VALUES (1, 'before');",
         )
@@ -165,7 +165,11 @@ def main() -> int:
             if value != "before":
                 print(f"恢复值错误：{value!r}", file=sys.stderr)
                 return 1
-        print("MySQL 备份/恢复往返通过")
+            version = exec_sql(name, password, database, "SELECT MAX(version) FROM schema_migrations")
+            if version != "20":
+                print(f"恢复后的迁移版本错误：{version!r}（期望 20）", file=sys.stderr)
+                return 1
+        print("MySQL 备份/恢复往返通过（迁移版本 20）")
         return 0
     finally:
         subprocess.run(

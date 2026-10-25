@@ -3,6 +3,8 @@
 # 用法：scripts/gen-agent-certs.sh <agent-name> [--days <有效期天数>] [--out-dir <输出目录>]
 # 省略有效期时按 825 天签发；省略输出目录时写入 var/certs。
 set -euo pipefail
+# 中间文件与私钥默认只对当前用户可读；证书最终权限由下面显式收紧
+umask 077
 
 
 usage() {
@@ -75,20 +77,41 @@ if [[ -z "${out_dir}" ]]; then
 fi
 mkdir -p "${out_dir}"
 # 临时工作文件与成品同目录，避免在 CA 目录留下本次调用的 CSR 或扩展文件
+key_file="${out_dir}/${name}-key.pem"
+certificate_file="${out_dir}/${name}.pem"
 extension_file="${out_dir}/${name}.ext"
 request_file="${out_dir}/${name}.csr"
+# 任一步失败时清掉半成品私钥与证书，避免留下与 CSR 不配对的材料
+cleanup() {
+    status=$?
+    rm -f "${request_file}" "${extension_file}"
+    if [[ ${status} -ne 0 ]]; then
+        rm -f "${key_file}" "${certificate_file}"
+    fi
+}
+trap cleanup EXIT
 
-openssl ecparam -name prime256v1 -genkey -noout -out "${out_dir}/${name}-key.pem"
-openssl req -new -key "${out_dir}/${name}-key.pem" -subj "//CN=${name}" -out "${request_file}"
+openssl ecparam -name prime256v1 -genkey -noout -out "${key_file}"
+openssl req -new -key "${key_file}" -subj "//CN=${name}" -out "${request_file}"
 cat > "${extension_file}" <<EOF
 extendedKeyUsage=clientAuth
 EOF
 # 串行号固定落在 CA 所在目录，输出目录改到别处也不会新建第二份 ca.srl
 openssl x509 -req -in "${request_file}" -CA "${ca_cert}" -CAkey "${ca_key}" -CAserial "${cert_dir}/ca.srl" -CAcreateserial \
-    -days "${validity_days}" -sha256 -extfile "${extension_file}" -out "${out_dir}/${name}.pem"
+    -days "${validity_days}" -sha256 -extfile "${extension_file}" -out "${certificate_file}"
 rm -f "${request_file}" "${extension_file}"
-chmod 600 "${out_dir}/${name}-key.pem" 2>/dev/null || true
-fingerprint="$(openssl x509 -in "${out_dir}/${name}.pem" -noout -fingerprint -sha256 | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]')"
-echo "证书：${out_dir}/${name}.pem"
+if ! chmod 600 "${key_file}" 2>/dev/null; then
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            # Windows 文件系统没有 POSIX 权限位，Agent 在 Windows 上依赖 ACL
+            ;;
+        *)
+            echo "无法把私钥权限收紧到 0600：${key_file}" >&2
+            exit 1
+            ;;
+    esac
+fi
+fingerprint="$(openssl x509 -in "${certificate_file}" -noout -fingerprint -sha256 | sed 's/.*=//' | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+echo "证书：${certificate_file}"
 echo "有效期：${validity_days} 天"
 echo "指纹：${fingerprint}"

@@ -24,6 +24,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from argparse import ArgumentParser
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -51,6 +52,8 @@ skips: list[str] = []
 passed = 0
 known_secrets: set[str] = set()
 admin_tokens: list[str] = []
+# 续期是门禁必跑场景：只有本机确实缺 bash/openssl 且显式传 --allow-missing-renewal 才允许跳过
+allow_missing_renewal = False
 
 
 def remember_secret(value: str) -> None:
@@ -269,13 +272,13 @@ def wait_agent_state(database: Path, key: str, expected: str | None, timeout: fl
     return read_agent_state(database, key)
 
 
-def wait_agent_state_changed(database: Path, key: str, previous: str, timeout: float) -> str | None:
-    """等到状态库里的值离开 previous；续期循环在安装并重载 HTTP 身份之后才写新指纹。"""
+def wait_agent_state_outside(database: Path, key: str, excluded: set[str], timeout: float) -> str | None:
+    """等到状态库里的值既不是旧身份也不是本轮的初始指纹；续期循环在安装并重载 HTTP 身份之后才写新指纹。"""
     deadline = time.time() + timeout
     value = read_agent_state(database, key)
     while time.time() < deadline:
         value = read_agent_state(database, key)
-        if value is not None and value != previous:
+        if value is not None and value not in excluded:
             return value
         time.sleep(0.3)
     return value
@@ -841,12 +844,15 @@ def generate_rebind_certificate(session: Session) -> tuple[Path, Path] | None:
     return certificate_path, key_path
 
 
-def generate_renewal_agent_certificate(session: Session) -> tuple[tuple[Path, Path] | None, str]:
-    """用开发 CA 在临时目录签发一张 1 天有效期的客户端证书，供自动续期场景切换到短期身份。"""
+def generate_renewal_agent_certificate(session: Session) -> tuple[tuple[Path, Path] | None, str, bool]:
+    """用开发 CA 在临时目录签发一张 1 天有效期的客户端证书，供自动续期场景切换到短期身份。
+
+    返回值第三项为 True 表示本机缺少 bash/openssl；生成器退出码非零或产物缺失属于真实失败，不参与跳过。
+    """
     if shutil.which("bash") is None:
-        return None, "缺少 bash，无法调用 scripts/gen-agent-certs.sh 生成短期证书"
+        return None, "缺少 bash，无法调用 scripts/gen-agent-certs.sh 生成短期证书", True
     if shutil.which("openssl") is None:
-        return None, "缺少 openssl，无法生成短期证书"
+        return None, "缺少 openssl，无法生成短期证书", True
     directory = session.temp_root / "renewal-certs"
     directory.mkdir(parents=True, exist_ok=True)
     name = f"e2e-renewal-{RUN_ID}"
@@ -856,8 +862,17 @@ def generate_renewal_agent_certificate(session: Session) -> tuple[tuple[Path, Pa
     key_path = directory / f"{name}-key.pem"
     if result.returncode != 0 or not certificate_path.exists() or not key_path.exists():
         detail = (result.stderr or result.stdout).strip()[-400:] or f"退出码 {result.returncode}"
-        return None, "scripts/gen-agent-certs.sh 未能生成短期证书：" + detail
-    return (certificate_path, key_path), ""
+        return None, "scripts/gen-agent-certs.sh 未能生成短期证书：" + detail, False
+    return (certificate_path, key_path), "", False
+
+
+def report_renewal_unavailable(detail: str, tooling_missing: bool) -> None:
+    """续期场景不可用时的判定：缺少工具链仅在显式允许时跳过，生成器失败一律按失败处理。"""
+    if tooling_missing and allow_missing_renewal:
+        skip("自动续期：短期证书", detail + "；已显式允许缺少续期工具链")
+        return
+    hint = "；续期是 E2E 必跑场景，只有本机缺工具链时才可显式加 --allow-missing-renewal" if tooling_missing else ""
+    report("自动续期：短期证书", False, detail + hint)
 
 
 def wait_log_message(session: Session, offsets: tuple[int, int], needle: str, timeout: float) -> str:
@@ -1092,9 +1107,9 @@ def run(session: Session) -> None:
         else:
             report("签名固件下发命令创建", False, "上传未返回固件标识")
 
-    renewal_certificate, renewal_detail = generate_renewal_agent_certificate(session)
+    renewal_certificate, renewal_detail, renewal_tooling_missing = generate_renewal_agent_certificate(session)
     if renewal_certificate is None:
-        skip("自动续期：短期证书", renewal_detail)
+        report_renewal_unavailable(renewal_detail, renewal_tooling_missing)
     else:
         renewal_cert, renewal_key = renewal_certificate
         initial_fingerprint = certificate_fingerprint(renewal_cert)
@@ -1129,8 +1144,9 @@ def run(session: Session) -> None:
                     lambda node: node.get("status") == "online" and node.get("certFingerprint") not in ("", session.agent_fingerprint), 60)
                 report("自动续期：短期证书注册上线", rebound_to_short is not None, f"指纹={(rebound_to_short or {}).get('certFingerprint')}")
 
-                # 状态库在安装并重载 HTTP 身份之后才写新指纹，因此它先变化，磁盘上的证书文件必定已是新的一对
-                state_fingerprint = wait_agent_state_changed(session.agent_database, "cert_fingerprint", initial_fingerprint, 120)
+                # 续期可能在轮询间隙就已完成，因此只排除上一轮开发证书与本轮短期证书的指纹；
+                # 新指纹与磁盘证书、节点详情的最终一致性由后面的两项断言核对
+                state_fingerprint = wait_agent_state_outside(session.agent_database, "cert_fingerprint", {session.agent_fingerprint, initial_fingerprint}, 120)
                 try:
                     final_fingerprint = certificate_fingerprint(active_certificate)
                     final_not_after = certificate_not_after(active_certificate)
@@ -1308,6 +1324,13 @@ def run(session: Session) -> None:
 
 
 def main() -> int:
+    global allow_missing_renewal
+    parser = ArgumentParser(description="生产 Agent 端到端验收；自动续期默认必跑。")
+    parser.add_argument("--allow-missing-renewal", action="store_true",
+                        help="仅当本机缺少 bash/openssl 时允许跳过自动续期场景；生成器失败仍然计为 FAIL")
+    options = parser.parse_args()
+    allow_missing_renewal = options.allow_missing_renewal
+
     certificate_error = ensure_dev_certificates()
     if certificate_error:
         report("开发证书就绪", False, certificate_error)
@@ -1337,7 +1360,11 @@ def main() -> int:
             except Exception as failure:  # noqa: BLE001
                 report("清理后无残留进程、端口与临时目录", False, f"清理检查异常：{type(failure).__name__}: {failure}")
     print()
+    renewal_skips = [name for name in skips if name.startswith("自动续期")]
+    if not allow_missing_renewal and renewal_skips:
+        failures.append("自动续期场景被跳过（未显式允许）：" + "、".join(renewal_skips))
     print(f"Agent 端到端验收：通过 {passed} 项，失败 {len(failures)} 项，跳过 {len(skips)} 项")
+    print(f"自动续期场景：{'已跳过（--allow-missing-renewal）' if renewal_skips else '已执行'}")
     if failures:
         print("失败项：" + "、".join(failures))
         return 1
