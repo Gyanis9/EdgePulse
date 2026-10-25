@@ -65,6 +65,11 @@ namespace EdgePulse::Firmware
             record.rolloutId          = Sql::integer(result, "rollout_id");
             record.waveId             = Sql::integer(result, "wave_id");
             record.commandId          = Sql::integer(result, "command_id");
+            if (record.commandId < 0)
+            {
+                // 未绑定命令的任务在库里用唯一负值占位，对外仍按 0 表示未关联
+                record.commandId = 0;
+            }
             return record;
         }
     } // namespace
@@ -265,17 +270,20 @@ namespace EdgePulse::Firmware
                     std::vector<DatabaseValue> parameters{firmwareId, nodeId, ownerTenantId};
                     const auto                 existing = Sql::executeOrThrow(
                             connection,
-                            "SELECT COUNT(*) AS total FROM biz_firmware_task WHERE firmware_id = ? AND node_id = ? AND tenant_id = ? AND status IN ('pending', 'downloading')",
+                            "SELECT COUNT(*) AS total FROM biz_firmware_task WHERE firmware_id = ? AND node_id = ? AND tenant_id = ? AND status IN ('pending', 'downloading', 'installing')",
                             parameters);
                     if (existing->next() && Sql::integer(*existing, "total") > 0)
                     {
                         return 0;
                     }
-                    const std::int64_t                  id  = Common::nextIdentifier();
-                    const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 13> insertParameters{
-                            id,        ownerTenantId, firmwareId, nodeId, std::string{"pending"}, std::int64_t{0}, std::string{}, now, now, previousFirmwareId,
-                            rolloutId, waveId,        commandId};
+                    const std::int64_t id  = Common::nextIdentifier();
+                    const std::string  now = Common::nowDateTimeUtc();
+                    // 未绑定命令的任务用唯一负值占位：V24 的 (firmware_id, node_id, command_id) 唯一索引
+                    // 不能容纳多行 0，同时又不能让旧任务与新任务撞键。
+                    const std::int64_t boundCommandId = commandId > 0 ? commandId : -id;
+                    const std::array<DatabaseValue, 13> insertParameters{id,        ownerTenantId, firmwareId,     nodeId, std::string{"pending"}, std::int64_t{0},
+                                                                         std::string{}, now,            now,            previousFirmwareId, rolloutId, waveId,
+                                                                         boundCommandId};
                     Sql::executeOrThrowVoid(connection,
                                             "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, "
                                             "previous_firmware_id, rollout_id, wave_id, command_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -293,15 +301,18 @@ namespace EdgePulse::Firmware
         co_return co_await m_database->withConnection<bool>(loop,
                                                             [taskId, commandId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                                                             {
-                                                                std::vector<DatabaseValue> parameters{commandId, taskId};
+                                                                std::vector<DatabaseValue> parameters{commandId, taskId, commandId};
                                                                 std::string                clause;
                                                                 if (!tenant.allTenants)
                                                                 {
                                                                     clause = " AND tenant_id = ?";
                                                                     parameters.emplace_back(tenant.tenantId);
                                                                 }
+                                                                // 只允许从未绑定或绑定同一命令的任务回填；已绑定其他命令时保持原值
                                                                 const auto update = Sql::executeOrThrow(
-                                                                        connection, "UPDATE biz_firmware_task SET command_id = ? WHERE id = ?" + clause, parameters);
+                                                                        connection,
+                                                                        "UPDATE biz_firmware_task SET command_id = ? WHERE id = ? AND (command_id <= 0 OR command_id = ?)" + clause,
+                                                                        parameters);
                                                                 return update->affectedRowCount() > 0;
                                                             });
     }
@@ -385,6 +396,11 @@ namespace EdgePulse::Firmware
                         clause = " AND tenant_id = ?";
                         parameters.emplace_back(tenant.tenantId);
                     }
+                    if (status == "failed")
+                    {
+                        // 已经确认安装的任务不因中止或迟到的失败收尾被改写
+                        clause += " AND status <> 'installed'";
+                    }
                     const auto update =
                             Sql::executeOrThrow(connection, "UPDATE biz_firmware_task SET status = ?, progress = ?, message = ?, updated_at = ? WHERE id = ?" + clause, parameters);
                     return update->affectedRowCount() > 0;
@@ -451,7 +467,7 @@ namespace EdgePulse::Firmware
                         if (commandId != 0)
                         {
                             // 升级前建立的任务没有命令号；只有在按命令更新落空时才回退到这些行
-                            clause = legacyOnly ? " AND command_id = 0" : " AND command_id = ?";
+                            clause = legacyOnly ? " AND command_id < 0" : " AND command_id = ?";
                             if (!legacyOnly)
                             {
                                 parameters.emplace_back(commandId);
@@ -461,6 +477,12 @@ namespace EdgePulse::Firmware
                         {
                             clause += " AND tenant_id = ?";
                             parameters.emplace_back(tenant.tenantId);
+                        }
+                        // Agent 带命令号的迟到回报不能把已判失败的任务重新写成进行中或已安装；
+                        // 不带命令号的旧调用维持原有按固件与节点更新全部任务的行为
+                        if (commandId != 0)
+                        {
+                            clause += " AND status <> 'failed'";
                         }
                         const auto update = Sql::executeOrThrow(
                                 connection, "UPDATE biz_firmware_task SET status = ?, progress = ?, message = ?, updated_at = ? WHERE firmware_id = ? AND node_id = ?" + clause,
@@ -483,7 +505,7 @@ namespace EdgePulse::Firmware
                     std::string                queryClause;
                     if (commandId != 0)
                     {
-                        queryClause = legacyFallback ? " AND t.command_id = 0" : " AND t.command_id = ?";
+                        queryClause = legacyFallback ? " AND t.command_id < 0" : " AND t.command_id = ?";
                         if (!legacyFallback)
                         {
                             queryParameters.emplace_back(commandId);
