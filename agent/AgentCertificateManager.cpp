@@ -1,12 +1,14 @@
 #include "AgentCertificateManager.h"
 
 #include "Platform/FileSystem/AtomicFileWriter.h"
+#include "Platform/FileSystem/FileSystem.h"
 
 #include "Core/Tls/TlsContext.h"
 #include "Core/Tls/TlsPolicy.h"
 
 #include "Base/Log/LogMacros.h"
 
+#include <openssl/asn1.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -14,12 +16,17 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -97,6 +104,47 @@ namespace EdgePulse::Agent
         }
 
         /**
+         * @brief 检查 PEM 文本里只有证书块
+         * @param certificatePem 服务端返回的 PEM 文本
+         * @return 成功返回证书块个数；出现其他标签或没有证书块时返回中文原因
+         * @details PEM 读取只挑 CERTIFICATE 块，其余块会被静默跳过；不先查标签就会把夹带私钥或
+         *          其他材料的响应当成一份干净证书收下
+         */
+        [[nodiscard]] std::expected<std::size_t, std::string> certificateBlockCount(const std::string_view certificatePem)
+        {
+            constexpr std::string_view kBeginMarker = "-----BEGIN ";
+            constexpr std::string_view kLabelEnd    = "-----";
+            std::size_t                count        = 0;
+            std::size_t                position     = 0;
+            for (;;)
+            {
+                const std::size_t begin = certificatePem.find(kBeginMarker, position);
+                if (begin == std::string_view::npos)
+                {
+                    break;
+                }
+                const std::size_t labelBegin = begin + kBeginMarker.size();
+                const std::size_t labelEnd   = certificatePem.find(kLabelEnd, labelBegin);
+                if (labelEnd == std::string_view::npos)
+                {
+                    return std::unexpected("服务端返回的证书里有一个没有结束标记的 PEM 段落");
+                }
+                const std::string_view label = certificatePem.substr(labelBegin, labelEnd - labelBegin);
+                if (label != "CERTIFICATE")
+                {
+                    return std::unexpected("服务端返回的证书包含非证书 PEM 段落（" + std::string{label} + "）");
+                }
+                ++count;
+                position = labelEnd + kLabelEnd.size();
+            }
+            if (count == 0)
+            {
+                return std::unexpected("服务端返回的证书不是 PEM 编码的 X.509 证书");
+            }
+            return count;
+        }
+
+        /**
          * @brief 解析证书链 PEM
          * @param certificatePem 服务端返回的 PEM 文本
          * @return 成功返回证书列表，第一张是叶证书；失败返回中文原因
@@ -106,6 +154,11 @@ namespace EdgePulse::Agent
             if (certificatePem.empty())
             {
                 return std::unexpected("服务端返回的证书为空");
+            }
+            const auto expectedCount = certificateBlockCount(certificatePem);
+            if (!expectedCount)
+            {
+                return std::unexpected(expectedCount.error());
             }
             BioHandle certificateBio(BIO_new_mem_buf(certificatePem.data(), static_cast<int>(certificatePem.size())), &BIO_free);
             if (!certificateBio)
@@ -124,11 +177,34 @@ namespace EdgePulse::Agent
                 }
                 certificates.push_back(std::move(certificate));
             }
-            if (certificates.empty())
+            if (certificates.size() != *expectedCount)
             {
-                return std::unexpected("服务端返回的证书不是 PEM 编码的 X.509 证书");
+                return std::unexpected("服务端返回的证书链里有 " + std::to_string(*expectedCount) + " 个证书块，但只能解析出 " + std::to_string(certificates.size()) + " 张证书");
             }
             return certificates;
+        }
+
+        /**
+         * @brief 把解析出的证书链重新编码成 PEM
+         * @param certificates 证书链，第一张是叶证书
+         * @return 成功返回规范化的证书链 PEM；失败返回中文原因
+         */
+        [[nodiscard]] std::expected<std::string, std::string> encodeCertificateChain(const std::vector<CertHandle> &certificates)
+        {
+            BioHandle outputBio(BIO_new(BIO_s_mem()), &BIO_free);
+            if (!outputBio)
+            {
+                return std::unexpected("无法创建证书输出缓冲");
+            }
+            for (const auto &certificate: certificates)
+            {
+                if (PEM_write_bio_X509(outputBio.get(), certificate.get()) != 1)
+                {
+                    ERR_clear_error();
+                    return std::unexpected("重新编码证书链失败");
+                }
+            }
+            return pemTextOf(*outputBio);
         }
 
         /**
@@ -209,6 +285,39 @@ namespace EdgePulse::Agent
         }
 
         /**
+         * @brief 检查证书剩余有效期是否超过续期提前窗口
+         * @param certificate 叶证书
+         * @param renewBeforeDays 续期提前天数
+         * @return 成功为空；剩余有效期不足以跨过窗口时返回中文原因
+         * @details 新证书的剩余有效期不比续期窗口长时，装好后立刻又会进入续期判定，形成换证循环；
+         *          这种情况按服务端签发参数错误处理，留在旧证书上等下一轮退避
+         */
+        [[nodiscard]] std::expected<void, std::string> verifyLifetimeBeyondRenewWindow(X509 &certificate, const int renewBeforeDays)
+        {
+            tm expires{};
+            if (ASN1_TIME_to_tm(X509_get0_notAfter(&certificate), &expires) != 1)
+            {
+                return std::unexpected("服务端返回的证书到期时间无法解析");
+            }
+#ifdef _WIN32
+            const std::time_t seconds = _mkgmtime(&expires);
+#else
+            const std::time_t seconds = timegm(&expires);
+#endif
+            if (seconds == static_cast<std::time_t>(-1))
+            {
+                return std::unexpected("服务端返回的证书到期时间无法转换成时钟时刻");
+            }
+            const auto remaining = std::chrono::system_clock::from_time_t(seconds) - std::chrono::system_clock::now();
+            const auto window    = std::chrono::days{std::clamp(renewBeforeDays, 1, 90)};
+            if (remaining <= window)
+            {
+                return std::unexpected("服务端返回的证书剩余有效期不超过续期提前量（" + std::to_string(window.count()) + " 天），拒绝安装");
+            }
+            return {};
+        }
+
+        /**
          * @brief 用临时 TLS 上下文校验一对证书与私钥文件能装载
          * @param configuration 配置，只用 CA 路径
          * @param certificateFile 待验证的证书文件
@@ -236,6 +345,114 @@ namespace EdgePulse::Agent
             {
                 return std::unexpected("创建临时 TLS 上下文失败：" + std::string{failure.what()});
             }
+        }
+
+        /**
+         * @brief 取一次安装中断标记记录的路径
+         */
+        struct InstallMarker
+        {
+            std::filesystem::path certificate;       ///< 正式证书路径
+            std::filesystem::path certificateBackup; ///< 安装前证书的备份路径
+            std::filesystem::path privateKey;        ///< 正式私钥路径
+            std::filesystem::path privateKeyBackup;  ///< 安装前私钥的备份路径
+        };
+
+        /**
+         * @brief 取安装中断标记的路径
+         * @param configuration 身份配置
+         * @return std::filesystem::path 与证书同目录的标记文件
+         */
+        [[nodiscard]] std::filesystem::path installMarkerPath(const AgentConfiguration &configuration)
+        {
+            return configuration.certificateFile.string() + ".install-pending";
+        }
+
+        /**
+         * @brief 拼出安装中断标记的正文
+         * @param configuration 身份配置
+         * @return std::string 四行路径清单，路径按 UTF-8 编码
+         */
+        [[nodiscard]] std::string installMarkerText(const AgentConfiguration &configuration)
+        {
+            const auto backupOf = [](const std::filesystem::path &path) { return std::filesystem::path{path.string() + ".bak"}; };
+            const auto utf8Of   = [](const std::filesystem::path &path) { return AsynGyanis::Platform::FileSystem::utf8FromPath(path); };
+            return "certificate=" + utf8Of(configuration.certificateFile) + "\n" + "certificate_backup=" + utf8Of(backupOf(configuration.certificateFile)) + "\n" +
+                   "private_key=" + utf8Of(configuration.privateKeyFile) + "\n" + "private_key_backup=" + utf8Of(backupOf(configuration.privateKeyFile)) + "\n";
+        }
+
+        /**
+         * @brief 读安装中断标记
+         * @param markerPath 标记路径
+         * @return 成功返回四项路径；文件打不开或内容不完整时返回中文原因
+         */
+        [[nodiscard]] std::expected<InstallMarker, std::string> readInstallMarker(const std::filesystem::path &markerPath)
+        {
+            std::ifstream stream(markerPath, std::ios::binary);
+            if (!stream.is_open())
+            {
+                return std::unexpected("无法读取证书安装标记：" + AsynGyanis::Platform::FileSystem::utf8FromPath(markerPath));
+            }
+
+            InstallMarker marker;
+            bool          hasCertificate       = false;
+            bool          hasCertificateBackup = false;
+            bool          hasPrivateKey        = false;
+            bool          hasPrivateKeyBackup  = false;
+            std::string   line;
+            while (std::getline(stream, line))
+            {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+                {
+                    line.pop_back();
+                }
+                const std::size_t separator = line.find('=');
+                if (separator == std::string::npos || separator == 0 || separator + 1 >= line.size())
+                {
+                    continue;
+                }
+                const std::string key   = line.substr(0, separator);
+                const auto        value = AsynGyanis::Platform::FileSystem::pathFromUtf8(line.substr(separator + 1));
+                if (key == "certificate")
+                {
+                    marker.certificate = value;
+                    hasCertificate     = true;
+                } else if (key == "certificate_backup")
+                {
+                    marker.certificateBackup = value;
+                    hasCertificateBackup     = true;
+                } else if (key == "private_key")
+                {
+                    marker.privateKey = value;
+                    hasPrivateKey     = true;
+                } else if (key == "private_key_backup")
+                {
+                    marker.privateKeyBackup = value;
+                    hasPrivateKeyBackup     = true;
+                }
+            }
+            if (!hasCertificate || !hasCertificateBackup || !hasPrivateKey || !hasPrivateKeyBackup)
+            {
+                return std::unexpected("证书安装标记内容不完整：" + AsynGyanis::Platform::FileSystem::utf8FromPath(markerPath));
+            }
+            return marker;
+        }
+
+        /**
+         * @brief 删除一个文件，不存在视为成功
+         * @param path 目标路径
+         * @param label 写进失败原因的名字
+         * @return 成功为空；删除失败返回中文原因
+         */
+        [[nodiscard]] std::expected<void, std::string> removeFileChecked(const std::filesystem::path &path, const std::string_view label)
+        {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            if (error)
+            {
+                return std::unexpected("删除" + std::string{label} + "失败：" + AsynGyanis::Platform::FileSystem::utf8FromPath(path) + "：" + error.message());
+            }
+            return {};
         }
     } // namespace
 
@@ -330,6 +547,17 @@ namespace EdgePulse::Agent
         {
             return std::unexpected(expired.error());
         }
+        if (const auto lifetime = verifyLifetimeBeyondRenewWindow(leaf, m_configuration.certificateRenewBeforeDays); !lifetime)
+        {
+            return std::unexpected(lifetime.error());
+        }
+
+        // 只把解析出的证书块写回磁盘：响应里夹带的说明文字或其他材料一律不进正式文件
+        const auto encodedChain = encodeCertificateChain(*certificates);
+        if (!encodedChain)
+        {
+            return std::unexpected(encodedChain.error());
+        }
 
         BioHandle keyBio(BIO_new_mem_buf(m_pending.privateKeyPem.data(), static_cast<int>(m_pending.privateKeyPem.size())), &BIO_free);
         if (!keyBio)
@@ -369,7 +597,7 @@ namespace EdgePulse::Agent
             std::filesystem::remove(temporaryCertificate, cleanupError);
             std::filesystem::remove(temporaryPrivateKey, cleanupError);
         };
-        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(temporaryCertificate, std::string{certificatePem}, std::nullopt, &writeError) ||
+        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(temporaryCertificate, *encodedChain, std::nullopt, &writeError) ||
             !AsynGyanis::Platform::AtomicFileWriter::writeText(temporaryPrivateKey, m_pending.privateKeyPem, kPrivateKeyPermissions, &writeError))
         {
             removeTemporary();
@@ -403,7 +631,7 @@ namespace EdgePulse::Agent
             previousPrivateKey = *read;
         }
 
-        // 磁盘备份留下来供人工恢复；内存备份供同一进程内的 reload 失败时立即回退
+        // 磁盘备份留下来供启动恢复与人工核对；内存备份供同一进程内的 reload 失败时立即回退
         const std::filesystem::path certificateBackup = certificateFile.string() + ".bak";
         const std::filesystem::path privateKeyBackup  = privateKeyFile.string() + ".bak";
         if (!previousCertificate.empty() && !AsynGyanis::Platform::AtomicFileWriter::writeText(certificateBackup, previousCertificate, std::nullopt, &writeError))
@@ -415,10 +643,25 @@ namespace EdgePulse::Agent
             return std::unexpected("备份现有私钥失败：" + writeError);
         }
 
+        // 标记写在两份正式文件被替换之前：进程若死在两次替换之间，下次启动按它找回上一对材料
+        const std::filesystem::path markerPath = installMarkerPath(m_configuration);
+        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(markerPath, installMarkerText(m_configuration), std::nullopt, &writeError))
+        {
+            return std::unexpected("写入证书安装标记失败：" + writeError);
+        }
+
         m_previousCertificatePem = previousCertificate;
         m_previousPrivateKeyPem  = previousPrivateKey;
         m_hasPrevious            = true;
-        const auto rollback      = [this]() -> std::expected<void, std::string> { return restoreFromMemory(); };
+        const auto rollback      = [this, &markerPath]() -> std::expected<void, std::string>
+        {
+            const auto restored = restoreFromMemory();
+            if (!restored)
+            {
+                return restored;
+            }
+            return removeFileChecked(markerPath, "证书安装标记");
+        };
 
         // 先写私钥再写证书：证书是服务端认可的身份凭据，私钥没落好之前先换上证书只会留下半对材料
         if (!AsynGyanis::Platform::AtomicFileWriter::writeText(privateKeyFile, m_pending.privateKeyPem, kPrivateKeyPermissions, &writeError))
@@ -430,7 +673,7 @@ namespace EdgePulse::Agent
             }
             return std::unexpected("写入新私钥失败：" + writeError);
         }
-        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(certificateFile, std::string{certificatePem}, std::nullopt, &writeError))
+        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(certificateFile, *encodedChain, std::nullopt, &writeError))
         {
             const auto restored = rollback();
             if (!restored)
@@ -451,6 +694,11 @@ namespace EdgePulse::Agent
             return std::unexpected("安装后的身份加载失败：" + identity.error());
         }
 
+        // 两份正式文件都已换好，标记不再需要；删不掉时下次启动会复核配对后自行清理
+        if (const auto cleared = removeFileChecked(markerPath, "证书安装标记"); !cleared)
+        {
+            LOG_WARN_FMT("{}；下次启动会复核证书配对后清理", cleared.error());
+        }
         m_pending = CertificateRequestMaterial{};
         return *identity;
     }
@@ -466,10 +714,120 @@ namespace EdgePulse::Agent
         {
             return restored;
         }
+        const auto removeBackups = [this]()
+        {
+            const auto certificateBackup = std::filesystem::path{m_configuration.certificateFile.string() + ".bak"};
+            const auto privateKeyBackup  = std::filesystem::path{m_configuration.privateKeyFile.string() + ".bak"};
+            if (const auto removed = removeFileChecked(certificateBackup, "证书备份"); !removed)
+            {
+                LOG_WARN_FMT("{}", removed.error());
+            }
+            if (const auto removed = removeFileChecked(privateKeyBackup, "私钥备份"); !removed)
+            {
+                LOG_WARN_FMT("{}", removed.error());
+            }
+        };
+        removeBackups();
         m_hasPrevious = false;
         m_previousCertificatePem.clear();
         m_previousPrivateKeyPem.clear();
         return {};
+    }
+
+    void AgentCertificateManager::commitInstalledIdentity()
+    {
+        const auto certificateBackup = std::filesystem::path{m_configuration.certificateFile.string() + ".bak"};
+        const auto privateKeyBackup  = std::filesystem::path{m_configuration.privateKeyFile.string() + ".bak"};
+        if (const auto removed = removeFileChecked(certificateBackup, "证书备份"); !removed)
+        {
+            LOG_WARN_FMT("{}", removed.error());
+        }
+        if (const auto removed = removeFileChecked(privateKeyBackup, "私钥备份"); !removed)
+        {
+            LOG_WARN_FMT("{}", removed.error());
+        }
+        m_hasPrevious = false;
+        m_previousCertificatePem.clear();
+        m_previousPrivateKeyPem.clear();
+    }
+
+    std::expected<bool, std::string> AgentCertificateManager::recoverInterruptedInstall(const AgentConfiguration &configuration)
+    {
+        const std::filesystem::path markerPath = installMarkerPath(configuration);
+        std::error_code             existsError;
+        if (!std::filesystem::exists(markerPath, existsError))
+        {
+            if (existsError)
+            {
+                return std::unexpected("检查证书安装标记失败：" + AsynGyanis::Platform::FileSystem::utf8FromPath(markerPath) + "：" + existsError.message());
+            }
+            return false;
+        }
+
+        const auto marker = readInstallMarker(markerPath);
+        if (!marker)
+        {
+            return std::unexpected(marker.error());
+        }
+        if (marker->certificate != configuration.certificateFile || marker->privateKey != configuration.privateKeyFile)
+        {
+            return std::unexpected("证书安装标记记录的路径与当前配置不一致，请人工核对后删除标记：" + AsynGyanis::Platform::FileSystem::utf8FromPath(markerPath));
+        }
+
+        const auto pairLoaded = verifyTlsIdentity(configuration, configuration.certificateFile, configuration.privateKeyFile);
+        if (pairLoaded)
+        {
+            const auto cleared = removeFileChecked(markerPath, "证书安装标记");
+            if (!cleared)
+            {
+                return std::unexpected(cleared.error());
+            }
+            LOG_INFO("检测到上次证书安装的标记，配置路径上的证书与私钥可以正常装载，已清理标记");
+            return false;
+        }
+
+        LOG_WARN_FMT("上次证书安装在中途中断（{}），开始用安装前的备份恢复", pairLoaded.error());
+        const auto certificateBackupText = readTextFile(marker->certificateBackup);
+        if (!certificateBackupText)
+        {
+            return std::unexpected("恢复中断的证书安装失败：" + certificateBackupText.error());
+        }
+        const auto privateKeyBackupText = readTextFile(marker->privateKeyBackup);
+        if (!privateKeyBackupText)
+        {
+            return std::unexpected("恢复中断的证书安装失败：" + privateKeyBackupText.error());
+        }
+
+        std::string writeError;
+        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(configuration.privateKeyFile, *privateKeyBackupText, kPrivateKeyPermissions, &writeError))
+        {
+            return std::unexpected("恢复上一份私钥失败：" + writeError);
+        }
+        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(configuration.certificateFile, *certificateBackupText, std::nullopt, &writeError))
+        {
+            return std::unexpected("恢复上一份证书失败：" + writeError);
+        }
+
+        const auto restored = verifyTlsIdentity(configuration, configuration.certificateFile, configuration.privateKeyFile);
+        if (!restored)
+        {
+            return std::unexpected("用备份恢复后证书与私钥仍无法装载，保留安装标记等待人工处理：" + restored.error());
+        }
+        const auto cleared = removeFileChecked(markerPath, "证书安装标记");
+        if (!cleared)
+        {
+            return std::unexpected(cleared.error());
+        }
+        if (const auto removed = removeFileChecked(marker->certificateBackup, "证书备份"); !removed)
+        {
+            LOG_WARN_FMT("{}", removed.error());
+        }
+        if (const auto removed = removeFileChecked(marker->privateKeyBackup, "私钥备份"); !removed)
+        {
+            LOG_WARN_FMT("{}", removed.error());
+        }
+        LOG_WARN("已用安装前的备份恢复证书与私钥，并清理安装标记");
+        return true;
     }
 
     std::expected<void, std::string> AgentCertificateManager::restoreFromMemory()
@@ -477,25 +835,24 @@ namespace EdgePulse::Agent
         std::string writeError;
         if (m_previousPrivateKeyPem.empty())
         {
-            std::error_code removeError;
-            std::filesystem::remove(m_configuration.privateKeyFile, removeError);
+            if (const auto removed = removeFileChecked(m_configuration.privateKeyFile, "新私钥"); !removed)
+            {
+                return removed;
+            }
         } else if (!AsynGyanis::Platform::AtomicFileWriter::writeText(m_configuration.privateKeyFile, m_previousPrivateKeyPem, kPrivateKeyPermissions, &writeError))
         {
             return std::unexpected("恢复上一份私钥失败：" + writeError);
         }
         if (m_previousCertificatePem.empty())
         {
-            std::error_code removeError;
-            std::filesystem::remove(m_configuration.certificateFile, removeError);
+            if (const auto removed = removeFileChecked(m_configuration.certificateFile, "新证书"); !removed)
+            {
+                return removed;
+            }
         } else if (!AsynGyanis::Platform::AtomicFileWriter::writeText(m_configuration.certificateFile, m_previousCertificatePem, std::nullopt, &writeError))
         {
             return std::unexpected("恢复上一份证书失败：" + writeError);
         }
         return {};
-    }
-
-    void AgentCertificateManager::discardPending()
-    {
-        m_pending = CertificateRequestMaterial{};
     }
 } // namespace EdgePulse::Agent

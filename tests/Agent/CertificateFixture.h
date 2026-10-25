@@ -69,6 +69,18 @@ namespace EdgePulse::Agent::Testing
     CertificateAuthorityMaterial writeCertificateAuthority(const TestSupport::TemporaryDirectory &directory, const std::string &prefix);
 
     /**
+     * @brief 在临时目录里生成一张由根 CA 签发的中级 CA
+     * @param directory 临时目录
+     * @param prefix 文件名前缀
+     * @param root 签发中级证书的根 CA
+     * @return CertificateAuthorityMaterial 中级证书、私钥与指纹
+     * @throws std::runtime_error 根 CA 材料读取或签发失败
+     * @note 中级证书带 CA:TRUE 与 keyCertSign，可用于签发叶证书以构造三段链
+     */
+    CertificateAuthorityMaterial writeIntermediateCertificateAuthority(const TestSupport::TemporaryDirectory &directory, const std::string &prefix,
+                                                                       const CertificateAuthorityMaterial &root);
+
+    /**
      * @brief 用测试 CA 按 CSR 签发一张客户端叶证书
      * @param authority 签发用的 CA 材料
      * @param csrPem CSR 的 PEM 文本

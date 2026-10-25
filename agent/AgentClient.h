@@ -245,8 +245,8 @@ namespace EdgePulse::Agent
          * @param nodeId 服务端分配的节点 ID
          * @param csrPem 本次生成的证书签名请求 PEM
          * @return 成功返回新证书与元数据；失败带中文原因与重试分类
-         * @note 403 表示节点证书已吊销或租户停用，按终止处理；400 表示 CSR 不合法，重试同一份材料不会改变结论；
-         *       408、425、429 与 5xx 可重试。请求与响应正文都不写入日志
+         * @note 只有 403 表示节点证书已吊销或租户停用，按终止处理；400、404 与其他非 403 响应
+         *       以及正文校验失败都标记为可重试，由续期循环决定退避节奏。请求与响应正文都不写入日志
          */
         AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>> renewCertificate(std::int64_t nodeId, std::string csrPem);
 
@@ -254,9 +254,11 @@ namespace EdgePulse::Agent
          * @brief 在事件循环线程上重新装载磁盘上的客户端证书与私钥
          * @param restoreBackups 装载失败时的回退动作；返回 true 表示已把旧文件写回
          * @return 装载成功返回 true；失败返回 false，调用方应稍后再试
-         * @details 新材料先按配置路径装载到内置 TLS 上下文，成功后关闭空闲连接，让后续请求重新握手；
-         *          失败时（可选）执行回退动作并再次装载旧材料。明文测试配置没有客户端身份，直接返回 true。
-         * @note 必须在客户端所属事件循环线程上调用：setClientCertificate 会改写共用的 TLS 上下文
+         * @details 候选客户端连同新证书与私钥一起构造并验证，全部通过后才在循环线程上整体替换；
+         *          构造失败时旧客户端与旧身份原样保留，不会出现半换的状态。成功后更新身份并收掉
+         *          旧客户端的空闲连接，后续请求按新身份重新握手；在途请求继续持有旧客户端直到完成。
+         *          失败时（可选）执行回退动作，再用回退后的文件重建一次客户端。
+         * @note 必须在客户端所属事件循环线程上调用；替换动作只改写本对象持有的客户端指针
          */
         bool reloadIdentityFromDisk(const std::function<bool()> &restoreBackups = {});
 
@@ -270,10 +272,23 @@ namespace EdgePulse::Agent
         }
 
     private:
+        /**
+         * @brief 按当前配置重建接口地址与单次请求时限
+         */
+        void configureEndpoints();
+
+        /**
+         * @brief 按当前配置构造一个可用的 HTTP 客户端
+         * @return 成功返回新客户端；地址、TLS 策略或客户端身份装载失败时返回中文原因
+         * @details 重建的是整个客户端而不是只换证书：连接池、TLS 策略与客户端身份都随新实例一起
+         *          建立，调用方拿到的是一个完整可用的对象，不会观察到换到一半的状态
+         */
+        [[nodiscard]] std::expected<std::shared_ptr<AsynGyanis::Net::HttpClient>, std::string> createClient() const;
+
         AsynGyanis::Core::EventLoop                 &m_loop;                     ///< 请求所属事件循环
         AgentConfiguration                           m_configuration;            ///< 本次进程使用的配置副本
         AgentIdentity                                m_identity;                 ///< 证书指纹与到期时间
-        std::unique_ptr<AsynGyanis::Net::HttpClient> m_client;                   ///< 带连接池的 HTTP 客户端
+        std::shared_ptr<AsynGyanis::Net::HttpClient> m_client;                   ///< 带连接池的 HTTP 客户端；换证时整体替换
         std::string                                  m_baseUrl;                  ///< 去掉结尾斜杠的服务端基地址
         std::string                                  m_registerUrl;              ///< 注册接口的绝对地址
         std::string                                  m_heartbeatUrl;             ///< 心跳接口的绝对地址
@@ -284,6 +299,6 @@ namespace EdgePulse::Agent
         std::string                                  m_renewalUrl;               ///< 证书续期接口的绝对地址
         std::string                                  m_initializationError;      ///< 客户端装配失败原因，空表示可用
         bool                                         m_tlsIdentityLoaded{false}; ///< 是否在 TLS 上下文上装载了客户端证书
-        std::chrono::milliseconds                    m_requestTimeout;           ///< 单次注册请求的整体时限
+        std::chrono::milliseconds                    m_requestTimeout{30000};    ///< 单次请求的整体时限
     };
 } // namespace EdgePulse::Agent

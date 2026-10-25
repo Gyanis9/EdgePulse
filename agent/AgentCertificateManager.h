@@ -67,23 +67,29 @@ namespace EdgePulse::Agent
         /**
          * @brief 把最近一次 install 之前的证书与私钥写回配置路径
          * @return 成功为空；没有可恢复的上一份或写入失败时返回中文原因
-         * @note 供上层在 HTTP 通道装载新身份失败时回退；恢复成功后清空备份，重复调用返回错误
+         * @note 供上层在 HTTP 通道装载新身份失败时回退；恢复成功后清空内存备份并删除磁盘备份，
+         *       重复调用返回错误
          */
         [[nodiscard]] std::expected<void, std::string> restorePrevious();
 
         /**
-         * @brief 丢弃尚未安装的私钥与 CSR
+         * @brief 丢弃本次安装留下的回退材料
+         * @details HTTP 与 WebSocket 两条通道都已装载新身份后调用：删除磁盘上的 .bak 并清空内存备份，
+         *          此后 restorePrevious() 不再可用。删除失败只记录 WARN，不影响已经生效的身份。
          */
-        void discardPending();
+        void commitInstalledIdentity();
 
         /**
-         * @brief 取当前配置副本
-         * @return const AgentConfiguration & 构造时记录的配置
+         * @brief 处理上次进程在两次替换之间中断留下的安装标记
+         * @param configuration 已通过形态校验的配置
+         * @return 成功时返回是否回退了旧材料；读标记或回退失败时返回中文原因
+         * @details 标记由 install() 在两份正式文件被替换之前写下，里面记录证书、私钥与两份 .bak
+         *          的路径。启动时若标记存在：配置路径上的证书与私钥能配对装载，说明上次替换已经
+         *          完成，只删标记；配对失败说明进程死在两次替换之间，把两份 .bak 写回配置路径
+         *          后再删标记。没有标记时直接返回 false。
+         * @note 必须在加载身份之前调用；回退失败时保留标记与备份，下次启动继续尝试
          */
-        [[nodiscard]] const AgentConfiguration &configuration() const noexcept
-        {
-            return m_configuration;
-        }
+        [[nodiscard]] static std::expected<bool, std::string> recoverInterruptedInstall(const AgentConfiguration &configuration);
 
     private:
         /**

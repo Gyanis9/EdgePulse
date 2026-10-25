@@ -455,17 +455,49 @@ namespace EdgePulse::Agent
         EXPECT_NE(std::string::npos, outcome.error().message.find("频繁"));
     }
 
-    TEST(AgentClient, RenewalInvalidCsrIsNotRetryable)
+    TEST(AgentClient, RenewalInvalidCsrIsRetryable)
     {
         auto                       capture = std::make_shared<RenewalCapture>();
         TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
                                           { installRenewalRoute(router, capture, 400, R"({"code":400,"message":"CSR 不合法","data":null,"traceId":"trace-renew"})"); });
 
+        // 400 不再按终止处理：续期循环要给服务端与本地时钟留出纠正机会，按更长退避重试
         const auto outcome = runRenewal(renewalConfiguration(server.port()), 7, "csr");
         ASSERT_FALSE(outcome.has_value());
-        EXPECT_FALSE(outcome.error().retryable);
+        EXPECT_TRUE(outcome.error().retryable);
         EXPECT_FALSE(outcome.error().authorizationRejected);
         EXPECT_EQ(400, outcome.error().httpStatus);
+    }
+
+    TEST(AgentClient, RenewalNotFoundIsRetryable)
+    {
+        auto                       capture = std::make_shared<RenewalCapture>();
+        TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                                          { installRenewalRoute(router, capture, 404, R"({"code":404,"message":"节点不存在","data":null,"traceId":"trace-renew"})"); });
+
+        const auto outcome = runRenewal(renewalConfiguration(server.port()), 7, "csr");
+        ASSERT_FALSE(outcome.has_value());
+        EXPECT_TRUE(outcome.error().retryable);
+        EXPECT_FALSE(outcome.error().authorizationRejected);
+        EXPECT_EQ(404, outcome.error().httpStatus);
+    }
+
+    TEST(AgentClient, RenewalMalformedSuccessBodyIsRetryable)
+    {
+        auto                       capture = std::make_shared<RenewalCapture>();
+        TestSupport::ServerHarness server(
+                [capture](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                {
+                    installRenewalRoute(router, capture, 200,
+                                        R"({"code":200,"message":"ok","data":{"certificatePem":"","fingerprint":")" + std::string(64U, 'c') +
+                                                R"(","notAfter":"2027-10-25 08:00:00"},"traceId":"trace-renew"})");
+                });
+
+        // 200 但正文不可用时同样可能只是服务端瞬时故障，按可重试处理
+        const auto outcome = runRenewal(renewalConfiguration(server.port()), 7, "csr");
+        ASSERT_FALSE(outcome.has_value());
+        EXPECT_TRUE(outcome.error().retryable);
+        EXPECT_NE(std::string::npos, outcome.error().message.find("certificatePem"));
     }
 
     TEST(AgentClient, RenewalServerErrorIsRetryable)
@@ -493,7 +525,7 @@ namespace EdgePulse::Agent
 
         const auto outcome = runRenewal(renewalConfiguration(server.port()), 7, "csr");
         ASSERT_FALSE(outcome.has_value());
-        EXPECT_FALSE(outcome.error().retryable);
+        EXPECT_TRUE(outcome.error().retryable) << "200 但正文缺证书仍可能是服务端瞬时故障";
         EXPECT_NE(std::string::npos, outcome.error().message.find("certificatePem"));
     }
 
@@ -547,5 +579,32 @@ namespace EdgePulse::Agent
         EXPECT_EQ(next.fingerprint, client.identity().fingerprint);
         EXPECT_EQ(goodCertificate, readFileText(configuration.certificateFile));
         EXPECT_EQ(goodKey, readFileText(configuration.privateKeyFile));
+    }
+
+    TEST(AgentClient, ReloadIdentityFromDiskKeepsClientUsableAfterFailedLoad)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      initial       = Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent");
+        const auto                      next          = Testing::writeSelfSignedCertificate(directory, 60L * 24L * 60L * 60L, "next");
+        const auto                      configuration = httpsConfiguration(initial);
+
+        AgentLoop     agentLoop;
+        AgentClient   client(agentLoop.loop(), configuration, testIdentity());
+        LoopStopGuard guard(agentLoop);
+
+        // 新私钥坏了：构造候选客户端必须失败，旧客户端与旧身份原样保留
+        ASSERT_TRUE(writeIdentityFile(configuration.certificateFile, readFileText(next.certificateFile)));
+        ASSERT_TRUE(writeIdentityFile(configuration.privateKeyFile, "not-a-private-key"));
+        const auto failed = agentLoop.run(reloadIdentityTask(client, {}), std::chrono::seconds{10}, "失败身份重载");
+        ASSERT_TRUE(failed.has_value());
+        EXPECT_FALSE(*failed);
+        EXPECT_EQ(testIdentity().fingerprint, client.identity().fingerprint);
+
+        // 修好私钥后同一条客户端仍能完成换代，说明失败没有把内部状态改坏
+        ASSERT_TRUE(writeIdentityFile(configuration.privateKeyFile, readFileText(next.privateKeyFile)));
+        const auto reloaded = agentLoop.run(reloadIdentityTask(client, {}), std::chrono::seconds{10}, "再次身份重载");
+        ASSERT_TRUE(reloaded.has_value());
+        EXPECT_TRUE(*reloaded);
+        EXPECT_EQ(next.fingerprint, client.identity().fingerprint);
     }
 } // namespace EdgePulse::Agent

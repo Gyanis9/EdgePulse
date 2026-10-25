@@ -5,10 +5,13 @@
 #include "CertificateFixture.h"
 #include "TestSupport/TemporaryDirectory.h"
 
+#include "Platform/FileSystem/FileSystem.h"
+
 #include <gtest/gtest.h>
 
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
@@ -112,6 +115,81 @@ namespace EdgePulse::Agent
             tampered[lineBegin]  = tampered[lineBegin] == 'A' ? 'B' : 'A';
             return tampered;
         }
+
+        /**
+         * @brief 取 CSR 主题里的 CN
+         * @param csrPem CSR 文本
+         * @return std::string CN；解析失败或没有 CN 时为空
+         */
+        [[nodiscard]] std::string certificateRequestCommonName(const std::string &csrPem)
+        {
+            BioHandle csrBio(BIO_new_mem_buf(csrPem.data(), static_cast<int>(csrPem.size())), &BIO_free);
+            if (!csrBio)
+            {
+                return {};
+            }
+            RequestHandle request(PEM_read_bio_X509_REQ(csrBio.get(), nullptr, nullptr, nullptr), &X509_REQ_free);
+            if (!request)
+            {
+                return {};
+            }
+            char      buffer[256]{};
+            const int length = X509_NAME_get_text_by_NID(X509_REQ_get_subject_name(request.get()), NID_commonName, buffer, sizeof(buffer));
+            return length > 0 ? std::string{buffer, static_cast<std::size_t>(length)} : std::string{};
+        }
+
+        /**
+         * @brief 数一段 PEM 里出现几张证书
+         * @param pemText 待检查文本
+         * @return int 证书块个数
+         */
+        [[nodiscard]] int countCertificateBlocks(const std::string &pemText)
+        {
+            constexpr std::string_view kBeginMarker = "-----BEGIN CERTIFICATE-----";
+            int                        count        = 0;
+            for (auto position = pemText.find(kBeginMarker); position != std::string::npos; position = pemText.find(kBeginMarker, position + kBeginMarker.size()))
+            {
+                ++count;
+            }
+            return count;
+        }
+
+        /**
+         * @brief 覆盖写一段文本
+         * @param path 目标路径
+         * @param text 正文
+         * @return bool 写入成功
+         */
+        [[nodiscard]] bool writeTextFile(const std::filesystem::path &path, const std::string &text)
+        {
+            std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+            stream << text;
+            stream.close();
+            return static_cast<bool>(stream);
+        }
+
+        /**
+         * @brief 取安装中断标记的路径
+         * @param configuration 身份配置
+         * @return std::filesystem::path 标记路径
+         */
+        [[nodiscard]] std::filesystem::path installMarkerPath(const AgentConfiguration &configuration)
+        {
+            return configuration.certificateFile.string() + ".install-pending";
+        }
+
+        /**
+         * @brief 按实现约定拼出安装中断标记的正文
+         * @param configuration 身份配置
+         * @return std::string 四行路径清单
+         */
+        [[nodiscard]] std::string installMarkerText(const AgentConfiguration &configuration)
+        {
+            const auto utf8   = [](const std::filesystem::path &path) { return AsynGyanis::Platform::FileSystem::utf8FromPath(path); };
+            const auto backup = [](const std::filesystem::path &path) { return std::filesystem::path{path.string() + ".bak"}; };
+            return "certificate=" + utf8(configuration.certificateFile) + "\n" + "certificate_backup=" + utf8(backup(configuration.certificateFile)) + "\n" +
+                   "private_key=" + utf8(configuration.privateKeyFile) + "\n" + "private_key_backup=" + utf8(backup(configuration.privateKeyFile)) + "\n";
+        }
     } // namespace
 
     TEST(AgentCertificateManager, GeneratesEcP256KeyAndSignedCsr)
@@ -126,6 +204,7 @@ namespace EdgePulse::Agent
         EXPECT_NE(std::string::npos, request->privateKeyPem.find("BEGIN PRIVATE KEY"));
         EXPECT_NE(std::string::npos, request->csrPem.find("BEGIN CERTIFICATE REQUEST"));
         EXPECT_TRUE(isEcP256CertificateRequest(request->csrPem));
+        EXPECT_EQ("edge-01", certificateRequestCommonName(request->csrPem)) << "CSR 主题必须取配置里的节点名";
     }
 
     TEST(AgentCertificateManager, InstallsSignedCertificateAndReloadsIdentity)
@@ -272,5 +351,166 @@ namespace EdgePulse::Agent
         const auto reloaded = AgentIdentity::reload(managerConfiguration(directory, authority.certificateFile));
         ASSERT_TRUE(reloaded.has_value()) << reloaded.error();
         EXPECT_EQ(initial.fingerprint, reloaded->fingerprint);
+    }
+
+    TEST(AgentCertificateManager, InstallsLeafWithIntermediateChain)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      root         = Testing::writeCertificateAuthority(directory, "root");
+        const auto                      intermediate = Testing::writeIntermediateCertificateAuthority(directory, "intermediate", root);
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        AgentCertificateManager manager(managerConfiguration(directory, root.certificateFile));
+        const auto              request = manager.generateKeyAndCsr();
+        ASSERT_TRUE(request.has_value()) << request.error();
+
+        const auto        issued    = Testing::signCertificateRequest(intermediate, request->csrPem, 90L * 24L * 60L * 60L);
+        const std::string chain     = issued.certificatePem + readText(intermediate.certificateFile);
+        const auto        installed = manager.install(chain);
+        ASSERT_TRUE(installed.has_value()) << installed.error();
+        EXPECT_EQ(issued.fingerprint, installed->fingerprint);
+
+        const std::string installedChain = readText(managerConfiguration(directory, root.certificateFile).certificateFile);
+        EXPECT_EQ(2, countCertificateBlocks(installedChain)) << "叶证书与中间证书都必须落盘";
+
+        const auto loaded = AgentIdentity::load(managerConfiguration(directory, root.certificateFile));
+        ASSERT_TRUE(loaded.has_value()) << loaded.error();
+        EXPECT_EQ(issued.fingerprint, loaded->fingerprint);
+    }
+
+    TEST(AgentCertificateManager, RejectsCertificateWhoseLifetimeDoesNotExceedRenewWindow)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      authority          = Testing::writeCertificateAuthority(directory, "ca");
+        const auto                      initial            = Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent");
+        const std::string               initialCertificate = readText(initial.certificateFile);
+        const std::string               initialKey         = readText(initial.privateKeyFile);
+
+        AgentConfiguration configuration         = managerConfiguration(directory, authority.certificateFile);
+        configuration.certificateRenewBeforeDays = 7;
+        AgentCertificateManager manager(configuration);
+        const auto              request = manager.generateKeyAndCsr();
+        ASSERT_TRUE(request.has_value()) << request.error();
+
+        // 剩余 5 天会在装好后立刻又进入续期窗口，必须按失败处理而不是反复换证
+        const auto issued    = Testing::signCertificateRequest(authority, request->csrPem, 5L * 24L * 60L * 60L);
+        const auto installed = manager.install(issued.certificatePem);
+        ASSERT_FALSE(installed.has_value());
+        EXPECT_NE(std::string::npos, installed.error().find("提前量"));
+        EXPECT_EQ(initialCertificate, readText(initial.certificateFile));
+        EXPECT_EQ(initialKey, readText(initial.privateKeyFile));
+    }
+
+    TEST(AgentCertificateManager, RejectsResponseWithNonCertificatePemBlock)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      authority          = Testing::writeCertificateAuthority(directory, "ca");
+        const auto                      initial            = Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent");
+        const std::string               initialCertificate = readText(initial.certificateFile);
+        const std::string               initialKey         = readText(initial.privateKeyFile);
+
+        AgentCertificateManager manager(managerConfiguration(directory, authority.certificateFile));
+        const auto              request = manager.generateKeyAndCsr();
+        ASSERT_TRUE(request.has_value()) << request.error();
+        const auto issued = Testing::signCertificateRequest(authority, request->csrPem, 90L * 24L * 60L * 60L);
+
+        // 私钥块混进证书响应：旧解析只挑 CERTIFICATE 块，会让这份材料通过并原样落盘
+        const std::string response  = request->privateKeyPem + issued.certificatePem;
+        const auto        installed = manager.install(response);
+        ASSERT_FALSE(installed.has_value());
+        EXPECT_NE(std::string::npos, installed.error().find("非证书"));
+        EXPECT_EQ(initialCertificate, readText(initial.certificateFile));
+        EXPECT_EQ(initialKey, readText(initial.privateKeyFile));
+    }
+
+    TEST(AgentCertificateManager, WritesOnlyParsedCertificateChain)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      authority = Testing::writeCertificateAuthority(directory, "ca");
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        AgentCertificateManager manager(managerConfiguration(directory, authority.certificateFile));
+        const auto              request = manager.generateKeyAndCsr();
+        ASSERT_TRUE(request.has_value()) << request.error();
+        const auto issued = Testing::signCertificateRequest(authority, request->csrPem, 90L * 24L * 60L * 60L);
+
+        // 响应里夹带说明文字时仍按证书块解析；写盘只写解析出的链，不回抄响应原文
+        const std::string response  = "证书链如下\n" + issued.certificatePem + "以上为全部证书\n";
+        const auto        installed = manager.install(response);
+        ASSERT_TRUE(installed.has_value()) << installed.error();
+
+        const std::string installedChain = readText(managerConfiguration(directory, authority.certificateFile).certificateFile);
+        EXPECT_EQ(std::string::npos, installedChain.find("证书链如下")) << "落盘的只能是解析出的证书块";
+        EXPECT_EQ(0U, installedChain.find("-----BEGIN CERTIFICATE-----"));
+        EXPECT_EQ(1, countCertificateBlocks(installedChain));
+    }
+
+    TEST(AgentCertificateManager, RecoversInterruptedInstallWhenPairDoesNotLoad)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      initial        = Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent");
+        const auto                      next           = Testing::writeSelfSignedCertificate(directory, 60L * 24L * 60L * 60L, "next");
+        const std::string               oldCertificate = readText(initial.certificateFile);
+        const std::string               oldKey         = readText(initial.privateKeyFile);
+        const auto                      configuration  = managerConfiguration(directory, initial.certificateFile);
+
+        // 模拟两次替换之间崩溃：私钥已换成新的，证书还是旧的，备份是完整旧材料
+        ASSERT_TRUE(writeTextFile(configuration.privateKeyFile, readText(next.privateKeyFile)));
+        ASSERT_TRUE(writeTextFile(configuration.certificateFile, oldCertificate));
+        ASSERT_TRUE(writeTextFile(std::filesystem::path{configuration.certificateFile.string() + ".bak"}, oldCertificate));
+        ASSERT_TRUE(writeTextFile(std::filesystem::path{configuration.privateKeyFile.string() + ".bak"}, oldKey));
+        const auto marker = installMarkerPath(configuration);
+        ASSERT_TRUE(writeTextFile(marker, installMarkerText(configuration)));
+
+        const auto recovered = AgentCertificateManager::recoverInterruptedInstall(configuration);
+        ASSERT_TRUE(recovered.has_value()) << recovered.error();
+        EXPECT_TRUE(*recovered) << "配对失败时必须回退备份";
+        EXPECT_EQ(oldCertificate, readText(configuration.certificateFile));
+        EXPECT_EQ(oldKey, readText(configuration.privateKeyFile));
+        EXPECT_FALSE(std::filesystem::exists(marker)) << "恢复完成后必须删除安装标记";
+
+        const auto identity = AgentIdentity::load(configuration);
+        ASSERT_TRUE(identity.has_value()) << identity.error();
+        EXPECT_EQ(initial.fingerprint, identity->fingerprint);
+    }
+
+    TEST(AgentCertificateManager, ClearsInterruptedInstallMarkerWhenPairLoads)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      initial            = Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent");
+        const std::string               initialCertificate = readText(initial.certificateFile);
+        const auto                      configuration      = managerConfiguration(directory, initial.certificateFile);
+        const auto                      marker             = installMarkerPath(configuration);
+        ASSERT_TRUE(writeTextFile(marker, installMarkerText(configuration)));
+
+        const auto recovered = AgentCertificateManager::recoverInterruptedInstall(configuration);
+        ASSERT_TRUE(recovered.has_value()) << recovered.error();
+        EXPECT_FALSE(*recovered) << "新的一对能装载时不应回退";
+        EXPECT_FALSE(std::filesystem::exists(marker));
+        EXPECT_EQ(initialCertificate, readText(configuration.certificateFile));
+    }
+
+    TEST(AgentCertificateManager, RemovesBackupFilesAfterCommit)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      authority = Testing::writeCertificateAuthority(directory, "ca");
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+        const auto configuration = managerConfiguration(directory, authority.certificateFile);
+
+        AgentCertificateManager manager(configuration);
+        const auto              request = manager.generateKeyAndCsr();
+        ASSERT_TRUE(request.has_value()) << request.error();
+        const auto issued = Testing::signCertificateRequest(authority, request->csrPem, 90L * 24L * 60L * 60L);
+        ASSERT_TRUE(manager.install(issued.certificatePem).has_value());
+
+        const auto certificateBackup = std::filesystem::path{configuration.certificateFile.string() + ".bak"};
+        const auto privateKeyBackup  = std::filesystem::path{configuration.privateKeyFile.string() + ".bak"};
+        ASSERT_TRUE(std::filesystem::exists(certificateBackup));
+        ASSERT_TRUE(std::filesystem::exists(privateKeyBackup));
+
+        manager.commitInstalledIdentity();
+        EXPECT_FALSE(std::filesystem::exists(certificateBackup));
+        EXPECT_FALSE(std::filesystem::exists(privateKeyBackup));
+        EXPECT_FALSE(manager.restorePrevious().has_value()) << "提交后不再保留回退材料";
     }
 } // namespace EdgePulse::Agent

@@ -47,11 +47,13 @@ namespace EdgePulse::Agent
         std::function<AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>(std::int64_t, std::string)> renew;              ///< 提交 CSR
         std::function<std::expected<AgentIdentity, std::string>(std::string_view)>                                                     install;            ///< 安装新证书
         std::function<bool()>                                                                                                          reloadHttpIdentity; ///< 重载 HTTP 通道身份
-        std::function<bool()>                                  reloadWebSocketIdentity; ///< 重载 WebSocket 通道身份
-        std::function<std::chrono::system_clock::time_point()> now;                     ///< 当前时刻，空表示系统时钟
-        std::chrono::milliseconds                              checkInterval{0};        ///< 检查间隔覆盖值，0 表示按配置
-        std::vector<std::chrono::milliseconds>                 retryBackoff;            ///< 失败退避表，空表示 5、10、30、60、300 秒
-        std::function<void(std::chrono::milliseconds)>         waitObserver;            ///< 每次等待前收到计划时长
+        std::function<bool()>                                  reloadWebSocketIdentity;         ///< 重载 WebSocket 通道身份
+        std::function<void()>                                  commitInstalledIdentity;         ///< 两条通道都重载后清理安装备份
+        std::function<std::chrono::system_clock::time_point()> now;                             ///< 当前时刻，空表示系统时钟
+        std::chrono::milliseconds                              checkInterval{0};                ///< 检查间隔覆盖值，0 表示按配置
+        std::chrono::milliseconds                              websocketReloadRetryInterval{0}; ///< WebSocket 重载复查间隔，0 表示 30 秒
+        std::vector<std::chrono::milliseconds>                 retryBackoff;                    ///< 失败退避表，空表示 5、10、30、60、300 秒
+        std::function<void(std::chrono::milliseconds)>         waitObserver;                    ///< 每次等待前收到计划时长
     };
 
     /**
@@ -94,8 +96,11 @@ namespace EdgePulse::Agent
          * @return 协程任务
          * @details 每轮先比较到期时间与提前天数，未到点就等待下一次检查；到点后生成新密钥与 CSR，
          *          换回证书、校验安装、重载 HTTP 与 WebSocket，最后更新状态库。可重试失败按
-         *          dependencies.retryBackoff（默认 5、10、30、60、300 秒）退避后重试；403 与其他
-         *          不可重试的失败记录 ERROR 后终止本循环，注册、心跳、遥测与命令通道不受影响。
+         *          dependencies.retryBackoff（默认 5、10、30、60、300 秒）退避后重试，HTTP 400 的
+         *          退避上限放宽到一小时；只有 403 与调用参数错误记录 ERROR 后终止本循环，注册、心跳、
+         *          遥测与命令通道不受影响。WebSocket 重载失败时保留待重载标记，按
+         *          dependencies.websocketReloadRetryInterval（默认 30 秒）复查直到成功，成功日志只在
+         *          HTTP 与 WebSocket 都换好之后才写。循环体有异常兜底，依赖抛出的异常不会结束协程。
          * @note 日志只写指纹、到期时间与失败原因，不写私钥与 CSR 正文
          */
         static AsynGyanis::Core::Task<> runCertificateRenewal(AsynGyanis::Core::EventLoop &loop, AgentState &state, std::int64_t nodeId, const AgentConfiguration &configuration,

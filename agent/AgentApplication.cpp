@@ -1009,18 +1009,34 @@ namespace EdgePulse::Agent
                                            ? dependencies.checkInterval
                                            : std::chrono::milliseconds{std::chrono::seconds{std::clamp(configuration.certificateRenewalCheckSeconds, 60, 86400)}};
         const auto renewBefore   = std::chrono::days{std::clamp(configuration.certificateRenewBeforeDays, 1, 90)};
+        const auto websocketReloadRetryInterval =
+                dependencies.websocketReloadRetryInterval.count() > 0 ? dependencies.websocketReloadRetryInterval : std::chrono::milliseconds{std::chrono::seconds{30}};
         const std::vector<std::chrono::milliseconds>  defaultBackoff{std::chrono::seconds{5}, std::chrono::seconds{10}, std::chrono::seconds{30}, std::chrono::seconds{60},
                                                                      std::chrono::seconds{300}};
         const std::vector<std::chrono::milliseconds> &backoff = dependencies.retryBackoff.empty() ? defaultBackoff : dependencies.retryBackoff;
+        // 400 可能是 CSR 细节或本地时钟与服务端不一致造成的，重试仍值得做，但间隔不能像 5xx 那样压到五分钟
+        const std::chrono::milliseconds kInvalidRequestBackoffCap = std::chrono::hours{1};
 
         std::string currentExpiresAt = dependencies.expiresAt;
-        std::size_t retryIndex       = 0;
-        const auto  nextFailureDelay = [&backoff, &retryIndex]()
+        std::string activeFingerprint;
+        std::string activeExpiresAt;
+        bool        websocketReloadPending = false;
+        std::size_t retryIndex             = 0;
+        const auto  nextFailureDelay       = [&backoff, &retryIndex]()
         {
             const auto delay = backoff[std::min(retryIndex, backoff.size() - 1)];
             if (retryIndex + 1 < backoff.size())
             {
                 ++retryIndex;
+            }
+            return delay;
+        };
+        const auto nextFailureDelayFor = [&nextFailureDelay, kInvalidRequestBackoffCap](const bool longerCap)
+        {
+            auto delay = nextFailureDelay();
+            if (longerCap)
+            {
+                delay = std::min(kInvalidRequestBackoffCap, delay * 4);
             }
             return delay;
         };
@@ -1051,116 +1067,257 @@ namespace EdgePulse::Agent
             co_return !stopRequested.load(std::memory_order_acquire);
         };
 
+        const auto commitBackups = [&dependencies]()
+        {
+            if (!dependencies.commitInstalledIdentity)
+            {
+                return;
+            }
+            try
+            {
+                dependencies.commitInstalledIdentity();
+            } catch (const std::exception &failure)
+            {
+                LOG_WARN_FMT("清理证书安装备份时异常：{}", failure.what());
+            } catch (...)
+            {
+                LOG_WARN("清理证书安装备份时发生未知异常");
+            }
+        };
+        const auto reloadWebSocketIdentity = [&dependencies]() -> bool
+        {
+            if (!dependencies.reloadWebSocketIdentity)
+            {
+                return true;
+            }
+            try
+            {
+                return dependencies.reloadWebSocketIdentity();
+            } catch (const std::exception &failure)
+            {
+                LOG_ERROR_FMT("WebSocket 通道重载新证书异常：{}", failure.what());
+                return false;
+            } catch (...)
+            {
+                LOG_ERROR("WebSocket 通道重载新证书异常：未知错误");
+                return false;
+            }
+        };
+        const auto finishWebSocketReload = [&]()
+        {
+            websocketReloadPending = false;
+            commitBackups();
+            LOG_INFO_FMT("证书续期完成：WebSocket 通道已切换到新证书，指纹 {}，到期 {}（UTC），HTTP 与 WebSocket 均使用新身份", activeFingerprint, activeExpiresAt);
+        };
+
         for (;;)
         {
             if (stopRequested.load(std::memory_order_acquire))
             {
                 co_return;
             }
-
-            const auto expiry = parseUtcTimestamp(currentExpiresAt);
-            if (!expiry.has_value())
+            std::optional<std::string> loopFailure;
+            try
             {
-                LOG_ERROR_FMT("证书到期时间无法解析（{}），本轮跳过自动续期；请检查证书文件", currentExpiresAt);
-                if (!co_await waitFor(checkInterval))
+                // WebSocket 换代失败时旧连接仍可用，但随后所有请求都会重启用旧证书；按较短间隔持续
+                // 复查，直到新证书真的装上为止
+                if (websocketReloadPending)
+                {
+                    if (reloadWebSocketIdentity())
+                    {
+                        finishWebSocketReload();
+                    } else
+                    {
+                        LOG_WARN_FMT("WebSocket 通道仍未装载新证书，现有连接继续使用旧证书；{} 毫秒后再次尝试", websocketReloadRetryInterval.count());
+                        if (!co_await waitFor(websocketReloadRetryInterval))
+                        {
+                            co_return;
+                        }
+                        continue;
+                    }
+                }
+
+                const auto expiry = parseUtcTimestamp(currentExpiresAt);
+                if (!expiry.has_value())
+                {
+                    LOG_ERROR_FMT("证书到期时间无法解析（{}），本轮跳过自动续期；请检查证书文件", currentExpiresAt);
+                    if (!co_await waitFor(checkInterval))
+                    {
+                        co_return;
+                    }
+                    continue;
+                }
+                if (nowProvider() < *expiry - renewBefore)
+                {
+                    if (!co_await waitFor(checkInterval))
+                    {
+                        co_return;
+                    }
+                    continue;
+                }
+
+                LOG_INFO_FMT("证书将在 {} 到期，开始自动续期", currentExpiresAt);
+                if (!dependencies.generateRequest || !dependencies.renew || !dependencies.install)
+                {
+                    LOG_ERROR("自动续期缺少生成、续期或安装入口，本循环停止");
+                    co_return;
+                }
+
+                // 生成私钥与安装证书都要读 OpenSSL 与磁盘，放到阻塞执行器上跑，完成后再回到循环线程
+                std::expected<CertificateRequestMaterial, std::string> material = std::unexpected("续期材料生成任务未执行");
+                try
+                {
+                    material = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<CertificateRequestMaterial, std::string>>(
+                            loop, [&dependencies]() { return dependencies.generateRequest(); });
+                } catch (const std::exception &failure)
+                {
+                    material = std::unexpected("提交续期密钥生成任务失败：" + std::string{failure.what()});
+                } catch (...)
+                {
+                    material = std::unexpected("提交续期密钥生成任务失败：未知异常");
+                }
+                if (!material)
+                {
+                    const auto delay = nextFailureDelay();
+                    LOG_WARN_FMT("生成续期密钥与 CSR 失败：{}；{} 毫秒后重试", material.error(), delay.count());
+                    if (!co_await waitFor(delay))
+                    {
+                        co_return;
+                    }
+                    continue;
+                }
+
+                const auto renewed = co_await dependencies.renew(nodeId, material->csrPem);
+                if (!renewed)
+                {
+                    const CertificateRenewalFailure &failure = renewed.error();
+                    if (failure.authorizationRejected)
+                    {
+                        LOG_ERROR_FMT("自动续期被服务端拒绝：{}；请重新入场注册并重启 Agent，自动续期已停止", failure.message);
+                        co_return;
+                    }
+                    if (!failure.retryable)
+                    {
+                        LOG_ERROR_FMT("自动续期失败且不可重试：{}；自动续期已停止", failure.message);
+                        co_return;
+                    }
+                    const auto delay = nextFailureDelayFor(failure.httpStatus == 400);
+                    if (failure.httpStatus == 400)
+                    {
+                        LOG_ERROR_FMT("自动续期请求被服务端判定为非法（HTTP 400）：{}；{} 毫秒后重试，退避上限一小时", failure.message, delay.count());
+                    } else
+                    {
+                        LOG_WARN_FMT("自动续期失败：{}；{} 毫秒后重试", failure.message, delay.count());
+                    }
+                    if (!co_await waitFor(delay))
+                    {
+                        co_return;
+                    }
+                    continue;
+                }
+
+                std::expected<AgentIdentity, std::string> installed = std::unexpected("证书安装任务未执行");
+                try
+                {
+                    installed = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<AgentIdentity, std::string>>(
+                            loop, [&dependencies, certificatePem = renewed->certificatePem]() { return dependencies.install(certificatePem); });
+                } catch (const std::exception &failure)
+                {
+                    installed = std::unexpected("提交证书安装任务失败：" + std::string{failure.what()});
+                } catch (...)
+                {
+                    installed = std::unexpected("提交证书安装任务失败：未知异常");
+                }
+                if (!installed)
+                {
+                    const auto delay = nextFailureDelay();
+                    LOG_WARN_FMT("安装新证书失败，旧证书继续使用：{}；{} 毫秒后重试", installed.error(), delay.count());
+                    if (!co_await waitFor(delay))
+                    {
+                        co_return;
+                    }
+                    continue;
+                }
+
+                // HTTP 身份没换过去说明文件已经回退，本轮按失败处理；WebSocket 的换代失败不影响
+                // 已建立的连接（服务端在重叠窗口内仍接受旧证书），但会留下待重载标记持续复查
+                bool httpReloaded = true;
+                if (dependencies.reloadHttpIdentity)
+                {
+                    try
+                    {
+                        httpReloaded = dependencies.reloadHttpIdentity();
+                    } catch (const std::exception &failure)
+                    {
+                        LOG_ERROR_FMT("HTTP 通道重载新证书异常：{}", failure.what());
+                        httpReloaded = false;
+                    } catch (...)
+                    {
+                        LOG_ERROR("HTTP 通道重载新证书异常：未知错误");
+                        httpReloaded = false;
+                    }
+                }
+                if (!httpReloaded)
+                {
+                    const auto delay = nextFailureDelay();
+                    LOG_WARN_FMT("HTTP 通道重载新证书失败，已回退旧身份；{} 毫秒后重试", delay.count());
+                    if (!co_await waitFor(delay))
+                    {
+                        co_return;
+                    }
+                    continue;
+                }
+
+                currentExpiresAt  = installed->expiresAt;
+                activeFingerprint = installed->fingerprint;
+                activeExpiresAt   = installed->expiresAt;
+                retryIndex        = 0;
+                state.set("cert_fingerprint", installed->fingerprint);
+                state.set("cert_expiry", installed->expiresAt);
+
+                if (reloadWebSocketIdentity())
+                {
+                    commitBackups();
+                    if (dependencies.reloadWebSocketIdentity)
+                    {
+                        LOG_INFO_FMT("证书续期完成：新指纹 {}，到期 {}（UTC），HTTP 与 WebSocket 已切换到新身份", installed->fingerprint, installed->expiresAt);
+                    } else
+                    {
+                        LOG_INFO_FMT("证书续期完成：新指纹 {}，到期 {}（UTC），HTTP 通道已切换到新身份", installed->fingerprint, installed->expiresAt);
+                    }
+                } else
+                {
+                    websocketReloadPending = true;
+                    LOG_WARN("HTTP 通道已切换到新证书，但 WebSocket 通道未能装载新证书；现有连接继续使用旧证书，将按复查间隔重试");
+                }
+
+                if (stopRequested.load(std::memory_order_acquire))
                 {
                     co_return;
                 }
-                continue;
-            }
-            if (nowProvider() < *expiry - renewBefore)
-            {
-                if (!co_await waitFor(checkInterval))
+                // WebSocket 还在等新证书时用较短的复查间隔；否则按常规检查间隔等下一次到期判断
+                const auto nextCheckDelay = websocketReloadPending ? websocketReloadRetryInterval : checkInterval;
+                if (!co_await waitFor(nextCheckDelay))
                 {
                     co_return;
                 }
-                continue;
-            }
-
-            LOG_INFO_FMT("证书将在 {} 到期，开始自动续期", currentExpiresAt);
-            if (!dependencies.generateRequest || !dependencies.renew || !dependencies.install)
+            } catch (const std::exception &failure)
             {
-                LOG_ERROR("自动续期缺少生成、续期或安装入口，本循环停止");
-                co_return;
+                loopFailure = failure.what();
+            } catch (...)
+            {
+                loopFailure = "未知错误";
             }
 
-            const auto material = dependencies.generateRequest();
-            if (!material)
+            // co_await 不能出现在 catch 处理器里：先记下异常原因，退出处理器后再等待重试
+            if (loopFailure.has_value())
             {
                 const auto delay = nextFailureDelay();
-                LOG_WARN_FMT("生成续期密钥与 CSR 失败：{}；{} 毫秒后重试", material.error(), delay.count());
+                LOG_ERROR_FMT("自动续期循环异常：{}；{} 毫秒后重试", *loopFailure, delay.count());
                 if (!co_await waitFor(delay))
                 {
                     co_return;
                 }
-                continue;
-            }
-
-            const auto renewed = co_await dependencies.renew(nodeId, material->csrPem);
-            if (!renewed)
-            {
-                const CertificateRenewalFailure &failure = renewed.error();
-                if (failure.authorizationRejected)
-                {
-                    LOG_ERROR_FMT("自动续期被服务端拒绝：{}；请重新入场注册并重启 Agent，自动续期已停止", failure.message);
-                    co_return;
-                }
-                if (!failure.retryable)
-                {
-                    LOG_ERROR_FMT("自动续期失败且不可重试：{}；自动续期已停止", failure.message);
-                    co_return;
-                }
-                const auto delay = nextFailureDelay();
-                LOG_WARN_FMT("自动续期失败：{}；{} 毫秒后重试", failure.message, delay.count());
-                if (!co_await waitFor(delay))
-                {
-                    co_return;
-                }
-                continue;
-            }
-
-            const auto installed = dependencies.install(renewed->certificatePem);
-            if (!installed)
-            {
-                const auto delay = nextFailureDelay();
-                LOG_WARN_FMT("安装新证书失败，旧证书继续使用：{}；{} 毫秒后重试", installed.error(), delay.count());
-                if (!co_await waitFor(delay))
-                {
-                    co_return;
-                }
-                continue;
-            }
-
-            // HTTP 身份没换过去说明文件已经回退，本轮按失败处理；WebSocket 的换代失败不影响
-            // 已建立的连接（服务端在重叠窗口内仍接受旧证书），下一次重连自然用新证书
-            if (dependencies.reloadHttpIdentity && !dependencies.reloadHttpIdentity())
-            {
-                const auto delay = nextFailureDelay();
-                LOG_WARN_FMT("HTTP 通道重载新证书失败，已回退旧身份；{} 毫秒后重试", delay.count());
-                if (!co_await waitFor(delay))
-                {
-                    co_return;
-                }
-                continue;
-            }
-            if (dependencies.reloadWebSocketIdentity && !dependencies.reloadWebSocketIdentity())
-            {
-                LOG_WARN("WebSocket 通道未能装载新证书，现有连接继续使用旧证书，下一次重连时生效");
-            }
-
-            currentExpiresAt = installed->expiresAt;
-            state.set("cert_fingerprint", installed->fingerprint);
-            state.set("cert_expiry", installed->expiresAt);
-            retryIndex = 0;
-            LOG_INFO_FMT("证书续期完成：新指纹 {}，到期 {}（UTC），HTTP 与 WebSocket 已切换到新身份", installed->fingerprint, installed->expiresAt);
-
-            if (stopRequested.load(std::memory_order_acquire))
-            {
-                co_return;
-            }
-            if (!co_await waitFor(checkInterval))
-            {
-                co_return;
             }
         }
     }
@@ -1191,6 +1348,15 @@ namespace EdgePulse::Agent
             {
                 shutdown.emplace();
                 shutdown->onShutdown([this] { requestStop(); });
+            }
+
+            // 上次进程可能死在证书与私钥两次替换之间；先按安装标记回退，再加载身份
+            if (const auto recovered = AgentCertificateManager::recoverInterruptedInstall(m_configuration); !recovered.has_value())
+            {
+                LOG_ERROR_FMT("处理上次中断的证书安装失败：{}", recovered.error());
+            } else if (*recovered)
+            {
+                LOG_WARN("上次证书安装未完成，已用安装前的备份恢复证书与私钥");
             }
 
             const auto identity = AgentIdentity::load(m_configuration);
@@ -1291,6 +1457,7 @@ namespace EdgePulse::Agent
                 renewal.reloadHttpIdentity = [&client, &certificateManager]()
                 { return client.reloadIdentityFromDisk([&certificateManager]() { return certificateManager.restorePrevious().has_value(); }); };
                 renewal.reloadWebSocketIdentity = [&webSocket]() { return webSocket.reloadIdentityFromDisk(); };
+                renewal.commitInstalledIdentity = [&certificateManager]() { certificateManager.commitInstalledIdentity(); };
                 frames.push_back(runCertificateRenewal(loop, *state, *nodeId, m_configuration, std::move(renewal), m_stopRequested));
             } else
             {

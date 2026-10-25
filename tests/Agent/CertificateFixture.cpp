@@ -197,6 +197,59 @@ namespace EdgePulse::Agent::Testing
         return material;
     }
 
+    CertificateAuthorityMaterial writeIntermediateCertificateAuthority(const TestSupport::TemporaryDirectory &directory, const std::string &prefix,
+                                                                       const CertificateAuthorityMaterial &root)
+    {
+        BioHandle rootCertificateBio(BIO_new_file(root.certificateFile.string().c_str(), "rb"), &BIO_free);
+        requireStep(rootCertificateBio != nullptr, "打开根 CA 证书");
+        CertHandle rootCertificate(PEM_read_bio_X509(rootCertificateBio.get(), nullptr, nullptr, nullptr), &X509_free);
+        requireStep(rootCertificate != nullptr, "解析根 CA 证书");
+
+        BioHandle rootKeyBio(BIO_new_file(root.privateKeyFile.string().c_str(), "rb"), &BIO_free);
+        requireStep(rootKeyBio != nullptr, "打开根 CA 私钥");
+        KeyHandle rootKey(PEM_read_bio_PrivateKey(rootKeyBio.get(), nullptr, nullptr, nullptr), &EVP_PKEY_free);
+        requireStep(rootKey != nullptr, "解析根 CA 私钥");
+
+        KeyHandle key(EVP_RSA_gen(2048U), &EVP_PKEY_free);
+        requireStep(key != nullptr, "生成中级 CA 私钥");
+
+        CertHandle certificate(X509_new(), &X509_free);
+        requireStep(certificate != nullptr, "创建中级 CA 证书对象");
+        X509_set_version(certificate.get(), 2);
+        ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 3);
+        X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60);
+        X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 5L * 365L * 24L * 60L * 60L);
+        requireStep(X509_set_pubkey(certificate.get(), key.get()) == 1, "写入中级 CA 公钥");
+
+        X509_NAME        *subject    = X509_get_subject_name(certificate.get());
+        const std::string commonName = prefix + "-edgepulse-test-intermediate";
+        requireStep(X509_NAME_add_entry_by_txt(subject, SN_commonName, MBSTRING_ASC, reinterpret_cast<const unsigned char *>(commonName.c_str()), -1, -1, 0) == 1,
+                    "写入中级 CA 主题");
+        requireStep(X509_set_issuer_name(certificate.get(), X509_get_subject_name(rootCertificate.get())) == 1, "写入中级 CA 签发者");
+        addExtension(*certificate, NID_basic_constraints, "critical,CA:TRUE");
+        addExtension(*certificate, NID_key_usage, "critical,keyCertSign,cRLSign");
+        requireStep(X509_sign(certificate.get(), rootKey.get(), EVP_sha256()) != 0, "签名中级 CA 证书");
+
+        BioHandle certificateBio(BIO_new(BIO_s_mem()), &BIO_free);
+        requireStep(certificateBio != nullptr, "创建中级 CA 证书内存缓冲");
+        requireStep(PEM_write_bio_X509(certificateBio.get(), certificate.get()) == 1, "输出中级 CA 证书 PEM");
+        const std::string certificateText = pemText(*certificateBio);
+
+        BioHandle keyBio(BIO_new(BIO_s_mem()), &BIO_free);
+        requireStep(keyBio != nullptr, "创建中级 CA 私钥内存缓冲");
+        requireStep(PEM_write_bio_PrivateKey(keyBio.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1, "输出中级 CA 私钥 PEM");
+        const std::string keyText = pemText(*keyBio);
+
+        CertificateAuthorityMaterial material;
+        material.certificateFile = directory.write(prefix + "-ca.pem", certificateText);
+        material.privateKeyFile  = directory.write(prefix + "-ca-key.pem", keyText);
+        material.fingerprint     = fingerprintOf(*certificate);
+#ifndef _WIN32
+        requireStep(::chmod(material.privateKeyFile.c_str(), S_IRUSR | S_IWUSR) == 0, "设置中级 CA 私钥权限");
+#endif
+        return material;
+    }
+
     SignedCertificateMaterial signCertificateRequest(const CertificateAuthorityMaterial &authority, const std::string_view csrPem, const long validitySeconds)
     {
         BioHandle csrBio(BIO_new_mem_buf(csrPem.data(), static_cast<int>(csrPem.size())), &BIO_free);

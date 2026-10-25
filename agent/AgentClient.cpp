@@ -178,21 +178,9 @@ namespace EdgePulse::Agent
     } // namespace
 
     AgentClient::AgentClient(AsynGyanis::Core::EventLoop &loop, const AgentConfiguration &configuration, AgentIdentity identity) :
-        m_loop(loop), m_configuration(configuration), m_identity(std::move(identity)),
-        m_requestTimeout(std::chrono::seconds{configuration.requestTimeoutSeconds > 0 ? configuration.requestTimeoutSeconds : 30})
+        m_loop(loop), m_configuration(configuration), m_identity(std::move(identity))
     {
-        m_baseUrl = configuration.baseUrl;
-        while (m_baseUrl.size() > 1 && m_baseUrl.back() == '/')
-        {
-            m_baseUrl.pop_back();
-        }
-        m_registerUrl   = m_baseUrl + "/api/agent/register";
-        m_heartbeatUrl  = m_baseUrl + "/api/agent/heartbeat";
-        m_telemetryUrl  = m_baseUrl + "/api/agent/telemetry";
-        m_commandsUrl   = m_baseUrl + "/api/agent/commands";
-        m_agentNodesUrl = m_baseUrl + "/api/agent/nodes";
-        m_firmwareUrl   = m_baseUrl + "/api/agent/firmware";
-        m_renewalUrl    = m_baseUrl + "/api/agent/certificate/renew";
+        configureEndpoints();
 
         try
         {
@@ -203,27 +191,55 @@ namespace EdgePulse::Agent
             return;
         }
 
+        auto client = createClient();
+        if (!client)
+        {
+            m_initializationError = client.error();
+            return;
+        }
+        m_client            = std::move(*client);
+        m_tlsIdentityLoaded = configuration.baseUrl.starts_with("https://");
+    }
+
+    void AgentClient::configureEndpoints()
+    {
+        m_baseUrl = m_configuration.baseUrl;
+        while (m_baseUrl.size() > 1 && m_baseUrl.back() == '/')
+        {
+            m_baseUrl.pop_back();
+        }
+        m_registerUrl    = m_baseUrl + "/api/agent/register";
+        m_heartbeatUrl   = m_baseUrl + "/api/agent/heartbeat";
+        m_telemetryUrl   = m_baseUrl + "/api/agent/telemetry";
+        m_commandsUrl    = m_baseUrl + "/api/agent/commands";
+        m_agentNodesUrl  = m_baseUrl + "/api/agent/nodes";
+        m_firmwareUrl    = m_baseUrl + "/api/agent/firmware";
+        m_renewalUrl     = m_baseUrl + "/api/agent/certificate/renew";
+        m_requestTimeout = std::chrono::milliseconds{std::chrono::seconds{m_configuration.requestTimeoutSeconds > 0 ? m_configuration.requestTimeoutSeconds : 30}};
+    }
+
+    std::expected<std::shared_ptr<AsynGyanis::Net::HttpClient>, std::string> AgentClient::createClient() const
+    {
         try
         {
             AsynGyanis::Core::TlsPolicy policy;
-            if (!configuration.caFile.empty())
+            if (!m_configuration.caFile.empty())
             {
-                policy.certificateAuthorityFile = configuration.caFile.string();
+                policy.certificateAuthorityFile = m_configuration.caFile.string();
             }
-            m_client = std::make_unique<AsynGyanis::Net::HttpClient>(m_loop, AsynGyanis::Net::HttpOutboundConnectionPool::Config{}, policy);
-            if (configuration.baseUrl.starts_with("https://") && !m_client->setClientCertificate(configuration.certificateFile.string(), configuration.privateKeyFile.string()))
+            auto client = std::make_shared<AsynGyanis::Net::HttpClient>(m_loop, AsynGyanis::Net::HttpOutboundConnectionPool::Config{}, policy);
+            if (m_configuration.baseUrl.starts_with("https://") && !client->setClientCertificate(m_configuration.certificateFile.string(), m_configuration.privateKeyFile.string()))
             {
-                m_initializationError = "加载客户端证书与私钥失败：请确认两个文件都是 PEM 编码且相互配对（证书：" + configuration.certificateFile.string() + "，私钥：" +
-                                        configuration.privateKeyFile.string() + "）";
-                m_client.reset();
-            } else
-            {
-                m_tlsIdentityLoaded = m_client != nullptr && configuration.baseUrl.starts_with("https://");
+                return std::unexpected("加载客户端证书与私钥失败：请确认两个文件都是 PEM 编码且相互配对（证书：" + m_configuration.certificateFile.string() + "，私钥：" +
+                                       m_configuration.privateKeyFile.string() + "）");
             }
+            return client;
         } catch (const std::exception &failure)
         {
-            m_initializationError = "初始化 HTTPS 客户端失败：" + std::string{failure.what()};
-            m_client.reset();
+            return std::unexpected("初始化 HTTPS 客户端失败：" + std::string{failure.what()});
+        } catch (...)
+        {
+            return std::unexpected("初始化 HTTPS 客户端失败：未知异常");
         }
     }
 
@@ -231,7 +247,8 @@ namespace EdgePulse::Agent
 
     AsynGyanis::Core::Task<std::expected<std::int64_t, RegistrationFailure>> AgentClient::registerAgent(std::string enrollmentToken, std::string agentVersion)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(RegistrationFailure{m_initializationError, false, false});
         }
@@ -257,7 +274,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_registerUrl, request, m_requestTimeout);
+            response = co_await client->send(m_registerUrl, request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected(RegistrationFailure{"注册请求异常：" + std::string{failure.what()}, false, false});
@@ -304,7 +321,8 @@ namespace EdgePulse::Agent
 
     AsynGyanis::Core::Task<std::expected<HeartbeatReply, std::string>> AgentClient::heartbeat(std::int64_t nodeId, std::string agentVersion)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(m_initializationError);
         }
@@ -321,7 +339,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_heartbeatUrl, request, m_requestTimeout);
+            response = co_await client->send(m_heartbeatUrl, request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected("心跳请求异常：" + std::string{failure.what()});
@@ -355,7 +373,8 @@ namespace EdgePulse::Agent
 
     AsynGyanis::Core::Task<std::expected<std::optional<AsynGyanis::Base::ConfigValue>, std::string>> AgentClient::takeNextCommand(const std::int64_t nodeId)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(m_initializationError);
         }
@@ -366,7 +385,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_commandsUrl + "/next?nodeId=" + std::to_string(nodeId), request, m_requestTimeout);
+            response = co_await client->send(m_commandsUrl + "/next?nodeId=" + std::to_string(nodeId), request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected("拉取命令请求异常：" + std::string{failure.what()});
@@ -409,7 +428,8 @@ namespace EdgePulse::Agent
     AsynGyanis::Core::Task<ResultPostOutcome> AgentClient::reportCommandResult(const std::int64_t commandId, const std::int64_t nodeId, const std::string_view status,
                                                                                const std::string_view result, const std::string_view message)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return ResultPostOutcome{ResultPostDisposition::Retryable, 0, m_initializationError};
         }
@@ -430,7 +450,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_commandsUrl + "/" + std::to_string(commandId) + "/result", request, m_requestTimeout);
+            response = co_await client->send(m_commandsUrl + "/" + std::to_string(commandId) + "/result", request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return ResultPostOutcome{ResultPostDisposition::Retryable, 0, "上报命令结果请求异常：" + std::string{failure.what()}};
@@ -452,7 +472,8 @@ namespace EdgePulse::Agent
 
     AsynGyanis::Core::Task<std::expected<void, TelemetryFailure>> AgentClient::sendTelemetry(const std::int64_t nodeId, const AsynGyanis::Base::ConfigValue &samples)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(TelemetryFailure{m_initializationError, true, 0});
         }
@@ -482,7 +503,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_telemetryUrl, request, m_requestTimeout);
+            response = co_await client->send(m_telemetryUrl, request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected(TelemetryFailure{"遥测上报请求异常：" + std::string{failure.what()}, true, 0});
@@ -502,7 +523,8 @@ namespace EdgePulse::Agent
 
     AsynGyanis::Core::Task<std::expected<AgentConfigSnapshot, std::string>> AgentClient::fetchConfig(const std::int64_t nodeId)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(m_initializationError);
         }
@@ -517,7 +539,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_agentNodesUrl + "/" + std::to_string(nodeId) + "/config", request, m_requestTimeout);
+            response = co_await client->send(m_agentNodesUrl + "/" + std::to_string(nodeId) + "/config", request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected("拉取配置请求异常：" + std::string{failure.what()});
@@ -576,7 +598,8 @@ namespace EdgePulse::Agent
                                                                                        const AsynGyanis::Base::ConfigValue &content, const std::string_view status,
                                                                                        const std::string_view message)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(m_initializationError);
         }
@@ -613,7 +636,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_agentNodesUrl + "/" + std::to_string(nodeId) + "/config/report", request, m_requestTimeout);
+            response = co_await client->send(m_agentNodesUrl + "/" + std::to_string(nodeId) + "/config/report", request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected("上报配置结果请求异常：" + std::string{failure.what()});
@@ -636,7 +659,8 @@ namespace EdgePulse::Agent
 
     AsynGyanis::Core::Task<std::expected<DownloadResult, std::string>> AgentClient::downloadFile(std::string downloadPath, AsynGyanis::Net::HttpResponseBodyReceiver receiver)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(m_initializationError);
         }
@@ -658,7 +682,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(*resolved, request, kDownloadTimeout);
+            response = co_await client->send(*resolved, request, kDownloadTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected("下载请求异常：" + std::string{failure.what()});
@@ -681,7 +705,8 @@ namespace EdgePulse::Agent
     AsynGyanis::Core::Task<std::expected<void, std::string>> AgentClient::reportFirmwareStatus(const std::int64_t firmwareId, const std::int64_t nodeId,
                                                                                                const std::string_view status, const int progress, const std::string_view message)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(m_initializationError);
         }
@@ -715,7 +740,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_firmwareUrl + "/" + std::to_string(firmwareId) + "/status", request, m_requestTimeout);
+            response = co_await client->send(m_firmwareUrl + "/" + std::to_string(firmwareId) + "/status", request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected("上报固件状态请求异常：" + std::string{failure.what()});
@@ -738,7 +763,8 @@ namespace EdgePulse::Agent
 
     AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>> AgentClient::renewCertificate(const std::int64_t nodeId, std::string csrPem)
     {
-        if (!m_initializationError.empty() || m_client == nullptr)
+        const auto client = m_client;
+        if (!m_initializationError.empty() || client == nullptr)
         {
             co_return std::unexpected(CertificateRenewalFailure{"证书续期不可用：" + m_initializationError, false, false, 0});
         }
@@ -763,7 +789,7 @@ namespace EdgePulse::Agent
         std::unique_ptr<AsynGyanis::Net::HttpClientResponse> response;
         try
         {
-            response = co_await m_client->send(m_renewalUrl, request, m_requestTimeout);
+            response = co_await client->send(m_renewalUrl, request, m_requestTimeout);
         } catch (const std::exception &failure)
         {
             co_return std::unexpected(CertificateRenewalFailure{"证书续期请求异常：" + std::string{failure.what()}, true, false, 0});
@@ -781,13 +807,15 @@ namespace EdgePulse::Agent
         }
         if (status < 200 || status >= 300)
         {
-            co_return std::unexpected(CertificateRenewalFailure{httpFailure("证书续期", status, response->body), isRetryableStatus(status), false, status});
+            // 只有 403 是终态：400 可能是本地时钟或 CSR 细节与服务端不一致，404 可能是节点登记尚未
+            // 传播完；其余非 403 响应一律交给续期循环按退避重试（400 使用更长的退避上限）
+            co_return std::unexpected(CertificateRenewalFailure{httpFailure("证书续期", status, response->body), true, false, status});
         }
 
         const auto data = successData(response->body);
         if (!data)
         {
-            co_return std::unexpected(CertificateRenewalFailure{"证书续期" + data.error(), false, false, status});
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期" + data.error(), true, false, status});
         }
 
         const auto stringFieldOf = [&data](const std::string_view key) -> std::string
@@ -804,15 +832,15 @@ namespace EdgePulse::Agent
         renewed.serial         = stringFieldOf("serial");
         if (renewed.certificatePem.empty())
         {
-            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应缺少非空 certificatePem", false, false, status});
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应缺少非空 certificatePem", true, false, status});
         }
         if (renewed.fingerprint.size() != 64U || renewed.fingerprint.find_first_not_of("0123456789abcdef") != std::string::npos)
         {
-            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应的 fingerprint 不是 64 位小写十六进制", false, false, status});
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应的 fingerprint 不是 64 位小写十六进制", true, false, status});
         }
         if (renewed.notAfter.empty())
         {
-            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应缺少 notAfter", false, false, status});
+            co_return std::unexpected(CertificateRenewalFailure{"证书续期响应缺少 notAfter", true, false, status});
         }
         co_return renewed;
     }
@@ -829,27 +857,37 @@ namespace EdgePulse::Agent
             return true;
         }
 
-        const auto loadCurrent = [this]() -> std::expected<AgentIdentity, std::string>
+        // 候选客户端连同新证书一起构造并验证；任何一步失败都不会碰当前客户端
+        const auto loadCurrent = [this]() -> std::expected<std::pair<std::shared_ptr<AsynGyanis::Net::HttpClient>, AgentIdentity>, std::string>
         {
             auto identity = AgentIdentity::load(m_configuration);
             if (!identity)
             {
                 return std::unexpected(identity.error());
             }
-            if (!m_client->setClientCertificate(m_configuration.certificateFile.string(), m_configuration.privateKeyFile.string()))
+            auto candidate = createClient();
+            if (!candidate)
             {
-                return std::unexpected("装载客户端证书与私钥失败：请确认两个文件都是 PEM 编码且相互配对（证书：" + m_configuration.certificateFile.string() + "，私钥：" +
-                                       m_configuration.privateKeyFile.string() + "）");
+                return std::unexpected(candidate.error());
             }
-            return identity;
+            return std::pair<std::shared_ptr<AsynGyanis::Net::HttpClient>, AgentIdentity>{std::move(*candidate), std::move(*identity)};
+        };
+        const auto adopt = [this](std::pair<std::shared_ptr<AsynGyanis::Net::HttpClient>, AgentIdentity> loaded)
+        {
+            auto previous = std::move(m_client);
+            m_client      = std::move(loaded.first);
+            m_identity    = std::move(loaded.second);
+            if (previous != nullptr)
+            {
+                // 旧客户端的空闲连接不会再用；在途请求持有的引用会把它保活到请求结束
+                previous->closeIdleConnections();
+            }
         };
 
         const auto loaded = loadCurrent();
         if (loaded)
         {
-            // 旧连接可能仍带旧证书；收掉空闲连接，让后续请求按新身份重新握手
-            m_client->closeIdleConnections();
-            m_identity = *loaded;
+            adopt(std::move(*loaded));
             return true;
         }
 
@@ -859,8 +897,7 @@ namespace EdgePulse::Agent
             const auto restored = loadCurrent();
             if (restored)
             {
-                m_client->closeIdleConnections();
-                m_identity = *restored;
+                adopt(std::move(*restored));
                 LOG_WARN("已回退到上一份客户端证书，HTTP 通道继续使用旧身份");
             } else
             {
