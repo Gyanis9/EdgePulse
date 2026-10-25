@@ -204,7 +204,51 @@ namespace EdgePulse::Firmware
 
         [[nodiscard]] bool taskActive(const std::string &status)
         {
-            return status == "pending" || status == "downloading";
+            return status == "pending" || status == "downloading" || status == "installing";
+        }
+
+        [[nodiscard]] std::string healthField(const std::string &json, const std::string &key)
+        {
+            const std::optional<ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(json);
+            if (!parsed.has_value() || !parsed->is_object() || !parsed->contains(key))
+            {
+                return {};
+            }
+            const std::optional<std::string> value = AsynGyanis::Base::configValueAs<std::string>(parsed->at(key));
+            return value.value_or(std::string{});
+        }
+
+        /**
+         * @brief 回滚流程是否为该目标留下过决定
+         * @note 目标状态 rolling_back 带着命令与任务表示已派发；rolled_back 表示已确认；
+         *       failed 且门控为 rollback_unavailable 或 rollback_failed 表示派发阶段已给出终局结论
+         */
+        [[nodiscard]] bool rollbackDecided(const FirmwareRolloutTargetRecord &target)
+        {
+            if (target.status == "rolling_back")
+            {
+                return target.commandId > 0 && target.taskId > 0;
+            }
+            if (target.status == "rolled_back")
+            {
+                return true;
+            }
+            if (target.status != "failed")
+            {
+                return false;
+            }
+            const std::string gate = healthField(target.healthJson, "gate");
+            return gate == "rollback_unavailable" || gate == "rollback_failed";
+        }
+
+        [[nodiscard]] bool commandTargetsFirmware(const std::string &payload, const std::int64_t firmwareId)
+        {
+            const std::optional<ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(payload);
+            if (!parsed.has_value() || !parsed->is_object() || !parsed->contains("firmwareId"))
+            {
+                return false;
+            }
+            return AsynGyanis::Base::configValueAs<std::int64_t>(parsed->at("firmwareId")).value_or(0) == firmwareId;
         }
 
         [[nodiscard]] std::string healthIdentity(const std::string &json)
@@ -690,19 +734,15 @@ namespace EdgePulse::Firmware
 
             if (status == "rolling_back")
             {
-                bool rollbackStarted = wave->status == "rolling_back" || wave->status == "rolled_back";
-                for (const FirmwareRolloutTargetRecord &target: aggregate->targets)
+                // 先补齐所有还没有回滚决定的目标，再评估已下发命令的目标；
+                // 中途异常或进程重启后，下一拍仍会从缺少决定的目标继续
+                co_await dispatchRollback(loop, *aggregate, *policy, now);
+                const auto refreshed = co_await m_allRollouts->find(loop, rolloutId);
+                if (!refreshed.has_value() || refreshed->rollout.status != "rolling_back")
                 {
-                    rollbackStarted =
-                            rollbackStarted || target.status == "rolling_back" || target.status == "rolled_back" || target.healthJson.find("rollback_failed") != std::string::npos;
+                    co_return;
                 }
-                if (rollbackStarted)
-                {
-                    co_await evaluateRollback(loop, *aggregate, *policy, now);
-                } else
-                {
-                    co_await dispatchRollback(loop, *aggregate, *policy, now);
-                }
+                co_await evaluateRollback(loop, *refreshed, *policy, now);
                 co_return;
             }
             if ((status == "scheduled" || status == "preparing") && !policy->allowsTime(now))
@@ -984,10 +1024,14 @@ namespace EdgePulse::Firmware
         const bool allSettled = settled >= targets.size();
         if (allSettled)
         {
-            const std::string              dispatchedAt = wave->dispatchedAt.empty() ? sqlTime(now) : wave->dispatchedAt;
-            const std::optional<TimePoint> start        = parseSqlTime(dispatchedAt);
-            const std::string              deadline     = start.has_value() ? sqlTime(addSeconds(*start, policy.maxWaveSeconds)) : std::string{};
-            static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "observing", dispatchedAt, deadline));
+            // 观察窗口已经确定时不再每拍重写波次行
+            if (wave->status != "observing" || wave->dispatchedAt.empty() || wave->deadlineAt.empty())
+            {
+                const std::string              dispatchedAt = wave->dispatchedAt.empty() ? sqlTime(now) : wave->dispatchedAt;
+                const std::optional<TimePoint> start        = parseSqlTime(dispatchedAt);
+                const std::string              deadline     = start.has_value() ? sqlTime(addSeconds(*start, policy.maxWaveSeconds)) : std::string{};
+                static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "observing", dispatchedAt, deadline));
+            }
         } else if (wave->status != "dispatching")
         {
             static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "dispatching", {}, {}, {}));
@@ -1410,19 +1454,17 @@ namespace EdgePulse::Firmware
                     co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "failed", aggregate.rollout.currentWave, "", "回滚波次不存在"));
             co_return;
         }
-        std::vector<std::string> unavailable;
-        std::size_t              issued         = 0;
-        std::size_t              activeRollback = 0;
-        for (const FirmwareRolloutTargetRecord &target: aggregate.targets)
+        if (wave->status != "rolling_back" || wave->deadlineAt.empty())
         {
-            if (target.status == "rolling_back" && target.commandId > 0)
-            {
-                ++activeRollback;
-            }
+            // 回滚期限在进入回滚时确定；中断恢复后沿用原期限，避免每次补发都把期限向后推
+            const std::string dispatchedAt = wave->dispatchedAt.empty() ? sqlTime(now) : wave->dispatchedAt;
+            static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "rolling_back", dispatchedAt, sqlTime(addSeconds(now, policy.maxWaveSeconds))));
         }
+        std::vector<std::string> unavailable;
+        std::size_t              issued = 0;
         for (const FirmwareRolloutTargetRecord &target: aggregate.targets)
         {
-            if (target.commandId <= 0 || target.status == "rolling_back" || target.status == "rolled_back")
+            if (rollbackDecided(target))
             {
                 continue;
             }
@@ -1432,85 +1474,125 @@ namespace EdgePulse::Firmware
                 co_return;
             }
             co_await cancelInFlight(loop, target, "回滚前停止未完成的安装命令");
-            if (target.previousFirmwareId <= 0)
+            std::string reason;
+            if (target.commandId <= 0)
             {
-                unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 缺少可回滚的历史版本");
-                continue;
+                reason = "节点 " + std::to_string(target.nodeId) + " 未下发安装命令，无需回滚";
+            } else if (target.previousFirmwareId <= 0)
+            {
+                reason = "节点 " + std::to_string(target.nodeId) + " 缺少可回滚的历史版本";
             }
-            const auto previous = co_await m_allFirmware->find(loop, target.previousFirmwareId);
-            if (!previous.has_value() || previous->tenantId != aggregate.rollout.tenantId)
+            std::optional<FirmwareRecord> previous;
+            if (reason.empty())
             {
-                unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 的历史固件不存在");
-                continue;
-            }
-            if (signatureRequired(m_signingPolicy) && previous->signature.empty())
-            {
-                unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 的历史固件未签名");
-                continue;
+                previous = co_await m_allFirmware->find(loop, target.previousFirmwareId);
+                if (!previous.has_value() || previous->tenantId != aggregate.rollout.tenantId)
+                {
+                    reason = "节点 " + std::to_string(target.nodeId) + " 的历史固件不存在";
+                } else if (signatureRequired(m_signingPolicy) && previous->signature.empty())
+                {
+                    reason = "节点 " + std::to_string(target.nodeId) + " 的历史固件未签名";
+                }
             }
             std::int64_t                          taskId = 0;
             std::optional<Command::CommandRecord> command;
-            std::string                           rollbackFailure;
-            try
+            bool                                  reused = false;
+            if (reason.empty())
             {
-                taskId = co_await m_allFirmware->createTask(loop, target.previousFirmwareId, target.nodeId, aggregate.rollout.firmwareId, aggregate.rollout.id, target.waveId, 0);
-                if (taskId == 0)
+                std::string rollbackFailure;
+                try
                 {
-                    taskId = co_await existingTask(loop, target.previousFirmwareId, aggregate.rollout.id, target.waveId, target.nodeId);
-                }
-                if (taskId == 0)
+                    // 进程在命令已绑定、目标未回写之间重启时沿用原任务与命令，不再重复建单
+                    taskId = co_await existingRollbackTask(loop, target.previousFirmwareId, aggregate.rollout.id, target.waveId, target.nodeId);
+                    if (taskId > 0)
+                    {
+                        const auto task = co_await m_allFirmware->findTask(loop, taskId);
+                        if (task.has_value() && task->commandId > 0)
+                        {
+                            auto existingCommand = co_await m_allCommands->find(loop, task->commandId);
+                            if (existingCommand.has_value() && existingCommand->nodeId == target.nodeId &&
+                                commandTargetsFirmware(existingCommand->payload, target.previousFirmwareId))
+                            {
+                                command = std::move(existingCommand);
+                                reused  = true;
+                            }
+                        }
+                    }
+                    if (taskId == 0)
+                    {
+                        taskId = co_await m_allFirmware->createTask(loop, target.previousFirmwareId, target.nodeId, aggregate.rollout.firmwareId, aggregate.rollout.id,
+                                                                    target.waveId, 0);
+                        if (taskId == 0)
+                        {
+                            taskId = co_await existingTask(loop, target.previousFirmwareId, aggregate.rollout.id, target.waveId, target.nodeId);
+                        }
+                    }
+                    if (taskId == 0)
+                    {
+                        reason = "节点 " + std::to_string(target.nodeId) + " 无法创建回滚任务";
+                    } else if (!command.has_value())
+                    {
+                        command = co_await m_allCommands->create(loop, target.nodeId, "firmware.update", downloadPayload(*previous, target.nodeId), aggregate.rollout.createdBy,
+                                                                 m_commandTimeout);
+                        if (!command.has_value())
+                        {
+                            static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "创建回滚命令失败"));
+                            reason = "节点 " + std::to_string(target.nodeId) + " 无法创建回滚命令";
+                        } else if (!co_await m_allFirmware->bindTaskCommand(loop, taskId, command->id))
+                        {
+                            static_cast<void>(co_await m_allCommands->cancel(loop, command->id));
+                            static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "绑定回滚任务与命令失败"));
+                            command.reset();
+                            reason = "节点 " + std::to_string(target.nodeId) + " 无法绑定回滚命令";
+                        }
+                    }
+                } catch (const std::exception &failure)
                 {
-                    unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 无法创建回滚任务");
-                    continue;
+                    rollbackFailure = failure.what();
                 }
-                command = co_await m_allCommands->create(loop, target.nodeId, "firmware.update", downloadPayload(*previous, target.nodeId), aggregate.rollout.createdBy,
-                                                         m_commandTimeout);
-                if (!command.has_value())
+                if (!rollbackFailure.empty())
                 {
-                    static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "创建回滚命令失败"));
-                    unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 无法创建回滚命令");
-                    continue;
+                    if (taskId > 0)
+                    {
+                        static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "创建回滚命令失败"));
+                    }
+                    if (command.has_value())
+                    {
+                        static_cast<void>(co_await m_allCommands->cancel(loop, command->id));
+                    }
+                    command.reset();
+                    reason = "节点 " + std::to_string(target.nodeId) + " 创建回滚命令失败：" + truncateUtf8(rollbackFailure, 160);
                 }
-                if (!co_await m_allFirmware->bindTaskCommand(loop, taskId, command->id))
+            }
+            if (reason.empty() && !reused)
+            {
+                bool        publishFailed = false;
+                std::string publishError;
+                try
+                {
+                    co_await m_publisher(*command);
+                } catch (const std::exception &failure)
+                {
+                    publishFailed = true;
+                    publishError  = failure.what();
+                }
+                if (publishFailed)
                 {
                     static_cast<void>(co_await m_allCommands->cancel(loop, command->id));
-                    static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "绑定回滚任务与命令失败"));
-                    unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 无法绑定回滚命令");
-                    continue;
+                    static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "发布回滚命令失败"));
+                    LOG_WARN_FMT("灰度发布 {} 回滚命令 {} 发布失败：{}", aggregate.rollout.id, command->id, publishError);
+                    command.reset();
+                    reason = "节点 " + std::to_string(target.nodeId) + " 发布回滚命令失败";
                 }
-            } catch (const std::exception &failure)
-            {
-                rollbackFailure = failure.what();
             }
-            if (!rollbackFailure.empty())
+            if (!reason.empty())
             {
-                if (taskId > 0)
-                {
-                    static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "创建回滚命令失败"));
-                }
-                if (command.has_value())
-                {
-                    static_cast<void>(co_await m_allCommands->cancel(loop, command->id));
-                }
-                unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 创建回滚命令失败：" + truncateUtf8(rollbackFailure, 160));
-                continue;
-            }
-            bool        publishFailed = false;
-            std::string publishError;
-            try
-            {
-                co_await m_publisher(*command);
-            } catch (const std::exception &failure)
-            {
-                publishFailed = true;
-                publishError  = failure.what();
-            }
-            if (publishFailed)
-            {
-                static_cast<void>(co_await m_allCommands->cancel(loop, command->id));
-                static_cast<void>(co_await m_allFirmware->updateTaskById(loop, taskId, "failed", 0, "发布回滚命令失败"));
-                unavailable.push_back("节点 " + std::to_string(target.nodeId) + " 发布回滚命令失败");
-                LOG_WARN_FMT("灰度发布 {} 回滚命令 {} 发布失败：{}", aggregate.rollout.id, command->id, publishError);
+                // 无法回滚同样要落成目标的终局决定，避免下一拍反复重试或提前收尾
+                FirmwareRolloutTargetUpdate decision;
+                decision.status     = "failed";
+                decision.healthJson = ConfigValue::object({{"gate", "rollback_unavailable"}, {"reason", reason}}).dump();
+                static_cast<void>(co_await m_allRollouts->updateTarget(loop, target.id, decision));
+                unavailable.push_back(reason);
                 continue;
             }
             FirmwareRolloutTargetUpdate update;
@@ -1521,29 +1603,10 @@ namespace EdgePulse::Firmware
             static_cast<void>(co_await m_allRollouts->updateTarget(loop, target.id, update));
             ++issued;
         }
-        const std::string message     = joinReasons(unavailable, 400);
-        const std::size_t totalIssued = issued + activeRollback;
-        if (totalIssued == 0)
+        if (issued > 0 || !unavailable.empty())
         {
-            if (unavailable.empty())
-            {
-                static_cast<void>(co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "rolled_back", aggregate.rollout.currentWave, "",
-                                                                       "没有已下发的目标"));
-            } else
-            {
-                static_cast<void>(co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "rollback_unavailable", aggregate.rollout.currentWave,
-                                                                       "", message));
-            }
-            co_return;
-        }
-        const std::string dispatchedAt = wave->dispatchedAt.empty() ? sqlTime(now) : wave->dispatchedAt;
-        static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "rolling_back", dispatchedAt, sqlTime(addSeconds(now, policy.maxWaveSeconds)), {}));
-        static_cast<void>(co_await m_allRollouts->appendGate(
-                loop, wave->id, ConfigValue::object({{"rollback", true}, {"issued", totalIssued}, {"unavailable", unavailable.size()}, {"at", sqlTime(now)}}).dump()));
-        if (!unavailable.empty())
-        {
-            static_cast<void>(co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "failed", aggregate.rollout.currentWave, "",
-                                                                   "部分目标无法回滚：" + message));
+            static_cast<void>(co_await m_allRollouts->appendGate(
+                    loop, wave->id, ConfigValue::object({{"rollback", true}, {"issued", issued}, {"unavailable", unavailable.size()}, {"at", sqlTime(now)}}).dump()));
         }
         co_return;
     }
@@ -1559,12 +1622,15 @@ namespace EdgePulse::Firmware
                     co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "failed", aggregate.rollout.currentWave, "", "回滚波次不存在"));
             co_return;
         }
-        const std::optional<TimePoint> deadline    = parseSqlTime(wave->deadlineAt);
-        const TimePoint                rollbackEnd = deadline.has_value() ? *deadline : addSeconds(now, policy.maxWaveSeconds);
-        std::size_t                    confirmed   = 0;
-        std::size_t                    waiting     = 0;
+        const std::optional<TimePoint> deadline         = parseSqlTime(wave->deadlineAt);
+        const TimePoint                rollbackEnd      = deadline.has_value() ? *deadline : addSeconds(now, policy.maxWaveSeconds);
+        std::size_t                    confirmed        = 0;
+        std::size_t                    waiting          = 0;
+        std::size_t                    undecided        = 0;
+        std::size_t                    unavailableCount = 0;
         std::vector<std::string>       failures;
         std::vector<std::string>       waitingReasons;
+        std::vector<std::string>       unavailableReasons;
         for (const FirmwareRolloutTargetRecord &target: aggregate.targets)
         {
             if (target.status == "rolled_back")
@@ -1572,13 +1638,28 @@ namespace EdgePulse::Firmware
                 ++confirmed;
                 continue;
             }
-            if (target.status == "failed" && target.healthJson.find("rollback_failed") != std::string::npos)
+            if (target.status == "failed")
             {
-                failures.push_back("节点 " + std::to_string(target.nodeId) + " 回滚失败");
+                const std::string gate = healthField(target.healthJson, "gate");
+                if (gate == "rollback_failed")
+                {
+                    failures.push_back("节点 " + std::to_string(target.nodeId) + " 回滚失败");
+                    continue;
+                }
+                if (gate == "rollback_unavailable")
+                {
+                    ++unavailableCount;
+                    const std::string reason = healthField(target.healthJson, "reason");
+                    unavailableReasons.push_back(reason.empty() ? "节点 " + std::to_string(target.nodeId) + " 回滚不可用" : reason);
+                    continue;
+                }
+                // 门控失败等安装阶段结论还没有回滚决定，不能当作已处理
+                ++undecided;
                 continue;
             }
-            if (target.status != "rolling_back")
+            if (target.status != "rolling_back" || target.commandId <= 0 || target.taskId <= 0)
             {
+                ++undecided;
                 continue;
             }
             std::string failure;
@@ -1595,7 +1676,7 @@ namespace EdgePulse::Firmware
                 pendingReason = "回滚命令尚未完成";
             } else
             {
-                const auto task = target.taskId > 0 ? co_await m_allFirmware->findTask(loop, target.taskId) : std::optional<FirmwareTaskRecord>{};
+                const auto task = co_await m_allFirmware->findTask(loop, target.taskId);
                 if (!task.has_value())
                 {
                     failure = "节点 " + std::to_string(target.nodeId) + " 回滚任务不存在";
@@ -1657,7 +1738,23 @@ namespace EdgePulse::Firmware
                                                                    "回滚失败：" + joinReasons(failures, 400)));
             co_return;
         }
-        if (waiting == 0 && confirmed > 0)
+        if (unavailableCount > 0 && undecided == 0)
+        {
+            const std::string message = joinReasons(unavailableReasons, 400);
+            static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "failed", {}, {}, sqlTime(now)));
+            if (confirmed == 0 && waiting == 0)
+            {
+                static_cast<void>(co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "rollback_unavailable", aggregate.rollout.currentWave,
+                                                                       "", message));
+            } else
+            {
+                static_cast<void>(co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "failed", aggregate.rollout.currentWave, "",
+                                                                       "部分目标无法回滚：" + message));
+            }
+            co_return;
+        }
+        // 只有每个目标都已确认回滚或已有明确的回滚终局决定才允许收尾
+        if (waiting == 0 && undecided == 0)
         {
             static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "rolled_back", {}, {}, sqlTime(now)));
             static_cast<void>(co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "rolled_back", aggregate.rollout.currentWave));
@@ -1665,9 +1762,18 @@ namespace EdgePulse::Firmware
         }
         if (now >= rollbackEnd)
         {
+            std::string reasons = joinReasons(waitingReasons, 360);
+            if (undecided > 0)
+            {
+                if (!reasons.empty())
+                {
+                    reasons += "；";
+                }
+                reasons += std::to_string(undecided) + " 个目标尚未派发回滚命令";
+            }
             static_cast<void>(co_await m_allRollouts->setWave(loop, wave->id, "failed", {}, {}, sqlTime(now)));
             static_cast<void>(co_await m_allRollouts->updateStatus(loop, aggregate.rollout.id, aggregate.rollout.version, "failed", aggregate.rollout.currentWave, "",
-                                                                   "回滚未在期限内确认：" + joinReasons(waitingReasons, 400)));
+                                                                   "回滚未在期限内确认：" + reasons));
         }
         co_return;
     }
@@ -1746,6 +1852,27 @@ namespace EdgePulse::Firmware
             {
                 matched = std::max(matched, task.id);
             }
+        }
+        co_return matched;
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> FirmwareRolloutService::existingRollbackTask(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId,
+                                                                                      const std::int64_t rolloutId, const std::int64_t waveId, const std::int64_t nodeId)
+    {
+        const std::vector<FirmwareTaskRecord> tasks   = co_await m_allFirmware->tasks(loop, firmwareId);
+        std::int64_t                          matched = 0;
+        for (const FirmwareTaskRecord &task: tasks)
+        {
+            if (task.rolloutId != rolloutId || task.waveId != waveId || task.nodeId != nodeId || task.commandId <= 0)
+            {
+                continue;
+            }
+            // 安装中或刚安装完的任务都可能停在“命令已绑定、目标未回写”的重启窗口里
+            if (task.status != "pending" && task.status != "downloading" && task.status != "installing" && task.status != "installed")
+            {
+                continue;
+            }
+            matched = std::max(matched, task.id);
         }
         co_return matched;
     }

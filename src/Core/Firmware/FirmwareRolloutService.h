@@ -229,6 +229,8 @@ namespace EdgePulse::Firmware
         AsynGyanis::Core::Task<bool>         failTarget(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, std::string reason);
         AsynGyanis::Core::Task<std::int64_t> existingTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t rolloutId, std::int64_t waveId,
                                                           std::int64_t nodeId);
+        AsynGyanis::Core::Task<std::int64_t> existingRollbackTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t rolloutId, std::int64_t waveId,
+                                                                  std::int64_t nodeId);
 
     private:
         std::shared_ptr<FirmwareRepository>             m_firmware;             ///< 租户视图入口，实际调用先 scoped

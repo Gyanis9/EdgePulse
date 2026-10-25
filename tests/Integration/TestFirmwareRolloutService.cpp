@@ -63,7 +63,22 @@ namespace
             m_telemetry = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
             m_alarms    = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
             m_signing   = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(EdgePulse::Firmware::FirmwareSigningPolicy{requireSignature, nullptr});
+            m_service   = std::make_unique<EdgePulse::Firmware::FirmwareRolloutService>(dependencies());
+        }
 
+        /**
+         * @brief 按同一批仓储重建服务，模拟进程重启后从同一数据库恢复
+         */
+        void restartService()
+        {
+            m_service = std::make_unique<EdgePulse::Firmware::FirmwareRolloutService>(dependencies());
+        }
+
+        /**
+         * @brief 组装服务依赖；进程重启与时序用例共用同一发布口
+         */
+        [[nodiscard]] EdgePulse::Firmware::FirmwareRolloutDependencies dependencies()
+        {
             EdgePulse::Firmware::FirmwareRolloutDependencies dependencies;
             dependencies.firmware                 = m_firmware;
             dependencies.rollouts                 = m_rollouts;
@@ -87,7 +102,7 @@ namespace
                 }
                 co_return;
             };
-            m_service = std::make_unique<EdgePulse::Firmware::FirmwareRolloutService>(std::move(dependencies));
+            return dependencies;
         }
 
         [[nodiscard]] std::int64_t createFirmware(const std::string &version, const std::string &signature = "sig")
@@ -141,6 +156,28 @@ namespace
         void pauseRolloutDirect(const std::int64_t rolloutId)
         {
             executeSql("UPDATE biz_firmware_rollout SET status = 'paused', version = version + 1 WHERE id = " + std::to_string(rolloutId));
+        }
+
+        void setRolloutStatusDirect(const std::int64_t rolloutId, const std::string &status)
+        {
+            executeSql("UPDATE biz_firmware_rollout SET status = '" + status + "', version = version + 1 WHERE id = " + std::to_string(rolloutId));
+        }
+
+        /**
+         * @brief 让指定目标写回 rolling_back 时抛错，模拟回滚派发循环中途被打断
+         */
+        void failRollbackTargetUpdate(const std::int64_t nodeId)
+        {
+            executeSql("CREATE TRIGGER fail_rollback_target_update BEFORE UPDATE OF status ON biz_firmware_rollout_target "
+                       "WHEN NEW.node_id = " +
+                       std::to_string(nodeId) +
+                       " AND NEW.status = 'rolling_back' "
+                       "BEGIN SELECT RAISE(ABORT, '回滚目标写入失败'); END");
+        }
+
+        void dropTrigger(const std::string &name)
+        {
+            executeSql("DROP TRIGGER IF EXISTS " + name);
         }
 
         void failTaskBinds()
@@ -792,6 +829,183 @@ TEST(FirmwareRolloutService, ForcePromoteRequiresReasonAndManualRollback)
     rollbackHarness.completeCommand(1, "1.0.0", later(base, 4));
     rollbackHarness.tick(later(base, 5));
     EXPECT_EQ("rolled_back", rollbackHarness.aggregate(rollbackId).rollout.status);
+}
+
+// 钉住：回滚派发中途抛错后，下一拍补齐剩余目标，未确认前不落 rolled_back
+TEST(FirmwareRolloutService, RollbackResumesRemainingTargetsAfterInterruption)
+{
+    RolloutHarness     harness;
+    const TimePoint    base   = fakeBase();
+    const std::int64_t first  = harness.createNode("rollout-resume-a");
+    const std::int64_t second = harness.createNode("rollout-resume-b");
+    harness.heartbeatAt(first, "1.0.0", later(base, 1));
+    harness.heartbeatAt(second, "1.0.0", later(base, 1));
+    const std::int64_t previous  = harness.createFirmware("1.0.0");
+    const std::int64_t target    = harness.createFirmware("2.9.0");
+    const char        *policy    = R"({"waves":[{"size":2}],"settleSeconds":2,"observeSeconds":4,"maxWaveSeconds":30,"autoRollback":true})";
+    const std::int64_t rolloutId = harness.createRollout(target, "回滚中断恢复", policy, {first, second});
+    harness.tick(base);
+    ASSERT_EQ(2U, harness.published.size());
+    // 两台都已装上新固件，第二台因告警判失败；回滚未完成前它仍停留在新固件
+    harness.completeCommand(0, "2.9.0", later(base, 2));
+    harness.completeCommand(1, "2.9.0", later(base, 2));
+    harness.raiseAlarm(second, "cpu.high", 201);
+    harness.tick(later(base, 2));
+    ASSERT_EQ("rolling_back", harness.aggregate(rolloutId).rollout.status);
+
+    harness.failRollbackTargetUpdate(second);
+    harness.tick(later(base, 3));
+    ASSERT_EQ(4U, harness.published.size());
+    ASSERT_EQ(first, harness.published[2].nodeId);
+    ASSERT_EQ(second, harness.published[3].nodeId);
+    ASSERT_EQ(previous, firmwareIdOf(harness.published[2]));
+    ASSERT_EQ(previous, firmwareIdOf(harness.published[3]));
+    auto aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolling_back", aggregate.rollout.status);
+    ASSERT_NE(nullptr, targetOf(aggregate, first));
+    ASSERT_NE(nullptr, targetOf(aggregate, second));
+    EXPECT_EQ("rolling_back", targetOf(aggregate, first)->status);
+    // 第二台的 rolling_back 回写被中断，命令已经送达但聚合里还没记录
+    EXPECT_EQ("failed", targetOf(aggregate, second)->status);
+    harness.dropTrigger("fail_rollback_target_update");
+
+    harness.tick(later(base, 4));
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolling_back", aggregate.rollout.status);
+    ASSERT_NE(nullptr, targetOf(aggregate, second));
+    EXPECT_EQ("rolling_back", targetOf(aggregate, second)->status);
+    EXPECT_EQ(harness.published[3].id, targetOf(aggregate, second)->commandId);
+    // 恢复时沿用已经绑定的任务与命令，不重复建单
+    EXPECT_EQ(4U, harness.published.size());
+    harness.tick(later(base, 4));
+    EXPECT_EQ(4U, harness.published.size());
+
+    harness.completeCommand(2, "1.0.0", later(base, 5));
+    harness.tick(later(base, 5));
+    aggregate = harness.aggregate(rolloutId);
+    // 第一台确认后第二台仍未确认，不得提前落 rolled_back
+    EXPECT_EQ("rolling_back", aggregate.rollout.status);
+    EXPECT_EQ("rolled_back", targetOf(aggregate, first)->status);
+    EXPECT_EQ("rolling_back", targetOf(aggregate, second)->status);
+
+    harness.completeCommand(3, "1.0.0", later(base, 6));
+    harness.tick(later(base, 6));
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolled_back", aggregate.rollout.status);
+    EXPECT_EQ("rolled_back", targetOf(aggregate, first)->status);
+    EXPECT_EQ("rolled_back", targetOf(aggregate, second)->status);
+}
+
+// 钉住：进程重启后从同一数据库恢复回滚派发，未确认的目标不会被跳过
+TEST(FirmwareRolloutService, RollbackResumesAfterServiceRestart)
+{
+    RolloutHarness     harness;
+    const TimePoint    base   = fakeBase();
+    const std::int64_t first  = harness.createNode("rollout-restart-a");
+    const std::int64_t second = harness.createNode("rollout-restart-b");
+    harness.heartbeatAt(first, "1.0.0", later(base, 1));
+    harness.heartbeatAt(second, "1.0.0", later(base, 1));
+    const std::int64_t previous  = harness.createFirmware("1.0.0");
+    const std::int64_t target    = harness.createFirmware("2.9.1");
+    const char        *policy    = R"({"waves":[{"size":2}],"settleSeconds":2,"observeSeconds":4,"maxWaveSeconds":30,"autoRollback":true})";
+    const std::int64_t rolloutId = harness.createRollout(target, "回滚重启恢复", policy, {first, second});
+    harness.tick(base);
+    ASSERT_EQ(2U, harness.published.size());
+    harness.completeCommand(0, "2.9.1", later(base, 2));
+    harness.completeCommand(1, "2.9.1", later(base, 2), false);
+    harness.tick(later(base, 2));
+    ASSERT_EQ("rolling_back", harness.aggregate(rolloutId).rollout.status);
+
+    // 第一台回滚命令发出后直接暂停，模拟派发循环被进程边界截断
+    harness.afterPublish = [&harness, rolloutId]
+    {
+        if (harness.published.size() == 3)
+        {
+            harness.pauseRolloutDirect(rolloutId);
+        }
+    };
+    harness.tick(later(base, 3));
+    harness.afterPublish = nullptr;
+    ASSERT_EQ(3U, harness.published.size());
+    auto aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("paused", aggregate.rollout.status);
+    ASSERT_NE(nullptr, targetOf(aggregate, first));
+    ASSERT_NE(nullptr, targetOf(aggregate, second));
+    EXPECT_EQ("rolling_back", targetOf(aggregate, first)->status);
+    EXPECT_EQ("failed", targetOf(aggregate, second)->status);
+
+    harness.setRolloutStatusDirect(rolloutId, "rolling_back");
+    harness.restartService();
+    harness.tick(later(base, 4));
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolling_back", aggregate.rollout.status);
+    EXPECT_EQ("rolling_back", targetOf(aggregate, first)->status);
+    EXPECT_EQ("rolling_back", targetOf(aggregate, second)->status);
+    ASSERT_EQ(4U, harness.published.size());
+    EXPECT_EQ(second, harness.published[3].nodeId);
+    EXPECT_EQ(previous, firmwareIdOf(harness.published[3]));
+
+    harness.completeCommand(2, "1.0.0", later(base, 5));
+    harness.tick(later(base, 5));
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolling_back", aggregate.rollout.status);
+    EXPECT_EQ("rolled_back", targetOf(aggregate, first)->status);
+    EXPECT_EQ("rolling_back", targetOf(aggregate, second)->status);
+
+    harness.completeCommand(3, "1.0.0", later(base, 6));
+    harness.tick(later(base, 6));
+    EXPECT_EQ("rolled_back", harness.aggregate(rolloutId).rollout.status);
+}
+
+// 钉住：安装中的任务同样在中止时被关闭，而不是留在 installing
+TEST(FirmwareRolloutService, AbortCancelsInstallingTasks)
+{
+    RolloutHarness     harness;
+    const TimePoint    base   = fakeBase();
+    const std::int64_t nodeId = harness.createNode("rollout-abort-installing");
+    harness.heartbeatAt(nodeId, "0.9.0", later(base, 1));
+    const std::int64_t firmwareId = harness.createFirmware("2.9.2");
+    const std::int64_t rolloutId  = harness.createRollout(firmwareId, "中止安装中任务", kSinglePolicy, {nodeId});
+    harness.tick(base);
+    ASSERT_EQ(1U, harness.published.size());
+    auto aggregate = harness.aggregate(rolloutId);
+    ASSERT_NE(nullptr, targetOf(aggregate, nodeId));
+    const std::int64_t taskId = targetOf(aggregate, nodeId)->taskId;
+    ASSERT_GT(taskId, 0);
+    static_cast<void>(harness.m_runner->run(harness.m_firmware->updateTask(harness.m_runner->loop(), firmwareId, nodeId, "installing", 100, "安装中", harness.published[0].id)));
+
+    const auto aborted = harness.m_runner->run(harness.m_service->abort(harness.m_runner->loop(), EdgePulse::System::TenantScope{1, false}, rolloutId, later(base, 1)));
+    ASSERT_TRUE(aborted.has_value()) << (aborted.has_value() ? "" : aborted.error().message);
+    EXPECT_EQ("canceled", harness.commandStatus(harness.published[0].id));
+    const auto task = harness.task(taskId);
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ("failed", task->status);
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("failed", targetOf(aggregate, nodeId)->status);
+}
+
+// 钉住：已进入观察的波次不会每拍重写 updated_at
+TEST(FirmwareRolloutService, ObservingWaveIsNotRewrittenEachTick)
+{
+    RolloutHarness     harness;
+    const TimePoint    base   = fakeBase();
+    const std::int64_t first  = harness.createNode("rollout-observe-a");
+    const std::int64_t second = harness.createNode("rollout-observe-b");
+    harness.heartbeatAt(first, "0.9.0", later(base, 1));
+    harness.heartbeatAt(second, "0.9.0", later(base, 1));
+    const std::int64_t firmwareId = harness.createFirmware("2.9.3");
+    const std::int64_t rolloutId  = harness.createRollout(firmwareId, "观察不重写", kOneWavePolicy, {first, second});
+    harness.tick(base);
+    ASSERT_EQ(2U, harness.published.size());
+    auto aggregate = harness.aggregate(rolloutId);
+    ASSERT_EQ(1U, aggregate.waves.size());
+    ASSERT_EQ("observing", aggregate.waves[0].status);
+    harness.executeSql("UPDATE biz_firmware_rollout_wave SET updated_at = '2000-01-01 00:00:00' WHERE id = " + std::to_string(aggregate.waves[0].id));
+
+    harness.tick(base);
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("2000-01-01 00:00:00", aggregate.waves[0].updatedAt);
+    EXPECT_EQ(2U, harness.published.size());
 }
 
 // 钉住：非 leader 不推进，取得领导权后才派发
