@@ -480,7 +480,8 @@ class Session:
             (r"^(\s*)heartbeat_interval_seconds: 10\s*$", r"\g<1>heartbeat_interval_seconds: 5", "agent.heartbeat_interval_seconds"),
             (r"^(\s*)certificate_file: var/certs/ca\.pem\s*$", rf"\g<1>certificate_file: '{(CERTS / 'ca.pem').as_posix()}'", "agent_ca.certificate_file"),
             (r"^(\s*)key_file: var/certs/ca-key\.pem\s*$", rf"\g<1>key_file: '{(CERTS / 'ca-key.pem').as_posix()}'", "agent_ca.key_file"),
-            # 自动签发的证书只活两天：Agent 的续期提前量是 1 天，新证书剩余有效期必须大于它才会被安装
+            # 自动签发的证书只活两天：规范窗口 max(25% 生命周期, 24h) 对新证书是 24 小时，
+            # 新证书剩余有效期必须大于它才会被安装
             (r"^(\s*)validity_days: 30\s*$", r"\g<1>validity_days: 2", "agent_ca.validity_days"),
         ]
         patched = patch_lines(source, replacements)
@@ -505,7 +506,7 @@ class Session:
     websocket_enabled: true
     request_timeout_seconds: 10
   certificate:
-    renew_before_days: 1
+    renew_before_days: 0
     renewal_check_seconds: 60
   telemetry:
     interval_seconds: 5
@@ -1007,12 +1008,16 @@ def run(session: Session) -> None:
         return
 
     agent_environment = build_agent_environment({ENROLLMENT_ENV: enrollment_token, HOOK_MARKER_ENV: str(session.hook_marker)})
+    startup_log_offsets = session.log_offsets()
     if not session.start_agent(agent_environment):
         return
     if not wait_registration(session):
         report("Agent 注册", False, "60 秒内没有写入 node_id：" + read_log_tail(session.agent_stdout))
         return
     report("Agent 注册", True, f"nodeId={session.node_id}")
+
+    websocket_line = wait_log_message(session, startup_log_offsets, "WebSocket 命令通道已建立", 30)
+    report("WebSocket 命令通道建立", bool(websocket_line), websocket_line or "30 秒内未出现「WebSocket 命令通道已建立」")
 
     registered = wait_node_detail(token, session.node_id, lambda node: node.get("status") == "online", 30)
     report("Agent 节点上线", registered is not None, f"nodeId={session.node_id}")
@@ -1123,7 +1128,7 @@ def run(session: Session) -> None:
         if not renewal_token:
             report("自动续期：切换到短期证书", False, "未取得改绑令牌")
         else:
-            # 用 1 天证书重新入场；续期提前量也是 1 天，Agent 启动后第一轮检查就会触发自动续期
+            # 用 1 天证书重新入场；规范窗口对 1 天证书是 24 小时，Agent 启动后第一轮检查就会触发自动续期
             session.stop_agent()
             session.write_agent_config(renewal_cert, renewal_key)
             short_config_check = subprocess.run([str(agent_binary), "--check-config", "--config", str(session.agent_config)], capture_output=True, text=True,
