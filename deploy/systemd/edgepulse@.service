@@ -15,7 +15,9 @@ WorkingDirectory=/opt/edgepulse
 # 各配置的 http_port/https_port/agent_port/ops_port 必须互不冲突。
 # 日志配置放在 /etc/edgepulse/logging.yaml，与 %i.yaml 同目录；其中滚动 sink 的
 # directory 要写 /var/lib/edgepulse/logs，不要写相对路径，否则会落到只读的
-# /opt/edgepulse 下。ReadWritePaths 已包含 /var/lib/edgepulse。
+# /opt/edgepulse 下。StateDirectory 创建 /var/lib/edgepulse 并交给服务用户，
+# ExecStartPre 再建 logs 子目录；ReadWritePaths 显式放开固件、日志与运行时配置。
+StateDirectory=edgepulse
 EnvironmentFile=/etc/edgepulse/%i.env
 ExecStartPre=/bin/mkdir -p /var/lib/edgepulse/logs
 ExecStart=/opt/edgepulse/edgepulse-server --config /etc/edgepulse/%i.yaml

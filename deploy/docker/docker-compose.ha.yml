@@ -75,7 +75,9 @@ x-edgepulse-service: &edgepulse-service
       source: firmware-data
       target: /var/lib/edgepulse/firmware
   healthcheck:
-    # 就绪探针而不是存活探针：依赖未就绪时容器保持 unhealthy，nginx 不会接入流量
+    # 就绪探针而不是存活探针：依赖未就绪时容器保持 unhealthy，便于编排观测与人工排查。
+    # nginx 不读取容器 health 状态，也不消费 /readyz；它只按 upstream 的
+    # max_fails/fail_timeout 被动摘除，见 deploy/nginx/edgepulse.conf。
     test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9100/readyz"]
     interval: 5s
     timeout: 3s
@@ -157,7 +159,7 @@ services:
     image: nginx:1.27-alpine
     restart: unless-stopped
     # 只等容器启动，不等应用 healthy：单个实例故障时 nginx 仍可用另一台上游提供服务。
-    # 应用的就绪由 upstream 被动摘除与 healthcheck 负责，启动期的失败请求由
+    # 应用的就绪由 upstream 的 max_fails/fail_timeout 被动摘除负责，启动期的失败请求由
     # proxy_next_upstream 重试；不要改回 service_healthy，否则一台起不来就整体不可用。
     depends_on:
       edgepulse-1:
