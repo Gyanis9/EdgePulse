@@ -1,15 +1,21 @@
 #include "Core/Command/CommandRepository.h"
 
+#include "Base/Config/ConfigValue.h"
 #include "Base/Database/SqlExecution.h"
 #include "Base/Database/SqlHelpers.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 
+#include <algorithm>
 #include <array>
+#include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -64,6 +70,61 @@ namespace EdgePulse::Command
             }
             return readCommand(*rows);
         }
+
+        /**
+         * @brief 把 SQL DATETIME 文本（YYYY-MM-DD HH:MM:SS）解析成 UTC 时刻
+         * @param text 数据库读出的时间文本
+         * @return std::optional<std::chrono::system_clock::time_point> 合法时返回时刻；空串或格式错误时为空
+         */
+        [[nodiscard]] std::optional<std::chrono::system_clock::time_point> parseSqlDateTime(const std::string_view text)
+        {
+            if (text.size() < 19 || text[4] != '-' || text[7] != '-' || text[10] != ' ' || text[13] != ':' || text[16] != ':')
+            {
+                return std::nullopt;
+            }
+            const auto readPart = [](const std::string_view source, const std::size_t offset, const std::size_t length) -> std::optional<int>
+            {
+                int value = 0;
+                const auto [end, error] = std::from_chars(source.data() + offset, source.data() + offset + length, value);
+                if (error != std::errc{} || end != source.data() + offset + length)
+                {
+                    return std::nullopt;
+                }
+                return value;
+            };
+            const std::optional<int> year   = readPart(text, 0, 4);
+            const std::optional<int> month  = readPart(text, 5, 2);
+            const std::optional<int> day    = readPart(text, 8, 2);
+            const std::optional<int> hour   = readPart(text, 11, 2);
+            const std::optional<int> minute = readPart(text, 14, 2);
+            const std::optional<int> second = readPart(text, 17, 2);
+            if (!year.has_value() || !month.has_value() || !day.has_value() || !hour.has_value() || !minute.has_value() || !second.has_value())
+            {
+                return std::nullopt;
+            }
+            const std::chrono::year_month_day calendar{std::chrono::year{*year}, std::chrono::month{static_cast<unsigned>(*month)},
+                                                       std::chrono::day{static_cast<unsigned>(*day)}};
+            if (!calendar.ok() || *hour < 0 || *hour > 23 || *minute < 0 || *minute > 59 || *second < 0 || *second > 59)
+            {
+                return std::nullopt;
+            }
+            return std::chrono::sys_days{calendar} + std::chrono::hours{*hour} + std::chrono::minutes{*minute} + std::chrono::seconds{*second};
+        }
+
+        /**
+         * @brief 从命令载荷里取固件标识，供旧版未绑定任务按固件与节点兜底匹配
+         */
+        [[nodiscard]] std::int64_t payloadFirmwareId(const std::string &payload)
+        {
+            const std::optional<AsynGyanis::Base::ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(payload);
+            if (!parsed.has_value() || !parsed->is_object() || !parsed->contains("firmwareId"))
+            {
+                return 0;
+            }
+            return AsynGyanis::Base::configValueAs<std::int64_t>(parsed->at("firmwareId")).value_or(0);
+        }
+
+        constexpr std::string_view kCommandTimeoutMessage = "执行超时：超过 timeoutSeconds 与宽限期仍未收到结果";
     } // namespace
 
     CommandRepository::CommandRepository(std::shared_ptr<Common::Database> database, System::TenantScope tenant) : m_database(std::move(database)), m_tenant(tenant)
@@ -376,6 +437,127 @@ namespace EdgePulse::Command
                         return std::nullopt;
                     }
                     return findOnConnection(connection, commandId, tenant);
+                });
+    }
+
+    AsynGyanis::Core::Task<CommandTimeoutSweepResult> CommandRepository::expireTimedOut(AsynGyanis::Core::EventLoop &loop, const std::chrono::system_clock::time_point now,
+                                                                                      const int graceSeconds, const std::size_t limit)
+    {
+        co_return co_await m_database->withConnection<CommandTimeoutSweepResult>(
+                loop,
+                [now, graceSeconds, limit, tenant = m_tenant](DatabaseConnection &connection) -> CommandTimeoutSweepResult
+                {
+                    struct Candidate
+                    {
+                        std::int64_t id{0};
+                        std::int64_t tenantId{1};
+                        std::int64_t nodeId{0};
+                        std::string  payload;
+                    };
+
+                    Sql::executeOrThrowVoid(connection, "BEGIN");
+                    try
+                    {
+                        std::vector<DatabaseValue> parameters;
+                        std::string                clause;
+                        if (!tenant.allTenants)
+                        {
+                            clause = " AND c.tenant_id = ?";
+                            parameters.emplace_back(tenant.tenantId);
+                        }
+                        parameters.emplace_back(static_cast<std::int64_t>(limit));
+                        // 先按真正开始执行的时刻排序：running 看 dispatched_at，pending 看 scheduled_at；
+                        // 两者都为空时才回退 created_at。窗口必须有界，单次最多处理 limit 条
+                        const auto rows = Sql::executeOrThrow(connection,
+                                                              "SELECT c.id, c.tenant_id, c.node_id, c.payload, c.status, c.created_at, c.dispatched_at, c.scheduled_at, "
+                                                              "c.timeout_seconds FROM biz_command c WHERE c.status IN ('pending', 'running') AND c.timeout_seconds > 0" +
+                                                                      clause + " ORDER BY COALESCE(c.dispatched_at, c.scheduled_at, c.created_at), c.id LIMIT ?",
+                                                              parameters);
+
+                        const auto nowSeconds = std::chrono::floor<std::chrono::seconds>(now);
+                        const auto grace      = std::chrono::seconds{std::max(0, graceSeconds)};
+                        std::vector<Candidate> candidates;
+                        while (rows->next())
+                        {
+                            const int         timeoutSeconds = static_cast<int>(Sql::integer(*rows, "timeout_seconds"));
+                            const std::string status         = Sql::text(*rows, "status");
+                            const std::string dispatchedAt   = Sql::dateTimeText(*rows, "dispatched_at");
+                            const std::string scheduledAt    = Sql::dateTimeText(*rows, "scheduled_at");
+                            const std::string createdAt      = Sql::dateTimeText(*rows, "created_at");
+                            std::string       baseText       = createdAt;
+                            if (status == "running" && !dispatchedAt.empty())
+                            {
+                                baseText = dispatchedAt;
+                            } else if (status != "running" && !scheduledAt.empty())
+                            {
+                                baseText = scheduledAt;
+                            }
+                            const std::optional<std::chrono::system_clock::time_point> base = parseSqlDateTime(baseText);
+                            if (timeoutSeconds <= 0 || !base.has_value())
+                            {
+                                continue;
+                            }
+                            if (*base + std::chrono::seconds{timeoutSeconds} + grace > nowSeconds)
+                            {
+                                continue;
+                            }
+                            candidates.push_back(Candidate{Sql::integer(*rows, "id"), Sql::integer(*rows, "tenant_id"), Sql::integer(*rows, "node_id"),
+                                                           Sql::text(*rows, "payload")});
+                        }
+
+                        CommandTimeoutSweepResult result;
+                        const std::string         finishedAt = Common::formatDateTimeUtc(now);
+                        for (const Candidate &candidate: candidates)
+                        {
+                            const auto updated = Sql::executeOrThrow(
+                                    connection,
+                                    "UPDATE biz_command SET status = 'timeout', result = ?, message = ?, finished_at = ? WHERE id = ? AND status IN ('pending', 'running')",
+                                    std::array<DatabaseValue, 4>{std::string{"{}"}, std::string{kCommandTimeoutMessage}, finishedAt, candidate.id});
+                            if (updated->affectedRowCount() == 0)
+                            {
+                                continue;
+                            }
+
+                            // 绑定任务按 command_id 精确命中；旧版任务用负值占位，按载荷固件与节点兜底
+                            std::vector<DatabaseValue> taskParameters{std::string{kCommandTimeoutMessage}, finishedAt, candidate.id, candidate.tenantId};
+                            const auto                 boundTasks = Sql::executeOrThrow(
+                                    connection,
+                                    "UPDATE biz_firmware_task SET status = 'failed', progress = 0, message = ?, updated_at = ? WHERE command_id = ? AND tenant_id = ? "
+                                    "AND status NOT IN ('installed', 'failed')",
+                                    taskParameters);
+                            std::size_t failedTasks = boundTasks->affectedRowCount();
+                            if (failedTasks == 0)
+                            {
+                                if (const std::int64_t firmwareId = payloadFirmwareId(candidate.payload); firmwareId > 0)
+                                {
+                                    const std::array<DatabaseValue, 5> legacyParameters{std::string{kCommandTimeoutMessage}, finishedAt, firmwareId, candidate.nodeId,
+                                                                                        candidate.tenantId};
+                                    const auto                         legacyTasks = Sql::executeOrThrow(
+                                            connection,
+                                            "UPDATE biz_firmware_task SET status = 'failed', progress = 0, message = ?, updated_at = ? WHERE firmware_id = ? AND node_id = ? "
+                                            "AND tenant_id = ? AND command_id < 0 AND status NOT IN ('installed', 'failed')",
+                                            legacyParameters);
+                                    failedTasks = legacyTasks->affectedRowCount();
+                                }
+                            }
+                            result.failedFirmwareTasks += failedTasks;
+                            if (auto command = findOnConnection(connection, candidate.id, tenant); command.has_value())
+                            {
+                                result.commands.push_back(std::move(*command));
+                            }
+                        }
+                        Sql::executeOrThrowVoid(connection, "COMMIT");
+                        return result;
+                    } catch (...)
+                    {
+                        try
+                        {
+                            Sql::executeOrThrowVoid(connection, "ROLLBACK");
+                        } catch (...)
+                        {
+                        }
+                        throw;
+                    }
                 });
     }
 

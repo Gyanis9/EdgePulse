@@ -15,6 +15,7 @@
 
 #include <Core/Coroutine/Task.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -50,6 +51,15 @@ namespace EdgePulse::Command
         int          timeoutSeconds{60}; ///< 超时秒数
         std::string  scheduledAt;        ///< 计划执行时间，空表示立即
         std::int64_t batchId{0};         ///< 批量标识，0 表示单条
+    };
+
+    /**
+     * @brief 一次超时清理的结果
+     */
+    struct CommandTimeoutSweepResult
+    {
+        std::vector<CommandRecord> commands;          ///< 本批被标记为 timeout 的命令
+        std::size_t                failedFirmwareTasks{0}; ///< 同批被标记为 failed 的固件任务数
     };
 
     /**
@@ -116,6 +126,21 @@ namespace EdgePulse::Command
          * @return std::vector<CommandRecord> 命令
          */
         AsynGyanis::Core::Task<std::vector<CommandRecord>> listDue(AsynGyanis::Core::EventLoop &loop, std::size_t limit = 100);
+
+        /**
+         * @brief 把超过 timeout_seconds + 宽限期的 pending/running 命令标记为 timeout
+         * @param loop 恢复协程用的事件循环
+         * @param now 本次判定使用的当前时刻；测试注入假时钟，生产传 system_clock::now()
+         * @param graceSeconds 超时之上的宽限秒数，给 Agent 回报留出网络与排队余量
+         * @param limit 本次最多检查多少条候选，必须有界
+         * @return CommandTimeoutSweepResult 本批命令与同步标记失败的固件任务数
+         * @note 只由控制面 leader 周期调用；timeout_seconds 为 0 或负数的命令不参与
+         * @note pending 从 created_at、running 从 dispatched_at（为空时回退 created_at）起算
+         * @note 固件任务先按 command_id 命中；未命中时才按命令载荷的 firmwareId 与 node_id 匹配旧版未绑定任务
+         * @note 已 installed 的任务不会被改写；单个事务失败时整批回滚
+         */
+        AsynGyanis::Core::Task<CommandTimeoutSweepResult> expireTimedOut(AsynGyanis::Core::EventLoop &loop, std::chrono::system_clock::time_point now, int graceSeconds,
+                                                                         std::size_t limit = 200);
 
         /**
          * @brief 标记命令已下发

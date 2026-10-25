@@ -109,6 +109,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <expected>
@@ -121,6 +122,15 @@ namespace EdgePulse::App
 {
     namespace
     {
+        /// 命令超时宽限：在 timeout_seconds 之上给 Agent 回报与队列留出的余量
+        constexpr int kCommandTimeoutGraceSeconds = 30;
+
+        /// 命令超时扫描周期：调度循环每两秒一拍，十五拍约三十秒
+        constexpr std::size_t kCommandTimeoutSweepTicks = 15;
+
+        /// 单次超时扫描最多检查多少条候选，避免一次长事务
+        constexpr std::size_t kCommandTimeoutSweepBatch = 200;
+
         /**
          * @brief 取运维口 Bearer 令牌：环境变量优先，其次读未跟踪文件
          * @param tokenFile 令牌文件路径
@@ -747,10 +757,30 @@ namespace EdgePulse::App
         // 没有 Agent 连接时到期命令会一直留在 pending；同一命令每 2 秒重发一次只会制造无意义的
         // 跨实例扇出，因此 leader 在内存里按命令标识节流。领导权切换后新 leader 从空表开始
         Command::CommandPublishThrottle dueThrottle;
+        // leader 上的超时收尾与计划命令共用一条门控拍；首拍立即扫一次，之后约三十秒一次
+        std::size_t ticksUntilTimeoutSweep = 1;
         // follower 只等待：计划命令是控制面单飞工作，多实例同时推进会把同一条命令重复下发
         System::LeaderTick leaderTick(leaderGate,
-                                      [this, &loop, allCommands, &dueThrottle]() -> AsynGyanis::Core::Task<>
+                                      [this, &loop, allCommands, &dueThrottle, &ticksUntilTimeoutSweep]() -> AsynGyanis::Core::Task<>
                                       {
+                                          if (--ticksUntilTimeoutSweep == 0)
+                                          {
+                                              ticksUntilTimeoutSweep = kCommandTimeoutSweepTicks;
+                                              try
+                                              {
+                                                  const Command::CommandTimeoutSweepResult expired =
+                                                          co_await allCommands->expireTimedOut(loop, std::chrono::system_clock::now(), kCommandTimeoutGraceSeconds,
+                                                                                               kCommandTimeoutSweepBatch);
+                                                  for (const Command::CommandRecord &command: expired.commands)
+                                                  {
+                                                      LOG_WARN_FMT("命令执行超时已收尾：command={} node={} type={}", command.id, command.nodeId, command.type);
+                                                      co_await publishCommandStatus(command);
+                                                  }
+                                              } catch (const std::exception &failure)
+                                              {
+                                                  LOG_WARN_FMT("命令超时扫描失败：{}", failure.what());
+                                              }
+                                          }
                                           std::vector<Command::CommandRecord> due;
                                           try
                                           {

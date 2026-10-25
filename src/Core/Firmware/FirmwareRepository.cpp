@@ -478,9 +478,9 @@ namespace EdgePulse::Firmware
                             clause += " AND tenant_id = ?";
                             parameters.emplace_back(tenant.tenantId);
                         }
-                        // Agent 带命令号的迟到回报不能把已判失败的任务重新写成进行中或已安装；
-                        // 不带命令号的旧调用维持原有按固件与节点更新全部任务的行为
-                        if (commandId != 0)
+                        // 已判失败的任务（含发布中止或命令超时收尾）不能被迟到回报改回进行中或已安装；
+                        // 旧 Agent 不带命令号时同样适用，只有再次写入 failed 本身允许
+                        if (status != "failed")
                         {
                             clause += " AND status <> 'failed'";
                         }

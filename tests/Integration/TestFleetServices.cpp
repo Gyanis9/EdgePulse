@@ -1,3 +1,5 @@
+#include "Base/Config/ConfigValue.h"
+#include "Base/Database/Database.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
@@ -14,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +30,21 @@ namespace
         result.value  = value;
         result.unit   = "%";
         return result;
+    }
+
+    /**
+     * @brief 直接在临时库上改时间戳，模拟已经滞留一段时间的命令
+     */
+    void executeSql(const std::filesystem::path &databasePath, const std::string &sql)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        ASSERT_NE(nullptr, connection);
+        ASSERT_NE(nullptr, connection->execute(sql)) << connection->lastError();
+    }
+
+    [[nodiscard]] std::chrono::system_clock::time_point fakeNow()
+    {
+        return std::chrono::sys_days{std::chrono::year{2026} / std::chrono::January / 2} + std::chrono::hours{1};
     }
 } // namespace
 
@@ -192,6 +210,114 @@ TEST(FleetServices, ScheduledCommandsWaitForDueTime)
     const auto next = runner.run(repository.takeNext(runner.loop(), nodeId));
     ASSERT_TRUE(next.has_value());
     EXPECT_EQ(due->id, next->id);
+}
+
+// 钉住：超过 timeoutSeconds + 宽限期的命令被标记 timeout，并同步把绑定命令的固件任务判失败；
+// 未超时、timeoutSeconds 为 0 与尚未到计划时间的命令保持原状
+TEST(FleetServices, CommandTimeoutSweepExpiresStuckCommandAndBoundTask)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Command::CommandRepository   repository(context.database);
+    EdgePulse::Device::NodeRepository       nodes(context.database);
+    EdgePulse::Firmware::FirmwareRepository firmware(context.database);
+    const std::int64_t                      nodeId = runner.run(nodes.create(runner.loop(), "timeout-node", "{}")).id;
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name        = "EdgePulse OS timeout";
+    record.version     = "1.0.1";
+    record.fileName    = "os-timeout.bin";
+    record.sizeBytes   = 1024;
+    record.sha256      = std::string(64, 'b');
+    record.storagePath = "unused-timeout.bin";
+    const std::int64_t firmwareId = runner.run(firmware.create(runner.loop(), record));
+    const std::int64_t taskId     = runner.run(firmware.createTask(runner.loop(), firmwareId, nodeId));
+    ASSERT_GT(taskId, 0);
+
+    const auto fresh = runner.run(repository.create(runner.loop(), nodeId, "diagnostics.collect", "{}", 1, 60));
+    ASSERT_TRUE(fresh.has_value());
+    const auto running = runner.run(repository.takeNext(runner.loop(), nodeId));
+    ASSERT_TRUE(running.has_value());
+    ASSERT_EQ(fresh->id, running->id);
+
+    const auto stuck = runner.run(repository.create(runner.loop(), nodeId, "firmware.update",
+                                                    AsynGyanis::Base::ConfigValue::object({{"firmwareId", firmwareId}}).dump(), 1, 30));
+    ASSERT_TRUE(stuck.has_value());
+    ASSERT_TRUE(runner.run(firmware.bindTaskCommand(runner.loop(), taskId, stuck->id)));
+    ASSERT_TRUE(runner.run(firmware.updateTaskById(runner.loop(), taskId, "downloading", 40, "下载中")));
+
+    const auto noTimeout = runner.run(repository.create(runner.loop(), nodeId, "diagnostics.collect", "{}", 1, 0));
+    ASSERT_TRUE(noTimeout.has_value());
+    const std::string future = EdgePulse::Common::formatDateTimeUtc(fakeNow() + std::chrono::hours{2});
+    const auto        scheduled = runner.run(repository.create(runner.loop(), nodeId, "reboot", "{}", 1, 30, future));
+    ASSERT_TRUE(scheduled.has_value());
+
+    executeSql(context.databasePath(),
+               "UPDATE biz_command SET created_at = '2026-01-02 00:00:00', scheduled_at = '2026-01-02 00:00:00' WHERE id = " + std::to_string(stuck->id));
+    executeSql(context.databasePath(), "UPDATE biz_command SET created_at = '2026-01-02 00:00:00' WHERE id = " + std::to_string(noTimeout->id));
+    executeSql(context.databasePath(), "UPDATE biz_command SET scheduled_at = '2026-01-02 03:00:00' WHERE id = " + std::to_string(scheduled->id));
+
+    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 30, 100));
+    ASSERT_EQ(1U, sweep.commands.size());
+    EXPECT_EQ(stuck->id, sweep.commands[0].id);
+    EXPECT_EQ("timeout", sweep.commands[0].status);
+    EXPECT_FALSE(sweep.commands[0].finishedAt.empty());
+    EXPECT_EQ(1U, sweep.failedFirmwareTasks);
+
+    const auto expired = runner.run(repository.find(runner.loop(), stuck->id));
+    ASSERT_TRUE(expired.has_value());
+    EXPECT_EQ("timeout", expired->status);
+    const auto task = runner.run(firmware.findTask(runner.loop(), taskId));
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ("failed", task->status);
+
+    const auto stillRunning = runner.run(repository.find(runner.loop(), fresh->id));
+    ASSERT_TRUE(stillRunning.has_value());
+    EXPECT_EQ("running", stillRunning->status);
+    const auto stillPending = runner.run(repository.find(runner.loop(), noTimeout->id));
+    ASSERT_TRUE(stillPending.has_value());
+    EXPECT_EQ("pending", stillPending->status);
+    const auto stillScheduled = runner.run(repository.find(runner.loop(), scheduled->id));
+    ASSERT_TRUE(stillScheduled.has_value());
+    EXPECT_EQ("pending", stillScheduled->status);
+
+    const auto secondSweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 30, 100));
+    EXPECT_TRUE(secondSweep.commands.empty()) << "已超时的命令不能被重复收尾";
+}
+
+// 钉住：旧版未绑定任务没有 command_id，按命令载荷里的 firmwareId 与 node_id 命中并判失败
+TEST(FleetServices, CommandTimeoutSweepFailsLegacyTaskByFirmware)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Command::CommandRepository   repository(context.database);
+    EdgePulse::Device::NodeRepository       nodes(context.database);
+    EdgePulse::Firmware::FirmwareRepository firmware(context.database);
+    const std::int64_t                      nodeId = runner.run(nodes.create(runner.loop(), "timeout-legacy-node", "{}")).id;
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name        = "EdgePulse OS legacy timeout";
+    record.version     = "1.0.2";
+    record.fileName    = "os-legacy-timeout.bin";
+    record.sizeBytes   = 1024;
+    record.sha256      = std::string(64, 'c');
+    record.storagePath = "unused-legacy-timeout.bin";
+    const std::int64_t firmwareId = runner.run(firmware.create(runner.loop(), record));
+    const std::int64_t taskId     = runner.run(firmware.createTask(runner.loop(), firmwareId, nodeId));
+    ASSERT_GT(taskId, 0);
+    ASSERT_TRUE(runner.run(firmware.updateTaskById(runner.loop(), taskId, "downloading", 30, "下载中")));
+
+    const auto stuck = runner.run(repository.create(runner.loop(), nodeId, "firmware.update",
+                                                    AsynGyanis::Base::ConfigValue::object({{"firmwareId", firmwareId}}).dump(), 1, 10));
+    ASSERT_TRUE(stuck.has_value());
+    executeSql(context.databasePath(), "UPDATE biz_command SET created_at = '2026-01-02 00:00:00' WHERE id = " + std::to_string(stuck->id));
+
+    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 30, 100));
+    ASSERT_EQ(1U, sweep.commands.size());
+    EXPECT_EQ(1U, sweep.failedFirmwareTasks);
+    const auto task = runner.run(firmware.findTask(runner.loop(), taskId));
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ("failed", task->status);
 }
 
 // 钉住：同一计划命令在节流间隔内不重复发布，间隔到点后允许重试；离开到期集合后清掉记录

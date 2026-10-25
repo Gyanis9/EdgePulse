@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -361,14 +362,21 @@ TEST(FirmwareRolloutRepository, TaskUpdatesScopeByCommandId)
     EXPECT_EQ("installed", secondRow->status);
     EXPECT_EQ("第二条完成", secondRow->message);
 
-    // 旧调用不带 commandId：仍按固件与节点更新全部任务，并返回最新一行
+    // 旧调用不带 commandId：按固件与节点更新所有未失败的任务，已失败的任务保持原状
     const auto legacy = runner.run(firmware.updateTask(runner.loop(), firmwareId, nodeId, "installed", 100, "旧调用"));
     ASSERT_TRUE(legacy.has_value());
     EXPECT_EQ(22, legacy->commandId);
     for (const EdgePulse::Firmware::FirmwareTaskRecord &row: runner.run(firmware.tasks(runner.loop(), firmwareId)))
     {
-        EXPECT_EQ("installed", row.status);
-        EXPECT_EQ("旧调用", row.message);
+        if (row.commandId == 11)
+        {
+            EXPECT_EQ("failed", row.status);
+            EXPECT_EQ("第一条失败", row.message);
+        } else
+        {
+            EXPECT_EQ("installed", row.status);
+            EXPECT_EQ("旧调用", row.message);
+        }
     }
 }
 
@@ -585,6 +593,55 @@ TEST(FirmwareRolloutRepository, UpdatesWaveTargetGateAndListsDue)
 }
 
 // 钉住：原因文本按列上限截断，且不会切断 UTF-8 多字节字符
+// 钉住：主键游标让候选窗口循环推进，超过一页的活动发布不会被旧窗口长期饿死
+TEST(FirmwareRolloutRepository, ListDueRolloutsRotatesAcrossPages)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
+    EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
+    const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.9");
+
+    for (int index = 0; index < 25; ++index)
+    {
+        const std::int64_t nodeId = runner.run(nodes.create(runner.loop(), "rollout-rotate-node-" + std::to_string(index), "{}")).id;
+        EdgePulse::Firmware::FirmwareRolloutDraft draft;
+        draft.rollout.firmwareId = firmwareId;
+        draft.rollout.name       = "游标灰度-" + std::to_string(index);
+        draft.rollout.policyJson = R"({"waves":[{"size":1}]})";
+        draft.rollout.status     = "scheduled";
+        draft.rollout.createdBy  = 7;
+        EdgePulse::Firmware::FirmwareRolloutWaveDraft wave;
+        wave.wave.waveIndex = 0;
+        wave.wave.status    = "pending";
+        EdgePulse::Firmware::FirmwareRolloutTargetRecord target;
+        target.nodeId = nodeId;
+        target.status = "pending";
+        wave.targets.push_back(target);
+        draft.waves.push_back(std::move(wave));
+        ASSERT_GT(runner.run(rollouts.create(runner.loop(), std::move(draft))), 0);
+    }
+
+    std::set<std::int64_t> seen;
+    std::int64_t           cursor = 0;
+    for (int page = 0; page < 8 && seen.size() < 25U; ++page)
+    {
+        const std::vector<EdgePulse::Firmware::FirmwareRolloutRecord> batch = runner.run(rollouts.listDueRollouts(runner.loop(), 10, cursor));
+        if (batch.empty())
+        {
+            cursor = 0;
+            continue;
+        }
+        for (const auto &record: batch)
+        {
+            seen.insert(record.id);
+        }
+        cursor = batch.back().id;
+    }
+    EXPECT_EQ(25U, seen.size()) << "候选窗口必须覆盖全部活动发布";
+}
+
 TEST(FirmwareRolloutRepository, TruncatesReasonsAtColumnLimits)
 {
     EdgePulse::TestSupport::AuthTestContext        context;
