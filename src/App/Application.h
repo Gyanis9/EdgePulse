@@ -113,6 +113,8 @@ namespace EdgePulse::Alarm
 namespace EdgePulse::Firmware
 {
     class FirmwareRepository;
+    class FirmwareRolloutRepository;
+    class FirmwareRolloutService;
     struct FirmwareSigningPolicy;
 } // namespace EdgePulse::Firmware
 namespace EdgePulse::Command
@@ -215,6 +217,14 @@ namespace EdgePulse::App
         AsynGyanis::Core::Task<> runFleetLifecycle(AsynGyanis::Core::EventLoop &loop);
 
         /**
+         * @brief 周期推进固件灰度发布
+         * @param loop 服务器所属事件循环
+         * @return AsynGyanis::Core::Task<> 周期协程，活到应用析构
+         * @note 只由 leader 执行，周期五秒；跟随者不派发也不判定波次
+         */
+        AsynGyanis::Core::Task<> runFirmwareRollout(AsynGyanis::Core::EventLoop &loop);
+
+        /**
          * @brief 把节点状态推给实时总线
          * @param node 待推送的节点
          * @return AsynGyanis::Core::Task<> 推送完成即返回
@@ -273,10 +283,13 @@ namespace EdgePulse::App
         std::shared_ptr<Notification::NotificationService>        m_notificationService;    ///< 通知投递
         std::shared_ptr<Notification::NotificationDispatcher>     m_notificationDispatcher; ///< 通知队列
         std::shared_ptr<Firmware::FirmwareRepository>             m_firmwareRepository;     ///< 固件
+        std::shared_ptr<Firmware::FirmwareRolloutRepository>      m_rolloutRepository;      ///< 灰度发布聚合
+        std::shared_ptr<Firmware::FirmwareRolloutService>         m_rolloutService;         ///< 灰度协调
         std::shared_ptr<Firmware::FirmwareSigningPolicy>          m_signingPolicy;          ///< 固件签名门禁
         std::shared_ptr<Command::CommandRepository>               m_commandRepository;      ///< 命令
         std::optional<AsynGyanis::Core::Task<>>                   m_commandScheduler;       ///< 计划命令推进协程
         std::optional<AsynGyanis::Core::Task<>>                   m_fleetLifecycle;         ///< 离线扫描与指标刷新协程
+        std::optional<AsynGyanis::Core::Task<>>                   m_firmwareRollout;        ///< 固件灰度推进协程
         std::optional<AsynGyanis::Core::Task<>>                   m_dataRetention;          ///< 数据保留期清理协程
         std::optional<AsynGyanis::Core::Task<>>                   m_readinessProbe;         ///< 缓存探针协程
         std::shared_ptr<Command::AgentChannelRegistry>            m_agentChannels;          ///< Agent 长连接

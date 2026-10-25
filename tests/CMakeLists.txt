@@ -50,6 +50,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestEnrollment.cpp
         Integration/TestExternalStores.cpp
         Integration/TestFirmwareRolloutRepository.cpp
+        Integration/TestFirmwareRolloutService.cpp
         Integration/TestFirmwareSignature.cpp
         Integration/TestLeaderLease.cpp
         Integration/TestMigrations.cpp
@@ -80,6 +81,7 @@ add_executable(edgepulse-protocol-tests
         Protocol/TestEnrollmentEndpoints.cpp
         Protocol/TestHealthServer.cpp
         Protocol/TestFleetEndpoints.cpp
+        Protocol/TestFirmwareRolloutEndpoints.cpp
         Protocol/TestIdempotency.cpp
         Protocol/TestMfaEndpoints.cpp
         Protocol/TestNodeConfigEndpoints.cpp

@@ -46,6 +46,7 @@ namespace EdgePulse::Web
 namespace EdgePulse::Firmware
 {
     class FirmwareRepository;
+    class FirmwareRolloutService;
     struct FirmwareSigningPolicy;
 } // namespace EdgePulse::Firmware
 
@@ -66,6 +67,7 @@ namespace EdgePulse::Firmware
         std::string                            storageDirectory{"var/firmware"};         ///< 落盘目录
         std::size_t                            maximumUploadBytes{256U * 1024U * 1024U}; ///< 上传上限
         std::shared_ptr<FirmwareSigningPolicy> signingPolicy;                            ///< 签名门禁；为空时按不强制签名处理
+        FirmwareRolloutService                *rollouts{nullptr};                        ///< 灰度服务；为空时不注册灰度路由
     };
 
     /**

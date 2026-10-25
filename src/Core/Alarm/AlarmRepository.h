@@ -16,6 +16,7 @@
 
 #include <Core/Coroutine/Task.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -163,6 +164,16 @@ namespace EdgePulse::Alarm
          * @return std::optional<AlarmRecord> 更新后的告警
          */
         AsynGyanis::Core::Task<std::optional<AlarmRecord>> resolve(AsynGyanis::Core::EventLoop &loop, std::int64_t alarmId, std::int64_t operatorId);
+
+        /**
+         * @brief 查节点在指定时刻之后触发的告警
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点
+         * @param since SQL DATETIME 起点，包含该时刻
+         * @param limit 最多返回多少条
+         * @return std::vector<AlarmRecord> 告警，按触发时间与标识升序
+         */
+        AsynGyanis::Core::Task<std::vector<AlarmRecord>> triggeredSince(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string since, std::size_t limit = 100);
 
         /**
          * @brief 未恢复告警数

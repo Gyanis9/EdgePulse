@@ -110,6 +110,14 @@ namespace EdgePulse::Firmware
         AsynGyanis::Core::Task<std::optional<FirmwareRecord>> find(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId);
 
         /**
+         * @brief 按版本号查最近一次上传的固件
+         * @param loop 恢复协程用的事件循环
+         * @param version 版本号
+         * @return std::optional<FirmwareRecord> 最新一条同版本且未删除的固件；没有时为空
+         */
+        AsynGyanis::Core::Task<std::optional<FirmwareRecord>> findByVersion(AsynGyanis::Core::EventLoop &loop, std::string version);
+
+        /**
          * @brief 软删除固件
          * @param loop 恢复协程用的事件循环
          * @param firmwareId 固件标识
@@ -156,6 +164,35 @@ namespace EdgePulse::Firmware
          * @return std::int64_t 固件标识；没有历史时 0
          */
         AsynGyanis::Core::Task<std::int64_t> latestOtherFirmware(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::int64_t excludeFirmwareId);
+
+        /**
+         * @brief 节点最近一次确认安装完成的其他版本
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点
+         * @param excludeFirmwareId 排除的固件
+         * @return std::int64_t 固件标识；没有安装成功的历史时 0
+         * @note 只认 status 为 installed 的任务，供灰度回滚解析上一版本
+         */
+        AsynGyanis::Core::Task<std::int64_t> latestInstalledFirmware(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::int64_t excludeFirmwareId);
+
+        /**
+         * @brief 按标识查固件任务
+         * @param loop 恢复协程用的事件循环
+         * @param taskId 任务标识
+         * @return std::optional<FirmwareTaskRecord> 任务；不在租户边界内时为空
+         */
+        AsynGyanis::Core::Task<std::optional<FirmwareTaskRecord>> findTask(AsynGyanis::Core::EventLoop &loop, std::int64_t taskId);
+
+        /**
+         * @brief 按任务标识改状态，不按固件与节点扩散
+         * @param loop 恢复协程用的事件循环
+         * @param taskId 任务标识
+         * @param status 新状态
+         * @param progress 进度
+         * @param message 说明
+         * @return bool 任务存在且写入成功时为 true
+         */
+        AsynGyanis::Core::Task<bool> updateTaskById(AsynGyanis::Core::EventLoop &loop, std::int64_t taskId, std::string status, int progress, std::string message);
 
         /**
          * @brief 某个固件在节点上的回滚目标版本

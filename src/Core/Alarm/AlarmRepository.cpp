@@ -473,6 +473,32 @@ namespace EdgePulse::Alarm
                 });
     }
 
+    AsynGyanis::Core::Task<std::vector<AlarmRecord>> AlarmRepository::triggeredSince(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string since,
+                                                                                     const std::size_t limit)
+    {
+        co_return co_await m_database->withConnection<std::vector<AlarmRecord>>(
+                loop,
+                [nodeId, since = std::move(since), limit, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<AlarmRecord>
+                {
+                    std::vector<DatabaseValue> parameters{nodeId, since};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND a.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    parameters.emplace_back(static_cast<std::int64_t>(limit));
+                    const auto rows = Sql::executeOrThrow(
+                            connection, std::string{kSelectAlarm} + "WHERE a.node_id = ? AND a.triggered_at >= ?" + clause + " ORDER BY a.triggered_at, a.id LIMIT ?", parameters);
+                    std::vector<AlarmRecord> alarms;
+                    while (rows->next())
+                    {
+                        alarms.push_back(readAlarm(*rows));
+                    }
+                    return alarms;
+                });
+    }
+
     AsynGyanis::Core::Task<std::int64_t> AlarmRepository::openCount(AsynGyanis::Core::EventLoop &loop)
     {
         co_return co_await m_database->withConnection<std::int64_t>(

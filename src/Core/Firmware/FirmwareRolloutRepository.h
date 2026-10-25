@@ -39,7 +39,7 @@ namespace EdgePulse::Firmware
         std::int64_t firmwareId{0};  ///< 目标固件
         std::string  name;           ///< 发布名称
         std::string  policyJson;     ///< 波次与门控策略 JSON
-        std::string  status;         ///< draft/scheduled/preparing/running/paused/rolling_back/completed/rolled_back/aborted
+        std::string  status;         ///< draft/scheduled/preparing/running/paused/rolling_back/completed/rolled_back/rollback_unavailable/aborted/failed
         int          currentWave{0}; ///< 当前波次下标，0 表示尚未推进
         int          totalWaves{0};  ///< 波次总数
         std::int64_t createdBy{0};   ///< 创建人

@@ -455,7 +455,7 @@ namespace EdgePulse::Firmware
                         current->pausedAt    = now;
                         current->pauseReason = pauseReason;
                     }
-                    const bool terminal = status == "completed" || status == "rolled_back" || status == "aborted" || status == "failed";
+                    const bool terminal = status == "completed" || status == "rolled_back" || status == "rollback_unavailable" || status == "aborted" || status == "failed";
                     if (terminal)
                     {
                         current->finishedAt = now;

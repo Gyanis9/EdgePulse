@@ -140,6 +140,36 @@ namespace EdgePulse::Telemetry
                 });
     }
 
+    AsynGyanis::Core::Task<std::optional<TelemetryFreshness>> TelemetryRepository::newestTimestamps(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
+    {
+        co_return co_await m_database->withConnection<std::optional<TelemetryFreshness>>(
+                loop,
+                [nodeId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<TelemetryFreshness>
+                {
+                    std::vector<DatabaseValue> parameters{nodeId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(
+                            connection, "SELECT MAX(created_at) AS created_at, MAX(collected_at) AS collected_at FROM biz_telemetry WHERE node_id = ?" + clause, parameters);
+                    if (!rows->next())
+                    {
+                        return std::nullopt;
+                    }
+                    TelemetryFreshness freshness;
+                    freshness.createdAt   = Sql::dateTimeText(*rows, "created_at");
+                    freshness.collectedAt = Sql::dateTimeText(*rows, "collected_at");
+                    if (freshness.createdAt.empty() && freshness.collectedAt.empty())
+                    {
+                        return std::nullopt;
+                    }
+                    return freshness;
+                });
+    }
+
     AsynGyanis::Core::Task<std::vector<TelemetryPoint>> TelemetryRepository::series(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string metric,
                                                                                     std::string from, std::string to, const int limit)
     {

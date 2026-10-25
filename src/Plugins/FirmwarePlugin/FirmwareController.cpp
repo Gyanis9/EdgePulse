@@ -16,6 +16,8 @@
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareFileWriter.h"
 #include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Firmware/FirmwareRolloutRepository.h"
+#include "Core/Firmware/FirmwareRolloutService.h"
 #include "Core/Firmware/FirmwareSignatureVerifier.h"
 #include "Core/Firmware/FirmwareSigningPolicy.h"
 #include "Core/Http/RealtimeBus.h"
@@ -36,6 +38,7 @@
 #include <charconv>
 #include <cstddef>
 #include <exception>
+#include <functional>
 #include <system_error>
 #include <cstdint>
 #include <filesystem>
@@ -82,9 +85,197 @@ namespace EdgePulse::Firmware
                                         {"updatedAt", task.updatedAt}});
         }
 
+        [[nodiscard]] ConfigValue parsedPolicy(const std::string &policyJson)
+        {
+            const std::optional<ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(policyJson);
+            return parsed.has_value() ? *parsed : ConfigValue{policyJson};
+        }
+
+        [[nodiscard]] ConfigValue gateEntries(const std::string &gateJson)
+        {
+            ConfigValue entries = ConfigValue::array();
+            std::size_t start   = 0;
+            while (start < gateJson.size())
+            {
+                const std::size_t end  = gateJson.find('\n', start);
+                const std::string line = gateJson.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                if (!line.empty())
+                {
+                    const std::optional<ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(line);
+                    entries.push_back(parsed.has_value() ? *parsed : ConfigValue{line});
+                }
+                if (end == std::string::npos)
+                {
+                    break;
+                }
+                start = end + 1;
+            }
+            return entries;
+        }
+
+        [[nodiscard]] ConfigValue parsedHealth(const std::string &healthJson)
+        {
+            const std::optional<ConfigValue> parsed = AsynGyanis::Base::parseConfigValue(healthJson);
+            return parsed.has_value() ? *parsed : ConfigValue::object();
+        }
+
+        [[nodiscard]] ConfigValue rolloutJson(const FirmwareRolloutRecord &rollout)
+        {
+            return ConfigValue::object({{"id", rollout.id},
+                                        {"tenantId", rollout.tenantId},
+                                        {"firmwareId", rollout.firmwareId},
+                                        {"name", rollout.name},
+                                        {"policy", parsedPolicy(rollout.policyJson)},
+                                        {"status", rollout.status},
+                                        {"currentWave", rollout.currentWave},
+                                        {"totalWaves", rollout.totalWaves},
+                                        {"createdBy", rollout.createdBy},
+                                        {"createdAt", rollout.createdAt},
+                                        {"startedAt", rollout.startedAt},
+                                        {"finishedAt", rollout.finishedAt},
+                                        {"pausedAt", rollout.pausedAt},
+                                        {"pauseReason", rollout.pauseReason},
+                                        {"lastError", rollout.lastError},
+                                        {"version", rollout.version}});
+        }
+
+        [[nodiscard]] ConfigValue waveJson(const FirmwareRolloutWaveRecord &wave)
+        {
+            return ConfigValue::object({{"id", wave.id},
+                                        {"rolloutId", wave.rolloutId},
+                                        {"waveIndex", wave.waveIndex},
+                                        {"status", wave.status},
+                                        {"targetCount", wave.targetCount},
+                                        {"dispatchedAt", wave.dispatchedAt},
+                                        {"deadlineAt", wave.deadlineAt},
+                                        {"settledAt", wave.settledAt},
+                                        {"gate", gateEntries(wave.gateJson)},
+                                        {"createdAt", wave.createdAt},
+                                        {"updatedAt", wave.updatedAt}});
+        }
+
+        [[nodiscard]] ConfigValue targetJson(const FirmwareRolloutTargetRecord &target)
+        {
+            return ConfigValue::object({{"id", target.id},
+                                        {"rolloutId", target.rolloutId},
+                                        {"waveId", target.waveId},
+                                        {"tenantId", target.tenantId},
+                                        {"nodeId", target.nodeId},
+                                        {"previousFirmwareId", target.previousFirmwareId},
+                                        {"taskId", target.taskId},
+                                        {"commandId", target.commandId},
+                                        {"status", target.status},
+                                        {"health", parsedHealth(target.healthJson)},
+                                        {"updatedAt", target.updatedAt}});
+        }
+
+        [[nodiscard]] ConfigValue rolloutAggregateJson(const FirmwareRolloutAggregate &aggregate)
+        {
+            ConfigValue root  = rolloutJson(aggregate.rollout);
+            ConfigValue waves = ConfigValue::array();
+            for (const FirmwareRolloutWaveRecord &wave: aggregate.waves)
+            {
+                waves.push_back(waveJson(wave));
+            }
+            ConfigValue targets = ConfigValue::array();
+            for (const FirmwareRolloutTargetRecord &target: aggregate.targets)
+            {
+                targets.push_back(targetJson(target));
+            }
+            root["waves"]   = std::move(waves);
+            root["targets"] = std::move(targets);
+            return root;
+        }
+
+        [[nodiscard]] int rolloutHttpStatus(const FirmwareRolloutErrorKind kind)
+        {
+            switch (kind)
+            {
+                case FirmwareRolloutErrorKind::NotFound:
+                    return Common::kCodeNotFound;
+                case FirmwareRolloutErrorKind::Conflict:
+                    return Common::kCodeConflict;
+                case FirmwareRolloutErrorKind::Internal:
+                    return Common::kCodeInternalServerError;
+                case FirmwareRolloutErrorKind::InvalidInput:
+                default:
+                    return Common::kCodeBadRequest;
+            }
+        }
+
+        [[nodiscard]] std::string policyTextFrom(const ConfigValue &body)
+        {
+            if (body.contains("policy"))
+            {
+                return body.at("policy").is_object() ? body.at("policy").dump() : std::string{};
+            }
+            if (body.contains("policyJson") && body.at("policyJson").is_string())
+            {
+                return body.at("policyJson").get<std::string>();
+            }
+            return {};
+        }
+
         void fail(AsynGyanis::Net::HttpResponse &response, const int status, const std::string &message, const std::string_view traceId)
         {
             Common::writeFailure(response, status, status, message, traceId);
+        }
+
+        using FirmwareRolloutAction =
+                std::function<AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>(AsynGyanis::Core::EventLoop &, System::TenantScope, std::int64_t, const std::string &)>;
+        using FirmwareRolloutActionHandler = std::function<AsynGyanis::Core::Task<>(AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &)>;
+
+        /**
+         * @brief 生成人工动作的处理函数
+         * @param loop 请求所属事件循环
+         * @param dependencies 固件依赖
+         * @param action 具体动作
+         * @param requiresReason 是否要求正文给出 reason
+         * @return FirmwareRolloutActionHandler 完成鉴权、动作与最新聚合回写的处理器
+         */
+        [[nodiscard]] FirmwareRolloutActionHandler makeRolloutActionHandler(AsynGyanis::Core::EventLoop &loop, const FirmwareDependencies &dependencies,
+                                                                            FirmwareRolloutAction action, const bool requiresReason)
+        {
+            return [&loop, dependencies, action = std::move(action), requiresReason](AsynGyanis::Net::HttpRequest  &request,
+                                                                                     AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+            {
+                const std::string traceId = Web::resolveRequestId(request);
+                const auto        session = co_await Web::requireSession(*dependencies.auth, loop, request, response, "device:firmware:upload", traceId);
+                if (!session.has_value())
+                {
+                    co_return;
+                }
+                const auto id = Common::parsePositiveIdentifier(request.param("id"));
+                if (!id.has_value())
+                {
+                    fail(response, Common::kCodeBadRequest, "灰度发布标识不合法", traceId);
+                    co_return;
+                }
+                std::string reason;
+                if (const auto body = request.jsonBody(); body.has_value() && body->is_object())
+                {
+                    reason = Json::stringField(*body, "reason");
+                }
+                if (requiresReason && reason.empty())
+                {
+                    fail(response, Common::kCodeBadRequest, "强制提升必须提供 reason", traceId);
+                    co_return;
+                }
+                const auto changed = co_await action(loop, session->tenantScope(), *id, reason);
+                if (!changed.has_value())
+                {
+                    fail(response, rolloutHttpStatus(changed.error().kind), changed.error().message, traceId);
+                    co_return;
+                }
+                const auto aggregate = co_await dependencies.rollouts->find(loop, session->tenantScope(), *id);
+                if (!aggregate.has_value())
+                {
+                    fail(response, Common::kCodeNotFound, "灰度发布不存在", traceId);
+                    co_return;
+                }
+                Common::writeSuccess(response, rolloutAggregateJson(*aggregate), traceId);
+                co_return;
+            };
         }
 
         /**
@@ -252,6 +443,161 @@ namespace EdgePulse::Firmware
                                         {"signatureAlgorithm", record.signatureAlgorithm},
                                         {"downloadPath", "/api/agent/firmware/" + std::to_string(record.id) + "/download?nodeId=" + std::to_string(nodeId)}})
                     .dump();
+        }
+
+        /**
+         * @brief 注册固件灰度路由
+         * @param router 公开路由器
+         * @param loop 服务器事件循环
+         * @param dependencies 固件依赖，rollouts 为空时整体跳过
+         */
+        void registerRolloutRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const FirmwareDependencies &dependencies)
+        {
+            if (dependencies.rollouts == nullptr)
+            {
+                return;
+            }
+
+            router.post("/api/firmware/:id/rollouts",
+                        [&loop, dependencies](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                        {
+                            const std::string traceId = Web::resolveRequestId(request);
+                            const auto        session = co_await Web::requireSession(*dependencies.auth, loop, request, response, "device:firmware:upload", traceId);
+                            if (!session.has_value())
+                            {
+                                co_return;
+                            }
+                            const auto id   = Common::parsePositiveIdentifier(request.param("id"));
+                            const auto body = request.jsonBody();
+                            if (!id.has_value() || !body.has_value() || !body->is_object())
+                            {
+                                fail(response, Common::kCodeBadRequest, "固件标识或请求正文不合法", traceId);
+                                co_return;
+                            }
+                            const std::string name       = Json::stringField(*body, "name");
+                            const std::string policyText = policyTextFrom(*body);
+                            const auto        nodeIds    = Json::integerArrayField(*body, "nodeIds");
+                            if (name.empty())
+                            {
+                                fail(response, Common::kCodeBadRequest, "发布名称不能为空", traceId);
+                                co_return;
+                            }
+                            if (policyText.empty())
+                            {
+                                fail(response, Common::kCodeBadRequest, "缺少 policy 或 policyJson", traceId);
+                                co_return;
+                            }
+                            const auto created = co_await dependencies.rollouts->create(loop, session->tenantScope(), session->userId, *id, name, policyText, nodeIds);
+                            if (!created.has_value())
+                            {
+                                fail(response, rolloutHttpStatus(created.error().kind), created.error().message, traceId);
+                                co_return;
+                            }
+                            const auto aggregate = co_await dependencies.rollouts->find(loop, session->tenantScope(), *created);
+                            if (!aggregate.has_value())
+                            {
+                                fail(response, Common::kCodeInternalServerError, "灰度发布创建后读取失败", traceId);
+                                co_return;
+                            }
+                            Common::writeSuccess(response, rolloutAggregateJson(*aggregate), traceId);
+                            co_return;
+                        });
+
+            router.get("/api/firmware/:id/rollouts",
+                       [&loop, dependencies](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                       {
+                           const std::string traceId = Web::resolveRequestId(request);
+                           const auto        session = co_await Web::requireSession(*dependencies.auth, loop, request, response, "device:firmware:list", traceId);
+                           if (!session.has_value())
+                           {
+                               co_return;
+                           }
+                           const auto id = Common::parsePositiveIdentifier(request.param("id"));
+                           if (!id.has_value())
+                           {
+                               fail(response, Common::kCodeBadRequest, "固件标识不合法", traceId);
+                               co_return;
+                           }
+                           const Common::QueryMap       query  = request.queryParams();
+                           const Common::PageParameters page   = Common::parsePageParameters(query);
+                           const auto                   result = co_await dependencies.rollouts->list(loop, session->tenantScope(), *id, page);
+                           ConfigValue                  rows   = ConfigValue::array();
+                           for (const FirmwareRolloutRecord &record: result.rows)
+                           {
+                               rows.push_back(rolloutJson(record));
+                           }
+                           Common::writeSuccess(response, Common::makePageResult(page, result.total, std::move(rows)), traceId);
+                           co_return;
+                       });
+
+            router.get("/api/firmware/rollouts/:id",
+                       [&loop, dependencies](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                       {
+                           const std::string traceId = Web::resolveRequestId(request);
+                           const auto        session = co_await Web::requireSession(*dependencies.auth, loop, request, response, "device:firmware:list", traceId);
+                           if (!session.has_value())
+                           {
+                               co_return;
+                           }
+                           const auto id = Common::parsePositiveIdentifier(request.param("id"));
+                           if (!id.has_value())
+                           {
+                               fail(response, Common::kCodeBadRequest, "灰度发布标识不合法", traceId);
+                               co_return;
+                           }
+                           const auto aggregate = co_await dependencies.rollouts->find(loop, session->tenantScope(), *id);
+                           if (!aggregate.has_value())
+                           {
+                               fail(response, Common::kCodeNotFound, "灰度发布不存在", traceId);
+                               co_return;
+                           }
+                           Common::writeSuccess(response, rolloutAggregateJson(*aggregate), traceId);
+                           co_return;
+                       });
+
+            FirmwareRolloutService *service = dependencies.rollouts;
+            router.post("/api/firmware/rollouts/:id/pause",
+                        makeRolloutActionHandler(
+                                loop, dependencies,
+                                [service](AsynGyanis::Core::EventLoop &actionLoop, const System::TenantScope scope, const std::int64_t rolloutId,
+                                          const std::string &reason) -> AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>
+                                { co_return co_await service->pause(actionLoop, scope, rolloutId, reason); },
+                                false));
+            router.post("/api/firmware/rollouts/:id/resume",
+                        makeRolloutActionHandler(
+                                loop, dependencies,
+                                [service](AsynGyanis::Core::EventLoop &actionLoop, const System::TenantScope scope, const std::int64_t rolloutId,
+                                          const std::string &) -> AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>
+                                { co_return co_await service->resume(actionLoop, scope, rolloutId); },
+                                false));
+            router.post("/api/firmware/rollouts/:id/promote",
+                        makeRolloutActionHandler(
+                                loop, dependencies,
+                                [service](AsynGyanis::Core::EventLoop &actionLoop, const System::TenantScope scope, const std::int64_t rolloutId,
+                                          const std::string &) -> AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>
+                                { co_return co_await service->promote(actionLoop, scope, rolloutId); },
+                                false));
+            router.post("/api/firmware/rollouts/:id/force-promote",
+                        makeRolloutActionHandler(
+                                loop, dependencies,
+                                [service](AsynGyanis::Core::EventLoop &actionLoop, const System::TenantScope scope, const std::int64_t rolloutId,
+                                          const std::string &reason) -> AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>
+                                { co_return co_await service->forcePromote(actionLoop, scope, rolloutId, reason); },
+                                true));
+            router.post("/api/firmware/rollouts/:id/abort",
+                        makeRolloutActionHandler(
+                                loop, dependencies,
+                                [service](AsynGyanis::Core::EventLoop &actionLoop, const System::TenantScope scope, const std::int64_t rolloutId,
+                                          const std::string &) -> AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>
+                                { co_return co_await service->abort(actionLoop, scope, rolloutId); },
+                                false));
+            router.post("/api/firmware/rollouts/:id/rollback",
+                        makeRolloutActionHandler(
+                                loop, dependencies,
+                                [service](AsynGyanis::Core::EventLoop &actionLoop, const System::TenantScope scope, const std::int64_t rolloutId,
+                                          const std::string &) -> AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>
+                                { co_return co_await service->rollback(actionLoop, scope, rolloutId); },
+                                false));
         }
     } // namespace
 
@@ -714,6 +1060,8 @@ namespace EdgePulse::Firmware
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;
                    });
+
+        registerRolloutRoutes(router, loop, dependencyInput);
     }
 
     void registerFirmwareAgentRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, const FirmwareDependencies &dependencyInput)

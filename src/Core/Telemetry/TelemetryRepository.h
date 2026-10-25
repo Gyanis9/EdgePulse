@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,15 @@ namespace AsynGyanis::Core
 
 namespace EdgePulse::Telemetry
 {
+    /**
+     * @brief 节点遥测的最新时间戳
+     */
+    struct TelemetryFreshness
+    {
+        std::string createdAt;   ///< 最新一条的服务端接收时间
+        std::string collectedAt; ///< 最新一条的采集时间
+    };
+
     /**
      * @brief 遥测仓储
      */
@@ -41,6 +51,15 @@ namespace EdgePulse::Telemetry
 
         /// 按租户边界派生仓储视图
         [[nodiscard]] std::shared_ptr<TelemetryRepository> scoped(System::TenantScope tenant) const;
+
+        /**
+         * @brief 节点遥测最新一条的服务端接收时间与采集时间
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点
+         * @return std::optional<TelemetryFreshness> 没有任何遥测时为空
+         * @note 两个时间各自取最大值，不要求来自同一行；门控只关心节点最近是否仍有数据上报
+         */
+        AsynGyanis::Core::Task<std::optional<TelemetryFreshness>> newestTimestamps(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
 
         /**
          * @brief 批量写入遥测

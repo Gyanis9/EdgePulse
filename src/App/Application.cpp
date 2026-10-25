@@ -60,6 +60,8 @@
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Firmware/FirmwareRepository.h"
+#include "Core/Firmware/FirmwareRolloutRepository.h"
+#include "Core/Firmware/FirmwareRolloutService.h"
 #include "Core/Firmware/FirmwareSignatureVerifier.h"
 #include "Core/Firmware/FirmwareSigningPolicy.h"
 #include "Core/Command/CommandRepository.h"
@@ -377,6 +379,26 @@ namespace EdgePulse::App
                                                                               { co_await publishCommandStatus(command); });
             m_opsRepository     = std::make_shared<Ops::OpsRepository>(m_database);
 
+            m_rolloutRepository = std::make_shared<Firmware::FirmwareRolloutRepository>(m_database);
+            Firmware::FirmwareRolloutDependencies rolloutDependencies;
+            rolloutDependencies.firmware                 = m_firmwareRepository;
+            rolloutDependencies.rollouts                 = m_rolloutRepository;
+            rolloutDependencies.commands                 = m_commandRepository;
+            rolloutDependencies.nodes                    = m_nodeRepository;
+            rolloutDependencies.telemetry                = m_telemetryRepository;
+            rolloutDependencies.alarms                   = m_alarmRepository;
+            rolloutDependencies.signingPolicy            = m_signingPolicy;
+            rolloutDependencies.heartbeatIntervalSeconds = m_configuration.heartbeatIntervalSeconds;
+            rolloutDependencies.publisher                = [this, &loop](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
+            {
+                if (m_realtimeBus != nullptr)
+                {
+                    co_await m_realtimeBus->publishAgent(loop, Command::makeAgentCommandMessage(command));
+                }
+                co_await publishCommandStatus(command);
+            };
+            m_rolloutService = std::make_shared<Firmware::FirmwareRolloutService>(std::move(rolloutDependencies));
+
             if (m_configuration.udpTelemetryEnabled)
             {
                 Telemetry::UdpTelemetryEndpoint::Configuration udpConfiguration;
@@ -685,6 +707,8 @@ namespace EdgePulse::App
         loop.scheduler().schedule(m_commandScheduler->handle());
         m_fleetLifecycle = runFleetLifecycle(loop);
         loop.scheduler().schedule(m_fleetLifecycle->handle());
+        m_firmwareRollout = runFirmwareRollout(loop);
+        loop.scheduler().schedule(m_firmwareRollout->handle());
         // 幂等记录固定 24 小时 TTL；清理与其它保留期任务一样只在 leader 上执行
         m_dataRetention = runDataRetention(loop);
         loop.scheduler().schedule(m_dataRetention->handle());
@@ -916,6 +940,31 @@ namespace EdgePulse::App
         }
     }
 
+    AsynGyanis::Core::Task<> Application::runFirmwareRollout(AsynGyanis::Core::EventLoop &loop)
+    {
+        AsynGyanis::Core::Timer ticker(loop);
+        System::LeaderGate      rolloutGate(
+                "固件灰度推进", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
+                [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
+        System::LeaderTick rolloutTick(rolloutGate,
+                                       [this, &loop]() -> AsynGyanis::Core::Task<>
+                                       {
+                                           try
+                                           {
+                                               co_await m_rolloutService->tick(loop, std::chrono::system_clock::now());
+                                           } catch (const std::exception &failure)
+                                           {
+                                               // 单轮失败不能终止周期任务，否则灰度会永久停在当前波次
+                                               LOG_WARN_FMT("固件灰度推进失败：{}", failure.what());
+                                           }
+                                       });
+        while (true)
+        {
+            co_await ticker.waitFor(std::chrono::seconds{5});
+            co_await rolloutTick.run();
+        }
+    }
+
     AsynGyanis::Core::Task<> Application::publishNodeStatus(const Device::NodeRecord &node)
     {
         const std::string payload = AsynGyanis::Base::ConfigValue::object({{"type", "node.status"}, {"data", Device::nodeToJson(node)}}).dump();
@@ -1026,6 +1075,7 @@ namespace EdgePulse::App
         firmwareDependencies.storageDirectory   = m_configuration.firmwareDirectory;
         firmwareDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
         firmwareDependencies.signingPolicy      = m_signingPolicy;
+        firmwareDependencies.rollouts           = m_rolloutService.get();
         Firmware::registerFirmwareRoutes(router, loop, firmwareDependencies);
 
         Ops::OpsDependencies opsDependencies;

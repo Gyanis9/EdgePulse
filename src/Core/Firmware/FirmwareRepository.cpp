@@ -168,6 +168,29 @@ namespace EdgePulse::Firmware
                 });
     }
 
+    AsynGyanis::Core::Task<std::optional<FirmwareRecord>> FirmwareRepository::findByVersion(AsynGyanis::Core::EventLoop &loop, std::string version)
+    {
+        co_return co_await m_database->withConnection<std::optional<FirmwareRecord>>(
+                loop,
+                [version = std::move(version), tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareRecord>
+                {
+                    std::vector<DatabaseValue> parameters{version};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows =
+                            Sql::executeOrThrow(connection, std::string{kSelectFirmware} + "WHERE version = ? AND deleted = 0" + clause + " ORDER BY id DESC LIMIT 1", parameters);
+                    if (!rows->next())
+                    {
+                        return std::nullopt;
+                    }
+                    return readFirmware(*rows);
+                });
+    }
+
     AsynGyanis::Core::Task<std::optional<FirmwareRecord>> FirmwareRepository::remove(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId)
     {
         co_return co_await m_database->withConnection<std::optional<FirmwareRecord>>(
@@ -301,6 +324,70 @@ namespace EdgePulse::Firmware
                                                                   " ORDER BY CASE WHEN status = 'installed' THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT 1",
                                                           parameters);
                     return rows->next() ? Sql::integer(*rows, "firmware_id") : 0;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::latestInstalledFirmware(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId,
+                                                                                     const std::int64_t excludeFirmwareId)
+    {
+        co_return co_await m_database->withConnection<std::int64_t>(
+                loop,
+                [nodeId, excludeFirmwareId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                {
+                    std::vector<DatabaseValue> parameters{nodeId, excludeFirmwareId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection,
+                                                          "SELECT firmware_id FROM biz_firmware_task WHERE node_id = ? AND firmware_id <> ? AND status = 'installed'" + clause +
+                                                                  " ORDER BY updated_at DESC, id DESC LIMIT 1",
+                                                          parameters);
+                    return rows->next() ? Sql::integer(*rows, "firmware_id") : 0;
+                });
+    }
+
+    AsynGyanis::Core::Task<std::optional<FirmwareTaskRecord>> FirmwareRepository::findTask(AsynGyanis::Core::EventLoop &loop, const std::int64_t taskId)
+    {
+        co_return co_await m_database->withConnection<std::optional<FirmwareTaskRecord>>(
+                loop,
+                [taskId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareTaskRecord>
+                {
+                    std::vector<DatabaseValue> parameters{taskId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND t.tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectTask} + "WHERE t.id = ?" + clause, parameters);
+                    if (!rows->next())
+                    {
+                        return std::nullopt;
+                    }
+                    return readTask(*rows);
+                });
+    }
+
+    AsynGyanis::Core::Task<bool> FirmwareRepository::updateTaskById(AsynGyanis::Core::EventLoop &loop, const std::int64_t taskId, std::string status, const int progress,
+                                                                    std::string message)
+    {
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [taskId, status = std::move(status), progress, message = std::move(message), tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{status, static_cast<std::int64_t>(progress), message, Common::nowDateTimeUtc(), taskId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto update =
+                            Sql::executeOrThrow(connection, "UPDATE biz_firmware_task SET status = ?, progress = ?, message = ?, updated_at = ? WHERE id = ?" + clause, parameters);
+                    return update->affectedRowCount() > 0;
                 });
     }
 
