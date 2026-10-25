@@ -1,0 +1,166 @@
+# EdgePulse 双实例 HA 编排样例。
+# 两个应用容器不发布 8080/8443/9443：浏览器流量走 nginx 的 8080/8443，Agent mTLS 走
+# nginx 的 9443 TCP 透传。两个实例共享 MySQL、Redis、证书目录与固件卷；instance_id 由
+# 入口脚本按 EDGEPULSE_INSTANCE_ID 生成到可写目录，容器内挂载的配置文件保持同一份。
+#
+# 使用前：
+#   1. cp .env.example .env，填入 MYSQL_ROOT_PASSWORD、EDGEPULSE_DB_PASSWORD、
+#      EDGEPULSE_REDIS_PASSWORD、EDGEPULSE_OPS_BEARER_TOKEN。
+#   2. 准备 var/certs（server.pem/server-key.pem/ca.pem 与 Agent CA 私钥）与
+#      config/prod.yaml；config/prod.yaml.example 里有 HA 相关注释。
+#   3. 启用 Agent 内部 CA 时，把 CA 私钥放到 deploy/docker/secrets/agent-ca-key.pem，
+#      宿主机 chmod 0400，并由 EDGEPULSE_AGENT_CA_KEY_FILE 指向它；该私钥不进入证书卷。
+#   4. 固件信任公钥放 config/firmware-keys；HA 必须使用共享固件卷，不能按实例各挂一份。
+
+name: edgepulse-ha
+
+x-edgepulse-environment: &edgepulse-environment
+  EDGEPULSE_DB_PASSWORD: ${EDGEPULSE_DB_PASSWORD:?请在 .env 中设置 EDGEPULSE_DB_PASSWORD}
+  EDGEPULSE_REDIS_PASSWORD: ${EDGEPULSE_REDIS_PASSWORD:?请在 .env 中设置 EDGEPULSE_REDIS_PASSWORD}
+  EDGEPULSE_OPS_BEARER_TOKEN: ${EDGEPULSE_OPS_BEARER_TOKEN:?请在 .env 中设置 EDGEPULSE_OPS_BEARER_TOKEN}
+  EDGEPULSE_AGENT_FINGERPRINT: ${EDGEPULSE_AGENT_FINGERPRINT:-}
+  EDGEPULSE_UDP_TELEMETRY_SECRET: ${EDGEPULSE_UDP_TELEMETRY_SECRET:-}
+  EDGEPULSE_OIDC_CLIENT_SECRET: ${EDGEPULSE_OIDC_CLIENT_SECRET:-}
+  EDGEPULSE_MFA_KEY: ${EDGEPULSE_MFA_KEY:-}
+  EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
+
+x-edgepulse-service: &edgepulse-service
+  image: ${EDGEPULSE_HA_IMAGE:-edgepulse:ha}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+  restart: unless-stopped
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  environment: *edgepulse-environment
+  volumes:
+    - type: bind
+      source: ${EDGEPULSE_HA_CONFIG_DIR:-../../config}
+      target: /app/config
+      read_only: true
+    - type: bind
+      source: ${EDGEPULSE_HA_CERT_DIR:-../../var/certs}
+      target: /etc/edgepulse/tls
+      read_only: true
+    - type: bind
+      source: ${EDGEPULSE_HA_FIRMWARE_KEYS_DIR:-../../config/firmware-keys}
+      target: /etc/edgepulse/firmware-keys
+      read_only: true
+    # CA 私钥单独挂载，与公开证书卷分开；宿主机权限 0400，容器内只读。
+    # 源文件必须提前存在；缺失时 Docker 会按目录创建挂载源并导致启动失败。
+    - type: bind
+      source: ${EDGEPULSE_AGENT_CA_KEY_FILE:-./secrets/agent-ca-key.pem}
+      target: /run/secrets/agent_ca_key
+      read_only: true
+    - type: volume
+      source: firmware-data
+      target: /var/lib/edgepulse/firmware
+  healthcheck:
+    # 就绪探针而不是存活探针：依赖未就绪时容器保持 unhealthy，nginx 不会接入流量
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9100/readyz"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 30s
+  # 停机时先让 /readyz 变 503 再排空连接；给 nginx 与在途上传留出余量
+  stop_grace_period: 40s
+  networks: [edgepulse]
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: edgepulse
+      MYSQL_USER: edgepulse
+      MYSQL_PASSWORD: ${EDGEPULSE_DB_PASSWORD:?请在 .env 中设置 EDGEPULSE_DB_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [edgepulse]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${EDGEPULSE_REDIS_PASSWORD:?请在 .env 中设置 EDGEPULSE_REDIS_PASSWORD}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${EDGEPULSE_REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [edgepulse]
+
+  edgepulse-1:
+    <<: *edgepulse-service
+    environment:
+      <<: *edgepulse-environment
+      # 必须与 edgepulse-2 不同；入口脚本用它生成该实例的配置副本
+      EDGEPULSE_INSTANCE_ID: edgepulse-1
+
+  edgepulse-2:
+    <<: *edgepulse-service
+    environment:
+      <<: *edgepulse-environment
+      EDGEPULSE_INSTANCE_ID: edgepulse-2
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      edgepulse-1:
+        condition: service_healthy
+      edgepulse-2:
+        condition: service_healthy
+    volumes:
+      - ../nginx/edgepulse.conf:/etc/nginx/nginx.conf:ro
+      - type: bind
+        source: ${EDGEPULSE_HA_CERT_DIR:-../../var/certs}
+        target: /etc/nginx/certs
+        read_only: true
+    ports:
+      - "${EDGEPULSE_HA_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_HTTP_PORT:-8080}:8080"
+      - "${EDGEPULSE_HA_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_HTTPS_PORT:-8443}:8443"
+      - "${EDGEPULSE_HA_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_AGENT_PORT:-9443}:9443"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 10s
+    networks: [edgepulse]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    # 可选组件：docker compose -f docker-compose.ha.yml --profile monitoring up -d
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    depends_on:
+      edgepulse-1:
+        condition: service_healthy
+      edgepulse-2:
+        condition: service_healthy
+    command: ["--config.file=/etc/prometheus/prometheus.ha.yml"]
+    volumes:
+      - ../prometheus:/etc/prometheus:ro
+    ports:
+      - "${EDGEPULSE_HA_BIND_ADDRESS:-127.0.0.1}:${EDGEPULSE_HA_PROMETHEUS_PORT:-9090}:9090"
+    networks: [edgepulse]
+
+volumes:
+  mysql-data:
+  redis-data:
+  firmware-data:
+
+networks:
+  edgepulse:

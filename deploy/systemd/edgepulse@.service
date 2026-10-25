@@ -1,0 +1,33 @@
+[Unit]
+Description=EdgePulse 实例 %i
+Documentation=https://github.com/Gyanis9/EdgePulse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edgepulse
+Group=edgepulse
+SyslogIdentifier=edgepulse-%i
+WorkingDirectory=/opt/edgepulse
+# %i 是实例名：/etc/edgepulse/<实例>.yaml 里放唯一的 edgepulse.instance_id，
+# /etc/edgepulse/<实例>.env 放该实例的秘密（权限 0600）。同机多实例时，
+# 各配置的 http_port/https_port/agent_port/ops_port 必须互不冲突。
+EnvironmentFile=/etc/edgepulse/%i.env
+ExecStart=/opt/edgepulse/edgepulse-server --config /etc/edgepulse/%i.yaml
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# 秘密来自 EnvironmentFile（权限 0600，不进版本库）；运行目录只放开固件与数据库。
+# 固件目录必须与其它实例共享，否则 HA 下固件上传与下载会落到不同机器。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/edgepulse
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

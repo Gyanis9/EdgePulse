@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # 两个实例都暴露 9100/metrics；HA 下分别抓取，便于区分单实例故障与集群故障。
+  # 运维令牌与单实例样例共用 deploy/prometheus/ops-token（不进版本库）。
+  - job_name: edgepulse
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/ops-token
+    static_configs:
+      - targets: ["edgepulse-1:9100"]
+        labels:
+          deployment: ha
+          ha_member: edgepulse-1
+      - targets: ["edgepulse-2:9100"]
+        labels:
+          deployment: ha
+          ha_member: edgepulse-2
