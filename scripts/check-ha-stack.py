@@ -65,6 +65,7 @@ LEADER_TAKEOVER_LIMIT = 2 * LEASE_TTL_SECONDS
 failures: list[str] = []
 passes = 0
 known_secrets: set[str] = set()
+ADMIN_PASSWORD = ""
 
 
 def remember_secret(value: str) -> None:
@@ -192,6 +193,7 @@ def patch_section_line(text: str, section: str, key: str, old: str, new: str, la
 
 
 def prepare() -> dict[str, str]:
+    global ADMIN_PASSWORD
     GATE.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     FIRMWARE_KEYS.mkdir(parents=True, exist_ok=True)
@@ -248,11 +250,14 @@ def prepare() -> dict[str, str]:
     shutil.copyfile(CERTS / "ca-key.pem", CA_KEY)
     os.chmod(CA_KEY, 0o400)
 
+    # 生产档不再接受种子口令 admin123；验收也走同一条启动收紧路径
+    ADMIN_PASSWORD = "Ha1!" + secrets.token_hex(12)
     values = {
         "MYSQL_ROOT_PASSWORD": secrets.token_hex(16),
         "EDGEPULSE_DB_PASSWORD": secrets.token_hex(16),
         "EDGEPULSE_REDIS_PASSWORD": secrets.token_hex(16),
         "EDGEPULSE_OPS_BEARER_TOKEN": secrets.token_hex(32),
+        "EDGEPULSE_ADMIN_PASSWORD": ADMIN_PASSWORD,
         "EDGEPULSE_AGENT_FINGERPRINT": "",
         "EDGEPULSE_INITIAL_PASSWORD": "",
     }
@@ -399,7 +404,7 @@ def login(port: int) -> str | None:
         return None
     status, payload = request_json(
         "POST", f"http://{HOST}:{port}/api/auth/login",
-        {"username": "admin", "password": "admin123", "captcha": code, "captchaUuid": data.get("uuid")},
+        {"username": "admin", "password": ADMIN_PASSWORD, "captcha": code, "captchaUuid": data.get("uuid")},
     )
     token = (payload.get("data") or {}).get("token", "")
     remember_secret(token)
@@ -715,6 +720,12 @@ def main() -> int:
         report("准备验收配置与证书", False, f"{type(failure).__name__}: {failure}")
         return 1
     report("准备验收配置与证书", True, str(GATE))
+    report("HA 管理员口令满足启动收紧策略",
+           len(ADMIN_PASSWORD) >= 10
+           and any(character.isupper() for character in ADMIN_PASSWORD)
+           and any(character.islower() for character in ADMIN_PASSWORD)
+           and any(character.isdigit() for character in ADMIN_PASSWORD)
+           and any(not character.isalnum() for character in ADMIN_PASSWORD))
 
     if arguments.build:
         command = ["docker", "build", "-f", "deploy/docker/Dockerfile", "-t", IMAGE]

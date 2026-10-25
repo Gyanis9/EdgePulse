@@ -276,3 +276,67 @@ TEST(AuthService, RejectsWeakPasswordOnChangeUnderStrictPolicy)
     const auto strong = runner.run(context.auth->changePassword(runner.loop(), *session, "admin123", "Strong-pass1"));
     ASSERT_TRUE(strong.has_value()) << strong.error().message;
 }
+
+// 钉住：种子管理员仍是 admin123 时，环境变量口令在启动检查里替换哈希，旧口令随即失效
+TEST(AuthService, DefaultAdminPasswordGuardAppliesEnvironmentPassword)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection =
+            EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+    ASSERT_NE(nullptr, connection);
+
+    const auto result = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "Ha-guard-pass1", .developmentMode = false});
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.applied);
+    EXPECT_FALSE(loginWithCaptcha(context, runner, "admin123").has_value());
+    EXPECT_TRUE(loginWithCaptcha(context, runner, "Ha-guard-pass1").has_value());
+}
+
+// 钉住：生产档没有环境变量口令且仍是种子口令时拒绝启动；开发档保留 admin123
+TEST(AuthService, DefaultAdminPasswordGuardFailsClosedInProductionAndAllowsDev)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection =
+            EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+    ASSERT_NE(nullptr, connection);
+
+    const auto production = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "", .developmentMode = false});
+    EXPECT_FALSE(production.applied);
+    EXPECT_NE(std::string::npos, production.error.find("EDGEPULSE_ADMIN_PASSWORD")) << production.error;
+    EXPECT_NE(std::string::npos, production.error.find("admin123")) << production.error;
+    EXPECT_TRUE(loginWithCaptcha(context, runner, "admin123").has_value());
+
+    const auto weak = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "short", .developmentMode = false});
+    EXPECT_FALSE(weak.applied);
+    EXPECT_NE(std::string::npos, weak.error.find("口令策略")) << weak.error;
+
+    const auto development = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "", .developmentMode = true});
+    EXPECT_TRUE(development.error.empty()) << development.error;
+    EXPECT_FALSE(development.applied);
+    EXPECT_TRUE(loginWithCaptcha(context, runner, "admin123").has_value());
+}
+
+// 钉住：管理员已改口令时忽略环境变量，既不覆盖新哈希也不阻断启动
+TEST(AuthService, DefaultAdminPasswordGuardLeavesChangedPasswordUntouched)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection =
+            EdgePulse::Common::Database::openDirectSqlite(context.databasePath().string());
+    ASSERT_NE(nullptr, connection);
+    const std::string changedHash = EdgePulse::Common::hashPassword("Changed-pass1");
+    ASSERT_NE(nullptr, connection->execute("UPDATE sys_user SET password = '" + changedHash + "' WHERE username = 'admin'")) << connection->lastError();
+
+    const auto result = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "Ignored-pass1", .developmentMode = false});
+    EXPECT_TRUE(result.error.empty()) << result.error;
+    EXPECT_FALSE(result.applied);
+    EXPECT_FALSE(loginWithCaptcha(context, runner, "Ignored-pass1").has_value());
+    EXPECT_TRUE(loginWithCaptcha(context, runner, "Changed-pass1").has_value());
+}

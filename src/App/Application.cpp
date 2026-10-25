@@ -210,6 +210,21 @@ namespace EdgePulse::App
                 }
                 const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirect(databaseOptions);
                 System::MigrationRunner::apply(*connection, m_configuration.migrationsDirectory);
+                // 迁移后、监听器前收紧种子管理员：生产档仍用 admin123 时宁可拒绝启动
+                const System::DefaultAdminPasswordGuardResult adminPasswordGuard = System::UserRepository::enforceDefaultAdminPassword(
+                        *connection, System::DefaultAdminPasswordGuardOptions{.password = m_configuration.adminPassword,
+                                                                              .developmentMode = m_configuration.exposeCaptchaCode,
+                                                                              .minimumLength  = m_configuration.passwordMinimumLength,
+                                                                              .requireComplexity = m_configuration.passwordRequireComplexity});
+                if (!adminPasswordGuard.error.empty())
+                {
+                    error = adminPasswordGuard.error;
+                    return false;
+                }
+                if (adminPasswordGuard.applied)
+                {
+                    LOG_INFO("默认管理员口令已按 EDGEPULSE_ADMIN_PASSWORD 收紧，种子口令 admin123 不再可用");
+                }
             }
             m_database    = Common::Database::open(databaseOptions);
             m_leaderLease = std::make_unique<System::LeaderLease>(m_database, m_configuration.instanceId);

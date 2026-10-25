@@ -366,6 +366,11 @@ namespace EdgePulse::App
         {
             configuration.redisPassword = *password;
         }
+        // 种子管理员口令只从环境变量读取；空值与未设置同义，不写日志也不回显
+        if (const auto password = Common::environmentValue("EDGEPULSE_ADMIN_PASSWORD"); password.has_value())
+        {
+            configuration.adminPassword = *password;
+        }
         // 指纹允许通过环境变量覆盖，run-dev.sh 会在生成证书后导出
         if (configuration.agentFingerprint.empty())
         {

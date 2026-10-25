@@ -22,7 +22,8 @@
 #
 # 使用前：
 #   1. cp .env.example .env，填入 MYSQL_ROOT_PASSWORD、EDGEPULSE_DB_PASSWORD、
-#      EDGEPULSE_REDIS_PASSWORD、EDGEPULSE_OPS_BEARER_TOKEN。
+#      EDGEPULSE_REDIS_PASSWORD、EDGEPULSE_OPS_BEARER_TOKEN 与 EDGEPULSE_ADMIN_PASSWORD。
+#      EDGEPULSE_ADMIN_PASSWORD 至少 10 位且同时含大写、小写、数字与符号；生产档不再允许 admin123。
 #   2. 按上面的分工准备两个证书目录与 config/prod.yaml；config/prod.yaml.example 里有
 #      HA、限流与 Agent CA 的说明。
 #   3. 启用内部 CA 时，CA 私钥宿主机权限 0400，且不要放进证书目录或版本库。旧部署把私钥放在
@@ -44,6 +45,8 @@ x-edgepulse-environment: &edgepulse-environment
   EDGEPULSE_OIDC_CLIENT_SECRET: ${EDGEPULSE_OIDC_CLIENT_SECRET:-}
   EDGEPULSE_MFA_KEY: ${EDGEPULSE_MFA_KEY:-}
   EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
+  # 种子管理员仍是 admin123 时由应用在启动期替换；生产档缺失且未改过口令会拒绝启动
+  EDGEPULSE_ADMIN_PASSWORD: ${EDGEPULSE_ADMIN_PASSWORD:-}
 
 x-edgepulse-service: &edgepulse-service
   image: ${EDGEPULSE_HA_IMAGE:-edgepulse:ha}

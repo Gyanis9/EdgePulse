@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -42,6 +43,58 @@ namespace
 
     private:
         std::filesystem::path m_path; ///< 临时文件
+    };
+
+    /**
+     * @brief 用例期间设置环境变量，析构时恢复原值
+     */
+    class ScopedEnvironmentVariable
+    {
+    public:
+        ScopedEnvironmentVariable(const char *name, const char *value) : m_name(name)
+        {
+#if defined(_WIN32)
+            char  *existing = nullptr;
+            size_t length   = 0;
+            if (_dupenv_s(&existing, &length, name) == 0 && existing != nullptr)
+            {
+                m_original    = existing;
+                m_hadOriginal = true;
+                std::free(existing);
+            }
+            _putenv_s(name, value);
+#else
+            if (const char *existing = std::getenv(name); existing != nullptr)
+            {
+                m_original    = existing;
+                m_hadOriginal = true;
+            }
+            setenv(name, value, 1);
+#endif
+        }
+
+        ~ScopedEnvironmentVariable()
+        {
+#if defined(_WIN32)
+            _putenv_s(m_name.c_str(), m_hadOriginal ? m_original.c_str() : "");
+#else
+            if (m_hadOriginal)
+            {
+                setenv(m_name.c_str(), m_original.c_str(), 1);
+            } else
+            {
+                unsetenv(m_name.c_str());
+            }
+#endif
+        }
+
+        ScopedEnvironmentVariable(const ScopedEnvironmentVariable &)            = delete;
+        ScopedEnvironmentVariable &operator=(const ScopedEnvironmentVariable &) = delete;
+
+    private:
+        std::string m_name;           ///< 变量名
+        std::string m_original;       ///< 原值
+        bool        m_hadOriginal{false}; ///< 原来是否已设置
     };
 } // namespace
 
@@ -280,4 +333,22 @@ TEST(ApplicationConfiguration, RejectsNonFiniteRateLimit)
     const auto infiniteConfiguration = EdgePulse::App::ApplicationConfiguration::load(infinite.path());
     ASSERT_FALSE(infiniteConfiguration.has_value());
     EXPECT_NE(std::string::npos, infiniteConfiguration.error().message.find("server.rate_limit.burst_capacity"));
+}
+
+// 钉住：种子管理员口令只从环境变量读取，不落 YAML；环境变量清空时不保留旧值
+TEST(ApplicationConfiguration, ReadsAdminPasswordFromEnvironmentOnly)
+{
+    const TemporaryConfigurationFile file("edgepulse:\n  threads: 1\n");
+    {
+        const ScopedEnvironmentVariable password("EDGEPULSE_ADMIN_PASSWORD", "Env-admin-pass1");
+        const auto                     configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_TRUE(configuration.has_value()) << configuration.error().message;
+        EXPECT_EQ("Env-admin-pass1", configuration->adminPassword);
+    }
+    {
+        const ScopedEnvironmentVariable absent("EDGEPULSE_ADMIN_PASSWORD", "");
+        const auto                     configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_TRUE(configuration.has_value()) << configuration.error().message;
+        EXPECT_TRUE(configuration->adminPassword.empty());
+    }
 }

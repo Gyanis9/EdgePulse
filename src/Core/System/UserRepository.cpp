@@ -5,6 +5,8 @@
 #include "Base/Exception/EdgePulseException.h"
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
+#include "Base/Security/PasswordHash.h"
+#include "Base/Security/PasswordPolicy.h"
 
 #include "Database/Common/DatabaseResult.h"
 #include "Database/Common/DatabaseValue.h"
@@ -13,10 +15,12 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -760,5 +764,56 @@ namespace EdgePulse::System
                     const auto result = execute(connection, "UPDATE sys_user SET last_login_time = ?, updated_at = ? WHERE id = ? AND deleted = 0", parameters);
                     return result->affectedRowCount() > 0;
                 });
+    }
+
+    DefaultAdminPasswordGuardResult UserRepository::enforceDefaultAdminPassword(DatabaseConnection &connection, const DefaultAdminPasswordGuardOptions &options)
+    {
+        const std::unique_ptr<DatabaseResult> row = connection.execute("SELECT id, password FROM sys_user WHERE username = 'admin' AND deleted = 0 ORDER BY id LIMIT 1");
+        if (!row)
+        {
+            return DefaultAdminPasswordGuardResult{false, "检查默认管理员口令失败：" + connection.lastError()};
+        }
+        if (!row->next())
+        {
+            // 没有种子账号就没有可收紧的默认口令
+            return {};
+        }
+        const std::int64_t storedId     = Sql::integer(*row, "id");
+        const std::string  storedHash   = Sql::text(*row, "password");
+        constexpr std::string_view kSeedPassword = "admin123";
+        if (!Common::verifyPassword(storedHash, kSeedPassword))
+        {
+            // 管理员已经改过口令：环境变量不得覆盖，也不参与策略判定
+            return {};
+        }
+        if (options.password.empty())
+        {
+            if (options.developmentMode)
+            {
+                return {};
+            }
+            return DefaultAdminPasswordGuardResult{
+                    false,
+                    "检测到默认管理员 admin 仍使用种子口令 admin123。请设置环境变量 EDGEPULSE_ADMIN_PASSWORD 为至少 10 个字符、同时包含大写字母、小写字母、数字与符号的强口令后重启；"
+                    "仅在本机开发时可把 edgepulse.captcha.expose_code 设为 true 以保留默认口令。"};
+        }
+        // 至少十位是任务给定下限；部署配置可以更严，但不能更宽
+        const Common::PasswordPolicy policy(std::max(10, options.minimumLength), options.requireComplexity);
+        if (const std::expected<void, std::string> validation = policy.validate(options.password); !validation)
+        {
+            return DefaultAdminPasswordGuardResult{false, "EDGEPULSE_ADMIN_PASSWORD 不符合口令策略：" + validation.error() +
+                                                                "；请改为至少 10 位且同时包含大写字母、小写字母、数字与符号的口令"};
+        }
+        const std::array<DatabaseValue, 4> parameters{Common::hashPassword(options.password), Common::nowDateTimeUtc(), storedId, storedHash};
+        const auto                         update = execute(connection,
+                                                            "UPDATE sys_user SET password = ?, failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, updated_at = ? "
+                                                            "WHERE id = ? AND password = ?",
+                                                            parameters);
+        if (!update)
+        {
+            return DefaultAdminPasswordGuardResult{false, "更新默认管理员口令失败：" + connection.lastError()};
+        }
+        // 比较并交换失败说明并发进程已经改过哈希，此时同样不再覆盖
+        return DefaultAdminPasswordGuardResult{update->affectedRowCount() > 0, {}};
     }
 } // namespace EdgePulse::System

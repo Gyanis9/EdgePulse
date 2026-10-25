@@ -55,6 +55,26 @@ namespace EdgePulse::System
     };
 
     /**
+     * @brief 启动期收紧默认管理员口令的输入
+     */
+    struct DefaultAdminPasswordGuardOptions
+    {
+        std::string password;                   ///< EDGEPULSE_ADMIN_PASSWORD 原值；空表示未设置
+        bool        developmentMode{false};     ///< 开发档保留种子口令 admin123
+        int         minimumLength{10};          ///< 最低长度；实际判定不小于 10
+        bool        requireComplexity{true};    ///< 是否要求同时包含四类字符
+    };
+
+    /**
+     * @brief 启动期收紧默认管理员口令的结论
+     */
+    struct DefaultAdminPasswordGuardResult
+    {
+        bool        applied{false}; ///< 默认哈希是否已替换成环境变量里的口令
+        std::string error;          ///< 非空表示必须拒绝启动的中文原因，不含口令本身
+    };
+
+    /**
      * @brief 用户仓储：认证读取与管理域 CRUD
      */
     class UserRepository
@@ -252,6 +272,18 @@ namespace EdgePulse::System
          * @return bool 是否命中一行
          */
         AsynGyanis::Core::Task<bool> touchLastLogin(AsynGyanis::Core::EventLoop &loop, std::int64_t userId, std::string loginTime);
+
+        /**
+         * @brief 启动期检查并收紧种子管理员口令
+         * @param connection 启动期直连；必须已应用全部迁移
+         * @param options 环境变量口令、开发档标记与口令策略
+         * @return DefaultAdminPasswordGuardResult 已收紧时为 applied；error 非空表示必须拒绝启动
+         * @note 只在 admin 仍是种子口令 admin123 时动作；已改过的口令忽略环境变量
+         * @note 生产档（developmentMode 为 false）缺少环境变量口令时失败；开发档保留 admin123
+         * @note 错误与日志都不回显口令内容
+         */
+        static DefaultAdminPasswordGuardResult enforceDefaultAdminPassword(AsynGyanis::Database::DatabaseConnection &connection,
+                                                                           const DefaultAdminPasswordGuardOptions &options);
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装
