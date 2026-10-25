@@ -24,6 +24,8 @@ edgepulse:
   # 容器或 Prometheus 要跨网络抓取时必须绑 0.0.0.0；只在本机抓取可改回 127.0.0.1
   ops_address: 0.0.0.0
   web_root: web
+  # 只放 ca.pem、server.pem、server-key.pem。CA 私钥（ca-key.pem）不得出现在这里：
+  # HA 编排用独立的 Compose secret 与 0400 命名卷交给应用，nginx 只拿到 server 证书。
   cert_dir: /etc/edgepulse/tls
   # HA 下所有实例必须挂同一个共享固件卷；本地卷会让上传与下载落到不同实例。
   firmware_dir: /var/lib/edgepulse/firmware
@@ -78,9 +80,11 @@ edgepulse:
     # 默认关闭。启用后控制面用这里的 CA 为 Agent 自动签发证书。
     # certificate_file 必须就是 9443 监听器信任的锚（cert_dir/ca.pem）；ca.pem 是拼接信任包时，
     # 该 CA 证书必须包含在其中，启动时按 SHA-256 指纹比对，对不上直接拒绝启动。
-    # 私钥单独挂载，不随配置、镜像或公开证书卷分发；宿主机权限 0400，容器内只读。
-    # Docker HA 编排把它挂在 /run/secrets/agent_ca_key，单机部署可用
-    # /etc/edgepulse/agent-ca-key.pem（同样要求 0400 且仅服务账号可读）。
+    # key_file 指向单独的 0400 私钥文件，不能与 certificate_file 相同，也不能放在 cert_dir。
+    # Docker HA 编排由 ca-key-init 把 Compose secret 复制到 /run/secrets/agent_ca_key（0400、
+    # 属主为容器用户）；单机部署可用 /etc/edgepulse/agent-ca-key.pem（同样要求 0400）。
+    # 旧部署把私钥放在 var/certs/ca-key.pem 时，先迁移到上述路径并从证书目录删除，避免
+    # nginx 或应用证书卷继续携带它。
     enabled: false
     certificate_file: /etc/edgepulse/tls/ca.pem
     key_file: /run/secrets/agent_ca_key

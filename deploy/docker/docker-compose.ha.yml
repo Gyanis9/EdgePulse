@@ -1,16 +1,29 @@
 # EdgePulse 双实例 HA 编排样例。
 # 两个应用容器不发布 8080/8443/9443：浏览器流量走 nginx 的 8080/8443，Agent mTLS 走
-# nginx 的 9443 TCP 透传。两个实例共享 MySQL、Redis、证书目录与固件卷；instance_id 由
-# 入口脚本按 EDGEPULSE_INSTANCE_ID 生成到可写目录，容器内挂载的配置文件保持同一份。
+# nginx 的 9443 TCP 透传。两个实例共享 MySQL、Redis、固件卷与同一份只读配置；instance_id
+# 由入口脚本按 EDGEPULSE_INSTANCE_ID 生成到可写目录，容器内挂载的配置文件保持同一份。
+#
+# 证书与私钥分三处，互不越权：
+#   EDGEPULSE_HA_CERT_DIR        应用证书：只放 ca.pem、server.pem、server-key.pem
+#   EDGEPULSE_HA_NGINX_CERT_DIR  nginx 证书：只放 server.pem、server-key.pem
+#   EDGEPULSE_AGENT_CA_KEY_FILE  Agent CA 私钥的宿主机文件，不进入任何证书目录
+# ca-key-init 以 root 读取私钥，复制到属主为 edgepulse、权限 0400 的命名卷；应用只挂
+# 该卷的 /run/secrets，nginx 既看不到私钥也看不到 ca.pem。Compose 的非 swarm 模式会忽略
+# secret 的 uid/gid/mode，Windows 绑定挂载还会把文件显示成 0555/0777，因此不能直接把
+# 宿主机文件当 0400 秘密挂进容器：应用启动时的私钥权限检查会拒绝。
 #
 # 使用前：
 #   1. cp .env.example .env，填入 MYSQL_ROOT_PASSWORD、EDGEPULSE_DB_PASSWORD、
 #      EDGEPULSE_REDIS_PASSWORD、EDGEPULSE_OPS_BEARER_TOKEN。
-#   2. 准备 var/certs（server.pem/server-key.pem/ca.pem 与 Agent CA 私钥）与
-#      config/prod.yaml；config/prod.yaml.example 里有 HA 相关注释。
-#   3. 启用 Agent 内部 CA 时，把 CA 私钥放到 deploy/docker/secrets/agent-ca-key.pem，
-#      宿主机 chmod 0400，并由 EDGEPULSE_AGENT_CA_KEY_FILE 指向它；该私钥不进入证书卷。
+#   2. 按上面的分工准备两个证书目录与 config/prod.yaml；config/prod.yaml.example 里有
+#      HA、限流与 Agent CA 的说明。
+#   3. CA 私钥宿主机权限 0400，且不要放进证书目录或版本库。旧部署把私钥放在
+#      var/certs/ca-key.pem 或 /etc/edgepulse/agent-ca-key.pem 时，迁移到
+#      EDGEPULSE_AGENT_CA_KEY_FILE，并确认应用证书目录里不再有 ca-key.pem。
 #   4. 固件信任公钥放 config/firmware-keys；HA 必须使用共享固件卷，不能按实例各挂一份。
+#
+# 端口默认：8080 只绑 127.0.0.1，明文入口不对外；8443/9443 对外；Prometheus 只绑
+# 127.0.0.1。需要改变时用 EDGEPULSE_HA_*_BIND_ADDRESS 显式指定网卡地址。
 
 name: edgepulse-ha
 
@@ -35,25 +48,28 @@ x-edgepulse-service: &edgepulse-service
       condition: service_healthy
     redis:
       condition: service_healthy
+    # 私钥先复制成容器用户可读的 0400 文件，应用才启动；失败时应用不会带半个秘密启动
+    ca-key-init:
+      condition: service_completed_successfully
   environment: *edgepulse-environment
   volumes:
     - type: bind
       source: ${EDGEPULSE_HA_CONFIG_DIR:-../../config}
       target: /app/config
       read_only: true
+    # 只含 ca.pem、server.pem、server-key.pem；CA 私钥不在这里
     - type: bind
-      source: ${EDGEPULSE_HA_CERT_DIR:-../../var/certs}
+      source: ${EDGEPULSE_HA_CERT_DIR:-./certs/app}
       target: /etc/edgepulse/tls
       read_only: true
     - type: bind
       source: ${EDGEPULSE_HA_FIRMWARE_KEYS_DIR:-../../config/firmware-keys}
       target: /etc/edgepulse/firmware-keys
       read_only: true
-    # CA 私钥单独挂载，与公开证书卷分开；宿主机权限 0400，容器内只读。
-    # 源文件必须提前存在；缺失时 Docker 会按目录创建挂载源并导致启动失败。
-    - type: bind
-      source: ${EDGEPULSE_AGENT_CA_KEY_FILE:-./secrets/agent-ca-key.pem}
-      target: /run/secrets/agent_ca_key
+    # ca-key-init 生成的 0400 私钥卷；应用只读挂载，看不到生成过程
+    - type: volume
+      source: ca-key-data
+      target: /run/secrets
       read_only: true
     - type: volume
       source: firmware-data
@@ -81,7 +97,8 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      # 口令走 MYSQL_PWD 环境变量，不进入 healthcheck 的 argv 与 docker inspect
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -uroot --silent"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -90,14 +107,37 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--requirepass", "${EDGEPULSE_REDIS_PASSWORD:?请在 .env 中设置 EDGEPULSE_REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${EDGEPULSE_REDIS_PASSWORD:?请在 .env 中设置 EDGEPULSE_REDIS_PASSWORD}
+    # 口令写进容器内的临时配置文件，redis-server 的 argv 里只有文件路径
+    command: ["sh", "-c", "umask 077; printf 'requirepass %s\\n' \"$$REDIS_PASSWORD\" > /run/redis.conf; exec redis-server /run/redis.conf"]
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${EDGEPULSE_REDIS_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli --no-auth-warning ping"]
       interval: 5s
       timeout: 3s
       retries: 30
+    networks: [edgepulse]
+
+  # 一次性初始化服务：读取 Compose secret，把私钥复制到命名卷并收紧到应用用户的 0400。
+  # 这样无论宿主机是 Linux（设 0400 root）还是 Windows（绑定挂载恒为 0555/0777），
+  # 应用看到的都是普通文件、属主自己、权限 0400。
+  ca-key-init:
+    image: ${EDGEPULSE_HA_IMAGE:-edgepulse:ha}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    user: "0:0"
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["install -d -m 0755 /keys && install -m 0400 -o edgepulse -g edgepulse /run/secrets/agent_ca_key /keys/agent_ca_key"]
+    secrets:
+      - agent_ca_key
+    volumes:
+      - type: volume
+        source: ca-key-data
+        target: /keys
     networks: [edgepulse]
 
   edgepulse-1:
@@ -116,21 +156,25 @@ services:
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
+    # 只等容器启动，不等应用 healthy：单个实例故障时 nginx 仍可用另一台上游提供服务。
+    # 应用的就绪由 upstream 被动摘除与 healthcheck 负责，启动期的失败请求由
+    # proxy_next_upstream 重试；不要改回 service_healthy，否则一台起不来就整体不可用。
     depends_on:
       edgepulse-1:
-        condition: service_healthy
+        condition: service_started
       edgepulse-2:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - ../nginx/edgepulse.conf:/etc/nginx/nginx.conf:ro
+      # 只有 server.pem 与 server-key.pem；不挂 ca.pem，更不挂 Agent CA 私钥
       - type: bind
-        source: ${EDGEPULSE_HA_CERT_DIR:-../../var/certs}
+        source: ${EDGEPULSE_HA_NGINX_CERT_DIR:-./certs/nginx}
         target: /etc/nginx/certs
         read_only: true
     ports:
-      - "${EDGEPULSE_HA_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_HTTP_PORT:-8080}:8080"
-      - "${EDGEPULSE_HA_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_HTTPS_PORT:-8443}:8443"
-      - "${EDGEPULSE_HA_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_AGENT_PORT:-9443}:9443"
+      - "${EDGEPULSE_HA_HTTP_BIND_ADDRESS:-127.0.0.1}:${EDGEPULSE_HA_HTTP_PORT:-8080}:8080"
+      - "${EDGEPULSE_HA_HTTPS_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_HTTPS_PORT:-8443}:8443"
+      - "${EDGEPULSE_HA_AGENT_BIND_ADDRESS:-0.0.0.0}:${EDGEPULSE_HA_AGENT_PORT:-9443}:9443"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
       interval: 10s
@@ -147,20 +191,28 @@ services:
     restart: unless-stopped
     depends_on:
       edgepulse-1:
-        condition: service_healthy
+        condition: service_started
       edgepulse-2:
-        condition: service_healthy
+        condition: service_started
     command: ["--config.file=/etc/prometheus/prometheus.ha.yml"]
     volumes:
       - ../prometheus:/etc/prometheus:ro
     ports:
-      - "${EDGEPULSE_HA_BIND_ADDRESS:-127.0.0.1}:${EDGEPULSE_HA_PROMETHEUS_PORT:-9090}:9090"
+      # 没有鉴权的管理界面默认只给本机；远程抓取走应用自己的 9100，不需要暴露这里
+      - "${EDGEPULSE_HA_PROMETHEUS_BIND_ADDRESS:-127.0.0.1}:${EDGEPULSE_HA_PROMETHEUS_PORT:-9090}:9090"
     networks: [edgepulse]
+
+secrets:
+  # 宿主机文件，权限 0400；ca-key-init 读取后只把 0400 副本放进 ca-key-data 卷
+  agent_ca_key:
+    file: ${EDGEPULSE_AGENT_CA_KEY_FILE:-./secrets/agent-ca-key.pem}
 
 volumes:
   mysql-data:
   redis-data:
   firmware-data:
+  # 只保存 ca-key-init 复制进去的 0400 私钥；docker compose down -v 时一并删除
+  ca-key-data:
 
 networks:
   edgepulse:

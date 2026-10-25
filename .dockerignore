@@ -11,5 +11,6 @@ frontend/playwright-report/
 *.ilk
 deploy/docker/.env
 deploy/docker/secrets/
+deploy/docker/certs/
 deploy/prometheus/ops-token
 config/prod.yaml

@@ -13,11 +13,16 @@ WorkingDirectory=/opt/edgepulse
 # %i 是实例名：/etc/edgepulse/<实例>.yaml 里放唯一的 edgepulse.instance_id，
 # /etc/edgepulse/<实例>.env 放该实例的秘密（权限 0600）。同机多实例时，
 # 各配置的 http_port/https_port/agent_port/ops_port 必须互不冲突。
+# 日志配置放在 /etc/edgepulse/logging.yaml，与 %i.yaml 同目录；其中滚动 sink 的
+# directory 要写 /var/lib/edgepulse/logs，不要写相对路径，否则会落到只读的
+# /opt/edgepulse 下。ReadWritePaths 已包含 /var/lib/edgepulse。
 EnvironmentFile=/etc/edgepulse/%i.env
+ExecStartPre=/bin/mkdir -p /var/lib/edgepulse/logs
 ExecStart=/opt/edgepulse/edgepulse-server --config /etc/edgepulse/%i.yaml
 Restart=on-failure
 RestartSec=3s
-TimeoutStopSec=30s
+# 与容器编排的 stop_grace_period 一致：先让 /readyz 变 503，再排空在途请求
+TimeoutStopSec=40s
 KillSignal=SIGTERM
 
 # 秘密来自 EnvironmentFile（权限 0600，不进版本库）；运行目录只放开固件与数据库。

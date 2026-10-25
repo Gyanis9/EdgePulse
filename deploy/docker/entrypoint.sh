@@ -28,6 +28,11 @@ if [ -n "${EDGEPULSE_INSTANCE_ID:-}" ]; then
     config_dir=/var/lib/edgepulse/runtime
     mkdir -p "${config_dir}"
     config="${config_dir}/prod-${instance_id}.yaml"
+    # 应用只在配置文件同目录查找 logging.yaml；不复制就会退回内置日志器，丢掉
+    # 配置里的滚动文件与 JSON 版式
+    if [ -f /app/config/logging.yaml ]; then
+        cp /app/config/logging.yaml "${config_dir}/logging.yaml"
+    fi
     if grep -Eq '^[[:space:]]*instance_id:' "${source_config}"; then
         awk -v id="${instance_id}" '{ if ($0 ~ /^[[:space:]]*instance_id:/) sub(/instance_id:.*/, "instance_id: " id); print }' "${source_config}" > "${config}"
     else
@@ -47,6 +52,11 @@ else
         config=/var/lib/edgepulse/prod.yaml
         if [ ! -f "${config}" ]; then
             cp "${source_config}" "${config}"
+        fi
+        # 与实例分支相同：日志配置必须和配置文件放在一起才会被载入。已有
+        # /var/lib/edgepulse/prod.yaml 的旧部署也补一份，避免继续用内置日志器。
+        if [ -f /app/config/logging.yaml ]; then
+            cp /app/config/logging.yaml /var/lib/edgepulse/logging.yaml
         fi
     fi
 fi
