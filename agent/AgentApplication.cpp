@@ -1163,12 +1163,14 @@ namespace EdgePulse::Agent
                     co_return;
                 }
 
-                // 生成私钥与安装证书都要读 OpenSSL 与磁盘，放到阻塞执行器上跑，完成后再回到循环线程
+                // 生成私钥与安装证书都要读 OpenSSL 与磁盘，放到阻塞执行器上跑，完成后再回到循环线程。
+                // 任务在别的线程上执行，不能引用协程帧里的 dependencies：先复制动作，帧销毁后任务仍持有自己的副本
                 std::expected<CertificateRequestMaterial, std::string> material = std::unexpected("续期材料生成任务未执行");
                 try
                 {
-                    material = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<CertificateRequestMaterial, std::string>>(
-                            loop, [&dependencies]() { return dependencies.generateRequest(); });
+                    auto generateRequest = dependencies.generateRequest;
+                    material             = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<CertificateRequestMaterial, std::string>>(
+                            loop, [generateRequest = std::move(generateRequest)]() { return generateRequest(); });
                 } catch (const std::exception &failure)
                 {
                     material = std::unexpected("提交续期密钥生成任务失败：" + std::string{failure.what()});
@@ -1219,8 +1221,9 @@ namespace EdgePulse::Agent
                 std::expected<AgentIdentity, std::string> installed = std::unexpected("证书安装任务未执行");
                 try
                 {
-                    installed = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<AgentIdentity, std::string>>(
-                            loop, [&dependencies, certificatePem = renewed->certificatePem]() { return dependencies.install(certificatePem); });
+                    auto installCertificate = dependencies.install;
+                    installed               = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<std::expected<AgentIdentity, std::string>>(
+                            loop, [installCertificate = std::move(installCertificate), certificatePem = renewed->certificatePem]() { return installCertificate(certificatePem); });
                 } catch (const std::exception &failure)
                 {
                     installed = std::unexpected("提交证书安装任务失败：" + std::string{failure.what()});
@@ -1417,11 +1420,13 @@ namespace EdgePulse::Agent
             // 重启动作必须在命令结果入队并尝试上报之后执行，否则结果会随进程退出丢失；
             // 平台服务管理器（systemd 或 SCM）负责把进程重新拉起来
             executors.push_back(std::make_shared<RestartExecutor>(true));
-            CommandDispatcher       dispatcher(client, *state, std::move(executors),
-                                               [this, &loop]() -> AsynGyanis::Core::Task<> { co_await restartAgentService(loop, [this] { requestStop(); }); });
-            AgentWebSocket          webSocket(loop, m_configuration);
-            TelemetryPublisher      telemetryPublisher(client, *state);
-            AgentCertificateManager certificateManager(m_configuration);
+            CommandDispatcher  dispatcher(client, *state, std::move(executors),
+                                          [this, &loop]() -> AsynGyanis::Core::Task<> { co_await restartAgentService(loop, [this] { requestStop(); }); });
+            AgentWebSocket     webSocket(loop, m_configuration);
+            TelemetryPublisher telemetryPublisher(client, *state);
+            // 续期动作会被复制到阻塞执行器上执行；共享所有权保证停机时即使协程帧已销毁，
+            // 排队或正在执行的任务仍能安全使用证书管理器
+            auto certificateManager = std::make_shared<AgentCertificateManager>(m_configuration);
 
             RuntimeFlags flags;
             flags.heartbeatIntervalSeconds = m_configuration.heartbeatIntervalSeconds;
@@ -1451,13 +1456,13 @@ namespace EdgePulse::Agent
             {
                 CertificateRenewalDependencies renewal;
                 renewal.expiresAt          = identity->expiresAt;
-                renewal.generateRequest    = [&certificateManager]() { return certificateManager.generateKeyAndCsr(); };
+                renewal.generateRequest    = [certificateManager]() { return certificateManager->generateKeyAndCsr(); };
                 renewal.renew              = [&client](std::int64_t renewingNodeId, std::string csrPem) { return client.renewCertificate(renewingNodeId, std::move(csrPem)); };
-                renewal.install            = [&certificateManager](std::string_view certificatePem) { return certificateManager.install(certificatePem); };
-                renewal.reloadHttpIdentity = [&client, &certificateManager]()
-                { return client.reloadIdentityFromDisk([&certificateManager]() { return certificateManager.restorePrevious().has_value(); }); };
+                renewal.install            = [certificateManager](std::string_view certificatePem) { return certificateManager->install(certificatePem); };
+                renewal.reloadHttpIdentity = [&client, certificateManager]()
+                { return client.reloadIdentityFromDisk([certificateManager]() { return certificateManager->restorePrevious().has_value(); }); };
                 renewal.reloadWebSocketIdentity = [&webSocket]() { return webSocket.reloadIdentityFromDisk(); };
-                renewal.commitInstalledIdentity = [&certificateManager]() { certificateManager.commitInstalledIdentity(); };
+                renewal.commitInstalledIdentity = [certificateManager]() { certificateManager->commitInstalledIdentity(); };
                 frames.push_back(runCertificateRenewal(loop, *state, *nodeId, m_configuration, std::move(renewal), m_stopRequested));
             } else
             {

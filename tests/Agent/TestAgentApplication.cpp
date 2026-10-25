@@ -2026,4 +2026,95 @@ agent:
         EXPECT_EQ(2, probe.renew.load(std::memory_order_acquire)) << "续期协程异常后应重试一次";
         EXPECT_EQ(1, probe.install.load(std::memory_order_acquire));
     }
+
+    TEST(AgentApplication, RenewalOffloadKeepsCopiedCallableAliveAfterFrameDestruction)
+    {
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openRenewalState(directory);
+
+        AgentConfiguration configuration;
+        configuration.certificateRenewBeforeDays     = 7;
+        configuration.certificateRenewalCheckSeconds = 3600;
+
+        AsynGyanis::Core::EventLoop loop;
+        std::thread                 loopThread([&loop] { loop.run(); });
+
+        std::atomic<bool>       stop{false};
+        std::atomic<bool>       finished{false};
+        std::mutex              gateMutex;
+        std::condition_variable gate;
+        bool                    entered   = false;
+        bool                    released  = false;
+        auto                    keepAlive = std::make_shared<int>(42);
+
+        std::optional<CertificateRenewalDependencies> dependencies;
+        dependencies.emplace();
+        dependencies->expiresAt = utcTextAt(std::chrono::system_clock::now() + std::chrono::days{5});
+        // 任务停在门闩上，测试才能在任务在途时销毁协程帧；keepAlive 只由协程帧与执行器任务持有，
+        // 帧销毁后引用计数仍大于 1 就说明执行器手里的副本没有跟着消失
+        dependencies->generateRequest = [keepAlive, &gateMutex, &gate, &entered, &released, &finished]()
+        {
+            {
+                std::unique_lock lock(gateMutex);
+                entered = true;
+                gate.notify_all();
+                gate.wait(lock, [&released] { return released; });
+            }
+            finished.store(true, std::memory_order_release);
+            return std::expected<CertificateRequestMaterial, std::string>{CertificateRequestMaterial{"key-pem", "csr-pem"}};
+        };
+        dependencies->renew = [](std::int64_t, std::string) -> AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>
+        { co_return RenewedCertificate{"cert-pem", std::string(64U, 'b'), "2026-10-25 08:00:00", "2027-10-25 08:00:00", "0a"}; };
+        dependencies->install       = [](std::string_view) { return std::expected<AgentIdentity, std::string>{AgentIdentity{std::string(64U, 'b'), "2027-10-25T08:00:00Z"}}; };
+        dependencies->checkInterval = std::chrono::milliseconds{25};
+
+        auto frame = AgentApplication::runCertificateRenewal(loop, state, 4242, configuration, std::move(*dependencies), stop);
+        // 帧已拿走唯一一份依赖；测试侧再持有副本会让引用计数无法区分「帧里的」与「执行器里的」副本。
+        // 标准不保证被移动的 std::function 目标一定为空，这里显式清掉再释放容器
+        dependencies->generateRequest = {};
+        dependencies->renew           = {};
+        dependencies->install         = {};
+        dependencies.reset();
+        loop.scheduler().scheduleRemote(frame.handle());
+        bool enteredInTime = false;
+        {
+            std::unique_lock lock(gateMutex);
+            enteredInTime = gate.wait_for(lock, std::chrono::seconds{10}, [&entered] { return entered; });
+        }
+        if (!enteredInTime)
+        {
+            // 失败退出前先解开门闩并回收循环，避免后台协作对象在测试析构时互相践踏
+            {
+                std::lock_guard lock(gateMutex);
+                released = true;
+            }
+            gate.notify_all();
+            loop.stop();
+            loopThread.join();
+            auto discarded = std::move(frame);
+            static_cast<void>(discarded);
+            FAIL() << "生成任务没有进入阻塞执行器";
+        }
+
+        // 停机次序：先停循环，再销毁仍挂在 submit 上的协程帧，任务本身还留在执行器里
+        loop.stop();
+        loopThread.join();
+        {
+            auto discarded = std::move(frame);
+            static_cast<void>(discarded);
+        }
+        EXPECT_GE(keepAlive.use_count(), 2L) << "执行器任务必须持有自己的一份可调用对象，不能引用已销毁的协程帧";
+
+        {
+            std::lock_guard lock(gateMutex);
+            released = true;
+        }
+        gate.notify_all();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        while (!finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        EXPECT_TRUE(finished.load(std::memory_order_acquire)) << "协程帧销毁后执行器任务仍应完成";
+    }
 } // namespace EdgePulse::Agent
