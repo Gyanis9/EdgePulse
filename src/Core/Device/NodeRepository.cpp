@@ -704,6 +704,30 @@ namespace EdgePulse::Device
                 });
     }
 
+    AsynGyanis::Core::Task<std::optional<std::string>> NodeRepository::lastCertificateIssuedAt(AsynGyanis::Core::EventLoop &loop, const System::TenantScope tenant,
+                                                                                               const std::int64_t nodeId)
+    {
+        co_return co_await m_database->withConnection<std::optional<std::string>>(
+                loop,
+                [tenant, nodeId](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<std::string>
+                {
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{nodeId};
+                    std::string                                      filter = " WHERE node_id = ?";
+                    if (!tenant.allTenants)
+                    {
+                        filter += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto rows =
+                            Sql::executeOrThrow(connection, "SELECT issued_at FROM biz_agent_certificate" + filter + " ORDER BY issued_at DESC, id DESC LIMIT 1", parameters);
+                    if (!rows->next())
+                    {
+                        return std::nullopt;
+                    }
+                    return Sql::dateTimeText(*rows, "issued_at");
+                });
+    }
+
     AsynGyanis::Core::Task<std::int64_t> NodeRepository::countExpiringCertificates(AsynGyanis::Core::EventLoop &loop, const int withinDays)
     {
         co_return co_await m_database->withConnection<std::int64_t>(

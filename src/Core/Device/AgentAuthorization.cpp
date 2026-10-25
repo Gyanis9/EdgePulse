@@ -29,7 +29,7 @@ namespace EdgePulse::Device
             co_return std::unexpected(AgentIdentityError{AgentIdentityError::Reason::NotFound, 404, "节点不存在或已删除，请先完成注册"});
         }
 
-        // 判据顺序按规范：身份 → 指纹 → 吊销，任何一项缺失都 fail-closed
+        // 判据顺序按规范：身份 → 吊销 → 指纹，任何一项缺失都 fail-closed
         const AsynGyanis::Core::TlsPeerIdentityPtr &identity = request.tlsPeerIdentity();
         if (!identity || !identity->isVerified())
         {

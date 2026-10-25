@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -300,8 +301,9 @@ protected:
      * @brief 启动一个带 Agent 路由的明文测试服务器
      * @param caEnabled CA 是否启用
      * @param versionBumps 每次写入轮换前人为推进版本的次数，用于制造版本冲突
+     * @param rotationHook 每次写入轮换前的附加动作，用于模拟改绑或租户停用等并发变化
      */
-    void startServer(const bool caEnabled = true, const int versionBumps = 0)
+    void startServer(const bool caEnabled = true, const int versionBumps = 0, std::function<void(std::int64_t)> rotationHook = {})
     {
         EdgePulse::Device::AgentCaOptions options;
         options.enabled         = caEnabled;
@@ -315,12 +317,16 @@ protected:
         m_versionBumps = versionBumps;
 
         m_server = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
-                [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
+                [this, rotationHook = std::move(rotationHook)](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
                 {
                     EdgePulse::TestSupport::installTestAgentIdentity(router);
                     EdgePulse::Device::registerRoutes(router, loop, *m_registry, *m_nodes, *m_tenants, 30, nullptr, &*m_authority,
-                                                      [this](const std::int64_t nodeId)
+                                                      [this, rotationHook = std::move(rotationHook)](const std::int64_t nodeId)
                                                       {
+                                                          if (rotationHook)
+                                                          {
+                                                              rotationHook(nodeId);
+                                                          }
                                                           if (m_versionBumps <= 0)
                                                           {
                                                               return;
@@ -366,6 +372,8 @@ protected:
         EXPECT_TRUE(rotated.has_value() && *rotated);
         const std::optional<EdgePulse::Device::NodeRecord> stored = m_runner.run(m_nodes->findById(m_runner.loop(), created.id));
         EXPECT_TRUE(stored.has_value());
+        // 夹具里的轮换是既成事实，把签发时间推到过去以免最短续期间隔挡住后续请求
+        blockOnSql("UPDATE biz_agent_certificate SET issued_at = '2026-01-01 00:00:00' WHERE node_id = " + std::to_string(created.id) + " AND status = 'active'");
         return stored.value_or(created);
     }
 
@@ -393,7 +401,7 @@ protected:
         KeyHandle                           key     = generateKey();
         const std::string                   csr     = makeCertificateRequest(*key, name);
         auto                                issued  = m_authority->issue(csr, created.id, name);
-        EXPECT_TRUE(issued.has_value()) << (issued.has_value() ? std::string{} : issued.error());
+        EXPECT_TRUE(issued.has_value()) << (issued.has_value() ? std::string{} : issued.error().message);
         if (!issued.has_value())
         {
             return {created, EdgePulse::Device::IssuedAgentCertificate{}};
@@ -606,6 +614,31 @@ TEST_F(AgentCertificateRenewalTest, RenewsAndBothFingerprintsWorkWithinOverlap)
     }
 }
 
+// 钉住：同一节点两次签发之间至少间隔 60 秒，判据来自签发历史而不是进程内状态
+TEST_F(AgentCertificateRenewalTest, ThrottlesRenewalWithinMinimumInterval)
+{
+    startServer();
+    auto [node, initial] = seedIssuedNode("renew-throttle");
+    ASSERT_FALSE(initial.fingerprint.empty());
+
+    KeyHandle         firstKey = generateKey();
+    const std::string firstCsr = makeCertificateRequest(*firstKey, "ignored-by-server");
+    const auto        first    = renew(node.id, firstCsr, initial.fingerprint);
+    ASSERT_EQ(200, first.status) << first.body;
+    const std::string firstFingerprint = (*first.json())["data"]["fingerprint"].get<std::string>();
+
+    KeyHandle         secondKey = generateKey();
+    const std::string secondCsr = makeCertificateRequest(*secondKey, "ignored-by-server");
+    const auto        throttled = renew(node.id, secondCsr, firstFingerprint);
+    EXPECT_EQ(429, throttled.status) << throttled.body;
+    EXPECT_NE(std::string::npos, throttled.body.find("频繁"));
+
+    // 把签发历史推到过去，证明限制只取决于持久化时间而不是进程内计数
+    blockOnSql("UPDATE biz_agent_certificate SET issued_at = '2026-01-01 00:00:00' WHERE node_id = " + std::to_string(node.id));
+    const auto allowed = renew(node.id, secondCsr, firstFingerprint);
+    EXPECT_EQ(200, allowed.status) << allowed.body;
+}
+
 // 钉住：重叠窗口过期后旧指纹失败，新证书仍有效
 TEST_F(AgentCertificateRenewalTest, RejectsOldFingerprintAfterOverlapExpires)
 {
@@ -678,6 +711,70 @@ TEST_F(AgentCertificateRenewalTest, RetriesOnceAfterVersionConflict)
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(newFingerprint, stored->certFingerprint);
     EXPECT_EQ(node.certFingerprint, stored->previousCertFingerprint);
+}
+
+// 钉住：版本冲突重试前重新校验请求身份，改绑后的新证书不会被旧证书持有者覆盖
+TEST_F(AgentCertificateRenewalTest, DoesNotOverwriteCertificateReboundBeforeRetry)
+{
+    const std::string reboundFingerprint(64, 'c');
+    bool              rebound = false;
+    startServer(true, 0,
+                [this, &rebound, &reboundFingerprint](const std::int64_t nodeId)
+                {
+                    if (rebound)
+                    {
+                        return;
+                    }
+                    rebound = true;
+                    blockOnSql("UPDATE biz_node SET cert_fingerprint = '" + reboundFingerprint +
+                               "', previous_cert_fingerprint = '', previous_cert_not_after = NULL, "
+                               "version = version + 1 WHERE id = " +
+                               std::to_string(nodeId));
+                });
+    const EdgePulse::Device::NodeRecord node = seedNode("renew-rebind", std::string(64, 'a'), "2030-01-01 00:00:00");
+
+    KeyHandle         newKey   = generateKey();
+    const std::string newCsr   = makeCertificateRequest(*newKey, "ignored-by-server");
+    const auto        response = renew(node.id, newCsr, node.certFingerprint);
+    EXPECT_EQ(403, response.status) << response.body;
+    EXPECT_NE(std::string::npos, response.body.find("不一致"));
+
+    const std::optional<EdgePulse::Device::NodeRecord> stored = m_runner.run(m_nodes->findById(m_runner.loop(), node.id));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(reboundFingerprint, stored->certFingerprint);
+    EXPECT_TRUE(stored->previousCertFingerprint.empty());
+
+    // 改绑后的新证书仍能代表节点，说明写入没有被旧证书持有者截走
+    EXPECT_EQ(200, heartbeat(node.id, reboundFingerprint).status);
+}
+
+// 钉住：版本冲突重试前重新检查租户状态，停用租户不能借重试完成续期
+TEST_F(AgentCertificateRenewalTest, RejectsTenantDisabledBeforeRetry)
+{
+    bool disabled = false;
+    startServer(true, 0,
+                [this, &disabled](const std::int64_t nodeId)
+                {
+                    if (disabled)
+                    {
+                        return;
+                    }
+                    disabled = true;
+                    blockOnSql("UPDATE biz_node SET version = version + 1 WHERE id = " + std::to_string(nodeId));
+                    blockOnSql("UPDATE sys_tenant SET status = 0 WHERE id = 1");
+                });
+    const EdgePulse::Device::NodeRecord node = seedNode("renew-tenant-retry", std::string(64, 'a'), "2030-01-01 00:00:00");
+
+    KeyHandle         newKey   = generateKey();
+    const std::string newCsr   = makeCertificateRequest(*newKey, "ignored-by-server");
+    const auto        response = renew(node.id, newCsr, node.certFingerprint);
+    EXPECT_EQ(403, response.status) << response.body;
+    EXPECT_NE(std::string::npos, response.body.find("租户已停用"));
+
+    const std::optional<EdgePulse::Device::NodeRecord> stored = m_runner.run(m_nodes->findById(m_runner.loop(), node.id));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(node.certFingerprint, stored->certFingerprint);
+    EXPECT_TRUE(stored->previousCertFingerprint.empty());
 }
 
 // 钉住：连续两次版本冲突返回 409，且不写入任何证书字段

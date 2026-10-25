@@ -2,6 +2,7 @@
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
+#include "Base/Log/LogMacros.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/AgentCertificateAuthority.h"
@@ -133,12 +134,47 @@ namespace EdgePulse::Device
 
         /**
          * @brief 判断签发失败是否由请求方材料引起
-         * @param message 签发器返回的中文原因
-         * @return bool CSR 相关失败按 400，其余按 500
+         * @param failure 签发器返回的失败原因
+         * @return bool 请求材料不合法时为 true
          */
-        [[nodiscard]] bool clientCertificateError(const std::string &message)
+        [[nodiscard]] bool requestCertificateError(const AgentCertificateIssueError &failure)
         {
-            return message.find("CSR") != std::string::npos;
+            return failure.reason == AgentCertificateIssueFailure::InvalidRequest;
+        }
+
+        /**
+         * @brief 查询节点所属租户是否仍处于启用状态
+         * @param loop 恢复协程用的事件循环
+         * @param tenants 租户仓储
+         * @param tenantId 租户标识
+         * @return bool 租户存在且启用时为 true
+         */
+        AsynGyanis::Core::Task<bool> tenantEnabled(AsynGyanis::Core::EventLoop &loop, System::TenantRepository &tenants, const std::int64_t tenantId)
+        {
+            const auto tenant = co_await tenants.findById(loop, tenantId);
+            co_return tenant.has_value() && tenant->status == 1;
+        }
+
+        /**
+         * @brief 判断节点是否已过最短续期间隔
+         * @details 以签发历史里的最近一次签发时间为准，多实例部署共用同一份判据；
+         *          没有签发历史的旧节点不设限。
+         * @param loop 恢复协程用的事件循环
+         * @param nodes 节点仓储
+         * @param node 已通过身份校验的节点
+         * @param minimumInterval 两次签发之间的最短间隔
+         * @return bool 可以继续签发时为 true
+         */
+        AsynGyanis::Core::Task<bool> renewalIntervalElapsed(AsynGyanis::Core::EventLoop &loop, NodeRepository &nodes, const NodeRecord &node,
+                                                            const std::chrono::seconds minimumInterval)
+        {
+            const auto lastIssued = co_await nodes.lastCertificateIssuedAt(loop, System::TenantScope{node.tenantId, false}, node.id);
+            if (!lastIssued.has_value())
+            {
+                co_return true;
+            }
+            const std::string earliest = Common::formatDateTimeUtc(std::chrono::system_clock::now() - minimumInterval);
+            co_return *lastIssued <= earliest;
         }
 
         /**
@@ -246,8 +282,7 @@ namespace EdgePulse::Device
                             co_return;
                         }
                         // 停用租户不能借续期继续维持 Agent 通道
-                        const auto tenant = co_await tenants.findById(loop, identity->tenantId);
-                        if (!tenant.has_value() || tenant->status != 1)
+                        if (!co_await tenantEnabled(loop, tenants, identity->tenantId))
                         {
                             Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "租户已停用，无法续期证书", traceId);
                             co_return;
@@ -257,16 +292,23 @@ namespace EdgePulse::Device
                             Common::writeFailure(response, Common::kCodeServiceUnavailable, Common::kCodeServiceUnavailable, "Agent 内部 CA 未启用，无法续期证书", traceId);
                             co_return;
                         }
+                        // 同一节点不允许多次签发挤在一起：判据落在数据库，避免多实例各自持有一份计数
+                        constexpr std::chrono::seconds kMinimumRenewalInterval{60};
+                        if (!co_await renewalIntervalElapsed(loop, nodes, *identity, kMinimumRenewalInterval))
+                        {
+                            Common::writeFailure(response, Common::kCodeTooManyRequests, Common::kCodeTooManyRequests, "证书续期过于频繁：同一节点两次签发至少间隔 60 秒", traceId);
+                            co_return;
+                        }
 
                         auto issued = certificateAuthority->issue(*csrPem, identity->id, identity->name);
                         if (!issued.has_value())
                         {
-                            if (clientCertificateError(issued.error()))
+                            if (requestCertificateError(issued.error()))
                             {
-                                Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, issued.error(), traceId);
+                                Common::writeFailure(response, Common::kCodeBadRequest, Common::kCodeBadRequest, issued.error().message, traceId);
                                 co_return;
                             }
-                            LOG_ERROR_FMT("Agent 证书签发失败：node={} reason={}", nodeId, issued.error());
+                            LOG_ERROR_FMT("Agent 证书签发失败：node={} reason={}", nodeId, issued.error().message);
                             Common::writeFailure(response, Common::kCodeInternalServerError, Common::kCodeInternalServerError, "证书签发失败，请稍后重试", traceId);
                             co_return;
                         }
@@ -285,16 +327,17 @@ namespace EdgePulse::Device
                         }
                         if (!*rotated)
                         {
-                            // 版本条件落空：重读一次，区分并发更新、吊销与删除，再给一次重试机会
-                            const auto refreshed = co_await nodes.scoped(System::TenantScope{0, true})->findById(loop, nodeId);
+                            // 版本条件落空说明节点已被并发修改：重试前必须按最新记录重新校验请求证书与租户，
+                            // 否则管理员改绑或重新注册后，旧证书持有者仍能把自己的证书写回去
+                            const auto refreshed = co_await requireAgentNode(loop, nodes, request, nodeId);
                             if (!refreshed.has_value())
                             {
-                                Common::writeFailure(response, Common::kCodeNotFound, Common::kCodeNotFound, "节点不存在或已删除，请先完成注册", traceId);
+                                Common::writeFailure(response, refreshed.error().httpStatus, refreshed.error().httpStatus, refreshed.error().message, traceId);
                                 co_return;
                             }
-                            if (!refreshed->certRevokedAt.empty())
+                            if (!co_await tenantEnabled(loop, tenants, refreshed->tenantId))
                             {
-                                Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "节点证书已吊销，请重新申请注册令牌并完成注册", traceId);
+                                Common::writeFailure(response, Common::kCodeForbidden, Common::kCodeForbidden, "租户已停用，无法续期证书", traceId);
                                 co_return;
                             }
                             current = *refreshed;

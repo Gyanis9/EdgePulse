@@ -72,6 +72,26 @@ namespace EdgePulse::Device
         }
 
         /**
+         * @brief 构造请求材料不合法导致的签发失败
+         * @param message 中文原因
+         * @return std::unexpected<AgentCertificateIssueError> 类别为 InvalidRequest
+         */
+        [[nodiscard]] std::unexpected<AgentCertificateIssueError> requestFailure(std::string message)
+        {
+            return std::unexpected(AgentCertificateIssueError{AgentCertificateIssueFailure::InvalidRequest, std::move(message)});
+        }
+
+        /**
+         * @brief 构造签发侧失败
+         * @param message 中文原因
+         * @return std::unexpected<AgentCertificateIssueError> 类别为 Internal
+         */
+        [[nodiscard]] std::unexpected<AgentCertificateIssueError> issuanceFailure(std::string message)
+        {
+            return std::unexpected(AgentCertificateIssueError{AgentCertificateIssueFailure::Internal, std::move(message)});
+        }
+
+        /**
          * @brief 拒绝为加密私钥索取口令
          * @return int 恒为 -1；PEM_read_bio_PrivateKey 收到负值即停止，不读终端也不挂起
          */
@@ -543,61 +563,62 @@ namespace EdgePulse::Device
         return AgentCertificateAuthority{std::move(implementation)};
     }
 
-    std::expected<IssuedAgentCertificate, std::string> AgentCertificateAuthority::issue(const std::string &csrPem, const std::int64_t nodeId, const std::string &nodeName)
+    std::expected<IssuedAgentCertificate, AgentCertificateIssueError> AgentCertificateAuthority::issue(const std::string &csrPem, const std::int64_t nodeId,
+                                                                                                       const std::string &nodeName)
     {
         if (!m_implementation || !m_implementation->options.enabled)
         {
-            return std::unexpected("Agent 内部 CA 未启用，无法签发证书");
+            return issuanceFailure("Agent 内部 CA 未启用，无法签发证书");
         }
         if (nodeId <= 0)
         {
-            return std::unexpected("节点标识必须是正整数");
+            return requestFailure("节点标识必须是正整数");
         }
         if (nodeName.empty())
         {
-            return std::unexpected("节点名称不能为空");
+            return issuanceFailure("节点名称不能为空");
         }
         if (nodeName.size() > kMaximumNodeNameLength || nodeName.find('\0') != std::string::npos)
         {
-            return std::unexpected("节点名称不能超过 128 字节，且不能包含空字符");
+            return issuanceFailure("节点名称不能超过 128 字节，且不能包含空字符");
         }
         // 落库的是审计用紧凑主题而不是 RFC 2253：后者会把每个非 ASCII 字节转义成四个字符，128 字节节点名可超过 255
         const std::string auditSubject = "CN=" + nodeName;
         if (auditSubject.size() > kMaximumSubjectLength)
         {
-            return std::unexpected("节点名称拼成审计主题后超过 255 字节，无法写入证书历史：" + std::to_string(auditSubject.size()) + " 字节");
+            return issuanceFailure("节点名称拼成审计主题后超过 255 字节，无法写入证书历史：" + std::to_string(auditSubject.size()) + " 字节");
         }
         if (csrPem.empty())
         {
-            return std::unexpected("CSR 为空：请提交 PEM 编码的 PKCS#10 请求");
+            return requestFailure("CSR 为空：请提交 PEM 编码的 PKCS#10 请求");
         }
 
         BioHandle csrBio(BIO_new_mem_buf(csrPem.data(), static_cast<int>(csrPem.size())), &BIO_free);
         if (!csrBio)
         {
-            return std::unexpected("CSR 解析失败：无法创建内存缓冲");
+            return issuanceFailure("CSR 解析失败：无法创建内存缓冲");
         }
         ReqHandle request(PEM_read_bio_X509_REQ(csrBio.get(), nullptr, nullptr, nullptr), &X509_REQ_free);
         if (!request)
         {
-            return std::unexpected("CSR 解析失败：请提交 PEM 编码的 PKCS#10 请求");
+            return requestFailure("CSR 解析失败：请提交 PEM 编码的 PKCS#10 请求");
         }
         EVP_PKEY *publicKey = X509_REQ_get0_pubkey(request.get());
         if (publicKey == nullptr)
         {
-            return std::unexpected("CSR 解析失败：请求没有携带公钥");
+            return requestFailure("CSR 解析失败：请求没有携带公钥");
         }
         if (X509_REQ_verify(request.get(), publicKey) != 1)
         {
-            return std::unexpected("CSR 自签名校验失败：请求可能被篡改，或公钥与签名不匹配");
+            return requestFailure("CSR 自签名校验失败：请求可能被篡改，或公钥与签名不匹配");
         }
         if (const auto error = publicKeyError(*publicKey))
         {
-            return std::unexpected(*error);
+            return requestFailure(*error);
         }
         if (const auto error = caRequestError(*request))
         {
-            return std::unexpected(*error);
+            return requestFailure(*error);
         }
 
         std::array<unsigned char, kSerialBytes> serialBytes{};
@@ -606,59 +627,59 @@ namespace EdgePulse::Device
         {
             if (RAND_bytes(serialBytes.data(), static_cast<int>(serialBytes.size())) != 1)
             {
-                return std::unexpected("生成证书序列号失败：随机数源不可用");
+                return issuanceFailure("生成证书序列号失败：随机数源不可用");
             }
             nonZero = std::any_of(serialBytes.begin(), serialBytes.end(), [](const unsigned char value) { return value != 0; });
         }
         BignumHandle serialNumber(BN_bin2bn(serialBytes.data(), static_cast<int>(serialBytes.size()), nullptr), &BN_free);
         if (!serialNumber)
         {
-            return std::unexpected("生成证书序列号失败：无法构造大整数");
+            return issuanceFailure("生成证书序列号失败：无法构造大整数");
         }
 
         CertHandle certificate(X509_new(), &X509_free);
         if (!certificate)
         {
-            return std::unexpected("创建证书失败：OpenSSL 没有返回证书对象");
+            return issuanceFailure("创建证书失败：OpenSSL 没有返回证书对象");
         }
         if (X509_set_version(certificate.get(), 2) != 1)
         {
-            return std::unexpected("创建证书失败：无法设置 X.509 v3 版本");
+            return issuanceFailure("创建证书失败：无法设置 X.509 v3 版本");
         }
         if (BN_to_ASN1_INTEGER(serialNumber.get(), X509_get_serialNumber(certificate.get())) == nullptr)
         {
-            return std::unexpected("创建证书失败：无法写入随机序列号");
+            return issuanceFailure("创建证书失败：无法写入随机序列号");
         }
         if (X509_set_pubkey(certificate.get(), publicKey) != 1)
         {
-            return std::unexpected("创建证书失败：无法写入 CSR 公钥");
+            return issuanceFailure("创建证书失败：无法写入 CSR 公钥");
         }
         if (X509_set_issuer_name(certificate.get(), X509_get_subject_name(m_implementation->certificate.get())) != 1)
         {
-            return std::unexpected("创建证书失败：无法写入签发者主题");
+            return issuanceFailure("创建证书失败：无法写入签发者主题");
         }
 
         NameHandle subject(X509_NAME_new(), &X509_NAME_free);
         if (!subject)
         {
-            return std::unexpected("创建证书失败：无法创建主题");
+            return issuanceFailure("创建证书失败：无法创建主题");
         }
         if (X509_NAME_add_entry_by_txt(subject.get(), "CN", MBSTRING_UTF8, reinterpret_cast<const unsigned char *>(nodeName.c_str()), -1, -1, 0) != 1)
         {
-            return std::unexpected("创建证书失败：无法写入节点名称");
+            return issuanceFailure("创建证书失败：无法写入节点名称");
         }
         if (X509_set_subject_name(certificate.get(), subject.get()) != 1)
         {
-            return std::unexpected("创建证书失败：无法设置证书主题");
+            return issuanceFailure("创建证书失败：无法设置证书主题");
         }
 
         if (X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -kNotBeforeBackdateSeconds) == nullptr)
         {
-            return std::unexpected("创建证书失败：无法设置生效时间");
+            return issuanceFailure("创建证书失败：无法设置生效时间");
         }
         if (X509_gmtime_adj(X509_getm_notAfter(certificate.get()), static_cast<long>(m_implementation->options.validityDays) * 24L * 60L * 60L) == nullptr)
         {
-            return std::unexpected("创建证书失败：无法设置到期时间");
+            return issuanceFailure("创建证书失败：无法设置到期时间");
         }
 
         X509V3_CTX context;
@@ -666,61 +687,61 @@ namespace EdgePulse::Device
         X509V3_set_ctx(&context, m_implementation->certificate.get(), certificate.get(), nullptr, nullptr, 0);
         if (const auto error = addExtension(*certificate, context, NID_basic_constraints, "critical,CA:FALSE"))
         {
-            return std::unexpected(*error);
+            return issuanceFailure(*error);
         }
         if (const auto error = addExtension(*certificate, context, NID_key_usage, "critical,digitalSignature,keyEncipherment"))
         {
-            return std::unexpected(*error);
+            return issuanceFailure(*error);
         }
         if (const auto error = addExtension(*certificate, context, NID_ext_key_usage, "clientAuth"))
         {
-            return std::unexpected(*error);
+            return issuanceFailure(*error);
         }
         if (const auto error = addExtension(*certificate, context, NID_subject_alt_name, "URI:edgepulse://node/" + std::to_string(nodeId)))
         {
-            return std::unexpected(*error);
+            return issuanceFailure(*error);
         }
 
         if (X509_sign(certificate.get(), m_implementation->privateKey.get(), EVP_sha256()) == 0)
         {
-            return std::unexpected("证书签名失败：CA 私钥无法完成 SHA-256 签名");
+            return issuanceFailure("证书签名失败：CA 私钥无法完成 SHA-256 签名");
         }
 
         BioHandle pemBio(BIO_new(BIO_s_mem()), &BIO_free);
         if (!pemBio)
         {
-            return std::unexpected("输出证书失败：无法创建内存缓冲");
+            return issuanceFailure("输出证书失败：无法创建内存缓冲");
         }
         if (PEM_write_bio_X509(pemBio.get(), certificate.get()) != 1)
         {
-            return std::unexpected("输出证书失败：无法写出 PEM 文本");
+            return issuanceFailure("输出证书失败：无法写出 PEM 文本");
         }
         char      *pemBuffer = nullptr;
         const long pemLength = BIO_get_mem_data(pemBio.get(), &pemBuffer);
         if (pemBuffer == nullptr || pemLength <= 0)
         {
-            return std::unexpected("输出证书失败：PEM 文本为空");
+            return issuanceFailure("输出证书失败：PEM 文本为空");
         }
 
         const auto fingerprint = fingerprintOf(*certificate);
         if (!fingerprint)
         {
-            return std::unexpected(fingerprint.error());
+            return issuanceFailure(fingerprint.error());
         }
         const auto serial = hexOf(*serialNumber);
         if (!serial)
         {
-            return std::unexpected(serial.error());
+            return issuanceFailure(serial.error());
         }
         const auto notBefore = formatAsn1Time(X509_get0_notBefore(certificate.get()));
         if (!notBefore)
         {
-            return std::unexpected(notBefore.error());
+            return issuanceFailure(notBefore.error());
         }
         const auto notAfter = formatAsn1Time(X509_get0_notAfter(certificate.get()));
         if (!notAfter)
         {
-            return std::unexpected(notAfter.error());
+            return issuanceFailure(notAfter.error());
         }
 
         IssuedAgentCertificate issued;

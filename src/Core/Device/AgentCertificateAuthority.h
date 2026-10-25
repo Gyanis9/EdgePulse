@@ -44,6 +44,24 @@ namespace EdgePulse::Device
     };
 
     /**
+     * @brief 一次签发的失败类别
+     */
+    enum class AgentCertificateIssueFailure
+    {
+        InvalidRequest, ///< 请求材料不合法：节点标识、名称或 CSR 内容
+        Internal,       ///< 签发侧失败：随机数、证书构造、签名或输出
+    };
+
+    /**
+     * @brief 一次签发失败的原因
+     */
+    struct AgentCertificateIssueError
+    {
+        AgentCertificateIssueFailure reason{AgentCertificateIssueFailure::Internal}; ///< 机器可判的类别
+        std::string                  message;                                        ///< 中文原因，不回显 CSR 或私钥
+    };
+
+    /**
      * @brief 用控制面私钥为 Agent 的 CSR 签发终端证书
      * @details CSR 只提供公钥与自签证明，主题、有效期与全部扩展都由服务端重建：
      *          主题固定为 CN=节点名，SAN 为 URI:edgepulse://node/<节点标识>，
@@ -73,9 +91,9 @@ namespace EdgePulse::Device
          * @param csrPem CSR 的 PEM 文本
          * @param nodeId 节点标识，必须为正整数，用于拼 SAN URI
          * @param nodeName 节点名，用作证书主题 CN
-         * @return 成功返回证书 PEM、指纹、序列号、主题与起止时间；失败返回中文原因，不回显 CSR 或私钥内容
+         * @return 成功返回证书 PEM、指纹、序列号、主题与起止时间；失败返回类别与中文原因，不回显 CSR 或私钥内容
          */
-        [[nodiscard]] std::expected<IssuedAgentCertificate, std::string> issue(const std::string &csrPem, std::int64_t nodeId, const std::string &nodeName);
+        [[nodiscard]] std::expected<IssuedAgentCertificate, AgentCertificateIssueError> issue(const std::string &csrPem, std::int64_t nodeId, const std::string &nodeName);
 
         /**
          * @brief 是否已启用签发

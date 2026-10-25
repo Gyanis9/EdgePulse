@@ -431,7 +431,7 @@ TEST(AgentCertificateAuthority, IssuesServerOwnedIdentityFromCsr)
 
     const std::time_t issuedAt = std::time(nullptr);
     const auto        issued   = authority->issue(csr, 42, "edge-42");
-    ASSERT_TRUE(issued.has_value()) << issued.error();
+    ASSERT_TRUE(issued.has_value()) << issued.error().message;
 
     EXPECT_EQ(std::string::npos, issued->certificatePem.find("PRIVATE KEY"));
     EXPECT_EQ(0U, issued->certificatePem.find("-----BEGIN CERTIFICATE-----"));
@@ -499,7 +499,7 @@ TEST(AgentCertificateAuthority, IssuesServerOwnedIdentityFromCsr)
     EXPECT_NEAR(static_cast<double>(epochOf(X509_get0_notAfter(certificate.get()))), static_cast<double>(issuedAt + 30 * 24 * 60 * 60), 120.0);
 
     const auto second = authority->issue(csr, 42, "edge-42");
-    ASSERT_TRUE(second.has_value()) << second.error();
+    ASSERT_TRUE(second.has_value()) << second.error().message;
     EXPECT_NE(issued->serial, second->serial);
 }
 
@@ -513,7 +513,7 @@ TEST(AgentCertificateAuthority, AcceptsRsa3072Csr)
     const KeyHandle   key    = generateRsaKey(3072U);
     const std::string csr    = makeCertificateRequest(*key, "rsa-agent", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 7, "edge-rsa");
-    ASSERT_TRUE(issued.has_value()) << issued.error();
+    ASSERT_TRUE(issued.has_value()) << issued.error().message;
     EXPECT_EQ("edge-rsa", commonNameOf(*parseCertificate(issued->certificatePem)));
 }
 
@@ -530,8 +530,8 @@ TEST(AgentCertificateAuthority, RejectsCsrWithBrokenSignature)
 
     const auto issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
-    EXPECT_NE(std::string::npos, issued.error().find("签名"));
-    expectNoSensitiveMaterial(issued.error());
+    EXPECT_NE(std::string::npos, issued.error().message.find("签名"));
+    expectNoSensitiveMaterial(issued.error().message);
 }
 
 TEST(AgentCertificateAuthority, RejectsCaTrueCsr)
@@ -545,8 +545,8 @@ TEST(AgentCertificateAuthority, RejectsCaTrueCsr)
     const std::string csr    = makeCertificateRequest(*key, "ca-request", CsrConstraints::CaTrue);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
-    EXPECT_NE(std::string::npos, issued.error().find("CA"));
-    expectNoSensitiveMaterial(issued.error());
+    EXPECT_NE(std::string::npos, issued.error().message.find("CA"));
+    expectNoSensitiveMaterial(issued.error().message);
 }
 
 TEST(AgentCertificateAuthority, RejectsNonP256EcCsr)
@@ -560,8 +560,8 @@ TEST(AgentCertificateAuthority, RejectsNonP256EcCsr)
     const std::string csr    = makeCertificateRequest(*key, "p384-agent", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
-    EXPECT_NE(std::string::npos, issued.error().find("P-256"));
-    expectNoSensitiveMaterial(issued.error());
+    EXPECT_NE(std::string::npos, issued.error().message.find("P-256"));
+    expectNoSensitiveMaterial(issued.error().message);
 }
 
 TEST(AgentCertificateAuthority, RejectsWeakRsaCsr)
@@ -575,8 +575,8 @@ TEST(AgentCertificateAuthority, RejectsWeakRsaCsr)
     const std::string csr    = makeCertificateRequest(*key, "weak-rsa", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
-    EXPECT_NE(std::string::npos, issued.error().find("3072"));
-    expectNoSensitiveMaterial(issued.error());
+    EXPECT_NE(std::string::npos, issued.error().message.find("3072"));
+    expectNoSensitiveMaterial(issued.error().message);
 }
 
 TEST(AgentCertificateAuthority, RejectsEmptyAndGarbageCsr)
@@ -590,8 +590,8 @@ TEST(AgentCertificateAuthority, RejectsEmptyAndGarbageCsr)
     {
         const auto issued = authority->issue(csr, 1, "edge-1");
         ASSERT_FALSE(issued.has_value());
-        EXPECT_NE(std::string::npos, issued.error().find("CSR"));
-        expectNoSensitiveMaterial(issued.error());
+        EXPECT_NE(std::string::npos, issued.error().message.find("CSR"));
+        expectNoSensitiveMaterial(issued.error().message);
     }
 }
 
@@ -612,8 +612,8 @@ TEST(AgentCertificateAuthority, RejectsDisabledAuthority)
     const std::string csr    = makeCertificateRequest(*key, "disabled", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 1, "edge-1");
     ASSERT_FALSE(issued.has_value());
-    EXPECT_NE(std::string::npos, issued.error().find("未启用"));
-    expectNoSensitiveMaterial(issued.error());
+    EXPECT_NE(std::string::npos, issued.error().message.find("未启用"));
+    expectNoSensitiveMaterial(issued.error().message);
 }
 
 TEST(AgentCertificateAuthority, RejectsMismatchedCertificateAndKey)
@@ -675,19 +675,19 @@ TEST(AgentCertificateAuthority, RejectsInvalidNodeIdentity)
 
     const auto invalidId = authority->issue(csr, 0, "edge-1");
     ASSERT_FALSE(invalidId.has_value());
-    EXPECT_NE(std::string::npos, invalidId.error().find("节点标识"));
+    EXPECT_NE(std::string::npos, invalidId.error().message.find("节点标识"));
 
     const auto negativeId = authority->issue(csr, -1, "edge-1");
     ASSERT_FALSE(negativeId.has_value());
-    EXPECT_NE(std::string::npos, negativeId.error().find("节点标识"));
+    EXPECT_NE(std::string::npos, negativeId.error().message.find("节点标识"));
 
     const auto emptyName = authority->issue(csr, 1, "");
     ASSERT_FALSE(emptyName.has_value());
-    EXPECT_NE(std::string::npos, emptyName.error().find("节点名称"));
+    EXPECT_NE(std::string::npos, emptyName.error().message.find("节点名称"));
 
     const auto tooLongName = authority->issue(csr, 1, std::string(129, 'a'));
     ASSERT_FALSE(tooLongName.has_value());
-    EXPECT_NE(std::string::npos, tooLongName.error().find("128"));
+    EXPECT_NE(std::string::npos, tooLongName.error().message.find("128"));
 }
 
 TEST(AgentCertificateAuthority, KeepsIssuedCertificatePublicKeyAndConfiguredValidity)
@@ -705,7 +705,7 @@ TEST(AgentCertificateAuthority, KeepsIssuedCertificatePublicKeyAndConfiguredVali
 
     const std::time_t issuedAt = std::time(nullptr);
     const auto        issued   = authority->issue(csr, 11, "edge-11");
-    ASSERT_TRUE(issued.has_value()) << issued.error();
+    ASSERT_TRUE(issued.has_value()) << issued.error().message;
 
     const CertHandle certificate = parseCertificate(issued->certificatePem);
     const ReqHandle  request     = parseRequest(csr);
@@ -730,7 +730,7 @@ TEST(AgentCertificateAuthority, AcceptsCaFalseCsr)
     const KeyHandle   key    = generateEcKey("prime256v1");
     const std::string csr    = makeCertificateRequest(*key, "explicit-leaf", CsrConstraints::CaFalse);
     const auto        issued = authority->issue(csr, 12, "edge-12");
-    ASSERT_TRUE(issued.has_value()) << issued.error();
+    ASSERT_TRUE(issued.has_value()) << issued.error().message;
     const CertHandle certificate = parseCertificate(issued->certificatePem);
 
     const std::unique_ptr<BASIC_CONSTRAINTS, decltype(&BASIC_CONSTRAINTS_free)> constraints(
@@ -757,7 +757,7 @@ TEST(AgentCertificateAuthority, UsesCompactAuditSubjectForLongNonAsciiNodeName)
     const KeyHandle   key    = generateEcKey("prime256v1");
     const std::string csr    = makeCertificateRequest(*key, "ignored-csr-name", CsrConstraints::Absent);
     const auto        issued = authority->issue(csr, 13, nodeName);
-    ASSERT_TRUE(issued.has_value()) << issued.error();
+    ASSERT_TRUE(issued.has_value()) << issued.error().message;
 
     EXPECT_EQ("CN=" + nodeName, issued->subject);
     EXPECT_LE(issued->subject.size(), 255U);

@@ -247,6 +247,15 @@ namespace EdgePulse::Device
                                                                                    std::int64_t expectedVersion, AgentCertificateRotation rotation);
 
         /**
+         * @brief 查询节点最近一次证书签发时间
+         * @param loop 恢复协程用的事件循环
+         * @param tenant 本次查询的租户边界；边界外的节点返回空
+         * @param nodeId 节点标识
+         * @return 历史中存在签发记录时返回 issued_at，否则为空
+         */
+        AsynGyanis::Core::Task<std::optional<std::string>> lastCertificateIssuedAt(AsynGyanis::Core::EventLoop &loop, System::TenantScope tenant, std::int64_t nodeId);
+
+        /**
          * @brief 统计指定天数内到期或已经到期的证书
          * @param loop 恢复协程用的事件循环
          * @param withinDays 观察窗口天数
