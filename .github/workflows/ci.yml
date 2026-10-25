@@ -143,6 +143,38 @@ jobs:
       - name: Backup and restore round trip
         run: python scripts/backup_restore_mysql_test.py
 
+  # 双实例 HA 验收用真实 Compose 起 MySQL/Redis/两实例/nginx，并做 SIGTERM/SIGKILL 切换。
+  # 镜像构建在 4 核 runner 上通常需要十几分钟，因此单独成 Job 并给足超时；本地发布前
+  # 仍必须跑同一命令，CI 只是补充回归。脚本自己在 finally 里 down -v，最后一步再兜底清理。
+  ha-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Show Docker versions
+        run: docker version && docker compose version
+      - name: HA two-instance acceptance
+        run: python scripts/check-ha-stack.py --build --require-docker
+      - name: Cleanup HA stack
+        if: always()
+        run: |
+          env_file=build/gate/ha/ha.env
+          override=build/gate/ha/docker-compose.ha.test.yml
+          if [ -f "$env_file" ] && [ -f "$override" ]; then
+            docker compose -p edgepulse-ha-check --project-directory deploy/docker \
+              --env-file "$env_file" --profile agent-ca -f deploy/docker/docker-compose.ha.yml -f "$override" \
+              down -v --remove-orphans || true
+          fi
+          ids=$(docker ps -aq --filter label=com.docker.compose.project=edgepulse-ha-check)
+          if [ -n "$ids" ]; then xargs -r docker rm -f <<< "$ids"; fi
+          volumes=$(docker volume ls -q --filter label=com.docker.compose.project=edgepulse-ha-check)
+          if [ -n "$volumes" ]; then xargs -r docker volume rm <<< "$volumes"; fi
+
   agent-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
