@@ -127,6 +127,8 @@ def compose(*arguments: str, check: bool = True, timeout: float = 600.0, input_t
         "docker", "compose", "-p", PROJECT,
         "--project-directory", str(COMPOSE_DIR),
         "--env-file", str(ENV_FILE),
+        # 验收配置启用 agent_ca；ca-key-init 只在 agent-ca profile 下启动
+        "--profile", "agent-ca",
         "-f", str(BASE_COMPOSE),
         "-f", str(OVERRIDE),
         *arguments,
@@ -367,6 +369,27 @@ def wait_ready(port: int, timeout: float = 180.0) -> bool:
     return bool(wait_until(probe, timeout, 1.0))
 
 
+def wait_ready_status(port: int, expected: int, timeout: float = 60.0) -> bool:
+    """等待 /readyz 返回指定状态；Redis 停机与恢复都靠它观察，不把连接错误算作命中。"""
+    def probe() -> bool:
+        try:
+            status, _ = readyz(port)
+        except (OSError, http.client.HTTPException, ssl.SSLError):
+            return False
+        return status == expected
+    return bool(wait_until(probe, timeout, 1.0))
+
+
+def sample_allowed_origins() -> tuple[bool, str]:
+    """静态检查交付样例：HA 发布的 8443 端口必须出现在 allowed_origins 中。"""
+    text = (ROOT / "config" / "prod.yaml.example").read_text(encoding="utf-8")
+    match = re.search(r"^\s*allowed_origins:\s*(.+)$", text, flags=re.MULTILINE)
+    if match is None:
+        return False, "config/prod.yaml.example 缺少 security.allowed_origins"
+    origins = [item.strip() for item in match.group(1).split(",") if item.strip()]
+    return "https://console.example.com:8443" in origins, ",".join(origins)
+
+
 def login(port: int) -> str | None:
     status, captcha = request_json("GET", f"http://{HOST}:{port}/api/auth/captcha")
     data = captcha.get("data") or {}
@@ -522,6 +545,22 @@ class WebSocketConnection:
                 self._send_control(0xA, payload)
         return None
 
+    def wait_for_close(self, timeout: float) -> tuple[int, str] | None:
+        """等待服务端 Close 帧并返回状态码与原因；只用于断言 1008 这类策略关闭。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.1, deadline - time.time())
+            try:
+                opcode, payload = self.receive(remaining)
+            except socket.timeout:
+                continue
+            if opcode == 0x8:
+                code = int.from_bytes(payload[:2], "big") if len(payload) >= 2 else 1005
+                return code, payload[2:].decode("utf-8", "replace")
+            if opcode == 0x9:
+                self._send_control(0xA, payload)
+        return None
+
     def close(self) -> None:
         try:
             self._send_control(0x8)
@@ -533,10 +572,11 @@ class WebSocketConnection:
             pass
 
 
-def check_browser_websocket(port: int, token: str) -> tuple[bool, str]:
+def check_browser_websocket(port: int, token: str, context: ssl.SSLContext | None = None,
+                            origin: str | None = None) -> tuple[bool, str]:
     connection: WebSocketConnection | None = None
     try:
-        connection = WebSocketConnection(HOST, port, "/api/ws", f"http://{HOST}:{port}")
+        connection = WebSocketConnection(HOST, port, "/api/ws", origin or f"http://{HOST}:{port}", context)
         connection.send_text(json.dumps({"type": "auth", "token": token}))
         acknowledgement = connection.wait_for_text(10.0) or ""
         if not acknowledgement:
@@ -551,6 +591,39 @@ def check_browser_websocket(port: int, token: str) -> tuple[bool, str]:
     finally:
         if connection is not None:
             connection.close()
+
+
+def check_ws_origin_rejected(port: int, origin: str) -> tuple[bool, str]:
+    """未列入 allowed_origins 的浏览器 Origin 必须在升级前收到 403。"""
+    connection: WebSocketConnection | None = None
+    try:
+        connection = WebSocketConnection(HOST, port, "/api/ws", origin)
+        return False, "握手未被拒绝"
+    except RuntimeError as failure:
+        return " 403 " in str(failure), str(failure)
+    except (OSError, ssl.SSLError, http.client.HTTPException) as failure:
+        return False, str(failure)
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def sse_probe(port: int, token: str, context: ssl.SSLContext | None = None,
+              timeout: float = 10.0) -> tuple[int, dict[str, str]]:
+    """只读 SSE 响应头：服务端先发 ready 事件，getresponse 在收到头部后立即返回。"""
+    if context is not None:
+        connection = http.client.HTTPSConnection(HOST, port, context=context, timeout=timeout)
+    else:
+        connection = http.client.HTTPConnection(HOST, port, timeout=timeout)
+    try:
+        connection.request("GET", "/api/events/alarms", headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "text/event-stream",
+        })
+        response = connection.getresponse()
+        return response.status, {key.lower(): value for key, value in response.getheaders()}
+    finally:
+        connection.close()
 
 
 def app_log(service: str) -> str:
@@ -632,6 +705,9 @@ def main() -> int:
         report("验收端口空闲", False, "被占用：" + ", ".join(busy))
         return 1
     report("验收端口空闲", True)
+
+    origins_ok, origins_detail = sample_allowed_origins()
+    report("交付样例 allowed_origins 覆盖 HA 发布端口 8443", origins_ok, origins_detail)
 
     try:
         prepare()
@@ -738,6 +814,20 @@ def main() -> int:
 
         browser_ok, browser_detail = check_browser_websocket(NGINX_HTTP, token)
         report("nginx 8080 /api/ws 升级成功（101）", browser_ok, browser_detail)
+
+        nginx_tls = ssl.create_default_context(cafile=str(CERTS / "ca.pem"))
+        wss_ok, wss_detail = check_browser_websocket(NGINX_HTTPS, token, context=nginx_tls,
+                                                     origin=f"https://{HOST}:{NGINX_HTTPS}")
+        report("nginx 8443 WSS /api/ws 升级成功（101）", wss_ok, wss_detail)
+        rejected_ok, rejected_detail = check_ws_origin_rejected(NGINX_HTTP, "https://evil.example.com")
+        report("nginx 拒绝未列入 allowed_origins 的 WebSocket Origin", rejected_ok, rejected_detail)
+        try:
+            sse_status, sse_headers = sse_probe(NGINX_HTTPS, token, context=nginx_tls)
+        except (OSError, ssl.SSLError, http.client.HTTPException) as failure:
+            sse_status, sse_headers = 0, {"error": str(failure)}
+        content_type = sse_headers.get("content-type", "")
+        report("nginx 8443 SSE 返回 text/event-stream", sse_status == 200 and "text/event-stream" in content_type,
+               f"HTTP {sse_status}，content-type={content_type or sse_headers.get('error', '无')}")
 
         # 用开发 Agent 证书注册一个真实节点，再用同一证书建 WS；节点身份由 mTLS 指纹核对。
         # 注册走 nginx 的 9443 TCP 透传，证明这条链路没有被 L7 终止。
@@ -858,6 +948,32 @@ def main() -> int:
                    verify.returncode == 0 and observed == renewal_fingerprint, (verify.stdout or verify.stderr).strip()[-300:])
         else:
             report("续期证书由配置的 CA 验证通过且指纹一致", False, "续期响应没有证书")
+
+        # 在实例 A 建立一条已登记的 Agent WS，再从实例 B 吊销该节点证书：关闭消息必须
+        # 经 Redis 转到 A，并把 A 上这条连接以 1008 关闭。前面的命令、固件与续期检查
+        # 都已完成，吊销不会影响它们。
+        revoke_ws = WebSocketConnection(HOST, INSTANCES["edgepulse-1"]["agent"], "/api/agent/ws",
+                                        f"https://{HOST}:{NGINX_HTTPS}", client_context)
+        try:
+            revoke_ws.send_text(json.dumps({"type": "hello", "nodeId": node_id, "agentVersion": "ha-check"}))
+            revoke_hello = revoke_ws.wait_for_text(10.0) or ""
+            revoke_hello_ok = False
+            if revoke_hello:
+                try:
+                    revoke_hello_ok = json.loads(revoke_hello).get("type") == "hello"
+                except json.JSONDecodeError:
+                    revoke_hello_ok = False
+            report("吊销前在实例 A 登记新的 Agent WS", revoke_hello_ok, revoke_hello or "10 秒内没有应答")
+            if not revoke_hello_ok:
+                return 1
+            status, _ = request_json("POST", f"http://{HOST}:{INSTANCES['edgepulse-2']['http']}/api/nodes/{node_id}/certificate/revoke",
+                                     token=token)
+            closed = revoke_ws.wait_for_close(15.0)
+            report("实例 B 吊销节点证书后实例 A 的 Agent WS 以 1008 关闭",
+                   status == 200 and closed is not None and closed[0] == 1008,
+                   f"HTTP {status}，close={closed[0] if closed else '无'}（{(closed[1] if closed else '15 秒内未收到关闭帧')}）")
+        finally:
+            revoke_ws.close()
 
         leader_state = wait_leader(30.0)
         report("sys_lease 选出 leader", leader_state is not None, f"holder={leader_state[0] if leader_state else '无'}，fence={leader_state[1] if leader_state else 0}")
@@ -1026,12 +1142,13 @@ def main() -> int:
             LEADER_TAKEOVER_LIMIT + 10.0, 0.5,
         )
         crash_elapsed = time.monotonic() - crash_started
-        # 旧 holder 的 expires_at 仍在未来时不允许立即接手；留 2 秒给轮询与整数秒截断
-        waited_for_expiry = remaining is None or crash_elapsed + 2.0 >= max(0, remaining)
+        # 旧 holder 的 expires_at 仍在未来时不允许立即接手；留 2 秒给轮询与整数秒截断。
+        # 读不到剩余时间不能当成“未提前”：那会把无法证明的接管报成通过。
+        waited_for_expiry = remaining is not None and crash_elapsed + 2.0 >= max(0, remaining)
         report("崩溃后新 leader 在 2 个 TTL 内接管且未提前抢占",
                crash_takeover is not None and crash_elapsed <= LEADER_TAKEOVER_LIMIT and waited_for_expiry,
                f"{crash_elapsed:.2f} 秒，holder={crash_takeover[0] if crash_takeover else '无'}，fence={crash_takeover[1] if crash_takeover else 0}，"
-               f"剩余 {remaining if remaining is not None else '?'} 秒")
+               f"剩余 {remaining if remaining is not None else '读取失败'} 秒")
         if crash_takeover is None:
             return 1
         report("崩溃接管后新 leader /readyz 就绪", wait_ready(INSTANCES[leader]["ops"], 60.0))
@@ -1045,6 +1162,17 @@ def main() -> int:
         report("崩溃重启的旧 holder 不清空新租约",
                after_crash_restart is not None and after_crash_restart[0] == leader and after_crash_restart[1] == crash_takeover[1],
                f"holder={after_crash_restart[0] if after_crash_restart else '无'}，fence={after_crash_restart[1] if after_crash_restart else 0}")
+
+        # 共享 Redis 是 /readyz 的第三项依赖：停掉后两个实例都必须变 503，恢复后都回到 200。
+        # 放在最后执行，避免会话或命令路由断言受 Redis 停机影响。
+        redis_stop = compose("stop", "redis", timeout=60, check=False)
+        report("停止共享 Redis", redis_stop.returncode == 0, (redis_stop.stderr or redis_stop.stdout).strip()[-200:])
+        report("停止 Redis 后实例 A /readyz 返回 503", wait_ready_status(INSTANCES["edgepulse-1"]["ops"], 503, 60.0))
+        report("停止 Redis 后实例 B /readyz 返回 503", wait_ready_status(INSTANCES["edgepulse-2"]["ops"], 503, 60.0))
+        redis_start = compose("start", "redis", timeout=120, check=False)
+        report("重新启动共享 Redis", redis_start.returncode == 0, (redis_start.stderr or redis_start.stdout).strip()[-200:])
+        report("Redis 恢复后实例 A /readyz 回到 200", wait_ready(INSTANCES["edgepulse-1"]["ops"], 120.0))
+        report("Redis 恢复后实例 B /readyz 回到 200", wait_ready(INSTANCES["edgepulse-2"]["ops"], 120.0))
     except Exception as failure:  # noqa: BLE001
         import traceback
         traceback.print_exc()
