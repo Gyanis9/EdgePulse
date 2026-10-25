@@ -45,6 +45,9 @@ services:
       EDGEPULSE_OIDC_CLIENT_SECRET: ${EDGEPULSE_OIDC_CLIENT_SECRET:-}
       EDGEPULSE_MFA_KEY: ${EDGEPULSE_MFA_KEY:-}
       EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
+      # 种子管理员仍为 admin123 时由应用在启动期替换；生产缺省且未显式确认会拒绝启动
+      EDGEPULSE_ADMIN_PASSWORD: ${EDGEPULSE_ADMIN_PASSWORD:-}
+      EDGEPULSE_ALLOW_DEFAULT_ADMIN: ${EDGEPULSE_ALLOW_DEFAULT_ADMIN:-false}
     volumes:
       - ../../config:/app/config:ro
       # 只挂应用实际读取的三个文件；var/certs 里的 ca-key.pem 不进入容器。

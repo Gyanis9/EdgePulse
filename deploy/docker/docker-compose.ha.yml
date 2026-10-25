@@ -47,6 +47,7 @@ x-edgepulse-environment: &edgepulse-environment
   EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
   # 种子管理员仍是 admin123 时由应用在启动期替换；生产档缺失且未改过口令会拒绝启动
   EDGEPULSE_ADMIN_PASSWORD: ${EDGEPULSE_ADMIN_PASSWORD:-}
+  EDGEPULSE_ALLOW_DEFAULT_ADMIN: ${EDGEPULSE_ALLOW_DEFAULT_ADMIN:-false}
 
 x-edgepulse-service: &edgepulse-service
   image: ${EDGEPULSE_HA_IMAGE:-edgepulse:ha}

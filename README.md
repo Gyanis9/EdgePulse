@@ -107,7 +107,7 @@ bash scripts/dev-certs.sh     # CA、服务器、Agent 与对照证书，写入�
 bash scripts/run-dev.sh       # 生成/读取运维令牌并前台启动 edgepulse-server
 ```
 
-打开 `http://127.0.0.1:8080`。迁移 `V2__seed.sql` 在开发档与生产档都会创建种子账号 `admin` / `admin123`（`EDGEPULSE_INITIAL_PASSWORD` 不会改它）。首次登录后必须改密；生产实例在改密前不要对外暴露。
+打开 `http://127.0.0.1:8080`。迁移 `V2__seed.sql` 仍会插入种子账号 `admin` / `admin123`。生产档启动时若该账号仍验证通过种子口令且未设置 `EDGEPULSE_ADMIN_PASSWORD`，应用会拒绝启动；设置后由启动期替换哈希并清零失败计数。开发档（`captcha.expose_code=true`）或显式设置 `EDGEPULSE_ALLOW_DEFAULT_ADMIN=true` 才保留种子口令；`EDGEPULSE_INITIAL_PASSWORD` 不会改它。
 
 ### 前端开发
 
@@ -305,7 +305,7 @@ running/paused/failed -> rolling_back -> rolled_back | rollback_unavailable | fa
 
 - 只有 leader 的 `LeaderTick` 每 5 秒调用一次推进，服务自身不判断领导权；每个发布以头部 `version` 做比较交换，follower 不推进。leader 切换可能让某一拍或一次租约过期的推进延后。
 - V22 新增 `biz_firmware_rollout`、`biz_firmware_rollout_wave`、`biz_firmware_rollout_target`，并给任务加 `rollout_id/wave_id/command_id`、给节点加 `installed_firmware_version`；V23 增加 `(rollout_id,wave_index)` 唯一索引，V24 把未绑定命令的任务改成唯一负值占位并增加 `(firmware_id,node_id,command_id)` 唯一索引。迁移只追加，升级前照常备份。
-- 已知限制：目标只接受节点标识，界面没有分组选择；波次与目标的多次写入和发布头 CAS 不在同一事务，崩溃后由下一拍按目标状态继续；`listDueRollouts` 固定 `LIMIT 20`，大批积压时较新的发布会排队，已登记为 P11 审计项。
+- 已知限制：目标只接受节点标识，界面没有分组选择；波次与目标的多次写入和发布头 CAS 不在同一事务，崩溃后由下一拍按目标状态继续；`listDueRollouts` 已改为主键游标分页、每拍窗口 100，活动发布不会因固定窗口被长期饿死，但分组目标与单目标派发成本仍未展开。
 
 节点通过心跳上报 `installedFirmwareVersion`，空值不会清空已有版本；Agent 的固件状态上报可带 `commandId`，只推进该命令绑定的任务，避免不同波次或手工下发的任务互相覆盖。
 
@@ -380,11 +380,11 @@ python scripts/check-ha-stack.py --require-docker
 
 ## 部署
 
-- Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌后 `docker compose up -d`；需要两步验证时再填入 `EDGEPULSE_MFA_KEY`（`openssl rand -base64 32`）。样例含 MySQL 8、Redis 7 与 Prometheus，是单实例/开发编排，不提供故障切换。首次登录后必须修改 `admin` 的种子口令 `admin123`。
+- Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌与 `EDGEPULSE_ADMIN_PASSWORD` 后 `docker compose up -d`；单实例编排同样透传该变量，生产档缺少它且种子口令未改会拒绝启动。需要两步验证时再填入 `EDGEPULSE_MFA_KEY`（`openssl rand -base64 32`）。样例含 MySQL 8、Redis 7 与 Prometheus，是单实例/开发编排，不提供故障切换。开发档若要保留 `admin` 的种子口令 `admin123`，显式设置 `EDGEPULSE_ALLOW_DEFAULT_ADMIN=true`。
 - 双实例 HA：同一目录的 `docker-compose.ha.yml` 起 MySQL、Redis、`edgepulse-1/2` 与 nginx，两个实例共享 MySQL、Redis、只读配置与证书目录、固件卷，只差 `EDGEPULSE_INSTANCE_ID`；见下文[高可用部署](#高可用部署)。
 - systemd：`deploy/systemd/edgepulse.service` 是单实例模板，`edgepulse@.service` 是按实例名模板化的多实例单元（`/etc/edgepulse/<实例>.yaml` 与 `<实例>.env`）；二进制、`web/`、`migrations/` 与配置分目录放置，秘密走 `EnvironmentFile`。
 - 静态站点：`bash scripts/build-web.sh`，由后端直接托管。
-- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、两步验证挑战与尝试计数、实时扇出与 Agent 命令路由）、每个实例唯一的 `edgepulse.instance_id`、共享固件目录、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流（HA 按实例计数，N 个实例各配总额的 1/N）、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、首次登录修改 `admin` 种子口令、可用备份。
+- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、两步验证挑战与尝试计数、实时扇出与 Agent 命令路由）、每个实例唯一的 `edgepulse.instance_id`、共享固件目录、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流（HA 按实例计数，N 个实例各配总额的 1/N）、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、启动前设置 `EDGEPULSE_ADMIN_PASSWORD`（或已改过 admin 口令）、可用备份。
 
 备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。HA 双实例要先停两台、确认 `sys_lease` 不再续约并清掉残留 holder，再按“单台就绪后第二台”的顺序启动；完整步骤见 [docs/部署.md](docs/部署.md)（含 11.1 的 HA 备份与恢复）。
 
