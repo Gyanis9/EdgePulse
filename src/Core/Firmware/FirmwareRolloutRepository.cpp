@@ -803,22 +803,24 @@ namespace EdgePulse::Firmware
                 });
     }
 
-    AsynGyanis::Core::Task<std::vector<FirmwareRolloutRecord>> FirmwareRolloutRepository::listDueRollouts(AsynGyanis::Core::EventLoop &loop, const std::size_t limit)
+    AsynGyanis::Core::Task<std::vector<FirmwareRolloutRecord>> FirmwareRolloutRepository::listDueRollouts(AsynGyanis::Core::EventLoop &loop, const std::size_t limit,
+                                                                                                          const std::int64_t afterId)
     {
         co_return co_await m_database->withConnection<std::vector<FirmwareRolloutRecord>>(
                 loop,
-                [limit, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<FirmwareRolloutRecord>
+                [limit, afterId, tenant = m_tenant](DatabaseConnection &connection) -> std::vector<FirmwareRolloutRecord>
                 {
                     // 暂停与草稿要等人工动作，只有这些状态需要协调器推进
-                    std::string                filter = "WHERE status IN ('scheduled', 'preparing', 'running', 'rolling_back')";
-                    std::vector<DatabaseValue> parameters;
+                    std::string                filter = "WHERE status IN ('scheduled', 'preparing', 'running', 'rolling_back') AND id > ?";
+                    std::vector<DatabaseValue> parameters{afterId};
                     if (!tenant.allTenants)
                     {
                         filter += " AND tenant_id = ?";
                         parameters.emplace_back(tenant.tenantId);
                     }
                     parameters.emplace_back(static_cast<std::int64_t>(limit));
-                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectRollout} + filter + " ORDER BY created_at, id LIMIT ?", parameters);
+                    // 主键游标而不是 createdAt 窗口：窗口外的发布不会因前 N 条一直停在活动状态而永远轮不到
+                    const auto rows = Sql::executeOrThrow(connection, std::string{kSelectRollout} + filter + " ORDER BY id LIMIT ?", parameters);
                     std::vector<FirmwareRolloutRecord> rollouts;
                     while (rows->next())
                     {

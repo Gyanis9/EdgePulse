@@ -698,11 +698,26 @@ namespace EdgePulse::Firmware
         std::vector<FirmwareRolloutRecord> due;
         try
         {
-            due = co_await m_allRollouts->listDueRollouts(loop, m_dueLimit);
+            due = co_await m_allRollouts->listDueRollouts(loop, m_dueLimit, m_dueCursor);
+            // 上一页刚好满窗时下一拍会读到空页；回到起点再取一次，避免整整一拍没有推进
+            if (due.empty() && m_dueCursor != 0)
+            {
+                m_dueCursor = 0;
+                due         = co_await m_allRollouts->listDueRollouts(loop, m_dueLimit, 0);
+            }
         } catch (const std::exception &failure)
         {
             LOG_WARN_FMT("灰度发布扫描失败：{}", failure.what());
             co_return;
+        }
+        // 游标推进而不是每拍都看最老的一页：活动状态不会离开列表，固定窗口会饿死后面的发布。
+        // 不满一页说明本轮已经扫到尾，下次从头开始；空页同样回到起点
+        if (due.size() < m_dueLimit)
+        {
+            m_dueCursor = 0;
+        } else
+        {
+            m_dueCursor = due.back().id;
         }
         for (const FirmwareRolloutRecord &record: due)
         {

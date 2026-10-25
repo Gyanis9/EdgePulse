@@ -291,13 +291,16 @@ namespace EdgePulse::Firmware
                                                    FirmwareRolloutTargetUpdate restore);
 
         /**
-         * @brief 取需要协调器推进的发布
+         * @brief 按主键游标取需要协调器推进的发布
          * @param loop 恢复协程用的事件循环
-         * @param limit 本次最多返回多少条
-         * @return std::vector<FirmwareRolloutRecord> scheduled、preparing、running 与 rolling_back 的发布，按创建时间升序
+         * @param limit 本次最多返回多少条，调用方应传不小于一百的窗口
+         * @param afterId 上一页最后一条主键；0 表示从最小主键开始
+         * @return std::vector<FirmwareRolloutRecord> scheduled、preparing、running 与 rolling_back 的发布，按主键升序；空表示本轮已扫完
          * @note 平台协调器应使用 allTenants 视图；暂停与草稿需要人工动作，不进入本列表
+         * @note 调用方以返回的末条主键推进游标，扫空后回到 0；窗口外的发布因此不会被长期占满窗口的条目饿死
          */
-        AsynGyanis::Core::Task<std::vector<FirmwareRolloutRecord>> listDueRollouts(AsynGyanis::Core::EventLoop &loop, std::size_t limit);
+        AsynGyanis::Core::Task<std::vector<FirmwareRolloutRecord>> listDueRollouts(AsynGyanis::Core::EventLoop &loop, std::size_t limit,
+                                                                                   std::int64_t afterId = 0);
 
     private:
         std::shared_ptr<Common::Database> m_database; ///< 数据库封装

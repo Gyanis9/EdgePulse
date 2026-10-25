@@ -23,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -52,7 +53,7 @@ namespace
     class RolloutHarness
     {
     public:
-        explicit RolloutHarness(const bool requireSignature = false)
+        explicit RolloutHarness(const bool requireSignature = false, const std::size_t dueLimit = 100) : m_dueLimit(dueLimit)
         {
             m_context   = std::make_shared<EdgePulse::TestSupport::AuthTestContext>();
             m_runner    = std::make_shared<EdgePulse::TestSupport::EventLoopRunner>();
@@ -88,6 +89,7 @@ namespace
             dependencies.alarms                   = m_alarms;
             dependencies.signingPolicy            = m_signing;
             dependencies.heartbeatIntervalSeconds = 1;
+            dependencies.dueLimit                 = m_dueLimit;
             dependencies.publisher                = [this](const EdgePulse::Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
             {
                 published.push_back(command);
@@ -318,6 +320,9 @@ namespace
         std::vector<EdgePulse::Command::CommandRecord>                  published;
         int                                                             failPublishes{0};
         std::function<void()>                                           afterPublish;
+
+    private:
+        std::size_t m_dueLimit{100}; ///< 每个 tick 的候选窗口
     };
 
     [[nodiscard]] std::int64_t firmwareIdOf(const EdgePulse::Command::CommandRecord &command)
@@ -1051,6 +1056,14 @@ TEST(FirmwareRolloutService, AbortCancelsInstallingTasks)
     EXPECT_EQ("failed", task->status);
     aggregate = harness.aggregate(rolloutId);
     EXPECT_EQ("failed", targetOf(aggregate, nodeId)->status);
+
+    // 已中止的任务已经判失败；旧 Agent 不带命令号的迟到 installed 也不能把它改回已安装
+    EXPECT_FALSE(harness.m_runner
+                         ->run(harness.m_firmware->updateTask(harness.m_runner->loop(), firmwareId, nodeId, "installed", 100, "迟到的安装结果", 0))
+                         .has_value());
+    const auto afterLateReport = harness.task(taskId);
+    ASSERT_TRUE(afterLateReport.has_value());
+    EXPECT_EQ("failed", afterLateReport->status);
 }
 
 // 钉住：已进入观察的波次不会每拍重写 updated_at
@@ -1099,6 +1112,38 @@ TEST(FirmwareRolloutService, OnlyLeaderTickDispatches)
     harness.m_runner->run(tick.run());
     EXPECT_EQ(1U, harness.published.size());
     EXPECT_EQ("running", harness.aggregate(rolloutId).rollout.status);
+}
+
+// 钉住：候选窗口按游标轮转，二十五个同时活动的发布都能在后续拍里被推进
+TEST(FirmwareRolloutService, RotatesDueWindowAcrossManyActiveRollouts)
+{
+    RolloutHarness  harness(false, 10);
+    const TimePoint base = fakeBase();
+    const std::int64_t firmwareId = harness.createFirmware("2.9.4");
+
+    std::vector<std::int64_t> nodeIds;
+    for (int index = 0; index < 25; ++index)
+    {
+        const std::int64_t nodeId = harness.createNode("rollout-rotate-" + std::to_string(index));
+        harness.heartbeatAt(nodeId, "0.9.0", later(base, 1));
+        nodeIds.push_back(nodeId);
+    }
+    for (const std::int64_t nodeId: nodeIds)
+    {
+        ASSERT_GT(harness.createRollout(firmwareId, "轮转灰度-" + std::to_string(nodeId), kSinglePolicy, {nodeId}), 0);
+    }
+
+    for (int tick = 0; tick < 4; ++tick)
+    {
+        harness.tick(later(base, tick));
+    }
+
+    std::set<std::int64_t> dispatched;
+    for (const EdgePulse::Command::CommandRecord &command: harness.published)
+    {
+        dispatched.insert(command.nodeId);
+    }
+    EXPECT_EQ(25U, dispatched.size()) << "每个活动发布都必须至少派发一次";
 }
 
 // 钉住：策略默认值与非法输入在创建阶段被拒绝

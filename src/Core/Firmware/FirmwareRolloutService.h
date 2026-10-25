@@ -105,7 +105,7 @@ namespace EdgePulse::Firmware
         FirmwareCommandPublisher                        publisher;                    ///< 命令发布
         std::shared_ptr<FirmwareSigningPolicy>          signingPolicy;                ///< 签名门禁，空表示不强制
         int                                             heartbeatIntervalSeconds{30}; ///< Agent 心跳间隔，用于校验 settle
-        std::size_t                                     dueLimit{20};                 ///< 每 tick 最多推进多少个发布
+        std::size_t                                     dueLimit{100};                ///< 每 tick 最多推进多少个发布
         int                                             commandTimeoutSeconds{600};   ///< 固件命令超时秒数
     };
 
@@ -255,7 +255,8 @@ namespace EdgePulse::Firmware
         FirmwareCommandPublisher                        m_publisher;            ///< 命令发布
         std::shared_ptr<FirmwareSigningPolicy>          m_signingPolicy;        ///< 签名门禁
         int                                             m_heartbeatSeconds{30}; ///< 心跳间隔
-        std::size_t                                     m_dueLimit{20};         ///< 每 tick 上限
+        std::size_t                                     m_dueLimit{100};        ///< 每 tick 上限
+        std::int64_t                                    m_dueCursor{0};         ///< 下一批候选的起始主键；0 表示从头开始
         int                                             m_commandTimeout{600};  ///< 命令超时
     };
 } // namespace EdgePulse::Firmware
