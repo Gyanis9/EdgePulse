@@ -83,12 +83,13 @@ namespace EdgePulse::Common
         options.driver          = "sqlite";
         options.path            = m_databasePath;
         options.maximumPoolSize = maximumPoolSize;
-        initialize(options);
+        m_options               = options;
+        initialize(m_options);
     }
 
-    Database::Database(DatabaseOptions options) : m_databasePath(options.path), m_maximumPoolSize(options.maximumPoolSize)
+    Database::Database(DatabaseOptions options) : m_databasePath(options.path), m_maximumPoolSize(options.maximumPoolSize), m_options(std::move(options))
     {
-        initialize(options);
+        initialize(m_options);
     }
 
     void Database::initialize(const DatabaseOptions &options)
@@ -132,6 +133,11 @@ namespace EdgePulse::Common
     std::size_t Database::maximumPoolSize() const noexcept
     {
         return m_maximumPoolSize;
+    }
+
+    const DatabaseOptions &Database::options() const noexcept
+    {
+        return m_options;
     }
 
     bool Database::probe()

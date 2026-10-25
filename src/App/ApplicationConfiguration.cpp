@@ -3,8 +3,10 @@
 #include "Base/Coding/Base64.h"
 #include "Base/Config/ConfigManager.h"
 #include "Base/Runtime/Environment.h"
+#include "Base/Security/RandomToken.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -16,6 +18,15 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace EdgePulse::App
 {
     namespace
@@ -23,6 +34,66 @@ namespace EdgePulse::App
         constexpr std::int64_t kMinimumPort = 0;     ///< 0 表示由内核分配端口
         constexpr std::int64_t kMaximumPort = 65535; ///< TCP/UDP 端口上限
         constexpr int          kMinimumTtl  = 1;     ///< TTL 必须为正
+        constexpr std::size_t  kMaximumInstanceIdLength = 128; ///< 与 sys_lease.holder 的列宽对齐
+
+        /**
+         * @brief 取主机名并把不适合写进 holder 的字符换成连字符
+         * @return std::string 只含字母、数字、点、下划线与连字符的主机名；取不到时为 edgepulse
+         */
+        [[nodiscard]] std::string sanitizedHostName()
+        {
+#if defined(_WIN32)
+            std::array<char, MAX_COMPUTERNAME_LENGTH + 1> buffer{};
+            DWORD                                         size = static_cast<DWORD>(buffer.size());
+            if (GetComputerNameA(buffer.data(), &size) == 0)
+            {
+                return "edgepulse";
+            }
+            const std::string hostName(buffer.data(), size);
+#else
+            std::array<char, 256> buffer{};
+            if (gethostname(buffer.data(), buffer.size() - 1) != 0)
+            {
+                return "edgepulse";
+            }
+            buffer.back() = '\0';
+            const std::string hostName(buffer.data());
+#endif
+            std::string sanitized;
+            sanitized.reserve(hostName.size());
+            for (const char character: hostName)
+            {
+                const unsigned char value = static_cast<unsigned char>(character);
+                // 实例标识会进日志与 sys_lease.holder，空白和控制字符一律折成连字符
+                sanitized.push_back(std::isalnum(value) != 0 || character == '-' || character == '_' || character == '.' ? character : '-');
+            }
+            return sanitized.empty() ? std::string{"edgepulse"} : sanitized;
+        }
+
+        /**
+         * @brief 生成缺省实例标识 hostname-pid-random
+         * @return std::string 形如 edgepulse-host-4242-1a2b3c4d
+         */
+        [[nodiscard]] std::string defaultInstanceId()
+        {
+#if defined(_WIN32)
+            const unsigned long processId = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+            const unsigned long processId = static_cast<unsigned long>(getpid());
+#endif
+            // 随机后缀用私有随机源，避免同机同名进程在同一秒启动时撞成同一个 holder
+            return sanitizedHostName() + "-" + std::to_string(processId) + "-" + Common::randomTokenHex(4);
+        }
+
+        /**
+         * @brief 判断文本里是否含空白字符
+         * @param text 待检查文本
+         * @return true 至少一个字符是空白
+         */
+        [[nodiscard]] bool containsWhitespace(const std::string_view text)
+        {
+            return std::any_of(text.begin(), text.end(), [](const unsigned char character) { return std::isspace(character) != 0; });
+        }
 
         /**
          * @brief 去掉首尾空白
@@ -196,6 +267,8 @@ namespace EdgePulse::App
         configuration.databaseHost           = configurationManager.getString("edgepulse.database.host", configuration.databaseHost);
         configuration.databaseName           = configurationManager.getString("edgepulse.database.name", configuration.databaseName);
         configuration.databaseUser           = configurationManager.getString("edgepulse.database.user", configuration.databaseUser);
+        configuration.instanceId             = trimCopy(configurationManager.getString("edgepulse.instance_id", configuration.instanceId));
+        configuration.haEnabled              = configurationManager.getBool("edgepulse.ha.enabled", configuration.haEnabled);
         configuration.redisEnabled           = configurationManager.getBool("edgepulse.redis.enabled", configuration.redisEnabled);
         configuration.redisHost              = configurationManager.getString("edgepulse.redis.host", configuration.redisHost);
         configuration.redisDatabase          = static_cast<int>(configurationManager.getInt("edgepulse.redis.database", configuration.redisDatabase));
@@ -299,6 +372,18 @@ namespace EdgePulse::App
             configuration.udpTelemetrySecret = *secret;
         }
 
+        if (configuration.instanceId.empty())
+        {
+            configuration.instanceId = defaultInstanceId();
+        }
+        if (configuration.instanceId.size() > kMaximumInstanceIdLength)
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.instance_id 长度必须在 1 到 128 之间，当前长度：" + std::to_string(configuration.instanceId.size())});
+        }
+        if (containsWhitespace(configuration.instanceId))
+        {
+            return std::unexpected(ConfigurationError{"edgepulse.instance_id 不能包含空白字符，HA 部署时各实例必须显式唯一"});
+        }
         if (configuration.databaseDriver != "sqlite" && configuration.databaseDriver != "mysql")
         {
             return std::unexpected(ConfigurationError{"database.driver 只能是 sqlite 或 mysql，当前值：" + configuration.databaseDriver});

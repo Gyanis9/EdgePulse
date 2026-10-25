@@ -49,6 +49,7 @@ add_executable(edgepulse-integration-tests
         Integration/TestEnrollment.cpp
         Integration/TestExternalStores.cpp
         Integration/TestFirmwareSignature.cpp
+        Integration/TestLeaderLease.cpp
         Integration/TestMigrations.cpp
         Integration/TestNodeConfig.cpp
         Integration/TestNodeLifecycle.cpp

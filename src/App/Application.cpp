@@ -42,6 +42,8 @@
 #include "Plugins/DevicePlugin/NodeJson.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Metrics/BusinessMetrics.h"
+#include "Core/System/LeaderLease.h"
+#include "Core/System/MigrationLock.h"
 #include "Core/System/MigrationRunner.h"
 #include "Core/System/DictionaryRepository.h"
 #include "Core/System/LogRepository.h"
@@ -103,6 +105,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -145,6 +148,11 @@ namespace EdgePulse::App
     Application::~Application()
     {
         m_ready.store(false);
+        // 先释放控制面租约，其他实例不必等 TTL 过期；循环已经停止，这里只做一次直连清理
+        if (m_leaderLease)
+        {
+            m_leaderLease->stop();
+        }
         AsynGyanis::Base::ConfigManager::instance().disableHotReload();
         if (m_healthProbe.joinable())
         {
@@ -168,31 +176,32 @@ namespace EdgePulse::App
         m_ioContext                       = std::make_unique<AsynGyanis::Core::IoContext>(static_cast<std::size_t>(m_configuration.threads));
         AsynGyanis::Core::EventLoop &loop = m_ioContext->threadPool().eventLoop(0);
 
+        Common::DatabaseOptions databaseOptions;
+        databaseOptions.driver          = m_configuration.databaseDriver;
+        databaseOptions.path            = m_configuration.databasePath;
+        databaseOptions.host            = m_configuration.databaseHost;
+        databaseOptions.port            = m_configuration.databasePort;
+        databaseOptions.userName        = m_configuration.databaseUser;
+        databaseOptions.password        = m_configuration.databasePassword;
+        databaseOptions.database        = m_configuration.databaseName;
+        databaseOptions.maximumPoolSize = 8;
+
         try
         {
-            // 启动期在独立连接上应用迁移；失败原因带文件名与语句序号，直接拒绝启动
+            // 启动期在独立连接上应用迁移；MySQL 先拿命名锁，SQLite 按单写者直接放行
             {
-                Common::DatabaseOptions options;
-                options.driver                                                             = m_configuration.databaseDriver;
-                options.path                                                               = m_configuration.databasePath;
-                options.host                                                               = m_configuration.databaseHost;
-                options.port                                                               = m_configuration.databasePort;
-                options.userName                                                           = m_configuration.databaseUser;
-                options.password                                                           = m_configuration.databasePassword;
-                options.database                                                           = m_configuration.databaseName;
-                const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirect(options);
+                const std::expected<std::unique_ptr<System::MigrationLock>, std::string> migrationLock = System::MigrationLock::acquire(databaseOptions, 30);
+                if (!migrationLock)
+                {
+                    error = "获取迁移锁失败，实例拒绝启动：" + migrationLock.error();
+                    return false;
+                }
+                const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirect(databaseOptions);
                 System::MigrationRunner::apply(*connection, m_configuration.migrationsDirectory);
             }
-            Common::DatabaseOptions databaseOptions;
-            databaseOptions.driver          = m_configuration.databaseDriver;
-            databaseOptions.path            = m_configuration.databasePath;
-            databaseOptions.host            = m_configuration.databaseHost;
-            databaseOptions.port            = m_configuration.databasePort;
-            databaseOptions.userName        = m_configuration.databaseUser;
-            databaseOptions.password        = m_configuration.databasePassword;
-            databaseOptions.database        = m_configuration.databaseName;
-            databaseOptions.maximumPoolSize = 8;
-            m_database                      = Common::Database::open(databaseOptions);
+            m_database    = Common::Database::open(databaseOptions);
+            m_leaderLease = std::make_unique<System::LeaderLease>(m_database, m_configuration.instanceId);
+            LOG_INFO_FMT("控制面租约已装配：instance={} HA={}", m_configuration.instanceId, m_configuration.haEnabled ? "启用" : "关闭");
             if (m_configuration.redisEnabled)
             {
                 m_cache = std::make_shared<Cache::RedisKeyValueStore>(m_configuration.redisHost, m_configuration.redisPort, m_configuration.redisPassword,
@@ -625,6 +634,9 @@ namespace EdgePulse::App
             error = std::string{"监听器启动失败："} + failure.what();
             return false;
         }
+        // 租约循环先于周期任务启动：start 返回首次获取结果，之后由循环按续约周期维护
+        m_leaderLeaseStart.emplace(m_leaderLease->start(loop));
+        loop.scheduler().schedule(m_leaderLeaseStart->handle());
         m_commandScheduler = runCommandScheduler(loop);
         loop.scheduler().schedule(m_commandScheduler->handle());
         m_fleetLifecycle = runFleetLifecycle(loop);
@@ -963,6 +975,11 @@ namespace EdgePulse::App
         }
         // 先让 /readyz 变 503，再停止接新连接并排空在途请求
         m_ready.store(false, std::memory_order_release);
+        // 停止请求一到达就释放租约；stop 幂等，析构时再调不会重复清库
+        if (m_leaderLease)
+        {
+            m_leaderLease->stop();
+        }
         if (!m_ioContext)
         {
             return;

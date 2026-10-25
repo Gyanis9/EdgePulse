@@ -53,8 +53,10 @@ add_library(edgepulse-core STATIC
         Notification/SmtpMailer.cpp
         Ops/OpsRepository.cpp
         System/DictionaryRepository.cpp
+        System/LeaderLease.cpp
         System/LogRepository.cpp
         System/MenuRepository.cpp
+        System/MigrationLock.cpp
         System/MigrationRunner.cpp
         System/OrgRepository.cpp
         System/RoleRepository.cpp

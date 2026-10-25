@@ -10,6 +10,7 @@
 #include "Core/Auth/LoginAudit.h"
 #include "Core/Cache/RedisKeyValueStore.h"
 #include "Core/System/LogRepository.h"
+#include "Core/System/MigrationLock.h"
 #include "Core/System/MigrationRunner.h"
 #include "TestSupport/EventLoopRunner.h"
 
@@ -82,7 +83,7 @@ namespace
     }
 } // namespace
 
-// 钉住：MySQL 上能完整应用二十版迁移，V7 归属列与 V15 至 V20 的注册、配置、签名、登录加固、企业身份与证书轮换表列生效，日志仓储按部门范围过滤
+// 钉住：MySQL 上能完整应用二十一版迁移，V7 归属列与 V15 至 V21 的注册、配置、签名、登录加固、企业身份、证书轮换与租约表生效，日志仓储按部门范围过滤
 TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
 {
     const std::optional<std::string> host = environmentText("EDGEPULSE_TEST_MYSQL_HOST");
@@ -104,15 +105,28 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
     options.maximumPoolSize = 4;
 
     {
+        // GET_LOCK 是连接级的：同一进程里的第二条连接必须等第一条释放才能拿到同名锁
+        const auto first = EdgePulse::System::MigrationLock::acquire(options, 5);
+        ASSERT_TRUE(first.has_value()) << first.error();
+        const auto blocked = EdgePulse::System::MigrationLock::acquire(options, 1);
+        EXPECT_FALSE(blocked.has_value());
+        (*first)->release();
+        const auto reacquired = EdgePulse::System::MigrationLock::acquire(options, 5);
+        ASSERT_TRUE(reacquired.has_value()) << reacquired.error();
+        (*reacquired)->release();
+    }
+
+    {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirect(options);
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
-        EXPECT_EQ(20, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
-        EXPECT_EQ(7, queryCount(*connection,
+        EXPECT_EQ(21, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
+        EXPECT_EQ(8, queryCount(*connection,
                                 "SELECT COUNT(*) AS total FROM information_schema.tables WHERE table_schema = ? AND table_name IN "
                                 "('biz_agent_enrollment', 'biz_node_config', 'biz_node_config_revision', 'biz_agent_certificate', 'sys_api_token', 'sys_idempotency', "
-                                "'sys_user_mfa')",
+                                "'sys_user_mfa', 'sys_lease')",
                                 std::array<AsynGyanis::Database::DatabaseValue, 1>{options.database}));
+        EXPECT_EQ(1, queryCount(*connection, "SELECT COUNT(*) AS total FROM sys_lease WHERE name = 'control-plane' AND holder = '' AND fence = 0"));
         EXPECT_EQ(2, queryCount(*connection,
                                 "SELECT COUNT(*) AS total FROM information_schema.columns WHERE table_schema = ? AND table_name = 'biz_node' AND column_name IN "
                                 "('previous_cert_fingerprint', 'previous_cert_not_after')",

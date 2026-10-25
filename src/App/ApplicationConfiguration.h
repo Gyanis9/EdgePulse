@@ -44,6 +44,8 @@ namespace EdgePulse::App
         std::string              databaseName{"edgepulse"};                           ///< MySQL 库名
         std::string              databaseUser{"edgepulse"};                           ///< MySQL 用户
         std::string              databasePassword;                                    ///< MySQL 口令，只从环境变量读取
+        std::string              instanceId;                                          ///< 实例标识；空值时装载阶段生成 hostname-pid-random
+        bool                     haEnabled{false};                                    ///< 是否按多实例 HA 部署；为 false 时单实例仍运行租约
         bool                     redisEnabled{false};                                 ///< 是否使用 Redis 会话
         std::string              redisHost{"127.0.0.1"};                              ///< Redis 主机
         std::uint16_t            redisPort{6379};                                     ///< Redis 端口

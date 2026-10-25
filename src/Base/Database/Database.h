@@ -122,6 +122,13 @@ namespace EdgePulse::Common
         [[nodiscard]] std::size_t maximumPoolSize() const noexcept;
 
         /**
+         * @brief 构造本实例时使用的连接参数
+         * @return const DatabaseOptions& 连接参数；供需要独立直连的启动期组件复制
+         * @note 口令字段原样保留，调用方不得把它写进日志或响应
+         */
+        [[nodiscard]] const DatabaseOptions &options() const noexcept;
+
+        /**
          * @brief 健康探针：借一条连接并执行驱动级存活检查
          * @return bool 取到连接且探针通过
          * @note 会阻塞，只能在工作线程或专门的探测线程上调用
@@ -153,6 +160,7 @@ namespace EdgePulse::Common
 
         std::string                                           m_databasePath;    ///< 数据库路径或库名
         std::size_t                                           m_maximumPoolSize; ///< 连接数上限
+        DatabaseOptions                                       m_options;         ///< 建池时使用的连接参数，供独立直连复用
         std::unique_ptr<AsynGyanis::Database::ConnectionPool> m_pool;            ///< 懒惰建连的连接池
     };
 } // namespace EdgePulse::Common

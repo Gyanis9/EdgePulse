@@ -136,7 +136,14 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_info('idx_agent_certificate_node') "
                                                      "WHERE (name = 'tenant_id' AND seqno = 0) OR (name = 'node_id' AND seqno = 1) OR (name = 'issued_at' AND seqno = 2)"));
         EXPECT_EQ(11, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_agent_certificate')"));
-        EXPECT_EQ(20, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 21"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sys_lease'"));
+        EXPECT_EQ(5, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('sys_lease') "
+                                                     "WHERE name IN ('name', 'holder', 'fence', 'expires_at', 'updated_at')"));
+        // 种子行必须可被接手：holder 为空、fence 为 0、expires_at 为 NULL，updated_at 用纪元作哨兵
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_lease WHERE name = 'control-plane' AND holder = '' AND fence = 0 "
+                                                     "AND expires_at IS NULL AND updated_at = '1970-01-01 00:00:00'"));
+        EXPECT_EQ(21, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }

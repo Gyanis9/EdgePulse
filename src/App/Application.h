@@ -83,6 +83,7 @@ namespace EdgePulse::Device
 namespace EdgePulse::System
 {
     class DictionaryRepository;
+    class LeaderLease;
     class TenantRepository;
     class LogRepository;
     class MenuRepository;
@@ -224,6 +225,8 @@ namespace EdgePulse::App
         std::filesystem::path                                     m_webRoot; ///< 前端构建产物目录
         std::unique_ptr<AsynGyanis::Core::IoContext>              m_ioContext;
         std::shared_ptr<Common::Database>                         m_database;               ///< 进程级数据库
+        std::unique_ptr<System::LeaderLease>                      m_leaderLease;            ///< 控制面单飞租约
+        std::optional<AsynGyanis::Core::Task<bool>>               m_leaderLeaseStart;       ///< 首次获取租约的启动协程
         std::shared_ptr<Cache::KeyValueStore>                     m_cache;                  ///< 会话与验证码存储
         std::shared_ptr<Auth::SessionStore>                       m_sessionStore;           ///< 会话表
         std::shared_ptr<Auth::CaptchaService>                     m_captchaService;         ///< 验证码
