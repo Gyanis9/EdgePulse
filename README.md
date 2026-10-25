@@ -42,7 +42,7 @@
 | 企业身份 | API Token（明文只显示一次、只存 SHA-256、scope 与 owner 当前权限取交集、轮换一小时重叠、吊销保留记录）、TOTP 两步验证（加密秘密、一次性恢复码、登录挑战、管理员重置） |
 | API 契约与幂等 | OpenAPI 3.1 契约由源码路由生成并在 CI 校验；写请求支持 `Idempotency-Key`，24 小时内重放已完成响应并对内容冲突返回 409 |
 | 多租户 | 租户编码登录、平台管理员跨租户、租户级 RBAC/部门/岗位/字典、节点与遥测/告警/固件/命令按租户隔离、停用租户阻断新登录、实时主题按租户分区 |
-| 设备生命周期 | Agent mTLS 注册、叶证书指纹绑定、一次性 `enroll`/`rebind` 令牌、证书到期与吊销、心跳超时离线、系统离线告警、节点详情与分组 |
+| 设备生命周期 | Agent mTLS 注册、叶证书指纹绑定、一次性 `enroll`/`rebind` 令牌、内部 CA 按 CSR 自动签发与续期（旧指纹重叠窗口）、证书到期与吊销、心跳超时离线、系统离线告警、节点详情与分组 |
 | 遥测与告警 | HTTP 与 UDP 遥测（HMAC-SHA256 防重放）、告警规则与确认/恢复生命周期、Webhook（HMAC 签名）与 SMTP 通知、投递记录与失败原因 |
 | 固件与命令 | 流式上传、ETag 与单段 Range 下载、Ed25519 签名与验签门禁、分批灰度与回滚、命令批量/计划/取消、Agent WebSocket 推送与轮询兜底 |
 | 实时 | 浏览器 WebSocket 的节点/告警/命令主题、告警 SSE、Redis 跨实例事件扇出、Agent 命令长连接 |
@@ -161,6 +161,10 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `edgepulse.agent.heartbeat_interval_seconds` | `10` | `30` | Agent 心跳周期 |
 | `edgepulse.agent.heartbeat_timeout_seconds` | `30` | `90` | 超过该时长未心跳即转离线 |
 | `edgepulse.agent.offline_sweep_seconds` | `5` | `30` | 离线扫描周期，必须小于心跳超时 |
+| `edgepulse.agent_ca.enabled` | `true` | `false` | 启用控制面内部 CA，Agent 可用 `POST /api/agent/certificate/renew` 提交 CSR 换证 |
+| `edgepulse.agent_ca.certificate_file` | `var/certs/ca.pem` | `/etc/edgepulse/tls/ca.pem` | 签发 CA；必须就是 9443 的信任锚（或包含在拼接信任包里），启动按 SHA-256 指纹核对 |
+| `edgepulse.agent_ca.key_file` | `var/certs/ca-key.pem` | `/etc/edgepulse/agent-ca-key.pem` | CA 私钥独立路径，POSIX 上要求 0600，不要放进公开证书卷、镜像或版本库 |
+| `edgepulse.agent_ca.validity_days` / `overlap_hours` | `30` / `24` | `30` / `24` | 新证书有效期（1–3650 天）与旧指纹重叠窗口（1–168 小时） |
 | `edgepulse.firmware.require_signature` | `false` | `true` | 开启后未签名固件不能上传、部署或回滚 |
 | `edgepulse.firmware.trusted_keys_dir` | `config/firmware-keys` | `/etc/edgepulse/firmware-keys` | 只放公钥；启用签名时不能为空，生产样例使用绝对路径 |
 | `edgepulse.security.password_min_length` | `8` | `10` | 建号、重置与改密共用 |
@@ -228,7 +232,7 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 - API Token：明文形如 `ep_api_` 加 64 位十六进制，只在创建或轮换响应出现一次；数据库只存 SHA-256 与前缀。令牌继承 owner 的身份但 `platformAdmin` 恒为 false，每次请求按 owner 当前权限与令牌 scope 的交集授权；令牌吊销/过期、owner 或租户停用都会立即失效。`/api/auth/me` 保留给令牌自省；`/api/auth/routes`、`/api/auth/logout` 等浏览器会话端点、浏览器 WebSocket 与改密入口会拒绝令牌。
 - TOTP 两步验证：秘密用 `EDGEPULSE_MFA_KEY` 做 AES-256-GCM 加密后落库（可解密用于校验），恢复码用同一主密钥做 HMAC-SHA256 后存储（不可逆）；两者都不以明文落库。登录挑战放在缓存中、300 秒过期、最多 5 次失败并绑定来源 IP；启用、关闭与换发恢复码对错误动态码另有每用户 5 次/300 秒的失败上限，设置入口不计数。MFA 是用户自助启用，没有租户级强制策略。
 - 幂等键：只在带 Bearer 的写请求上生效，按令牌与幂等键的 SHA-256 分区；请求指纹覆盖方法、完整 URI、表示头、权限摘要与正文，权限降级后同键重试返回 409 而不是旧的已授权响应。401、403、5xx 与超过 256 KiB 的响应不缓存，认证、Agent、令牌、用户/租户写入与流式上传路径整段排除，避免一次性明文或口令进入幂等表。
-- Agent 身份：9443 在 TLS 层校验客户端证书；注册自报的 SHA-256 指纹必须等于本条连接出示的叶证书；心跳、遥测、命令与固件状态都按叶证书绑定节点。吊销会清空指纹、置离线并以 1008 关闭已建立的 Agent WebSocket。
+- Agent 身份：9443 在 TLS 层校验客户端证书；注册自报的 SHA-256 指纹必须等于本条连接出示的叶证书；心跳、遥测、命令与固件状态都按叶证书绑定节点。开启 `edgepulse.agent_ca` 后，Agent 可在到期前用 CSR 通过 `POST /api/agent/certificate/renew` 换取新证书，服务端在 `overlap_hours` 内同时接受旧指纹；吊销会清空当前与上一枚指纹、置离线并以 1008 关闭已建立的 Agent WebSocket。
 - 注册令牌：`enroll` 与 `rebind` 一次性使用，数据库只存 SHA-256，明文只在签发响应出现一次；有效期限制在 300 到 2592000 秒。
 - 固件真实性：Ed25519 对文件 SHA-256 的 32 字节摘要签名，算法标识 `ed25519-sha256`；`require_signature=true` 时未签名固件不能上传、部署或回滚。
 - 运维口：代码默认只监听回环；生产样例与 Compose 绑 `0.0.0.0`，须由防火墙或网络策略限制来源。`/metrics` 与 `/debug/*` 需要 Bearer，`/healthz` 与 `/readyz` 匿名。
@@ -277,6 +281,7 @@ python scripts/check-docker-stack.py --build
 
 - 2026-10-24 全量回归（`feat/p6-production-agent` @ `bca5b24`）：`ctest --preset debug` 注册 306 项，通过 302，跳过 4，失败 0，耗时 102.95 秒；`npm run test:unit` 30 项、`npm run test:e2e` 9 项全部通过，`npm run build` 类型检查与构建通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0；`python scripts/backup_restore_test.py` 6 项中 5 项通过，1 项 Windows 文件权限位用例按平台跳过；`python scripts/run-external-tests.py` 三项门控用例全部通过、无跳过；`python scripts/backup_restore_mysql_test.py` 完成 MySQL 备份与恢复往返。
 - 2026-10-25 P7 门禁（代码基线 `8e3885c`，只含文档改动）：`cmake --build --preset debug` 无待编译目标；`ctest --preset debug` 注册 401 项，通过 397，跳过 4，失败 0，耗时 143.85 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42 项、E2E 18 项全部通过，`npm run build` 通过且产物含 `openapi.json`；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0。
+- 2026-10-25 P8 门禁（`feat/enterprise-hardening`，基线 `30c546b`）：`cmake --build --preset debug` 退出 0；`ctest --preset debug` 注册 504 项，通过 499，跳过 5，失败 0，耗时 167.57 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42/42、E2E 20/20 通过（38.8 秒），`npm run build` 通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 65 项、失败 0、跳过 0，覆盖短期证书自动续期、PID 不变、旧指纹重叠窗口与续期后的心跳/遥测/命令。
 - 远程 Linux 实测（阿里云 ECS，Ubuntu 24.04/systemd 255）：真实 `edgepulse-agent` 的 50 项端到端检查通过；`install-agent.sh` 安装后服务为 active，`systemctl stop/start` 正常，注册退避期间停止立即生效，`uninstall-agent.sh --purge` 清理二进制、unit、配置、状态与日志。
 - `ExternalStores.*` 与 `RealtimeBus.*` 需要真实 MySQL/Redis：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性容器并注入 `EDGEPULSE_TEST_MYSQL_*`、`EDGEPULSE_TEST_REDIS_*`，随后断言三项用例确实执行且输出不含 Skipped；镜像可用 `--mysql-image`/`--redis-image` 覆盖。直接跑 `ctest` 缺变量时仍 SKIP，不伪造通过。
 - 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
@@ -298,7 +303,8 @@ python scripts/check-docker-stack.py --build
 
 Linux 节点侧准备：
 
-- 节点证书、私钥与 CA 默认读取 `/etc/edgepulse/agent.pem`、`/etc/edgepulse/agent-key.pem` 与 `/etc/edgepulse/ca.pem`，私钥权限保持 0600。开发环境可先运行 `bash scripts/dev-certs.sh`，再用 `bash scripts/gen-agent-certs.sh <节点名>` 为单个节点签发证书。
+- 节点证书、私钥与 CA 默认读取 `/etc/edgepulse/agent.pem`、`/etc/edgepulse/agent-key.pem` 与 `/etc/edgepulse/ca.pem`，私钥权限保持 0600。开发环境可先运行 `bash scripts/dev-certs.sh`，再用 `bash scripts/gen-agent-certs.sh <节点名> [--days <天数>] [--out-dir <目录>]` 为单个节点签发证书。
+- 自动续期由 `agent.certificate.renew_before_days`（默认 7，1–90）与 `renewal_check_seconds`（默认 3600，60–86400）控制：剩余有效期进入提前窗口后生成新私钥与 CSR 调续期端点，校验服务端签回的链与有效期，原子替换证书后热切换 HTTP 与 WebSocket，进程不重启。控制面返回 403 时停止自动续期，需要重新签发 `rebind` 令牌并重新入场；其余可重试失败按 5/10/30/60/300 秒退避，HTTP 400 的退避上限放宽到一小时。
 - 在控制台签发一次性的 `enroll` 令牌（已有节点更换证书时签发 `rebind`），安装后写入 `/etc/edgepulse-agent/agent.env`，例如 `EDGEPULSE_AGENT_ENROLLMENT_TOKEN=...`。令牌只从环境变量读取，不写 YAML、不写日志。
 
 安装与卸载（Linux）：
@@ -359,7 +365,7 @@ src/
 agent/        生产 Agent 源码与 Linux/Windows 打包脚本
 frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
 3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
-migrations/    SQL 迁移 V1–V19，已应用文件不可修改
+migrations/    SQL 迁移 V1–V20，已应用文件不可修改
 config/        非敏感配置样例；生产配置与信任键目录不入库
 deploy/        Docker、systemd、Prometheus
 scripts/       证书、开发运行、固件签名、备份恢复与验收
@@ -373,7 +379,7 @@ docs/          架构、API、部署、验收与覆盖率
 
 ## Roadmap
 
-P7 已交付 API Token、TOTP 两步验证、写请求幂等键与 OpenAPI 3.1 契约。仍延后的能力见 [docs/ROADMAP.md](docs/ROADMAP.md)：`/api/v1` 版本前缀、OTLP tracing、HA 选主、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入，以及租户级 MFA 强制策略、按令牌限流等后续项。
+P7 已交付 API Token、TOTP 两步验证、写请求幂等键与 OpenAPI 3.1 契约；P8 已交付控制面内部 CA、Agent CSR 续期与旧指纹重叠窗口。仍延后的能力见 [docs/ROADMAP.md](docs/ROADMAP.md)：`/api/v1` 版本前缀、OTLP tracing、HA 选主、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入，以及租户级 MFA 强制策略、按令牌限流等后续项。
 
 ## 贡献
 

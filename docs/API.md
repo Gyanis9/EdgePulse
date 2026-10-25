@@ -224,7 +224,7 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 | PUT/DELETE | `/api/node-groups/{id}` | `device:node:write`；仍有子分组或节点时 409 |
 | GET | `/api/ws` | WebSocket；升级后首条消息认证 |
 
-节点字段：`id,name,status,agentVersion,certFingerprint,certNotAfter,certRevokedAt,labels,lastSeen,groupId,groupName,version`。`status` 为 `online` 或 `offline`；证书字段可空，吊销后指纹为空且 `certRevokedAt` 有值。
+节点字段：`id,name,status,agentVersion,certFingerprint,certNotAfter,previousCertFingerprint,previousCertNotAfter,certRevokedAt,labels,lastSeen,groupId,groupName,version`。`status` 为 `online` 或 `offline`；证书字段可空，吊销后当前与上一枚指纹都为空且 `certRevokedAt` 有值。`previousCertFingerprint` 与 `previousCertNotAfter` 是自动续期留下的重叠窗口；`previousCertNotAfter` 已过或为空时旧指纹不再被接受。
 
 节点生命周期：超过 `edgepulse.agent.heartbeat_timeout_seconds` 未心跳的在线节点会被后台扫描置为 `offline`，并生成 `metric=node.online`、级别 `critical` 的系统告警；恢复心跳后节点回到 `online`，告警自动置为 `resolved`。手工建节点在首次心跳前不参与离线扫描。
 
@@ -293,6 +293,7 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?,tenantCode?,enrollmentToken?}`；tenantCode 缺省 `default`；`certFingerprint` 必须与这条 mTLS 连接出示的叶证书一致 |
+| POST | `/api/agent/certificate/renew` | `{nodeId,csrPem}` → `{certificatePem,fingerprint,notBefore,notAfter,serial}`；见 6.1 |
 | POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}`；响应是节点记录并加 `desiredConfigVersion` 与 `heartbeatIntervalSeconds` |
 | POST | `/api/agent/telemetry` | `{nodeId,samples:[{metric,value,unit?,collectedAt?,labels?}]}`，1–500 条 |
 | GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
@@ -308,6 +309,34 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 除 `/api/agent/register` 这条注册入口外，所有 `/api/agent/*` 请求都要求连接叶证书指纹等于节点登记的 `certFingerprint`；注册接口本身没有可比的登记指纹，改为校验正文 `certFingerprint` 与本次连接出示的叶证书一致。指纹不符或证书已吊销返回 403，节点不存在返回 404。固件下载还要求固件与节点同租户。注册响应带 `certNotAfter`，心跳响应带节点状态；节点超过 `heartbeat_timeout_seconds` 未心跳会被判离线并产生 `node.online` 系统告警。
 
 Agent 请求没有会话：命令、固件任务、遥测都按目标节点/固件的租户归属落库，跨租户标识会被拒绝。
+
+### 6.1 证书自动续期
+
+`POST /api/agent/certificate/renew` 只挂在 9443 mTLS 路由上，调用方必须用当前节点证书建立连接。正文：
+
+```json
+{"nodeId": 1835921299101699, "csrPem": "-----BEGIN CERTIFICATE REQUEST-----\n...\n-----END CERTIFICATE REQUEST-----\n"}
+```
+
+服务端按连接出示的叶证书与节点登记的当前指纹或未过期的上一枚指纹校验身份，再检查节点未被吊销、租户启用、内部 CA 已启用，以及同一节点距上次签发不少于 60 秒。CSR 只接受 P-256 或至少 3072 位的 RSA 公钥，自签名必须有效，且不能声明 `CA:TRUE`。
+
+成功响应 `data:{certificatePem,fingerprint,notBefore,notAfter,serial}`，`cache-control: no-store`。`certificatePem` 是内部 CA 签出的叶证书 PEM；`fingerprint` 为叶证书 DER 的 SHA-256 小写十六进制。
+
+轮换写入是单事务：新指纹成为 `certFingerprint`，节点原来的指纹写入 `previousCertFingerprint`，`previousCertNotAfter = min(旧证书 notAfter, 当前时间 + edgepulse.agent_ca.overlap_hours)`；历史表 `biz_agent_certificate` 把旧 active 行改为 `previous`，插入新 active 行。重试时如果节点版本已被并发改绑或续期推进，服务端按最新节点重新校验连接证书与租户后最多再写一次，仍冲突返回 409。
+
+错误：
+
+| HTTP | 场景 |
+|---|---|
+| 400 | 正文缺整数 `nodeId` 或非空 `csrPem`；CSR 解析、自签校验或公钥强度不通过；CSR 声明 `CA:TRUE` |
+| 403 | 连接证书与当前/重叠指纹都不符、节点证书已吊销、租户停用 |
+| 404 | 节点不存在或已删除 |
+| 409 | 与并发改绑/续期版本冲突，重读后重试一次仍冲突 |
+| 429 | 同一节点 60 秒内重复申请签发 |
+| 500 | 签发失败或轮换写库失败 |
+| 503 | `edgepulse.agent_ca.enabled=false` 或 CA 未加载 |
+
+窗口内旧指纹可以继续完成心跳、遥测、命令与续期；`previousCertNotAfter` 到期后立即 403。吊销 `POST /api/nodes/{id}/certificate/revoke` 会同时清空当前与重叠指纹，并把历史里的 active/previous 行标为 `revoked`。节点详情返回 `previousCertFingerprint` 与 `previousCertNotAfter` 供排障。
 
 ### UDP 遥测数据报
 
@@ -350,17 +379,17 @@ SSE `/api/events/alarms`：连接后先收到 `event: ready`；告警变更以 `
 
 | HTTP | 场景 |
 |---|---|
-| 400 | 参数缺失、JSON 不合法、配置正文不合法；Webhook 地址被 SSRF 校验拒绝；缺固件签名头、验签失败；固件下载缺 `nodeId`；幂等键长度越界；两步验证设置过期或请求体缺字段 |
+| 400 | 参数缺失、JSON 不合法、配置正文不合法；Webhook 地址被 SSRF 校验拒绝；缺固件签名头、验签失败；固件下载缺 `nodeId`；幂等键长度越界；两步验证设置过期或请求体缺字段；Agent 续期的 CSR 不合法 |
 | 401 | 未登录、会话过期、Redis/数据库不可用导致的认证失败；两步验证挑战失效、来源不符、验证码错误或次数用尽；两步验证口令复核失败 |
-| 403 | 已登录但缺权限；Agent 连接证书与节点登记指纹不一致或证书已吊销；`required` 模式缺注册/改绑令牌；命令或固件不属于该节点/租户；租户管理员跨租户签发令牌；API 令牌访问只要求登录的浏览器入口（含 `/api/auth/routes` 与 `/api/auth/logout`） |
+| 403 | 已登录但缺权限；Agent 连接证书与节点登记指纹（含未过期的重叠指纹）不一致或证书已吊销；`required` 模式缺注册/改绑令牌；Agent 续期时租户已停用；命令或固件不属于该节点/租户；租户管理员跨租户签发令牌；API 令牌访问只要求登录的浏览器入口（含 `/api/auth/routes` 与 `/api/auth/logout`） |
 | 404 | 资源不存在；注册令牌不存在、已使用或已吊销；配置修订或节点不存在；固件文件缺失；`/api/*` 未命中；API 令牌不存在、已吊销或越权；关闭未启用的两步验证 |
-| 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；节点或配置 `expectedVersion` 乐观锁冲突；并发注册冲突；仍被占用的删除；幂等键内容冲突或同键请求处理中；重复启用两步验证或轮换已吊销/已过期/并发冲突的令牌 |
+| 409 | 用户名/角色编码/岗位编码/字典类型/配置键冲突；节点或配置 `expectedVersion` 乐观锁冲突；并发注册冲突；Agent 续期在版本冲突重试后仍冲突；仍被占用的删除；幂等键内容冲突或同键请求处理中；重复启用两步验证或轮换已吊销/已过期/并发冲突的令牌 |
 | 413 | 固件超过上传上限 |
 | 416 | Range 越界 |
 | 423 | 账号因窗口内连续登录失败被锁定；提示中的分钟数为配置的锁定时长 |
-| 429 | 验证码签发过频、登录失败过频、公开 API 全局限流；两步验证尝试次数达到上限 |
+| 429 | 验证码签发过频、登录失败过频、公开 API 全局限流；两步验证尝试次数达到上限；同一 Agent 节点 60 秒内重复续期 |
 | 500 | 数据库/文件/未知内部故障 |
-| 503 | 服务未就绪或停机排空；未配置 `EDGEPULSE_MFA_KEY` 时的两步验证设置、启用、关闭与换发恢复码；幂等占位写入失败 |
+| 503 | 服务未就绪或停机排空；未配置 `EDGEPULSE_MFA_KEY` 时的两步验证设置、启用、关闭与换发恢复码；幂等占位写入失败；Agent 续期时内部 CA 未启用 |
 
 ## 9. OpenAPI 契约
 
