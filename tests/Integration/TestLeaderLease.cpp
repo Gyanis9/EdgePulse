@@ -200,8 +200,19 @@ TEST(LeaderLease, ExpiredHolderYieldsToNextInstance)
 
         // A 已失去 holder，stop 只能按 holder=instance-a 清空，不能碰 B 的行
         leaseA.stop();
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+            EXPECT_EQ("instance-b", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'")) << "A 的 stop 不能清掉 B 已经接手的 holder";
+        }
+        // 跨过 B 的多个续约周期：行仍归 B，B 也没有被 A 的 stop 挤下去
+        std::this_thread::sleep_for(std::chrono::milliseconds{350});
         EXPECT_TRUE(leaseB.isLeader());
         EXPECT_EQ(2, leaseB.fence());
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+            EXPECT_EQ("instance-b", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'"));
+            EXPECT_EQ(2, queryInteger(*connection, "SELECT fence FROM sys_lease WHERE name = 'control-plane'"));
+        }
 
         leaseB.stop();
     }
@@ -224,23 +235,75 @@ TEST(LeaderLease, StaleHolderRenewalFailsAndFenceStays)
         EXPECT_TRUE(lease.isLeader());
         EXPECT_EQ(1, lease.fence());
 
-        // 模拟另一个实例在 A 停顿超过 TTL 后接手：holder 与 fence 一起被改写
+        // 只改 fence、保持 holder：续约必须因 fence 不匹配而失败，而不是被 holder 分支放行
         {
             const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
-            const std::vector<AsynGyanis::Database::DatabaseValue> parameters{"instance-b", std::int64_t{2},
-                                                                              EdgePulse::Common::formatDateTimeUtc(std::chrono::system_clock::now() + std::chrono::seconds{10}),
-                                                                              EdgePulse::Common::nowDateTimeUtc(), "control-plane"};
-            ASSERT_NE(nullptr, connection->execute("UPDATE sys_lease SET holder = ?, fence = ?, expires_at = ?, updated_at = ? WHERE name = ?", parameters))
-                    << connection->lastError();
+            const std::vector<AsynGyanis::Database::DatabaseValue>          parameters{std::int64_t{2}, "control-plane"};
+            ASSERT_NE(nullptr, connection->execute("UPDATE sys_lease SET fence = ? WHERE name = ?", parameters)) << connection->lastError();
         }
 
         ASSERT_TRUE(waitUntil([&lease] { return !lease.isLeader(); })) << "旧 holder 的续约 CAS 未在时限内失败";
         EXPECT_EQ(1, lease.fence()) << "失去租约后本地 fence 应停在最后一次成功值";
         EXPECT_FALSE(lease.isLeader());
+        // holder 仍是自己且未过期：后续获取也不能把自己重新抬成 leader
+        std::this_thread::sleep_for(std::chrono::milliseconds{350});
+        EXPECT_FALSE(lease.isLeader()) << "holder 未变时不应凭 holder=自己 重新获取";
+        EXPECT_EQ(1, lease.fence());
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+            EXPECT_EQ("instance-a", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'"));
+            EXPECT_EQ(2, queryInteger(*connection, "SELECT fence FROM sys_lease WHERE name = 'control-plane'"));
+        }
 
         lease.stop();
     }
     database.reset();
+    removeDatabaseFiles(databasePath);
+}
+
+// 钉住：两个进程配了同一个 instance_id 时，获取谓词不接受 holder=自己，后来者必须等 TTL 过期
+TEST(LeaderLease, DuplicatedInstanceIdWaitsForExpiry)
+{
+    const std::filesystem::path databasePath = makeTemporaryDatabasePath();
+    applyMigrations(databasePath);
+
+    std::shared_ptr<EdgePulse::Common::Database> databaseA = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    std::shared_ptr<EdgePulse::Common::Database> databaseB = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    EdgePulse::TestSupport::EventLoopRunner      runner;
+    {
+        // A 首次获取后 5 秒才续约一次，TTL 2 秒：行在 A 仍自认 leader 时进入可接手状态，
+        // 续约点也远晚于 B 的接手点，避免两个动作在 TTL 边界抢同一秒
+        EdgePulse::System::LeaderLease leaseA(databaseA, "instance-a", "control-plane", std::chrono::seconds{2}, std::chrono::seconds{5});
+        EdgePulse::System::LeaderLease leaseB(databaseB, "instance-a", "control-plane", std::chrono::seconds{2}, std::chrono::milliseconds{100});
+
+        ASSERT_TRUE(runner.run(leaseA.start(runner.loop())));
+        EXPECT_EQ(1, leaseA.fence());
+        ASSERT_FALSE(runner.run(leaseB.start(runner.loop())));
+        // TTL 未到时，同一个 instance_id 不能共享 holder
+        std::this_thread::sleep_for(std::chrono::milliseconds{800});
+        EXPECT_FALSE(leaseB.isLeader()) << "TTL 未到时同一 instance_id 不应抢到租约";
+        EXPECT_TRUE(leaseA.isLeader());
+
+        // TTL 过后 B 接手；A 在下一次续约时发现 fence CAS 失败并降级
+        ASSERT_TRUE(waitUntil([&leaseB] { return leaseB.isLeader(); }, std::chrono::seconds{5})) << "TTL 过后 B 未接手";
+        EXPECT_EQ(2, leaseB.fence());
+        ASSERT_TRUE(waitUntil([&leaseA] { return !leaseA.isLeader(); }, std::chrono::seconds{6})) << "A 的续约在 B 接手后未失败";
+        EXPECT_EQ(1, leaseA.fence());
+
+        // B 继续续约：跨过多个续约周期仍保持 leader，且行里的 fence 不再变化
+        std::this_thread::sleep_for(std::chrono::milliseconds{350});
+        EXPECT_TRUE(leaseB.isLeader());
+        EXPECT_EQ(2, leaseB.fence());
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+            EXPECT_EQ("instance-a", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'"));
+            EXPECT_EQ(2, queryInteger(*connection, "SELECT fence FROM sys_lease WHERE name = 'control-plane'"));
+        }
+
+        leaseB.stop();
+    }
+    databaseA.reset();
+    databaseB.reset();
     removeDatabaseFiles(databasePath);
 }
 

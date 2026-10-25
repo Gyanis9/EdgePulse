@@ -31,9 +31,10 @@ namespace EdgePulse::System
         constexpr std::size_t kMaximumInstanceIdLength = 128; ///< 与 holder VARCHAR(128) 对齐
         constexpr std::size_t kMaximumLeaseNameLength  = 64;  ///< 与 name VARCHAR(64) 对齐
 
-        /// 一次条件 UPDATE 同时完成空行、自己续期与过期接手三种情形
+        /// 一次条件 UPDATE 完成空行与过期接手两种情形；不接受 holder=自己，
+        /// 否则两个实例配了同一个 instanceId 时会同时把自己当成可续期的 holder
         constexpr const char *kAcquireSql = "UPDATE sys_lease SET holder = ?, fence = fence + 1, expires_at = ?, updated_at = ? "
-                                            "WHERE name = ? AND (holder = '' OR holder = ? OR expires_at IS NULL OR expires_at < ?)";
+                                            "WHERE name = ? AND (holder = '' OR expires_at IS NULL OR expires_at < ?)";
         /// 续约必须带 holder 与 fence，旧 leader 恢复后无法覆盖新 holder
         constexpr const char *kRenewSql = "UPDATE sys_lease SET expires_at = ?, updated_at = ? WHERE name = ? AND holder = ? AND fence = ?";
         /// 停止只清自己的 holder，不碰已经接手的新实例
@@ -127,7 +128,22 @@ namespace EdgePulse::System
 
         m_loopExited.store(false, std::memory_order_release);
         m_loopTask.emplace(runLoop(loop));
-        loop.scheduler().scheduleRemote(m_loopTask->handle());
+        try
+        {
+            loop.scheduler().schedule(m_loopTask->handle());
+        } catch (const std::exception &failure)
+        {
+            // 调度被拒时收回半启动状态，不留下一个已置 leader 却不会再续约的租约
+            m_loopTask.reset();
+            {
+                const std::lock_guard exitLock(m_exitMutex);
+                m_loopExited.store(true, std::memory_order_release);
+            }
+            m_exitCondition.notify_all();
+            markFollower();
+            LOG_WARN_FMT("启动控制面租约循环失败：instance={} error={}", m_instanceId, failure.what());
+            co_return false;
+        }
         co_return acquired;
     }
 
@@ -216,7 +232,11 @@ namespace EdgePulse::System
         // stop 已经清过；这里兜住直连清理失败或获取与停止交错的情形
         co_await releaseHolder(loop);
         markFollower();
-        m_loopExited.store(true, std::memory_order_release);
+        {
+            // 与析构里的判据共用同一把锁：先落标志再通知，不会漏掉已经进入等待的析构
+            const std::lock_guard exitLock(m_exitMutex);
+            m_loopExited.store(true, std::memory_order_release);
+        }
         m_exitCondition.notify_all();
         co_return;
     }
@@ -233,7 +253,7 @@ namespace EdgePulse::System
                     loop,
                     [instanceId, name, now, expiresAt](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<std::int64_t>
                     {
-                        const std::array<AsynGyanis::Database::DatabaseValue, 6> parameters{instanceId, expiresAt, now, name, instanceId, now};
+                        const std::array<AsynGyanis::Database::DatabaseValue, 5> parameters{instanceId, expiresAt, now, name, now};
                         const auto                                               update = Sql::executeOrThrow(connection, kAcquireSql, parameters);
                         if (update->affectedRowCount() <= 0)
                         {

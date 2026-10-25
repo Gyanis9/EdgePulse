@@ -72,7 +72,7 @@ namespace EdgePulse::App
 
         /**
          * @brief 生成缺省实例标识 hostname-pid-random
-         * @return std::string 形如 edgepulse-host-4242-1a2b3c4d
+         * @return std::string 形如 edgepulse-host-4242-1a2b3c4d；主机名过长时先截主机名，总长不超过 128
          */
         [[nodiscard]] std::string defaultInstanceId()
         {
@@ -82,7 +82,14 @@ namespace EdgePulse::App
             const unsigned long processId = static_cast<unsigned long>(getpid());
 #endif
             // 随机后缀用私有随机源，避免同机同名进程在同一秒启动时撞成同一个 holder
-            return sanitizedHostName() + "-" + std::to_string(processId) + "-" + Common::randomTokenHex(4);
+            const std::string suffix = "-" + std::to_string(processId) + "-" + Common::randomTokenHex(4);
+            std::string       hostName = sanitizedHostName();
+            // 主机名上限 255 字节，先截前缀而不是截随机后缀，保住同一台机器不同进程之间的区分度
+            if (hostName.size() + suffix.size() > kMaximumInstanceIdLength)
+            {
+                hostName.resize(kMaximumInstanceIdLength - suffix.size());
+            }
+            return hostName + suffix;
         }
 
         /**

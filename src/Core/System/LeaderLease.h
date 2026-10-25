@@ -36,7 +36,12 @@ namespace EdgePulse::System
      * @brief 用 sys_lease 的一行表达控制面 leader：条件 UPDATE 成功才是 leader
      * @details 获取与续约都只发一条带条件的 UPDATE，由数据库的行锁给出跨实例的互斥；
      *          fence 每次获取成功递增，续约按 holder 与 fence 做 CAS，旧 leader 恢复后
-     *          无法继续延长或写回租约。数据库异常只记录并视为非 leader，不做内存兜底。
+     *          无法继续延长或写回租约。获取条件不接受 holder=自己，两个实例配了同一个
+     *          instanceId 时后来者不会与先来者共享同一行，必须等 TTL 过期；代价是进程
+     *          崩溃后重启最长要等一个 TTL 才能重新成为 leader。数据库异常只记录并视为
+     *          非 leader，不做内存兜底。
+     * @note 所有实例的系统时钟必须由 NTP 对齐：expires_at 的写入与比较都取本机 UTC 时间，
+     *       时钟偏差超过 TTL 会让仍存活的 holder 被其他实例误判为过期，形成双 leader。
      */
     class LeaderLease
     {
@@ -44,7 +49,7 @@ namespace EdgePulse::System
         /**
          * @brief 构造一个尚未启动的租约
          * @param database 进程级数据库
-         * @param instanceId 本实例标识，必须非空、不含空白且不超过 128 字符
+         * @param instanceId 本实例标识，必须非空、不含空白且不超过 128 字符；同时存活的实例必须唯一
          * @param name 租约行名，默认 control-plane
          * @param ttl 每次获取或续约写入的有效期
          * @param renewInterval 续约周期；跟随者同样按该周期重试获取
@@ -69,8 +74,10 @@ namespace EdgePulse::System
         /**
          * @brief 在事件循环上先尝试获取一次，再启动周期续约循环
          * @param loop 事件循环
-         * @return true 首次获取成功；false 首次未获取到或数据库报错，循环仍会继续尝试
+         * @return true 首次获取成功；false 首次未获取到、数据库报错或循环调度被拒
          * @note 只能在事件循环线程上 co_await；重复调用返回当前 leader 状态，不会启动第二个循环。
+         *       首次未获取或数据库报错时循环仍会按续约周期重试；本地调度被拒时收回半启动状态
+         *       并返回 false，已写入的 holder 会在 TTL 后自然失效。
          *       事件循环必须比本对象活得久：析构会查询它是否仍在运行
          */
         AsynGyanis::Core::Task<bool> start(AsynGyanis::Core::EventLoop &loop);

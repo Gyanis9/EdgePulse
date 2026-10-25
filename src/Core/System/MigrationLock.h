@@ -28,7 +28,8 @@ namespace EdgePulse::System
     /**
      * @brief 迁移期的互斥锁：MySQL 用命名锁，SQLite 按单写者直接放行
      * @details MySQL 通过独立直连执行 GET_LOCK，连接存活期间持锁，析构或 release 时
-     *          执行 RELEASE_LOCK 并断开；SQLite 不承诺多实例，不在这里假装互斥。
+     *          执行 RELEASE_LOCK 并断开；锁名带库名，同一服务器上的不同库各自串行。
+     *          SQLite 不承诺多实例，不在这里假装互斥。
      */
     class MigrationLock
     {
@@ -63,10 +64,12 @@ namespace EdgePulse::System
         /**
          * @brief 接管一条已拿到 GET_LOCK 的连接
          * @param connection 直连；SQLite 路径为空
+         * @param lockName 与连接上取得的命名锁同名，释放时复用
          */
-        explicit MigrationLock(std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection) noexcept;
+        MigrationLock(std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection, std::string lockName) noexcept;
 
         std::unique_ptr<AsynGyanis::Database::DatabaseConnection> m_connection;  ///< 持锁连接；空表示 SQLite 直通
+        std::string                                               m_lockName;    ///< GET_LOCK 使用的锁名；空表示未持锁
         bool                                                      m_held{false}; ///< 是否仍持有 MySQL 命名锁
     };
 } // namespace EdgePulse::System
