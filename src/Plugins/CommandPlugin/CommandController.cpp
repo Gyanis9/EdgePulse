@@ -9,9 +9,10 @@
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/AuthService.h"
-#include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/NodeRepository.h"
+#include "Core/Http/RealtimeBus.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 #include "Net/Http/Message/HttpRequest.h"
@@ -139,20 +140,14 @@ namespace EdgePulse::Command
                             fail(response, Common::kCodeNotFound, "目标节点不存在", traceId);
                             co_return;
                         }
-                        if (deps->channels != nullptr && deps->channels->isConnected(*nodeId))
+                        if (deps->realtimeBus != nullptr)
                         {
-                            const ConfigValue commandValue = ConfigValue::object({{"id", created->id},
-                                                                                  {"nodeId", created->nodeId},
-                                                                                  {"type", created->type},
-                                                                                  {"payload", created->payload},
-                                                                                  {"timeoutSeconds", created->timeoutSeconds}});
-                            const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-                            if (co_await deps->channels->send(*nodeId, message))
+                            co_await deps->realtimeBus->publishAgent(loop, makeAgentCommandMessage(*created));
+                            // 状态由本地或远端实例的 handler 条件推进；读回数据库才是唯一事实来源
+                            const auto refreshed = co_await commands->find(loop, created->id);
+                            if (refreshed.has_value())
                             {
-                                if (co_await commands->markDispatched(loop, created->id))
-                                {
-                                    created = co_await commands->find(loop, created->id);
-                                }
+                                created = refreshed;
                             }
                         }
                         if (deps->notifier)
@@ -207,20 +202,13 @@ namespace EdgePulse::Command
                             {
                                 continue;
                             }
-                            if (due && deps->channels != nullptr && deps->channels->isConnected(nodeId))
+                            if (due && deps->realtimeBus != nullptr)
                             {
-                                const ConfigValue commandValue = ConfigValue::object({{"id", created->id},
-                                                                                      {"nodeId", created->nodeId},
-                                                                                      {"type", created->type},
-                                                                                      {"payload", created->payload},
-                                                                                      {"timeoutSeconds", created->timeoutSeconds}});
-                                const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-                                if (co_await deps->channels->send(nodeId, message))
+                                co_await deps->realtimeBus->publishAgent(loop, makeAgentCommandMessage(*created));
+                                const auto refreshed = co_await commands->find(loop, created->id);
+                                if (refreshed.has_value())
                                 {
-                                    if (co_await commands->markDispatched(loop, created->id))
-                                    {
-                                        created = co_await commands->find(loop, created->id);
-                                    }
+                                    created = refreshed;
                                 }
                             }
                             if (deps->notifier && created.has_value())

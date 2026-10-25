@@ -39,22 +39,26 @@ namespace EdgePulse::Agent
 
     /**
      * @brief WebSocket 通道与命令轮询之间的降级状态
-     * @details 轮询在启动时立即运行，只有通道通过 hello 确认可用后才暂停；任何断开都恢复轮询。
-     *          连续失败次数只用于重连退避与日志，不参与是否轮询的判定。这样在 hello 与通道
-     *          登记之间的空窗里创建的命令不会滞留到下一次连接失败。
-     * @note 只在事件循环线程上使用，内部不做同步。
+     * @details 轮询在启动时立即运行；hello 确认通道可用后不再连续轮询，但每 60 秒仍强制拉取一次，
+     *          防止 Redis 或跨实例路由故障把命令留在队列里。任何断开都立即恢复按配置间隔的轮询。
+     *          连续失败次数只用于重连退避与日志，不参与是否轮询的判定。
+     * @note 只在事件循环线程上使用，内部不做同步；时间来源可注入，测试用假时钟推进。
      */
     class WebSocketFallbackState
     {
     public:
+        /// 当前时刻来源；为空时使用 steady_clock::now()
+        using NowFunction = std::function<std::chrono::steady_clock::time_point()>;
+
         /**
          * @brief 构造降级状态；初始未连接，轮询因此是运行的
+         * @param now 当前时刻来源，测试注入假时钟
          */
-        WebSocketFallbackState() = default;
+        explicit WebSocketFallbackState(NowFunction now = {});
 
         /**
          * @brief 记录通道通过 hello 确认可用
-         * @details 暂停轮询并清零失败计数
+         * @details 暂停连续轮询、把 60 秒强制轮询的起点推到当前时刻，并清零失败计数
          */
         void recordConnected();
 
@@ -71,10 +75,24 @@ namespace EdgePulse::Agent
         void recordConnectFailure();
 
         /**
-         * @brief 轮询是否应当运行
-         * @return 通道当前未连接时返回 true；只有 hello 已确认的连接会暂停轮询
+         * @brief 本轮是否应当拉取命令
+         * @return 未连接时恒为 true；已连接时只在距上次轮询满 60 秒的那一次返回 true
+         * @note 返回 true 会把「上次轮询」推到当前时刻；断开连接时同样记录，避免恢复后立刻重复计时
          */
-        [[nodiscard]] bool shouldPoll() const;
+        [[nodiscard]] bool shouldPoll();
+
+        /**
+         * @brief 距离下一次轮询还有多久
+         * @param disconnectedInterval 断开期间使用的间隔；非正值退回 15 秒
+         * @return std::chrono::seconds 连接期间按 60 秒节拍计算，断开期间直接返回配置间隔
+         */
+        [[nodiscard]] std::chrono::seconds nextPollDelay(std::chrono::seconds disconnectedInterval) const;
+
+        /**
+         * @brief 通道是否已通过 hello 确认
+         * @return bool 已连接为 true
+         */
+        [[nodiscard]] bool isConnected() const;
 
         /**
          * @brief 当前连续连接失败次数
@@ -83,8 +101,19 @@ namespace EdgePulse::Agent
         [[nodiscard]] int consecutiveFailures() const;
 
     private:
-        bool m_connected{false};       ///< 通道是否已通过 hello 确认
-        int  m_consecutiveFailures{0}; ///< 连续连接失败次数
+        /**
+         * @brief 取当前时刻
+         * @return std::chrono::steady_clock::time_point 注入时钟或系统单调时钟
+         */
+        [[nodiscard]] std::chrono::steady_clock::time_point now() const;
+
+        static constexpr std::chrono::seconds kConnectedPollInterval{60};        ///< 已连接时的强制轮询间隔
+        static constexpr std::chrono::seconds kDisconnectedFallbackInterval{15}; ///< 配置非法时的断开轮询间隔
+
+        NowFunction                           m_now;                    ///< 当前时刻来源
+        std::chrono::steady_clock::time_point m_lastPoll{};             ///< 上次轮询或连接确认的时刻
+        bool                                  m_connected{false};       ///< 通道是否已通过 hello 确认
+        int                                   m_consecutiveFailures{0}; ///< 连续连接失败次数
     };
 
     /**

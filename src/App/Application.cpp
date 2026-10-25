@@ -64,6 +64,7 @@
 #include "Core/Firmware/FirmwareSigningPolicy.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Ops/OpsRepository.h"
 #include "Core/Http/SseBroadcaster.h"
 #include "Core/Http/AlarmEventStream.h"
@@ -227,8 +228,8 @@ namespace EdgePulse::App
             authOptions.loginFailureWindowSeconds = m_configuration.loginFailureWindowSeconds;
             authOptions.loginMaximumFailures      = m_configuration.loginMaximumFailures;
             authOptions.loginLockSeconds          = m_configuration.loginLockSeconds;
-            m_authService      = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache, m_tenantRepository, authOptions);
-            m_mfaService       = std::make_shared<Auth::MfaService>(m_database, m_cache, m_configuration.mfaEncryptionKey);
+            m_authService = std::make_shared<Auth::AuthService>(m_database, m_sessionStore, m_captchaService, m_loginAudit, m_cache, m_tenantRepository, authOptions);
+            m_mfaService  = std::make_shared<Auth::MfaService>(m_database, m_cache, m_configuration.mfaEncryptionKey);
             // 登录与外部身份签发共用同一个两步验证服务，装配阶段绑定一次
             m_authService->setMfaService(m_mfaService);
             // 只报告是否配置；密钥内容与长度都不进日志
@@ -243,13 +244,12 @@ namespace EdgePulse::App
             realtimeOptions.password   = m_configuration.redisPassword;
             realtimeOptions.database   = m_configuration.redisDatabase;
             m_realtimeBus              = std::make_unique<Web::RealtimeBus>(loop, *m_browserWebSocket, *m_sseBroadcaster, std::move(realtimeOptions));
-            m_realtimeBus->start();
-            m_nodeRepository = std::make_shared<Device::NodeRepository>(m_database);
+            m_nodeRepository           = std::make_shared<Device::NodeRepository>(m_database);
             // 离线判定按进程汇总；仓储默认只看默认租户，周期扫描必须显式取全租户视图
-            m_fleetNodes             = m_nodeRepository->scoped({0, true});
-            m_nodeConfigRepository   = std::make_shared<Device::NodeConfigRepository>(m_database);
-            m_enrollmentRepository   = std::make_shared<Device::EnrollmentRepository>(m_database);
-            m_enrollmentService      = std::make_shared<Device::EnrollmentService>(m_enrollmentRepository);
+            m_fleetNodes           = m_nodeRepository->scoped({0, true});
+            m_nodeConfigRepository = std::make_shared<Device::NodeConfigRepository>(m_database);
+            m_enrollmentRepository = std::make_shared<Device::EnrollmentRepository>(m_database);
+            m_enrollmentService    = std::make_shared<Device::EnrollmentService>(m_enrollmentRepository);
             // CA 私钥只在装配阶段读入；未启用时也保留一个禁用实例，后续路由按 enabled() 短路
             Device::AgentCaOptions agentCaOptions;
             agentCaOptions.enabled         = m_configuration.agentCaEnabled;
@@ -339,10 +339,10 @@ namespace EdgePulse::App
             m_logRepository        = std::make_shared<System::LogRepository>(m_database);
             // 中间件与保留期清理共用同一个仓储，过期幂等行才能被周期扫描物理删掉
             m_idempotencyRepository = std::make_shared<Web::IdempotencyRepository>(m_database);
-            m_dataScopeService     = std::make_shared<Auth::DataScopeService>(m_database);
-            m_nodeGroupRepository  = std::make_shared<Device::NodeGroupRepository>(m_database);
-            m_telemetryRepository  = std::make_shared<Telemetry::TelemetryRepository>(m_database);
-            m_firmwareRepository   = std::make_shared<Firmware::FirmwareRepository>(m_database);
+            m_dataScopeService      = std::make_shared<Auth::DataScopeService>(m_database);
+            m_nodeGroupRepository   = std::make_shared<Device::NodeGroupRepository>(m_database);
+            m_telemetryRepository   = std::make_shared<Telemetry::TelemetryRepository>(m_database);
+            m_firmwareRepository    = std::make_shared<Firmware::FirmwareRepository>(m_database);
             // 信任键在装配阶段一次读入；强制签名但目录无键时直接拒绝启动，避免上线后才发现门禁形同虚设
             auto verifier = Firmware::FirmwareSignatureVerifier::loadFromDirectory(m_configuration.firmwareTrustedKeysDirectory);
             if (!verifier.has_value())
@@ -358,12 +358,19 @@ namespace EdgePulse::App
             auto verifierPointer = std::make_shared<Firmware::FirmwareSignatureVerifier>(std::move(*verifier));
             m_signingPolicy =
                     std::make_shared<Firmware::FirmwareSigningPolicy>(Firmware::FirmwareSigningPolicy{m_configuration.firmwareRequireSignature, std::move(verifierPointer)});
-            m_commandRepository    = std::make_shared<Command::CommandRepository>(m_database);
-            m_agentChannels        = std::make_shared<Command::AgentChannelRegistry>();
-            m_nodeConfigService    = std::make_shared<Device::NodeConfigService>(m_nodeConfigRepository, m_nodeRepository, m_commandRepository, m_agentChannels.get(),
-                                                                                 [this](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
-                                                                                 { co_await publishCommandStatus(command); });
-            m_opsRepository        = std::make_shared<Ops::OpsRepository>(m_database);
+            m_commandRepository = std::make_shared<Command::CommandRepository>(m_database);
+            m_agentChannels     = std::make_shared<Command::AgentChannelRegistry>();
+            // Agent 消息的本地投递口：通道写出成功后才把命令从 pending 推进到 running；
+            // 本实例没有连接时保持待执行，跨实例转发由总线继续完成
+            auto agentCommandDelivery = std::make_shared<Command::AgentCommandDelivery>(*m_agentChannels, m_commandRepository->scoped({0, true}));
+            m_realtimeBus->setAgentMessageHandler([agentCommandDelivery, &loop](const Web::AgentMessage &message) -> AsynGyanis::Core::Task<>
+                                                  { co_await agentCommandDelivery->deliver(loop, message); });
+            // 投递口先就位再开订阅：启动窗口里到达的远端 Agent 命令不会因 handler 为空被丢弃
+            m_realtimeBus->start();
+            m_nodeConfigService = std::make_shared<Device::NodeConfigService>(m_nodeConfigRepository, m_nodeRepository, m_commandRepository, m_realtimeBus.get(),
+                                                                              [this](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<>
+                                                                              { co_await publishCommandStatus(command); });
+            m_opsRepository     = std::make_shared<Ops::OpsRepository>(m_database);
 
             if (m_configuration.udpTelemetryEnabled)
             {
@@ -464,15 +471,13 @@ namespace EdgePulse::App
 
         // 公开 HTTP/HTTPS 与 h3 接受固件上传，解析器上限给固件留出余量；Agent 与运维口只收小正文
         AsynGyanis::Net::HttpServerLimits limits;
-        limits.idleTimeout  = std::chrono::milliseconds{m_configuration.idleTimeoutMs};
-        limits.readTimeout  = std::chrono::milliseconds{m_configuration.readTimeoutMs};
-        limits.writeTimeout = std::chrono::milliseconds{m_configuration.writeTimeoutMs};
+        limits.idleTimeout                          = std::chrono::milliseconds{m_configuration.idleTimeoutMs};
+        limits.readTimeout                          = std::chrono::milliseconds{m_configuration.readTimeoutMs};
+        limits.writeTimeout                         = std::chrono::milliseconds{m_configuration.writeTimeoutMs};
         const std::size_t configuredMaximumBodySize = static_cast<std::size_t>(m_configuration.maximumRequestBodyBytes);
-        const std::size_t uploadMaximumBodySize =
-                std::max(configuredMaximumBodySize, static_cast<std::size_t>(m_configuration.maximumFirmwareBytes));
-        LOG_INFO_FMT("连接限额已生效：空闲 {} ms、读取 {} ms、写入 {} ms；Agent 与运维口正文上限 {} 字节，公开口与 h3 正文上限 {} 字节",
-                     m_configuration.idleTimeoutMs, m_configuration.readTimeoutMs, m_configuration.writeTimeoutMs, configuredMaximumBodySize,
-                     uploadMaximumBodySize);
+        const std::size_t uploadMaximumBodySize     = std::max(configuredMaximumBodySize, static_cast<std::size_t>(m_configuration.maximumFirmwareBytes));
+        LOG_INFO_FMT("连接限额已生效：空闲 {} ms、读取 {} ms、写入 {} ms；Agent 与运维口正文上限 {} 字节，公开口与 h3 正文上限 {} 字节", m_configuration.idleTimeoutMs,
+                     m_configuration.readTimeoutMs, m_configuration.writeTimeoutMs, configuredMaximumBodySize, uploadMaximumBodySize);
 
         if (m_configuration.requestsPerSecond > 0.0)
         {
@@ -611,17 +616,17 @@ namespace EdgePulse::App
                 telemetryAgentDependencies.alarms    = m_alarmService.get();
                 Telemetry::registerTelemetryAgentRoutes(m_agentServer->router(), loop, telemetryAgentDependencies);
                 Command::CommandDependencies commandAgentDependencies;
-                commandAgentDependencies.auth     = m_authService.get();
-                commandAgentDependencies.commands = m_commandRepository.get();
-                commandAgentDependencies.channels = m_agentChannels.get();
-                commandAgentDependencies.nodes    = m_nodeRepository.get();
+                commandAgentDependencies.auth        = m_authService.get();
+                commandAgentDependencies.commands    = m_commandRepository.get();
+                commandAgentDependencies.realtimeBus = m_realtimeBus.get();
+                commandAgentDependencies.nodes       = m_nodeRepository.get();
                 Command::registerCommandAgentRoutes(m_agentServer->router(), loop, commandAgentDependencies);
                 Firmware::FirmwareDependencies firmwareAgentDependencies;
                 firmwareAgentDependencies.auth               = m_authService.get();
                 firmwareAgentDependencies.firmware           = m_firmwareRepository.get();
                 firmwareAgentDependencies.nodes              = m_nodeRepository.get();
                 firmwareAgentDependencies.commands           = m_commandRepository.get();
-                firmwareAgentDependencies.channels           = m_agentChannels.get();
+                firmwareAgentDependencies.realtimeBus        = m_realtimeBus.get();
                 firmwareAgentDependencies.storageDirectory   = m_configuration.firmwareDirectory;
                 firmwareAgentDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
                 firmwareAgentDependencies.signingPolicy      = m_signingPolicy;
@@ -696,56 +701,40 @@ namespace EdgePulse::App
                 "计划命令调度", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
                 [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
         // follower 只等待：计划命令是控制面单飞工作，多实例同时推进会把同一条命令重复下发
-        System::LeaderTick leaderTick(
-                leaderGate, [this, &loop, allCommands]() -> AsynGyanis::Core::Task<>
-                {
-                    std::vector<Command::CommandRecord> due;
-                    try
-                    {
-                        due = co_await allCommands->listDue(loop, 100);
-                    } catch (const std::exception &failure)
-                    {
-                        LOG_WARN_FMT("计划命令扫描失败：{}", failure.what());
-                        co_return;
-                    }
-                    for (const Command::CommandRecord &command: due)
-                    {
-                        if (!m_agentChannels->isConnected(command.nodeId))
-                        {
-                            continue;
-                        }
-                        try
-                        {
-                            const AsynGyanis::Base::ConfigValue commandValue = AsynGyanis::Base::ConfigValue::object(
-                                    {{"id", command.id}, {"nodeId", command.nodeId}, {"type", command.type}, {"payload", command.payload}, {"timeoutSeconds", command.timeoutSeconds}});
-                            const std::string message = AsynGyanis::Base::ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-                            if (!co_await m_agentChannels->send(command.nodeId, message))
-                            {
-                                continue;
-                            }
-                            if (!co_await allCommands->markDispatched(loop, command.id))
-                            {
-                                continue;
-                            }
-                            const auto updated = co_await allCommands->find(loop, command.id);
-                            if (!updated.has_value())
-                            {
-                                continue;
-                            }
-                            const std::string statusPayload = AsynGyanis::Base::ConfigValue::object({{"type", "command.status"},
-                                                                                                     {"data", AsynGyanis::Base::ConfigValue::object({{"id", updated->id},
-                                                                                                                                                     {"nodeId", updated->nodeId},
-                                                                                                                                                     {"type", updated->type},
-                                                                                                                                                     {"status", updated->status},
-                                                                                                                                                     {"message", updated->message}})}})
-                                                                      .dump();
-                            co_await m_realtimeBus->publish("commands", updated->tenantId, statusPayload);
-                        } catch (const std::exception &failure)
-                        {
-                            LOG_WARN_FMT("计划命令下发失败：command={} error={}", command.id, failure.what());
-                        }
-                    }
-                });
+        System::LeaderTick leaderTick(leaderGate,
+                                      [this, &loop, allCommands]() -> AsynGyanis::Core::Task<>
+                                      {
+                                          std::vector<Command::CommandRecord> due;
+                                          try
+                                          {
+                                              due = co_await allCommands->listDue(loop, 100);
+                                          } catch (const std::exception &failure)
+                                          {
+                                              LOG_WARN_FMT("计划命令扫描失败：{}", failure.what());
+                                              co_return;
+                                          }
+                                          for (const Command::CommandRecord &command: due)
+                                          {
+                                              try
+                                              {
+                                                  if (m_realtimeBus == nullptr)
+                                                  {
+                                                      continue;
+                                                  }
+                                                  // 由持有该节点连接的实例写出；本实例没有连接时消息仍会跨实例转发
+                                                  co_await m_realtimeBus->publishAgent(loop, Command::makeAgentCommandMessage(command));
+                                                  const auto updated = co_await allCommands->find(loop, command.id);
+                                                  if (!updated.has_value() || updated->status == command.status)
+                                                  {
+                                                      continue;
+                                                  }
+                                                  co_await publishCommandStatus(*updated);
+                                              } catch (const std::exception &failure)
+                                              {
+                                                  LOG_WARN_FMT("计划命令下发失败：command={} error={}", command.id, failure.what());
+                                              }
+                                          }
+                                      });
         while (true)
         {
             co_await ticker.waitFor(std::chrono::seconds{2});
@@ -761,47 +750,47 @@ namespace EdgePulse::App
         System::LeaderGate                                          leaderGate(
                 "数据保留期清理", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
                 [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
-        bool             firstRun = true;
-        System::LeaderTick retentionTick(
-                leaderGate, [this, &loop, &firstRun, allTelemetry, allDeliveries]() -> AsynGyanis::Core::Task<>
-                {
-                    firstRun = false;
-                    // 三张表各自兜底，一张失败不拖住其余清理
-                    try
-                    {
-                        static_cast<void>(co_await allTelemetry->prune(loop, m_configuration.telemetryRetentionDays));
-                    } catch (const std::exception &failure)
-                    {
-                        LOG_WARN_FMT("遥测清理失败：{}", failure.what());
-                    }
-                    try
-                    {
-                        static_cast<void>(co_await m_logRepository->prune(loop, m_configuration.logRetentionDays));
-                    } catch (const std::exception &failure)
-                    {
-                        LOG_WARN_FMT("日志清理失败：{}", failure.what());
-                    }
-                    try
-                    {
-                        static_cast<void>(co_await allDeliveries->prune(loop, m_configuration.deliveryRetentionDays));
-                    } catch (const std::exception &failure)
-                    {
-                        LOG_WARN_FMT("投递记录清理失败：{}", failure.what());
-                    }
-                    try
-                    {
-                        const std::size_t pruned = co_await m_idempotencyRepository->pruneExpired(loop);
-                        if (pruned > 0)
-                        {
-                            LOG_INFO_FMT("幂等记录清理完成：删除 {} 条到期记录", pruned);
-                        }
-                    } catch (const std::exception &failure)
-                    {
-                        LOG_WARN_FMT("幂等记录清理失败：{}", failure.what());
-                    }
-                    LOG_INFO_FMT("数据清理完成（保留天数，0 表示关闭）：遥测 {}、日志 {}、投递记录 {}", m_configuration.telemetryRetentionDays, m_configuration.logRetentionDays,
-                                 m_configuration.deliveryRetentionDays);
-                });
+        bool               firstRun = true;
+        System::LeaderTick retentionTick(leaderGate,
+                                         [this, &loop, &firstRun, allTelemetry, allDeliveries]() -> AsynGyanis::Core::Task<>
+                                         {
+                                             firstRun = false;
+                                             // 三张表各自兜底，一张失败不拖住其余清理
+                                             try
+                                             {
+                                                 static_cast<void>(co_await allTelemetry->prune(loop, m_configuration.telemetryRetentionDays));
+                                             } catch (const std::exception &failure)
+                                             {
+                                                 LOG_WARN_FMT("遥测清理失败：{}", failure.what());
+                                             }
+                                             try
+                                             {
+                                                 static_cast<void>(co_await m_logRepository->prune(loop, m_configuration.logRetentionDays));
+                                             } catch (const std::exception &failure)
+                                             {
+                                                 LOG_WARN_FMT("日志清理失败：{}", failure.what());
+                                             }
+                                             try
+                                             {
+                                                 static_cast<void>(co_await allDeliveries->prune(loop, m_configuration.deliveryRetentionDays));
+                                             } catch (const std::exception &failure)
+                                             {
+                                                 LOG_WARN_FMT("投递记录清理失败：{}", failure.what());
+                                             }
+                                             try
+                                             {
+                                                 const std::size_t pruned = co_await m_idempotencyRepository->pruneExpired(loop);
+                                                 if (pruned > 0)
+                                                 {
+                                                     LOG_INFO_FMT("幂等记录清理完成：删除 {} 条到期记录", pruned);
+                                                 }
+                                             } catch (const std::exception &failure)
+                                             {
+                                                 LOG_WARN_FMT("幂等记录清理失败：{}", failure.what());
+                                             }
+                                             LOG_INFO_FMT("数据清理完成（保留天数，0 表示关闭）：遥测 {}、日志 {}、投递记录 {}", m_configuration.telemetryRetentionDays,
+                                                          m_configuration.logRetentionDays, m_configuration.deliveryRetentionDays);
+                                         });
         while (true)
         {
             // 重启后先尽快清一次，避免积压等到首个六小时周期；尚未当选时保持首轮标记，当选后一分钟内补跑
@@ -999,10 +988,10 @@ namespace EdgePulse::App
 
         const auto                   commandNotifier = [this](const Command::CommandRecord &command) -> AsynGyanis::Core::Task<> { co_await publishCommandStatus(command); };
         Command::CommandDependencies commandDependencies;
-        commandDependencies.auth     = m_authService.get();
-        commandDependencies.commands = m_commandRepository.get();
-        commandDependencies.channels = m_agentChannels.get();
-        commandDependencies.notifier = commandNotifier;
+        commandDependencies.auth        = m_authService.get();
+        commandDependencies.commands    = m_commandRepository.get();
+        commandDependencies.realtimeBus = m_realtimeBus.get();
+        commandDependencies.notifier    = commandNotifier;
         Command::registerCommandRoutes(router, loop, commandDependencies);
 
         Firmware::FirmwareDependencies firmwareDependencies;
@@ -1010,7 +999,7 @@ namespace EdgePulse::App
         firmwareDependencies.firmware           = m_firmwareRepository.get();
         firmwareDependencies.nodes              = m_nodeRepository.get();
         firmwareDependencies.commands           = m_commandRepository.get();
-        firmwareDependencies.channels           = m_agentChannels.get();
+        firmwareDependencies.realtimeBus        = m_realtimeBus.get();
         firmwareDependencies.notifier           = commandNotifier;
         firmwareDependencies.tenants            = m_tenantRepository.get();
         firmwareDependencies.storageDirectory   = m_configuration.firmwareDirectory;
@@ -1049,7 +1038,7 @@ namespace EdgePulse::App
             co_return Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                             session->departmentId, session->roles,    session->permissions};
         };
-        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get(), m_agentChannels.get(),
+        Device::registerRoutes(router, loop, *m_nodeService, accessResolver, m_dataScopeService.get(), m_tenantRepository.get(), m_lifecycle.get(), m_realtimeBus.get(),
                                m_nodeConfigRepository.get());
         Device::EnrollmentDependencies enrollmentDependencies;
         enrollmentDependencies.auth        = m_authService.get();

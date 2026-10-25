@@ -8,6 +8,7 @@
 #include "Core/Alarm/AlarmService.h"
 #include "Core/Auth/AuthService.h"
 #include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/NodeConfigRepository.h"
@@ -22,6 +23,8 @@
 #include "Core/Http/AgentWebSocket.h"
 #include "Core/Http/Authorization.h"
 #include "Core/Http/MiddlewareSetup.h"
+#include "Core/Http/RealtimeBus.h"
+#include "Core/Http/SseBroadcaster.h"
 #include "Core/Http/WebSocketEndpoints.h"
 #include "Core/System/LogRepository.h"
 #include "Core/System/TenantRepository.h"
@@ -71,7 +74,8 @@ namespace
     [[nodiscard]] std::int64_t countFirmwareTasks(const std::filesystem::path &databasePath, const std::int64_t firmwareId)
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
-        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result = connection->execute("SELECT COUNT(*) FROM biz_firmware_task WHERE firmware_id = " + std::to_string(firmwareId));
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result =
+                connection->execute("SELECT COUNT(*) FROM biz_firmware_task WHERE firmware_id = " + std::to_string(firmwareId));
         EXPECT_NE(nullptr, result) << connection->lastError();
         if (result == nullptr || !result->next())
         {
@@ -85,8 +89,8 @@ namespace
                             const std::int64_t nodeId)
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
-        const std::string now  = EdgePulse::Common::nowDateTimeUtc();
-        const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection->execute(
+        const std::string                                               now        = EdgePulse::Common::nowDateTimeUtc();
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result     = connection->execute(
                 "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, previous_firmware_id) VALUES (" +
                 std::to_string(taskId) + ", " + std::to_string(tenantId) + ", " + std::to_string(firmwareId) + ", " + std::to_string(nodeId) + ", 'pending', 0, '', '" + now +
                 "', '" + now + "', 0)");
@@ -208,8 +212,8 @@ namespace
             result.connected = true;
 
             // body 是 string_view：序列化结果要活到 co_await 返回，直接绑定 dump() 的临时串会在 send 读取前释放
-            const std::string                   bodyText = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"type", "ws-echo"}, {"payload", "{}"}, {"timeoutSeconds", 30}}).dump();
-            AsynGyanis::Net::HttpClientRequest  request;
+            const std::string bodyText = AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"type", "ws-echo"}, {"payload", "{}"}, {"timeoutSeconds", 30}}).dump();
+            AsynGyanis::Net::HttpClientRequest request;
             request.method      = "POST";
             request.contentType = "application/json";
             request.headers     = bearer(token);
@@ -436,9 +440,9 @@ class FleetEndpointsTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        m_context          = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
-        m_storage          = std::filesystem::temp_directory_path() / ("edgepulse-firmware-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-        m_keyDirectory     = std::filesystem::path(m_storage.string() + "-keys");
+        m_context      = std::make_unique<EdgePulse::TestSupport::AuthTestContext>();
+        m_storage      = std::filesystem::temp_directory_path() / ("edgepulse-firmware-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        m_keyDirectory = std::filesystem::path(m_storage.string() + "-keys");
         std::filesystem::create_directories(m_keyDirectory);
         m_signingKey = generateSigningKey();
         ASSERT_NE(nullptr, m_signingKey.privateKey.get());
@@ -447,13 +451,13 @@ protected:
         ASSERT_TRUE(signingVerifier.has_value()) << signingVerifier.error();
         m_signingPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(
                 EdgePulse::Firmware::FirmwareSigningPolicy{false, std::make_shared<EdgePulse::Firmware::FirmwareSignatureVerifier>(std::move(*signingVerifier))});
-        m_nodes            = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
-        m_nodeService      = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
-        m_groups           = std::make_shared<EdgePulse::Device::NodeGroupRepository>(m_context->database);
-        m_telemetry        = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
-        m_alarmRepo        = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
-        m_alarmService     = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
-        m_lifecycle        = std::make_unique<EdgePulse::Device::NodeLifecycleService>(
+        m_nodes        = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
+        m_nodeService  = std::make_shared<EdgePulse::Device::NodeService>(m_nodes);
+        m_groups       = std::make_shared<EdgePulse::Device::NodeGroupRepository>(m_context->database);
+        m_telemetry    = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
+        m_alarmRepo    = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
+        m_alarmService = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
+        m_lifecycle    = std::make_unique<EdgePulse::Device::NodeLifecycleService>(
                 *m_nodes, *m_alarmService, [](const EdgePulse::Device::NodeRecord &) -> AsynGyanis::Core::Task<> { co_return; }, 90);
         // 与 Application 一致：注册表把每次注册与心跳都交给生命周期，是否发布由它按 becameOnline 决定
         EdgePulse::Device::AgentRegistry::Options agentOptions;
@@ -464,9 +468,13 @@ protected:
         m_channels         = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
         m_firmware         = std::make_shared<EdgePulse::Firmware::FirmwareRepository>(m_context->database);
         m_browserWebSocket = std::make_shared<EdgePulse::Web::BrowserWebSocket>();
+        m_sse              = std::make_shared<EdgePulse::Web::SseBroadcaster>();
+        // 测试不启用 Redis：publishAgent 只做本地投递，验证通道写出与命令行推进
+        EdgePulse::Web::RealtimeBusOptions realtimeOptions;
+        m_realtimeBus = std::make_unique<EdgePulse::Web::RealtimeBus>(m_runner.loop(), *m_browserWebSocket, *m_sse, std::move(realtimeOptions));
 
         m_nodeConfigs       = std::make_shared<EdgePulse::Device::NodeConfigRepository>(m_context->database);
-        m_nodeConfigService = std::make_shared<EdgePulse::Device::NodeConfigService>(m_nodeConfigs, m_nodes, m_commands, m_channels.get(), nullptr);
+        m_nodeConfigService = std::make_shared<EdgePulse::Device::NodeConfigService>(m_nodeConfigs, m_nodes, m_commands, m_realtimeBus.get(), nullptr);
 
         m_server = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
                 [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
@@ -496,7 +504,7 @@ protected:
                     configDependencies.service = m_nodeConfigService.get();
                     configDependencies.nodes   = m_nodes.get();
                     EdgePulse::Device::registerNodeConfigRoutes(router, loop, configDependencies);
-                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), m_lifecycle.get(), m_channels.get(),
+                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), m_lifecycle.get(), m_realtimeBus.get(),
                                                       m_nodeConfigs.get());
                     EdgePulse::Device::registerRoutes(router, loop, *m_agentRegistry, *m_nodes, *m_context->tenants, 30, m_nodeConfigs.get());
                     EdgePulse::Device::registerNodeConfigAgentRoutes(router, loop, configDependencies);
@@ -518,11 +526,15 @@ protected:
                     alarms.alarms = m_alarmService.get();
                     EdgePulse::Alarm::registerAlarmRoutes(router, loop, alarms);
 
+                    m_commandDelivery = std::make_shared<EdgePulse::Command::AgentCommandDelivery>(*m_channels, m_commands->scoped({0, true}));
+                    m_realtimeBus->setAgentMessageHandler([delivery = m_commandDelivery, &loop](const EdgePulse::Web::AgentMessage &message) -> AsynGyanis::Core::Task<>
+                                                          { co_await delivery->deliver(loop, message); });
+
                     EdgePulse::Command::CommandDependencies commands;
-                    commands.auth     = m_context->auth.get();
-                    commands.commands = m_commands.get();
-                    commands.channels = m_channels.get();
-                    commands.nodes    = m_nodes.get();
+                    commands.auth        = m_context->auth.get();
+                    commands.commands    = m_commands.get();
+                    commands.realtimeBus = m_realtimeBus.get();
+                    commands.nodes       = m_nodes.get();
                     EdgePulse::Command::registerCommandRoutes(router, loop, commands);
                     EdgePulse::Command::registerCommandAgentRoutes(router, loop, commands);
                     EdgePulse::Web::registerAgentWebSocket(router, loop, *m_nodes, *m_commands, *m_channels, m_lifecycle.get());
@@ -535,7 +547,7 @@ protected:
                     firmware.firmware           = m_firmware.get();
                     firmware.nodes              = m_nodes.get();
                     firmware.commands           = m_commands.get();
-                    firmware.channels           = m_channels.get();
+                    firmware.realtimeBus        = m_realtimeBus.get();
                     firmware.tenants            = m_context->tenants.get();
                     firmware.storageDirectory   = m_storage.string();
                     firmware.maximumUploadBytes = 8U * 1024U * 1024U;
@@ -548,6 +560,9 @@ protected:
     void TearDown() override
     {
         m_server.reset();
+        m_realtimeBus.reset();
+        m_commandDelivery.reset();
+        m_sse.reset();
         m_firmware.reset();
         m_nodeConfigService.reset();
         m_nodeConfigs.reset();
@@ -616,27 +631,30 @@ protected:
         ASSERT_NE(nullptr, connection->execute("UPDATE biz_node SET cert_fingerprint = '" + fingerprint + "' WHERE id = " + std::to_string(nodeId)));
     }
 
-    std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>   m_context;
-    EdgePulse::TestSupport::EventLoopRunner                    m_runner;
-    std::shared_ptr<EdgePulse::Device::NodeRepository>         m_nodes;
-    std::shared_ptr<EdgePulse::Device::NodeService>            m_nodeService;
-    std::shared_ptr<EdgePulse::Device::AgentRegistry>          m_agentRegistry;
-    std::shared_ptr<EdgePulse::Device::NodeGroupRepository>    m_groups;
-    std::shared_ptr<EdgePulse::Telemetry::TelemetryRepository> m_telemetry;
-    std::shared_ptr<EdgePulse::Alarm::AlarmRepository>         m_alarmRepo;
-    std::shared_ptr<EdgePulse::Alarm::AlarmService>            m_alarmService;
-    std::unique_ptr<EdgePulse::Device::NodeLifecycleService>   m_lifecycle;
-    std::shared_ptr<EdgePulse::Command::CommandRepository>     m_commands;
-    std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>  m_channels;
-    std::shared_ptr<EdgePulse::Device::NodeConfigRepository>   m_nodeConfigs;
-    std::shared_ptr<EdgePulse::Device::NodeConfigService>      m_nodeConfigService;
-    std::shared_ptr<EdgePulse::Firmware::FirmwareRepository>   m_firmware;
-    std::shared_ptr<EdgePulse::Web::BrowserWebSocket>          m_browserWebSocket;
-    std::unique_ptr<EdgePulse::TestSupport::ServerHarness>     m_server;
-    std::vector<AsynGyanis::Core::Task<>>                      m_probeTasks; ///< WebSocket 探针帧，活到夹具析构
-    std::filesystem::path                                      m_storage;
-    std::filesystem::path                                      m_keyDirectory;
-    SigningKeyPair                                             m_signingKey;
+    std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>    m_context;
+    EdgePulse::TestSupport::EventLoopRunner                     m_runner;
+    std::shared_ptr<EdgePulse::Device::NodeRepository>          m_nodes;
+    std::shared_ptr<EdgePulse::Device::NodeService>             m_nodeService;
+    std::shared_ptr<EdgePulse::Device::AgentRegistry>           m_agentRegistry;
+    std::shared_ptr<EdgePulse::Device::NodeGroupRepository>     m_groups;
+    std::shared_ptr<EdgePulse::Telemetry::TelemetryRepository>  m_telemetry;
+    std::shared_ptr<EdgePulse::Alarm::AlarmRepository>          m_alarmRepo;
+    std::shared_ptr<EdgePulse::Alarm::AlarmService>             m_alarmService;
+    std::unique_ptr<EdgePulse::Device::NodeLifecycleService>    m_lifecycle;
+    std::shared_ptr<EdgePulse::Command::CommandRepository>      m_commands;
+    std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>   m_channels;
+    std::shared_ptr<EdgePulse::Command::AgentCommandDelivery>   m_commandDelivery;
+    std::shared_ptr<EdgePulse::Device::NodeConfigRepository>    m_nodeConfigs;
+    std::shared_ptr<EdgePulse::Device::NodeConfigService>       m_nodeConfigService;
+    std::shared_ptr<EdgePulse::Firmware::FirmwareRepository>    m_firmware;
+    std::shared_ptr<EdgePulse::Web::BrowserWebSocket>           m_browserWebSocket;
+    std::shared_ptr<EdgePulse::Web::SseBroadcaster>             m_sse;
+    std::unique_ptr<EdgePulse::Web::RealtimeBus>                m_realtimeBus;
+    std::unique_ptr<EdgePulse::TestSupport::ServerHarness>      m_server;
+    std::vector<AsynGyanis::Core::Task<>>                       m_probeTasks; ///< WebSocket 探针帧，活到夹具析构
+    std::filesystem::path                                       m_storage;
+    std::filesystem::path                                       m_keyDirectory;
+    SigningKeyPair                                              m_signingKey;
     std::shared_ptr<EdgePulse::Firmware::FirmwareSigningPolicy> m_signingPolicy;
 };
 
@@ -647,7 +665,7 @@ TEST_F(FleetEndpointsTest, TelemetryTriggersAndAlarmLifecycle)
     const std::int64_t nodeId = createNode(token, "telemetry-node");
     const std::string  fingerprint(64, 'a');
     setNodeFingerprint(nodeId, fingerprint);
-    const std::string  body =
+    const std::string body =
             AsynGyanis::Base::ConfigValue::object(
                     {{"nodeId", nodeId},
                      {"samples", AsynGyanis::Base::ConfigValue::array({AsynGyanis::Base::ConfigValue::object({{"metric", "cpu.usage"}, {"value", 96}, {"unit", "%"}})})}})
@@ -678,7 +696,7 @@ TEST_F(FleetEndpointsTest, CommandRoundTrip)
     const std::int64_t nodeId = createNode(token, "command-node");
     const std::string  fingerprint(64, 'b');
     setNodeFingerprint(nodeId, fingerprint);
-    const auto         created =
+    const auto created =
             m_server->post("/api/commands", AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"type", "reboot"}, {"payload", "{}"}, {"timeoutSeconds", 30}}).dump(),
                            "application/json", bearer(token));
     ASSERT_EQ(200, created.status) << created.body;
@@ -703,8 +721,8 @@ TEST_F(FleetEndpointsTest, CommandRoundTrip)
 TEST_F(FleetEndpointsTest, AgentRequestsRequireCertificateBinding)
 {
     EdgePulse::TestSupport::EventLoopRunner runner;
-    const auto                                node = runner.run(m_nodes->create(runner.loop(), "agent-identity", "{}"));
-    const std::string                         fingerprint(64, 'a');
+    const auto                              node = runner.run(m_nodes->create(runner.loop(), "agent-identity", "{}"));
+    const std::string                       fingerprint(64, 'a');
     setNodeFingerprint(node.id, fingerprint);
 
     const std::string heartbeatBody = R"({"nodeId":)" + std::to_string(node.id) + R"(,"agentVersion":"1.0.0"})";
@@ -750,9 +768,9 @@ TEST_F(FleetEndpointsTest, HeartbeatCarriesDesiredConfigVersion)
 TEST_F(FleetEndpointsTest, HeartbeatWithoutTransitionResolvesSweepInsertedAlarm)
 {
     EdgePulse::TestSupport::EventLoopRunner runner;
-    const std::string                         token  = login();
-    const std::int64_t                        nodeId = createNode(token, "heartbeat-alarm-node");
-    const std::string                         fingerprint(64, '6');
+    const std::string                       token  = login();
+    const std::int64_t                      nodeId = createNode(token, "heartbeat-alarm-node");
+    const std::string                       fingerprint(64, '6');
     setNodeFingerprint(nodeId, fingerprint);
 
     const std::string heartbeatBody = R"({"nodeId":)" + std::to_string(nodeId) + R"(,"agentVersion":"1.0.0"})";
@@ -955,8 +973,8 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
     const std::int64_t nodeId = createNode(token, "firmware-node");
     const std::string  fingerprint(64, 'c');
     setNodeFingerprint(nodeId, fingerprint);
-    std::string        payload(1024 * 1024, 'E');
-    const auto         upload = m_server->send("POST", "/api/firmware?name=EdgePulse+OS&version=1.0.0&fileName=os.bin", payload, "application/octet-stream", bearer(token));
+    std::string payload(1024 * 1024, 'E');
+    const auto  upload = m_server->send("POST", "/api/firmware?name=EdgePulse+OS&version=1.0.0&fileName=os.bin", payload, "application/octet-stream", bearer(token));
     ASSERT_EQ(200, upload.status) << upload.body;
     const auto uploadJson = upload.json();
     ASSERT_TRUE(uploadJson.has_value());
@@ -993,9 +1011,9 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
     const auto downloadPayload = AsynGyanis::Base::parseConfigValue((*created)["payload"].get<std::string>());
     ASSERT_TRUE(downloadPayload.has_value());
     EXPECT_EQ("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(nodeId), (*downloadPayload)["downloadPath"].get<std::string>());
-    const auto         status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
-                                               AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "ok"}}).dump(),
-                                               "application/json", agentHeaders(fingerprint));
+    const auto status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "ok"}}).dump(),
+                                       "application/json", agentHeaders(fingerprint));
     ASSERT_EQ(200, status.status) << status.body;
     EXPECT_EQ(taskId, (*status.json())["data"]["id"].get<std::int64_t>());
 
@@ -1107,8 +1125,7 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedButAllowsLegacyD
     const std::string  fingerprint(64, '8');
     setNodeFingerprint(nodeId, fingerprint);
 
-    auto requiredPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(
-            EdgePulse::Firmware::FirmwareSigningPolicy{true, m_signingPolicy->verifier});
+    auto requiredPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(EdgePulse::Firmware::FirmwareSigningPolicy{true, m_signingPolicy->verifier});
     EdgePulse::TestSupport::ServerHarness requiredServer(
             [this, requiredPolicy](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
             {
@@ -1120,7 +1137,7 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedButAllowsLegacyD
                 firmware.firmware           = m_firmware.get();
                 firmware.nodes              = m_nodes.get();
                 firmware.commands           = m_commands.get();
-                firmware.channels           = m_channels.get();
+                firmware.realtimeBus        = nullptr;
                 firmware.tenants            = m_context->tenants.get();
                 firmware.storageDirectory   = m_storage.string();
                 firmware.maximumUploadBytes = 8U * 1024U * 1024U;
@@ -1130,17 +1147,15 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedButAllowsLegacyD
             });
 
     const std::string bytes(256, 'R');
-    const auto        unsignedUpload =
-            requiredServer.send("POST", "/api/firmware?name=Unsigned+OS&version=3.0.0&fileName=u.bin", bytes, "application/octet-stream", bearer(token));
+    const auto        unsignedUpload = requiredServer.send("POST", "/api/firmware?name=Unsigned+OS&version=3.0.0&fileName=u.bin", bytes, "application/octet-stream", bearer(token));
     EXPECT_EQ(400, unsignedUpload.status) << unsignedUpload.body;
 
-    const std::string digest    = AsynGyanis::Core::Digest::sha256Hex(bytes);
-    const std::string signature = signFirmwareDigest(m_signingKey.privateKey.get(), digest);
+    const std::string                                digest        = AsynGyanis::Core::Digest::sha256Hex(bytes);
+    const std::string                                signature     = signFirmwareDigest(m_signingKey.privateKey.get(), digest);
     std::vector<std::pair<std::string, std::string>> signedHeaders = bearer(token);
     signedHeaders.emplace_back("X-Firmware-Signature", signature);
     signedHeaders.emplace_back("X-Firmware-Key-Id", "protocol-key");
-    const auto signedUpload =
-            requiredServer.send("POST", "/api/firmware?name=Signed+OS&version=3.0.1&fileName=s.bin", bytes, "application/octet-stream", signedHeaders);
+    const auto signedUpload = requiredServer.send("POST", "/api/firmware?name=Signed+OS&version=3.0.1&fileName=s.bin", bytes, "application/octet-stream", signedHeaders);
     ASSERT_EQ(200, signedUpload.status) << signedUpload.body;
     const std::int64_t signedId = (*signedUpload.json())["data"]["id"].get<std::int64_t>();
     const auto         deploySigned =
@@ -1169,8 +1184,7 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedButAllowsLegacyD
     EXPECT_EQ(400, deployLegacy.status) << deployLegacy.body;
 
     // 历史未签名固件照常可下载，只是响应不宣称签名
-    const auto legacyDownload =
-            requiredServer.get("/api/agent/firmware/" + std::to_string(legacyId) + "/download?nodeId=" + std::to_string(nodeId), agentHeaders(fingerprint));
+    const auto legacyDownload = requiredServer.get("/api/agent/firmware/" + std::to_string(legacyId) + "/download?nodeId=" + std::to_string(nodeId), agentHeaders(fingerprint));
     ASSERT_EQ(200, legacyDownload.status) << legacyDownload.body;
     EXPECT_FALSE(legacyDownload.header("x-firmware-signature").has_value());
     EXPECT_EQ("legacy-bytes", legacyDownload.body);
@@ -1179,7 +1193,7 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedButAllowsLegacyD
 // 钉住：没有装配签名策略时，带签名头的请求不能静默跳过验签，必须在收正文前拒绝
 TEST_F(FleetEndpointsTest, FirmwareUploadWithoutSigningPolicyRejectsSignedRequest)
 {
-    const std::string token = login();
+    const std::string                     token = login();
     EdgePulse::TestSupport::ServerHarness unpolicedServer(
             [this](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
             {
@@ -1190,7 +1204,7 @@ TEST_F(FleetEndpointsTest, FirmwareUploadWithoutSigningPolicyRejectsSignedReques
                 firmware.firmware           = m_firmware.get();
                 firmware.nodes              = m_nodes.get();
                 firmware.commands           = m_commands.get();
-                firmware.channels           = m_channels.get();
+                firmware.realtimeBus        = nullptr;
                 firmware.storageDirectory   = m_storage.string();
                 firmware.maximumUploadBytes = 8U * 1024U * 1024U;
                 // signingPolicy 保持为空：模拟装配遗漏，策略缺位不等于允许无签名固件
@@ -1198,15 +1212,13 @@ TEST_F(FleetEndpointsTest, FirmwareUploadWithoutSigningPolicyRejectsSignedReques
             });
 
     const std::string bytes(128, 'P');
-    const auto        unsignedUpload =
-            unpolicedServer.send("POST", "/api/firmware?name=Plain+OS&version=4.0.0&fileName=p.bin", bytes, "application/octet-stream", bearer(token));
+    const auto        unsignedUpload = unpolicedServer.send("POST", "/api/firmware?name=Plain+OS&version=4.0.0&fileName=p.bin", bytes, "application/octet-stream", bearer(token));
     ASSERT_EQ(200, unsignedUpload.status) << unsignedUpload.body;
 
     std::vector<std::pair<std::string, std::string>> signedHeaders = bearer(token);
     signedHeaders.emplace_back("X-Firmware-Signature", AsynGyanis::Base::base64Encode(std::string(64, '\0')));
     signedHeaders.emplace_back("X-Firmware-Key-Id", "protocol-key");
-    const auto signedUpload =
-            unpolicedServer.send("POST", "/api/firmware?name=Signed+OS&version=4.0.1&fileName=s.bin", bytes, "application/octet-stream", signedHeaders);
+    const auto signedUpload = unpolicedServer.send("POST", "/api/firmware?name=Signed+OS&version=4.0.1&fileName=s.bin", bytes, "application/octet-stream", signedHeaders);
     EXPECT_EQ(400, signedUpload.status) << signedUpload.body;
     EXPECT_NE(std::string::npos, signedUpload.body.find("信任键"));
 
@@ -1248,8 +1260,8 @@ TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
     ASSERT_TRUE(provisioned.has_value()) << provisioned.error();
     const std::int64_t tenantId = provisioned->tenantId;
 
-    const auto tenantNodes    = m_nodes->scoped({tenantId, false});
-    const auto node           = m_runner.run(tenantNodes->create(m_runner.loop(), "tenant-b-node", "{}"));
+    const auto        tenantNodes = m_nodes->scoped({tenantId, false});
+    const auto        node        = m_runner.run(tenantNodes->create(m_runner.loop(), "tenant-b-node", "{}"));
     const std::string fingerprint(64, 'd');
     setNodeFingerprint(node.id, fingerprint);
     const auto tenantCommands = m_commands->scoped({tenantId, false});
@@ -1262,8 +1274,8 @@ TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
     EXPECT_EQ(command->id, (*next.json())["data"]["id"].get<std::int64_t>());
 
     const auto result = m_server->post("/api/agent/commands/" + std::to_string(command->id) + "/result",
-                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "succeeded"}, {"result", "{}"}}).dump(),
-                                       "application/json", agentHeaders(fingerprint));
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "succeeded"}, {"result", "{}"}}).dump(), "application/json",
+                                       agentHeaders(fingerprint));
     ASSERT_EQ(200, result.status) << result.body;
     EXPECT_EQ("succeeded", (*result.json())["data"]["status"].get<std::string>());
 
@@ -1280,8 +1292,8 @@ TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
     const std::int64_t taskId = m_runner.run(tenantFirmware->createTask(m_runner.loop(), firmwareId, node.id));
     ASSERT_GT(taskId, 0);
     const auto status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
-                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "installed"}, {"progress", 100}}).dump(),
-                                       "application/json", agentHeaders(fingerprint));
+                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", node.id}, {"status", "installed"}, {"progress", 100}}).dump(), "application/json",
+                                       agentHeaders(fingerprint));
     ASSERT_EQ(200, status.status) << status.body;
     EXPECT_EQ(taskId, (*status.json())["data"]["id"].get<std::int64_t>());
 
@@ -1289,24 +1301,24 @@ TEST_F(FleetEndpointsTest, AgentRoutesResolveTenantFromNodeAndFirmware)
     const auto        defaultNode = m_runner.run(m_nodes->create(m_runner.loop(), "tenant-a-node", "{}"));
     const std::string defaultFingerprint(64, '5');
     setNodeFingerprint(defaultNode.id, defaultFingerprint);
-    const auto crossTenant = m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(defaultNode.id),
-                                           agentHeaders(defaultFingerprint));
+    const auto crossTenant =
+            m_server->get("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(defaultNode.id), agentHeaders(defaultFingerprint));
     EXPECT_EQ(403, crossTenant.status) << crossTenant.body;
 }
 
 // 钉住：批量命令共享批次号；计划时间未到时 Agent 取不到，到点后可取
 TEST_F(FleetEndpointsTest, BatchAndScheduledCommands)
 {
-    const std::string  token  = login();
-    const std::int64_t nodeA  = createNode(token, "batch-node-a");
-    const std::int64_t nodeB  = createNode(token, "batch-node-b");
+    const std::string  token = login();
+    const std::int64_t nodeA = createNode(token, "batch-node-a");
+    const std::int64_t nodeB = createNode(token, "batch-node-b");
     const std::string  fingerprintA(64, 'e');
     const std::string  fingerprintB(64, '1');
     setNodeFingerprint(nodeA, fingerprintA);
     setNodeFingerprint(nodeB, fingerprintB);
-    const auto         now    = std::chrono::system_clock::now();
-    const std::string  future = EdgePulse::Common::formatDateTimeUtc(now + std::chrono::hours{1});
-    const std::string  past   = EdgePulse::Common::formatDateTimeUtc(now - std::chrono::minutes{1});
+    const auto        now    = std::chrono::system_clock::now();
+    const std::string future = EdgePulse::Common::formatDateTimeUtc(now + std::chrono::hours{1});
+    const std::string past   = EdgePulse::Common::formatDateTimeUtc(now - std::chrono::minutes{1});
 
     const auto scheduled =
             m_server->post("/api/commands/batch",
@@ -1360,12 +1372,12 @@ TEST_F(FleetEndpointsTest, FirmwareDeployRejectsCrossTenantNodes)
     const std::int64_t tenantId = provisioned->tenantId;
 
     EdgePulse::Firmware::FirmwareRecord record;
-    record.name        = "Tenant OS";
-    record.version     = "1.0.0";
-    record.fileName    = "tenant-os.bin";
-    record.contentType = "application/octet-stream";
-    record.sha256      = std::string(64, '4');
-    record.storagePath = (m_storage / "tenant-os.bin").string();
+    record.name                   = "Tenant OS";
+    record.version                = "1.0.0";
+    record.fileName               = "tenant-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, '4');
+    record.storagePath            = (m_storage / "tenant-os.bin").string();
     const std::int64_t firmwareId = m_runner.run(m_firmware->scoped({tenantId, false})->create(m_runner.loop(), record));
     ASSERT_GT(firmwareId, 0);
 
@@ -1384,12 +1396,12 @@ TEST_F(FleetEndpointsTest, FirmwareDeployRejectsMoreThanHundredNodes)
     const std::string token = login();
 
     EdgePulse::Firmware::FirmwareRecord record;
-    record.name        = "Batch OS";
-    record.version     = "1.0.0";
-    record.fileName    = "batch-os.bin";
-    record.contentType = "application/octet-stream";
-    record.sha256      = std::string(64, '6');
-    record.storagePath = (m_storage / "batch-os.bin").string();
+    record.name                   = "Batch OS";
+    record.version                = "1.0.0";
+    record.fileName               = "batch-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, '6');
+    record.storagePath            = (m_storage / "batch-os.bin").string();
     const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
     ASSERT_GT(firmwareId, 0);
 
@@ -1398,8 +1410,8 @@ TEST_F(FleetEndpointsTest, FirmwareDeployRejectsMoreThanHundredNodes)
     {
         nodeIds.push_back(nodeId);
     }
-    const auto deployed = m_server->post("/api/firmware/" + std::to_string(firmwareId) + "/deploy",
-                                         AsynGyanis::Base::ConfigValue::object({{"nodeIds", std::move(nodeIds)}}).dump(), "application/json", bearer(token));
+    const auto deployed = m_server->post("/api/firmware/" + std::to_string(firmwareId) + "/deploy", AsynGyanis::Base::ConfigValue::object({{"nodeIds", std::move(nodeIds)}}).dump(),
+                                         "application/json", bearer(token));
     EXPECT_EQ(400, deployed.status) << deployed.body;
     EXPECT_NE(std::string::npos, deployed.body.find("1 到 100"));
     EXPECT_EQ(0, countFirmwareTasks(m_context->databasePath(), firmwareId));
@@ -1422,12 +1434,12 @@ TEST_F(FleetEndpointsTest, FirmwareTaskListDoesNotExposeForeignNodeName)
     ASSERT_EQ(provisioned->tenantId, foreignNode.tenantId);
 
     EdgePulse::Firmware::FirmwareRecord record;
-    record.name        = "Task OS";
-    record.version     = "1.0.0";
-    record.fileName    = "task-os.bin";
-    record.contentType = "application/octet-stream";
-    record.sha256      = std::string(64, '7');
-    record.storagePath = (m_storage / "task-os.bin").string();
+    record.name                   = "Task OS";
+    record.version                = "1.0.0";
+    record.fileName               = "task-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, '7');
+    record.storagePath            = (m_storage / "task-os.bin").string();
     const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
     ASSERT_GT(firmwareId, 0);
 
@@ -1460,8 +1472,7 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedRollbackBeforeTa
     const std::string  token  = login();
     const std::int64_t nodeId = createNode(token, "unsigned-rollback-node");
 
-    auto requiredPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(
-            EdgePulse::Firmware::FirmwareSigningPolicy{true, m_signingPolicy->verifier});
+    auto requiredPolicy = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(EdgePulse::Firmware::FirmwareSigningPolicy{true, m_signingPolicy->verifier});
     EdgePulse::TestSupport::ServerHarness requiredServer(
             [this, requiredPolicy](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop)
             {
@@ -1472,7 +1483,7 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedRollbackBeforeTa
                 firmware.firmware           = m_firmware.get();
                 firmware.nodes              = m_nodes.get();
                 firmware.commands           = m_commands.get();
-                firmware.channels           = m_channels.get();
+                firmware.realtimeBus        = nullptr;
                 firmware.tenants            = m_context->tenants.get();
                 firmware.storageDirectory   = m_storage.string();
                 firmware.maximumUploadBytes = 8U * 1024U * 1024U;
@@ -1481,22 +1492,22 @@ TEST_F(FleetEndpointsTest, FirmwareRequiredPolicyRejectsUnsignedRollbackBeforeTa
             });
 
     EdgePulse::Firmware::FirmwareRecord legacy;
-    legacy.name        = "Legacy OS";
-    legacy.version     = "0.9.0";
-    legacy.fileName    = "legacy.bin";
-    legacy.contentType = "application/octet-stream";
-    legacy.sha256      = std::string(64, '8');
-    legacy.storagePath = (m_storage / "legacy.bin").string();
+    legacy.name                 = "Legacy OS";
+    legacy.version              = "0.9.0";
+    legacy.fileName             = "legacy.bin";
+    legacy.contentType          = "application/octet-stream";
+    legacy.sha256               = std::string(64, '8');
+    legacy.storagePath          = (m_storage / "legacy.bin").string();
     const std::int64_t legacyId = m_runner.run(m_firmware->create(m_runner.loop(), legacy));
     ASSERT_GT(legacyId, 0);
 
     EdgePulse::Firmware::FirmwareRecord signedRecord = legacy;
-    signedRecord.version            = "1.0.0";
-    signedRecord.fileName           = "signed.bin";
-    signedRecord.signature          = std::string(86, 'A');
-    signedRecord.signingKeyId       = "protocol-key";
-    signedRecord.signatureAlgorithm = "ed25519-sha256";
-    const std::int64_t signedId     = m_runner.run(m_firmware->create(m_runner.loop(), signedRecord));
+    signedRecord.version                             = "1.0.0";
+    signedRecord.fileName                            = "signed.bin";
+    signedRecord.signature                           = std::string(86, 'A');
+    signedRecord.signingKeyId                        = "protocol-key";
+    signedRecord.signatureAlgorithm                  = "ed25519-sha256";
+    const std::int64_t signedId                      = m_runner.run(m_firmware->create(m_runner.loop(), signedRecord));
     ASSERT_GT(signedId, 0);
     // 当前版本任务把上一版记为未签名固件，回滚源解析后目标即 legacy
     ASSERT_GT(m_runner.run(m_firmware->createTask(m_runner.loop(), signedId, nodeId, legacyId)), 0);
@@ -1532,8 +1543,8 @@ TEST_F(FleetEndpointsTest, FirmwareCanaryAndRollback)
     for (const auto &[nodeId, fingerprint]: {std::pair{nodeA, fingerprintA}, std::pair{nodeB, fingerprintB}})
     {
         ASSERT_EQ(200, m_server->post("/api/agent/firmware/" + std::to_string(firstId) + "/status",
-                                      AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}}).dump(),
-                                      "application/json", agentHeaders(fingerprint))
+                                      AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}}).dump(), "application/json",
+                                      agentHeaders(fingerprint))
                                .status);
     }
 
@@ -1550,8 +1561,8 @@ TEST_F(FleetEndpointsTest, FirmwareCanaryAndRollback)
     ASSERT_EQ(1, (*canaryJson)["data"]["deferredNodeIds"].size());
     EXPECT_EQ(nodeB, (*canaryJson)["data"]["deferredNodeIds"][0].get<std::int64_t>());
     ASSERT_EQ(200, m_server->post("/api/agent/firmware/" + std::to_string(secondId) + "/status",
-                                  AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeA}, {"status", "installed"}, {"progress", 100}}).dump(),
-                                  "application/json", agentHeaders(fingerprintA))
+                                  AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeA}, {"status", "installed"}, {"progress", 100}}).dump(), "application/json",
+                                  agentHeaders(fingerprintA))
                            .status);
 
     const auto rollback =

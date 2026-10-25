@@ -2,8 +2,9 @@
 
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogMacros.h"
-#include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Crypto/Digest.h"
+#include "Core/Http/RealtimeBus.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -77,8 +78,8 @@ namespace EdgePulse::Device
     } // namespace
 
     NodeConfigService::NodeConfigService(std::shared_ptr<NodeConfigRepository> configs, std::shared_ptr<NodeRepository> nodes, std::shared_ptr<Command::CommandRepository> commands,
-                                         Command::AgentChannelRegistry *channels, CommandNotifier notifier) :
-        m_repository(std::move(configs)), m_nodes(std::move(nodes)), m_commands(std::move(commands)), m_channels(channels), m_notifier(std::move(notifier))
+                                         Web::RealtimeBus *realtimeBus, CommandNotifier notifier) :
+        m_repository(std::move(configs)), m_nodes(std::move(nodes)), m_commands(std::move(commands)), m_realtimeBus(realtimeBus), m_notifier(std::move(notifier))
     {
     }
 
@@ -219,21 +220,14 @@ namespace EdgePulse::Device
                 // 节点在配置落库与命令创建之间被删除：期望版本仍保留，Agent 重连后按心跳版本自行拉取
                 co_return;
             }
-            if (m_channels != nullptr && m_channels->isConnected(node.id))
+            if (m_realtimeBus != nullptr)
             {
-                const ConfigValue commandValue = ConfigValue::object(
-                        {{"id", created->id}, {"nodeId", created->nodeId}, {"type", created->type}, {"payload", created->payload}, {"timeoutSeconds", created->timeoutSeconds}});
-                const std::string message = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-                if (co_await m_channels->send(node.id, message))
+                // 本地或远端实例的 handler 在真正写出后条件推进；没有连接时命令留在 pending 等轮询
+                co_await m_realtimeBus->publishAgent(loop, Command::makeAgentCommandMessage(*created));
+                const auto refreshed = co_await scopedCommands->find(loop, created->id);
+                if (refreshed.has_value())
                 {
-                    if (co_await scopedCommands->markDispatched(loop, created->id))
-                    {
-                        const auto refreshed = co_await scopedCommands->find(loop, created->id);
-                        if (refreshed.has_value())
-                        {
-                            created = refreshed;
-                        }
-                    }
+                    created = refreshed;
                 }
             }
             if (m_notifier)

@@ -94,9 +94,22 @@ namespace EdgePulse::Web
      * @param base 主题基名
      * @param tenantId 归属租户
      * @param payload 已序列化的 JSON 文本
-     * @return std::string 形如 {"instance":...,"base":...,"tenantId":...,"payload":...} 的 JSON
+     * @return std::string 形如 {"instance":...,"target":"browser","base":...,"tenantId":...,"nodeId":0,"commandId":0,"payload":...} 的 JSON
      */
     [[nodiscard]] std::string makeRealtimeEnvelope(std::string_view instanceId, std::string_view base, std::int64_t tenantId, std::string_view payload);
+
+    /**
+     * @brief 发给某台 Agent 的命令或关闭指令
+     */
+    struct AgentMessage
+    {
+        std::int64_t nodeId{0};       ///< 目标节点
+        std::string  payload;         ///< 已序列化的命令 JSON；关闭消息为空
+        std::int64_t commandId{0};    ///< 关联命令标识；0 表示不关联数据库行
+        bool         close{false};    ///< 是否关闭目标连接
+        int          closeCode{1008}; ///< 关闭状态码，默认策略违规
+        std::string  closeReason;     ///< 关闭原因
+    };
 
     /**
      * @brief Redis 转发参数
@@ -175,6 +188,23 @@ namespace EdgePulse::Web
          */
         AsynGyanis::Core::Task<> publish(std::string_view base, std::int64_t tenantId, const std::string &payload);
 
+        /**
+         * @brief 登记 Agent 消息的本地投递口
+         * @param handler 收到本实例或远端 Agent 消息时调用；空表示丢弃
+         * @note 置空或替换可在任意线程调用；handler 本身只在服务器循环上执行
+         */
+        void setAgentMessageHandler(std::function<AsynGyanis::Core::Task<>(const AgentMessage &)> handler);
+
+        /**
+         * @brief 把一条 Agent 消息投给本地连接并转发给其它实例
+         * @param loop 调用方循环；本地 handler 直接在该循环上运行
+         * @param message 目标节点、命令正文或关闭指令
+         * @return AsynGyanis::Core::Task<> 本地投递与一次 PUBLISH 尝试完成即返回
+         * @note 本地 handler 先执行；本地失败不影响跨实例转发。未启用 Redis 时只做本地投递，
+         *       没有本地连接时是空操作，命令行保持待执行，等待 Agent 轮询
+         */
+        AsynGyanis::Core::Task<> publishAgent(AsynGyanis::Core::EventLoop &loop, AgentMessage message);
+
     private:
         /**
          * @brief 只在本进程扇出
@@ -182,9 +212,19 @@ namespace EdgePulse::Web
         AsynGyanis::Core::Task<> deliverLocal(std::string_view base, std::int64_t tenantId, std::string_view payload);
 
         /**
+         * @brief 只在本进程把 Agent 消息交给登记的处理口
+         */
+        AsynGyanis::Core::Task<> deliverAgent(const AgentMessage &message);
+
+        /**
          * @brief 把远端事件排进本地队列并按需启动投递协程
          */
         void enqueueRemote(std::string base, std::int64_t tenantId, std::string payload);
+
+        /**
+         * @brief 把远端 Agent 消息排进本地队列并按需启动投递协程
+         */
+        void enqueueRemoteAgent(AgentMessage message);
 
         /**
          * @brief 投递远端事件队列
@@ -229,13 +269,18 @@ namespace EdgePulse::Web
 
         struct RemoteEvent
         {
-            std::string  base;
-            std::int64_t tenantId{0};
-            std::string  payload;
+            bool         agent{false}; ///< 是否为 Agent 消息
+            std::string  base;         ///< 浏览器主题基名
+            std::int64_t tenantId{0};  ///< 浏览器事件归属租户
+            std::string  payload;      ///< 浏览器事件正文
+            AgentMessage message;      ///< Agent 消息
         };
 
         std::deque<RemoteEvent>                 m_remoteQueue;          ///< 待本地投递的远端事件
         std::optional<AsynGyanis::Core::Task<>> m_remoteWorker;         ///< 投递协程帧
         bool                                    m_remoteRunning{false}; ///< 是否已有投递协程
+
+        std::mutex                                                    m_agentHandlerMutex; ///< 保护 Agent 投递口
+        std::function<AsynGyanis::Core::Task<>(const AgentMessage &)> m_agentHandler;      ///< Agent 本地投递口
     };
 } // namespace EdgePulse::Web

@@ -440,7 +440,7 @@ namespace EdgePulse::Agent
                 if (connected)
                 {
                     flags.fallback.recordConnected();
-                    LOG_INFO("WebSocket 命令通道已建立，命令轮询暂停");
+                    LOG_INFO("WebSocket 命令通道已建立，命令轮询降为每 60 秒兜底一次");
                 } else
                 {
                     flags.fallback.recordDisconnected();
@@ -480,17 +480,20 @@ namespace EdgePulse::Agent
         }
 
         /**
-         * @brief 按固定间隔轮询命令，WebSocket 可用期间暂停
+         * @brief 按轮询状态拉取命令，WebSocket 可用期间降为每 60 秒一次的兜底拉取
          * @param loop 事件循环
          * @param dispatcher 命令分发器
-         * @param intervalSeconds 轮询间隔
+         * @param intervalSeconds 断开期间的轮询间隔
          * @param flags 循环线程共享状态
          * @param stopRequested 停止标记
          * @return 协程任务
+         * @note 断开时按配置间隔轮询；已连接时每 60 秒仍强制拉取一次，防止 Redis 或跨实例路由
+         *       故障把命令留在待执行队列。已连接期间按一秒切片等待，通道一旦断开能立即恢复轮询。
          */
         AsynGyanis::Core::Task<> runPolling(AsynGyanis::Core::EventLoop &loop, CommandDispatcher &dispatcher, const int intervalSeconds, RuntimeFlags &flags,
                                             const std::atomic<bool> &stopRequested)
         {
+            const std::chrono::seconds disconnectedInterval{intervalSeconds > 0 ? intervalSeconds : 15};
             for (;;)
             {
                 if (stopRequested.load(std::memory_order_acquire))
@@ -506,8 +509,14 @@ namespace EdgePulse::Agent
                         LOG_WARN("命令结果上报未完成，将在下一轮轮询后重试");
                     }
                 }
+                std::chrono::seconds delay = flags.fallback.nextPollDelay(disconnectedInterval);
+                if (flags.fallback.isConnected() && delay > std::chrono::seconds{1})
+                {
+                    // 连接期间轮询由 60 秒节拍控制，但等待要切片：断开的那一刻不能还睡满一分钟
+                    delay = std::chrono::seconds{1};
+                }
                 AsynGyanis::Core::Timer timer(loop);
-                co_await timer.waitFor(std::chrono::seconds{intervalSeconds > 0 ? intervalSeconds : 15});
+                co_await timer.waitFor(delay);
             }
         }
 

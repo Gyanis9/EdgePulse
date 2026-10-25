@@ -23,9 +23,9 @@
 #include <memory>
 #include <string>
 
-namespace EdgePulse::Command
+namespace EdgePulse::Web
 {
-    class AgentChannelRegistry;
+    class RealtimeBus;
 }
 
 namespace EdgePulse::Device
@@ -54,11 +54,11 @@ namespace EdgePulse::Device
          * @param configs 配置仓储
          * @param nodes 节点仓储，用于校验节点存在与归属
          * @param commands 命令仓储；空表示不下发 config.apply
-         * @param channels Agent 在线通道；空表示不直推
+         * @param realtimeBus Agent 命令总线；空表示不直推
          * @param notifier 命令通知回调，可空
          */
         NodeConfigService(std::shared_ptr<NodeConfigRepository> configs, std::shared_ptr<NodeRepository> nodes, std::shared_ptr<Command::CommandRepository> commands,
-                          Command::AgentChannelRegistry *channels, CommandNotifier notifier);
+                          Web::RealtimeBus *realtimeBus, CommandNotifier notifier);
 
         /**
          * @brief 下发新的期望配置
@@ -115,10 +115,10 @@ namespace EdgePulse::Device
          */
         AsynGyanis::Core::Task<> dispatchConfigApply(AsynGyanis::Core::EventLoop &loop, const NodeRecord &node, std::int64_t version, std::int64_t operatorId);
 
-        std::shared_ptr<NodeConfigRepository>       m_repository; ///< 配置仓储
-        std::shared_ptr<NodeRepository>             m_nodes;      ///< 节点仓储
-        std::shared_ptr<Command::CommandRepository> m_commands;   ///< 命令仓储，可空
-        Command::AgentChannelRegistry              *m_channels;   ///< Agent 通道，可空
-        CommandNotifier                             m_notifier;   ///< 命令通知，可空
+        std::shared_ptr<NodeConfigRepository>       m_repository;  ///< 配置仓储
+        std::shared_ptr<NodeRepository>             m_nodes;       ///< 节点仓储
+        std::shared_ptr<Command::CommandRepository> m_commands;    ///< 命令仓储，可空
+        Web::RealtimeBus                           *m_realtimeBus; ///< Agent 命令总线，可空
+        CommandNotifier                             m_notifier;    ///< 命令通知，可空
     };
 } // namespace EdgePulse::Device

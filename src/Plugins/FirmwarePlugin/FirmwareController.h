@@ -29,7 +29,6 @@ namespace EdgePulse::Auth
 }
 namespace EdgePulse::Command
 {
-    class AgentChannelRegistry;
     class CommandRepository;
 } // namespace EdgePulse::Command
 namespace EdgePulse::Device
@@ -40,11 +39,15 @@ namespace EdgePulse::System
 {
     class TenantRepository;
 }
+namespace EdgePulse::Web
+{
+    class RealtimeBus;
+}
 namespace EdgePulse::Firmware
 {
     class FirmwareRepository;
     struct FirmwareSigningPolicy;
-}
+} // namespace EdgePulse::Firmware
 
 namespace EdgePulse::Firmware
 {
@@ -53,16 +56,16 @@ namespace EdgePulse::Firmware
      */
     struct FirmwareDependencies
     {
-        Auth::AuthService             *auth{nullptr};                            ///< 认证
-        FirmwareRepository            *firmware{nullptr};                        ///< 固件元数据
-        Device::NodeRepository        *nodes{nullptr};                           ///< 节点
-        Command::CommandRepository    *commands{nullptr};                        ///< 命令
-        Command::AgentChannelRegistry *channels{nullptr};                        ///< Agent 通道
-        Command::CommandNotifier       notifier;                                 ///< 浏览器通知
-        System::TenantRepository      *tenants{nullptr};                         ///< 租户，用于校验平台管理员指定的归属
-        std::string                    storageDirectory{"var/firmware"};         ///< 落盘目录
-        std::size_t                    maximumUploadBytes{256U * 1024U * 1024U}; ///< 上传上限
-        std::shared_ptr<FirmwareSigningPolicy> signingPolicy;                     ///< 签名门禁；为空时按不强制签名处理
+        Auth::AuthService                     *auth{nullptr};                            ///< 认证
+        FirmwareRepository                    *firmware{nullptr};                        ///< 固件元数据
+        Device::NodeRepository                *nodes{nullptr};                           ///< 节点
+        Command::CommandRepository            *commands{nullptr};                        ///< 命令
+        Web::RealtimeBus                      *realtimeBus{nullptr};                     ///< Agent 命令总线
+        Command::CommandNotifier               notifier;                                 ///< 浏览器通知
+        System::TenantRepository              *tenants{nullptr};                         ///< 租户，用于校验平台管理员指定的归属
+        std::string                            storageDirectory{"var/firmware"};         ///< 落盘目录
+        std::size_t                            maximumUploadBytes{256U * 1024U * 1024U}; ///< 上传上限
+        std::shared_ptr<FirmwareSigningPolicy> signingPolicy;                            ///< 签名门禁；为空时按不强制签名处理
     };
 
     /**

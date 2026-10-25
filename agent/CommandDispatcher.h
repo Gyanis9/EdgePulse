@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -112,11 +113,30 @@ namespace EdgePulse::Agent
          */
         void enqueueFailure(std::int64_t commandId, const std::string &message);
 
+        /**
+         * @brief 判断命令是否已经执行过
+         * @param commandId 命令标识
+         * @return bool 正在执行、结果仍在队列或已在本次运行内执行完成为 true
+         */
+        [[nodiscard]] bool alreadyHandled(std::int64_t commandId) const;
+
+        /**
+         * @brief 记住一条已执行完的命令
+         * @param commandId 命令标识
+         * @note 结果行被服务端确认后会从状态库删除；WebSocket 推送与轮询兜底仍可能各交来一份，
+         *       因此已执行标识必须在本进程内保留一段时间，不能只靠结果队列去重
+         */
+        void rememberCompleted(std::int64_t commandId);
+
+        static constexpr std::size_t kCompletedCommandLimit{1024}; ///< 已执行标识的保留条数
+
         AgentClient                                  &m_client;          ///< 服务端通信客户端
         AgentState                                   &m_state;           ///< 本地状态库
         std::vector<std::shared_ptr<CommandExecutor>> m_executors;       ///< 命令执行器
         RestartHandler                                m_restartHandler;  ///< 结果上报后的重启动作
         std::unordered_set<std::int64_t>              m_inFlight;        ///< 正在执行或等待上报的命令标识
+        std::unordered_set<std::int64_t>              m_completed;       ///< 本次运行内已执行完成的命令标识
+        std::deque<std::int64_t>                      m_completedOrder;  ///< 已执行标识的插入顺序，用于有界淘汰
         bool                                          m_flushing{false}; ///< 是否有一次结果上报正在进行
     };
 } // namespace EdgePulse::Agent

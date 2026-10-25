@@ -10,7 +10,7 @@
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/AuthService.h"
-#include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/AgentAuthorization.h"
 #include "Core/Device/NodeRepository.h"
@@ -18,6 +18,7 @@
 #include "Core/Firmware/FirmwareRepository.h"
 #include "Core/Firmware/FirmwareSignatureVerifier.h"
 #include "Core/Firmware/FirmwareSigningPolicy.h"
+#include "Core/Http/RealtimeBus.h"
 #include "Core/Http/RequestAuth.h"
 #include "Core/Http/RequestId.h"
 #include "Core/System/TenantRepository.h"
@@ -98,12 +99,12 @@ namespace EdgePulse::Firmware
             try
             {
                 const bool removed = co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop,
-                                                                                                       [path]()
-                                                                                                       {
-                                                                                                           std::error_code error;
-                                                                                                           std::filesystem::remove(path, error);
-                                                                                                           return !error;
-                                                                                                       });
+                                                                                                     [path]()
+                                                                                                     {
+                                                                                                         std::error_code error;
+                                                                                                         std::filesystem::remove(path, error);
+                                                                                                         return !error;
+                                                                                                     });
                 if (!removed)
                 {
                     LOG_WARN_FMT("删除固件成品失败：path={}", path);
@@ -296,8 +297,7 @@ namespace EdgePulse::Firmware
                                trustedKeyIds.push_back(keyId);
                            }
                        }
-                       Common::writeSuccess(response,
-                                            ConfigValue::object({{"requireSignature", signatureRequired(*deps)}, {"trustedKeyIds", std::move(trustedKeyIds)}}), traceId);
+                       Common::writeSuccess(response, ConfigValue::object({{"requireSignature", signatureRequired(*deps)}, {"trustedKeyIds", std::move(trustedKeyIds)}}), traceId);
                        co_return;
                    });
 
@@ -359,10 +359,8 @@ namespace EdgePulse::Firmware
                                  }
                                  if (signatureHeader.has_value() != keyIdHeader.has_value())
                                  {
-                                     fail(response,
-                                          Common::kCodeBadRequest,
-                                          signatureHeader.has_value() ? "提供了固件签名但缺少 X-Firmware-Key-Id" : "提供了 X-Firmware-Key-Id 但缺少 X-Firmware-Signature",
-                                          traceId);
+                                     fail(response, Common::kCodeBadRequest,
+                                          signatureHeader.has_value() ? "提供了固件签名但缺少 X-Firmware-Key-Id" : "提供了 X-Firmware-Key-Id 但缺少 X-Firmware-Signature", traceId);
                                      co_return;
                                  }
                                  if (signatureHeader.has_value() && (deps->signingPolicy == nullptr || deps->signingPolicy->verifier == nullptr))
@@ -554,18 +552,9 @@ namespace EdgePulse::Firmware
                             {
                                 continue;
                             }
-                            if (deps->channels != nullptr && deps->channels->isConnected(nodeId))
+                            if (deps->realtimeBus != nullptr)
                             {
-                                const ConfigValue commandValue = ConfigValue::object({{"id", command->id},
-                                                                                      {"nodeId", command->nodeId},
-                                                                                      {"type", command->type},
-                                                                                      {"payload", command->payload},
-                                                                                      {"timeoutSeconds", command->timeoutSeconds}});
-                                const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-                                if (co_await deps->channels->send(nodeId, message))
-                                {
-                                    static_cast<void>(co_await commandRepo->markDispatched(loop, command->id));
-                                }
+                                co_await deps->realtimeBus->publishAgent(loop, Command::makeAgentCommandMessage(*command));
                             }
                             if (deps->notifier)
                             {
@@ -661,23 +650,15 @@ namespace EdgePulse::Firmware
                             {
                                 continue;
                             }
-                            const auto command = co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(rollbackTarget.firmware, nodeId), session->userId, 600);
+                            const auto command =
+                                    co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(rollbackTarget.firmware, nodeId), session->userId, 600);
                             if (!command.has_value())
                             {
                                 continue;
                             }
-                            if (deps->channels != nullptr && deps->channels->isConnected(nodeId))
+                            if (deps->realtimeBus != nullptr)
                             {
-                                const ConfigValue commandValue = ConfigValue::object({{"id", command->id},
-                                                                                      {"nodeId", command->nodeId},
-                                                                                      {"type", command->type},
-                                                                                      {"payload", command->payload},
-                                                                                      {"timeoutSeconds", command->timeoutSeconds}});
-                                const std::string message      = ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-                                if (co_await deps->channels->send(nodeId, message))
-                                {
-                                    static_cast<void>(co_await commandRepo->markDispatched(loop, command->id));
-                                }
+                                co_await deps->realtimeBus->publishAgent(loop, Command::makeAgentCommandMessage(*command));
                             }
                             if (deps->notifier)
                             {

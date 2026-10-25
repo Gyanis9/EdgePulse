@@ -1,6 +1,7 @@
 #include "Core/Http/RealtimeBus.h"
 #include "Core/Http/SseBroadcaster.h"
 #include "Core/Http/WebSocketEndpoints.h"
+#include "Base/Config/ConfigValue.h"
 #include "Database/Redis/RedisConnection.h"
 #include "TestSupport/EventLoopRunner.h"
 
@@ -33,6 +34,8 @@ namespace
         std::atomic<bool>  blockNextPublish{false}; ///< 下一次 PUBLISH 是否在闸门处停住
         std::promise<void> publishEntered;          ///< 已进入 PUBLISH 的闸门
         std::future<void>  publishRelease;          ///< 用例放开 PUBLISH 的闸门
+        std::mutex         envelopeMutex;           ///< 保护 lastEnvelope
+        std::string        lastEnvelope;            ///< 最近一次 PUBLISH 的信封
     };
 
     /**
@@ -72,9 +75,13 @@ namespace
             return m_state->connected.load();
         }
 
-        [[nodiscard]] bool publish(std::string_view, std::string_view) override
+        [[nodiscard]] bool publish(std::string_view, std::string_view envelope) override
         {
             ++m_state->publishCalls;
+            {
+                const std::lock_guard lock(m_state->envelopeMutex);
+                m_state->lastEnvelope = std::string{envelope};
+            }
             if (m_state->blockNextPublish.exchange(false))
             {
                 m_state->publishEntered.set_value();
@@ -132,6 +139,46 @@ namespace
         return static_cast<std::uint16_t>(std::stoul(*text));
     }
 } // namespace
+
+// 钉住：浏览器发布仍是 target=browser 的本地扇出加一次 PUBLISH，agent 路径不改变它
+TEST(RealtimeBus, BrowserPublishKeepsBrowserTargetAndLocalFanout)
+{
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Web::BrowserWebSocket        webSocket;
+    EdgePulse::Web::SseBroadcaster          sse;
+
+    auto             state = std::make_shared<FakePublisherState>();
+    std::atomic<int> localDeliveries{0};
+
+    EdgePulse::Web::RealtimeBusOptions options;
+    options.enabled          = true;
+    options.instanceId       = "node-browser";
+    options.startSubscriber  = false;
+    options.publisherFactory = [state] { return std::make_unique<FakePublisherTransport>(state); };
+    options.localDelivery    = [&localDeliveries](std::string_view, std::int64_t, std::string_view) -> AsynGyanis::Core::Task<>
+    {
+        ++localDeliveries;
+        co_return;
+    };
+
+    EdgePulse::Web::RealtimeBus bus(runner.loop(), webSocket, sse, std::move(options));
+    bus.start();
+    runner.run(bus.publish("nodes", 7, R"({"type":"node.status"})"));
+
+    EXPECT_EQ(1, localDeliveries.load(std::memory_order_relaxed));
+    EXPECT_EQ(1, state->publishCalls.load(std::memory_order_relaxed));
+    std::string envelope;
+    {
+        const std::lock_guard lock(state->envelopeMutex);
+        envelope = state->lastEnvelope;
+    }
+    const auto parsed = AsynGyanis::Base::parseConfigValue(envelope);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ("browser", (parsed->value("target", std::string{})));
+    EXPECT_EQ("nodes", (parsed->value("base", std::string{})));
+    EXPECT_EQ(7, (parsed->value("tenantId", std::int64_t{0})));
+    EXPECT_EQ(R"({"type":"node.status"})", (parsed->value("payload", std::string{})));
+}
 
 // 钉住：两个实例共享 Redis 时，一个实例发布的事件能在另一个实例本地扇出（真实 Redis，缺环境变量即跳过）
 TEST(RealtimeBus, RedisFanoutReachesSecondInstance)

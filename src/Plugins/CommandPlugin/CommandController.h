@@ -27,13 +27,13 @@ namespace EdgePulse::Auth
 {
     class AuthService;
 }
-namespace EdgePulse::Command
-{
-    class AgentChannelRegistry;
-}
 namespace EdgePulse::Device
 {
     class NodeRepository;
+}
+namespace EdgePulse::Web
+{
+    class RealtimeBus;
 }
 
 namespace EdgePulse::Command
@@ -48,11 +48,11 @@ namespace EdgePulse::Command
      */
     struct CommandDependencies
     {
-        Auth::AuthService      *auth{nullptr};     ///< 认证
-        CommandRepository      *commands{nullptr}; ///< 命令仓储
-        AgentChannelRegistry   *channels{nullptr}; ///< Agent 通道
-        Device::NodeRepository *nodes{nullptr};    ///< 节点仓储，用于校验 Agent 证书身份
-        CommandNotifier         notifier;          ///< 浏览器通知
+        Auth::AuthService      *auth{nullptr};        ///< 认证
+        CommandRepository      *commands{nullptr};    ///< 命令仓储
+        Web::RealtimeBus       *realtimeBus{nullptr}; ///< Agent 命令总线，空表示不下发
+        Device::NodeRepository *nodes{nullptr};       ///< 节点仓储，用于校验 Agent 证书身份
+        CommandNotifier         notifier;             ///< 浏览器通知
     };
 
     /**

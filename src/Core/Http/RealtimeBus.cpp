@@ -36,7 +36,30 @@ namespace EdgePulse::Web
 
         [[nodiscard]] std::string envelopeOf(const std::string_view instanceId, const std::string_view base, const std::int64_t tenantId, const std::string_view payload)
         {
-            return AsynGyanis::Base::ConfigValue::object({{"instance", instanceId}, {"base", base}, {"tenantId", tenantId}, {"payload", payload}}).dump();
+            return AsynGyanis::Base::ConfigValue::object(
+                           {{"instance", instanceId}, {"target", "browser"}, {"base", base}, {"tenantId", tenantId}, {"nodeId", 0}, {"commandId", 0}, {"payload", payload}})
+                    .dump();
+        }
+
+        /**
+         * @brief 生成 Agent 消息的跨实例信封
+         * @param instanceId 发布实例标识
+         * @param message 目标节点、命令正文或关闭指令
+         * @return std::string 带 target=agent 的信封
+         */
+        [[nodiscard]] std::string agentEnvelopeOf(const std::string_view instanceId, const AgentMessage &message)
+        {
+            return AsynGyanis::Base::ConfigValue::object({{"instance", instanceId},
+                                                          {"target", "agent"},
+                                                          {"base", ""},
+                                                          {"tenantId", 0},
+                                                          {"nodeId", message.nodeId},
+                                                          {"commandId", message.commandId},
+                                                          {"close", message.close},
+                                                          {"closeCode", message.closeCode},
+                                                          {"closeReason", message.closeReason},
+                                                          {"payload", message.payload}})
+                    .dump();
         }
 
         /**
@@ -219,6 +242,60 @@ namespace EdgePulse::Web
         co_return;
     }
 
+    AsynGyanis::Core::Task<> RealtimeBus::publishAgent(AsynGyanis::Core::EventLoop &loop, AgentMessage message)
+    {
+        // 本地 handler 在本协程恢复的循环上执行；远端消息也由总线自己的循环排水
+        static_cast<void>(loop);
+        try
+        {
+            co_await deliverAgent(message);
+        } catch (const std::exception &failure)
+        {
+            // 本地没有连接或写失败不能拖住跨实例转发：真正持有该节点连接的可能是别的实例
+            LOG_WARN_FMT("Agent 消息本地投递失败：node={} error={}", message.nodeId, failure.what());
+        }
+        if (!m_options.enabled)
+        {
+            co_return;
+        }
+        if (!m_publisherHealth.isHealthy())
+        {
+            co_return;
+        }
+        std::unique_lock<std::mutex> publisherLock(m_publisherMutex, std::try_to_lock);
+        if (!publisherLock.owns_lock() || !m_publisher)
+        {
+            co_return;
+        }
+        if (m_publisher->publish(m_options.channel, agentEnvelopeOf(m_instanceId, message)))
+        {
+            co_return;
+        }
+        m_publisherHealth.markUnhealthy();
+        LOG_WARN_FMT("Agent 消息发布到 Redis 失败：instance={} endpoint={} node={} error={}", m_instanceId, endpointOf(m_options), message.nodeId, m_publisher->lastError());
+        co_return;
+    }
+
+    void RealtimeBus::setAgentMessageHandler(std::function<AsynGyanis::Core::Task<>(const AgentMessage &)> handler)
+    {
+        std::lock_guard<std::mutex> lock(m_agentHandlerMutex);
+        m_agentHandler = std::move(handler);
+    }
+
+    AsynGyanis::Core::Task<> RealtimeBus::deliverAgent(const AgentMessage &message)
+    {
+        std::function<AsynGyanis::Core::Task<>(const AgentMessage &)> handler;
+        {
+            std::lock_guard<std::mutex> lock(m_agentHandlerMutex);
+            handler = m_agentHandler;
+        }
+        if (handler)
+        {
+            co_await handler(message);
+        }
+        co_return;
+    }
+
     AsynGyanis::Core::Task<> RealtimeBus::deliverLocal(const std::string_view base, const std::int64_t tenantId, const std::string_view payload)
     {
         if (m_options.localDelivery)
@@ -237,7 +314,19 @@ namespace EdgePulse::Web
 
     void RealtimeBus::enqueueRemote(std::string base, const std::int64_t tenantId, std::string payload)
     {
-        m_remoteQueue.push_back(RemoteEvent{std::move(base), tenantId, std::move(payload)});
+        m_remoteQueue.push_back(RemoteEvent{false, std::move(base), tenantId, std::move(payload), AgentMessage{}});
+        if (m_remoteRunning)
+        {
+            return;
+        }
+        m_remoteRunning = true;
+        m_remoteWorker  = drainRemote();
+        m_loop.scheduler().schedule(m_remoteWorker->handle());
+    }
+
+    void RealtimeBus::enqueueRemoteAgent(AgentMessage message)
+    {
+        m_remoteQueue.push_back(RemoteEvent{true, {}, 0, {}, std::move(message)});
         if (m_remoteRunning)
         {
             return;
@@ -255,7 +344,13 @@ namespace EdgePulse::Web
             m_remoteQueue.pop_front();
             try
             {
-                co_await deliverLocal(event.base, event.tenantId, event.payload);
+                if (event.agent)
+                {
+                    co_await deliverAgent(event.message);
+                } else
+                {
+                    co_await deliverLocal(event.base, event.tenantId, event.payload);
+                }
             } catch (const std::exception &failure)
             {
                 LOG_WARN_FMT("远端实时事件本地投递失败：{}", failure.what());
@@ -387,21 +482,57 @@ namespace EdgePulse::Web
                 {
                     continue;
                 }
-                const std::string  base     = value->value("base", std::string{});
-                const std::int64_t tenantId = value->value("tenantId", std::int64_t{0});
-                const std::string  payload  = value->value("payload", std::string{});
-                if (base.empty() || payload.empty())
+                try
                 {
-                    continue;
-                }
-                m_loop.scheduler().postRemote(
-                        [this, base, tenantId, payload]
+                    const std::string target = value->value("target", std::string{"browser"});
+                    if (target == "agent")
+                    {
+                        AgentMessage message;
+                        message.nodeId      = value->value("nodeId", std::int64_t{0});
+                        message.commandId   = value->value("commandId", std::int64_t{0});
+                        message.payload     = value->value("payload", std::string{});
+                        message.close       = value->value("close", false);
+                        message.closeCode   = value->value("closeCode", 1008);
+                        message.closeReason = value->value("closeReason", std::string{});
+                        if (message.nodeId <= 0 || (!message.close && message.payload.empty()))
                         {
-                            if (!m_stopping.load())
+                            continue;
+                        }
+                        // 只投回本循环的本地 handler，不再二次发布：否则两个实例会互相回声
+                        m_loop.scheduler().postRemote(
+                                [this, message = std::move(message)]
+                                {
+                                    if (!m_stopping.load())
+                                    {
+                                        enqueueRemoteAgent(std::move(message));
+                                    }
+                                });
+                        continue;
+                    }
+                    if (target != "browser")
+                    {
+                        continue;
+                    }
+                    const std::string  base     = value->value("base", std::string{});
+                    const std::int64_t tenantId = value->value("tenantId", std::int64_t{0});
+                    const std::string  payload  = value->value("payload", std::string{});
+                    if (base.empty() || payload.empty())
+                    {
+                        continue;
+                    }
+                    m_loop.scheduler().postRemote(
+                            [this, base, tenantId, payload]
                             {
-                                enqueueRemote(base, tenantId, payload);
-                            }
-                        });
+                                if (!m_stopping.load())
+                                {
+                                    enqueueRemote(base, tenantId, payload);
+                                }
+                            });
+                } catch (const std::exception &failure)
+                {
+                    // 信封字段类型不对属于对端或版本问题：丢弃这一条，不能带走订阅线程
+                    LOG_WARN_FMT("远端实时事件信封解析失败：{}", failure.what());
+                }
             }
         }
         m_subscriberConnected.store(false);

@@ -352,7 +352,6 @@ protected:
                     EdgePulse::Command::CommandDependencies commandDependencies;
                     commandDependencies.nodes    = m_nodes.get();
                     commandDependencies.commands = m_commands.get();
-                    commandDependencies.channels = m_channels.get();
                     EdgePulse::Command::registerCommandAgentRoutes(router, loop, commandDependencies);
                     EdgePulse::Telemetry::TelemetryDependencies telemetryDependencies;
                     telemetryDependencies.nodes     = m_nodes.get();

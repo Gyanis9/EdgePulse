@@ -6,11 +6,12 @@
 #include "Base/Api/QueryParameters.h"
 #include "Base/Log/LogMacros.h"
 #include "Plugins/DevicePlugin/NodeJson.h"
-#include "Core/Command/AgentChannelRegistry.h"
+#include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Device/NodeConfigRepository.h"
 #include "Core/Device/NodeLifecycleService.h"
 #include "Core/Device/NodeService.h"
 #include "Core/Auth/DataScopeService.h"
+#include "Core/Http/RealtimeBus.h"
 #include "Core/System/TenantRepository.h"
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
@@ -160,7 +161,7 @@ namespace EdgePulse::Device
     } // namespace
 
     void registerRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, NodeService &nodeService, AccessResolver accessResolver,
-                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants, NodeLifecycleService *lifecycle, Command::AgentChannelRegistry *channels,
+                        Auth::DataScopeService *dataScopes, System::TenantRepository *tenants, NodeLifecycleService *lifecycle, Web::RealtimeBus *realtimeBus,
                         NodeConfigRepository *configs)
     {
         router.get("/api/nodes",
@@ -287,8 +288,8 @@ namespace EdgePulse::Device
                    });
 
         router.post("/api/nodes/:id/certificate/revoke",
-                    [&loop, &nodeService, accessResolver, dataScopes, lifecycle, channels](AsynGyanis::Net::HttpRequest  &request,
-                                                                                           AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                    [&loop, &nodeService, accessResolver, dataScopes, lifecycle, realtimeBus](AsynGyanis::Net::HttpRequest  &request,
+                                                                                              AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                     {
                         const std::string traceId = Web::resolveRequestId(request);
                         const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
@@ -318,9 +319,10 @@ namespace EdgePulse::Device
                         }
                         LOG_INFO_FMT("吊销节点证书：node={} name={}", revoked->id, revoked->name);
                         // 证书已清空；先掐断仍在线的 Agent WebSocket，再收口实时状态与告警
-                        if (channels != nullptr)
+                        if (realtimeBus != nullptr)
                         {
-                            co_await channels->closeNode(*nodeId, AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked");
+                            co_await realtimeBus->publishAgent(loop,
+                                                               Command::makeAgentCloseMessage(*nodeId, AsynGyanis::Net::kWebSocketPolicyViolationCode, "certificate revoked"));
                         }
                         if (lifecycle != nullptr)
                         {
@@ -406,8 +408,8 @@ namespace EdgePulse::Device
                    });
 
         router.del("/api/nodes/:id",
-                   [&loop, &nodeService, accessResolver, dataScopes, lifecycle, channels](AsynGyanis::Net::HttpRequest  &request,
-                                                                                          AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [&loop, &nodeService, accessResolver, dataScopes, lifecycle, realtimeBus](AsynGyanis::Net::HttpRequest  &request,
+                                                                                             AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
                        const auto        access  = co_await requireAccess(accessResolver, loop, request, response, kWritePermission, traceId);
@@ -435,9 +437,9 @@ namespace EdgePulse::Device
                            co_return;
                        }
                        // 删除后该节点不会再有心跳；和吊销一样先关闭在线 Agent 通道，再收口告警
-                       if (channels != nullptr)
+                       if (realtimeBus != nullptr)
                        {
-                           co_await channels->closeNode(*nodeId, AsynGyanis::Net::kWebSocketPolicyViolationCode, "node deleted");
+                           co_await realtimeBus->publishAgent(loop, Command::makeAgentCloseMessage(*nodeId, AsynGyanis::Net::kWebSocketPolicyViolationCode, "node deleted"));
                        }
                        // 删除后的节点不会再有心跳来销案，必须在这里收口它的系统离线告警
                        if (lifecycle != nullptr)

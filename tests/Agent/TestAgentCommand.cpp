@@ -499,6 +499,40 @@ namespace EdgePulse::Agent
         EXPECT_EQ(60, webSocketReconnectBackoffSeconds(100));
     }
 
+    TEST(AgentCommand, WebSocketFallbackForcedPollWhileConnected)
+    {
+        // 时钟由用例推进：断言自己造出「到点」与「未到点」两种状态，不靠真实调度时序
+        std::chrono::steady_clock::time_point now{};
+        WebSocketFallbackState                fallback([&now] { return now; });
+        const auto                            configuredInterval = std::chrono::seconds{15};
+        const auto                            connectedInterval  = std::chrono::seconds{60};
+        const auto                            oneSecond          = std::chrono::seconds{1};
+
+        EXPECT_TRUE(fallback.shouldPoll()) << "启动时通道未确认，轮询必须运行";
+        fallback.recordConnected();
+        EXPECT_TRUE(fallback.isConnected());
+        EXPECT_FALSE(fallback.shouldPoll()) << "连接确认后暂停连续轮询";
+        EXPECT_EQ(connectedInterval, fallback.nextPollDelay(configuredInterval));
+
+        now += std::chrono::seconds{59};
+        EXPECT_FALSE(fallback.shouldPoll()) << "连接期间 60 秒未到不得强制轮询";
+        EXPECT_EQ(oneSecond, fallback.nextPollDelay(configuredInterval));
+
+        now += std::chrono::seconds{1};
+        EXPECT_TRUE(fallback.shouldPoll()) << "连接期间每 60 秒必须强制轮询一次";
+        EXPECT_FALSE(fallback.shouldPoll()) << "同一次到点只消费一个轮询时隙";
+        EXPECT_EQ(connectedInterval, fallback.nextPollDelay(configuredInterval));
+
+        now += std::chrono::seconds{60};
+        EXPECT_TRUE(fallback.shouldPoll());
+
+        fallback.recordDisconnected();
+        EXPECT_FALSE(fallback.isConnected());
+        EXPECT_TRUE(fallback.shouldPoll()) << "断开后立即恢复轮询";
+        EXPECT_EQ(configuredInterval, fallback.nextPollDelay(configuredInterval));
+        EXPECT_EQ(configuredInterval, fallback.nextPollDelay(std::chrono::seconds{0})) << "非法配置退回 15 秒";
+    }
+
     TEST(AgentCommand, WebSocketCommandExecutesOnceAndPostsResult)
     {
         auto capture      = std::make_shared<ResultCapture>();
@@ -578,6 +612,30 @@ namespace EdgePulse::Agent
         ASSERT_TRUE(hello.has_value()) << helloPayload;
         EXPECT_EQ("hello", hello->value("type", std::string{}));
         EXPECT_EQ(77, hello->value("nodeId", 0));
+    }
+
+    TEST(AgentCommand, WebSocketCommandDeduplicatesAcrossOverlappingDeliveries)
+    {
+        auto                       capture = std::make_shared<ResultCapture>();
+        TestSupport::ServerHarness server([capture](AsynGyanis::Net::Router &router, EventLoop &) { installResultRoute(router, capture); });
+
+        TestSupport::TemporaryDirectory directory;
+        auto                            state = openState(directory);
+        ASSERT_TRUE(state.has_value()) << state.error();
+
+        AgentLoop         loop;
+        AgentClient       client(loop.loop(), plaintextConfiguration(server.port()), testIdentity());
+        auto              executor = std::make_shared<FakeExecutor>("fake.echo");
+        CommandDispatcher dispatcher(client, *state, {executor});
+        LoopStopGuard     stopGuard{loop};
+
+        // 轮询兜底与 WebSocket 推送可能各交来一份同标识命令；第一次的结果已被服务端确认并删除，
+        // 第二次仍必须按已执行命令丢弃，不能靠结果队列里恰好还有一行来挡
+        ASSERT_TRUE(loop.run(dispatcher.onWebSocketCommand(AgentCommand{1501, "fake.echo", "{}", 30}), std::chrono::seconds{15}, "首次投递"));
+        ASSERT_TRUE(loop.run(dispatcher.onWebSocketCommand(AgentCommand{1501, "fake.echo", "{}", 30}), std::chrono::seconds{15}, "重复投递"));
+
+        EXPECT_EQ(1, executor->executions()) << "同一命令标识只能执行一次";
+        EXPECT_EQ(1, capture->posts.load(std::memory_order_acquire)) << "重复投递不能重复上报结果";
     }
 
     TEST(AgentCommand, RestartRunsAfterResultAcknowledged)

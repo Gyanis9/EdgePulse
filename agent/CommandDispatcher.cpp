@@ -129,6 +129,25 @@ namespace EdgePulse::Agent
         m_state.enqueueResult(commandId, resultPayload(payload, "命令失败结果无法序列化为 JSON，已改用固定文本"));
     }
 
+    bool CommandDispatcher::alreadyHandled(const std::int64_t commandId) const
+    {
+        return m_inFlight.contains(commandId) || m_completed.contains(commandId) || m_state.hasResult(commandId);
+    }
+
+    void CommandDispatcher::rememberCompleted(const std::int64_t commandId)
+    {
+        if (!m_completed.insert(commandId).second)
+        {
+            return;
+        }
+        m_completedOrder.push_back(commandId);
+        while (m_completedOrder.size() > kCompletedCommandLimit)
+        {
+            m_completed.erase(m_completedOrder.front());
+            m_completedOrder.pop_front();
+        }
+    }
+
     AsynGyanis::Core::Task<bool> CommandDispatcher::execute(AgentCommand command)
     {
         m_inFlight.insert(command.id);
@@ -171,6 +190,7 @@ namespace EdgePulse::Agent
         const AsynGyanis::Base::ConfigValue payload =
                 AsynGyanis::Base::ConfigValue::object({{"status", outcome.succeeded ? "succeeded" : "failed"}, {"result", outcome.result}, {"message", outcome.message}});
         m_state.enqueueResult(command.id, resultPayload(payload, "命令执行结果无法序列化为 JSON，已改用固定文本"));
+        rememberCompleted(command.id);
         m_inFlight.erase(command.id);
         co_return restartAfterResult;
     }
@@ -202,9 +222,9 @@ namespace EdgePulse::Agent
             LOG_WARN("收到标识无效的命令，已跳过");
             co_return;
         }
-        if (m_inFlight.contains(command.id) || m_state.hasResult(command.id))
+        if (alreadyHandled(command.id))
         {
-            LOG_WARN_FMT("命令 {} 正在执行或已有结果，忽略重复投递", command.id);
+            LOG_WARN_FMT("命令 {} 正在执行、已有结果或已执行完成，忽略重复投递", command.id);
             co_return;
         }
 
@@ -229,14 +249,15 @@ namespace EdgePulse::Agent
             LOG_WARN_FMT("命令正文无效且没有可用的标识，无法上报失败结果：{}", message);
             co_return;
         }
-        if (m_inFlight.contains(commandId) || m_state.hasResult(commandId))
+        if (m_inFlight.contains(commandId) || m_completed.contains(commandId) || m_state.hasResult(commandId))
         {
-            LOG_WARN_FMT("命令 {} 正在执行或已有结果，忽略失败上报", commandId);
+            LOG_WARN_FMT("命令 {} 正在执行、已执行完成或已有结果，忽略失败上报", commandId);
             co_return;
         }
 
         LOG_WARN_FMT("命令 {} 无法执行：{}", commandId, message);
         enqueueFailure(commandId, message);
+        rememberCompleted(commandId);
         const ResultFlush flushed = co_await flushResults();
         if (flushed.failed)
         {

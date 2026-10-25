@@ -70,7 +70,7 @@ protected:
         m_configs     = std::make_shared<EdgePulse::Device::NodeConfigRepository>(m_context->database);
         m_commands    = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
         m_channels    = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
-        m_service     = std::make_shared<EdgePulse::Device::NodeConfigService>(m_configs, m_nodes, m_commands, m_channels.get(), nullptr);
+        m_service     = std::make_shared<EdgePulse::Device::NodeConfigService>(m_configs, m_nodes, m_commands, nullptr, nullptr);
         m_registry    = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, EdgePulse::Device::AgentRegistry::Options{});
 
         m_server = std::make_unique<EdgePulse::TestSupport::ServerHarness>(
@@ -104,7 +104,7 @@ protected:
                         co_return EdgePulse::Device::AccessContext{session->userId,       session->tenantId, session->platformAdmin, session->username,
                                                                    session->departmentId, session->roles,    session->permissions};
                     };
-                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), nullptr, m_channels.get(), m_configs.get());
+                    EdgePulse::Device::registerRoutes(router, loop, *m_nodeService, access, nullptr, m_context->tenants.get(), nullptr, nullptr, m_configs.get());
                     EdgePulse::Device::registerRoutes(router, loop, *m_registry, *m_nodes, *m_context->tenants, 30, m_configs.get());
                     EdgePulse::Device::registerNodeConfigAgentRoutes(router, loop, configDependencies);
                 });

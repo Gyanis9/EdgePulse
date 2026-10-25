@@ -50,10 +50,16 @@ namespace EdgePulse::Agent
         return kWebSocketBackoffSeconds[index];
     }
 
+    WebSocketFallbackState::WebSocketFallbackState(NowFunction now) : m_now(std::move(now))
+    {
+        m_lastPoll = this->now();
+    }
+
     void WebSocketFallbackState::recordConnected()
     {
         m_connected           = true;
         m_consecutiveFailures = 0;
+        m_lastPoll            = now();
     }
 
     void WebSocketFallbackState::recordDisconnected()
@@ -67,14 +73,49 @@ namespace EdgePulse::Agent
         ++m_consecutiveFailures;
     }
 
-    bool WebSocketFallbackState::shouldPoll() const
+    bool WebSocketFallbackState::shouldPoll()
     {
-        return !m_connected;
+        const auto current = now();
+        if (!m_connected)
+        {
+            m_lastPoll = current;
+            return true;
+        }
+        if (current - m_lastPoll < kConnectedPollInterval)
+        {
+            return false;
+        }
+        m_lastPoll = current;
+        return true;
+    }
+
+    std::chrono::seconds WebSocketFallbackState::nextPollDelay(const std::chrono::seconds disconnectedInterval) const
+    {
+        if (!m_connected)
+        {
+            return disconnectedInterval.count() > 0 ? disconnectedInterval : kDisconnectedFallbackInterval;
+        }
+        const auto elapsed = now() - m_lastPoll;
+        if (elapsed >= kConnectedPollInterval)
+        {
+            return std::chrono::seconds{0};
+        }
+        return std::chrono::ceil<std::chrono::seconds>(kConnectedPollInterval - elapsed);
+    }
+
+    bool WebSocketFallbackState::isConnected() const
+    {
+        return m_connected;
     }
 
     int WebSocketFallbackState::consecutiveFailures() const
     {
         return m_consecutiveFailures;
+    }
+
+    std::chrono::steady_clock::time_point WebSocketFallbackState::now() const
+    {
+        return m_now ? m_now() : std::chrono::steady_clock::now();
     }
 
     AgentWebSocket::AgentWebSocket(AsynGyanis::Core::EventLoop &loop, const AgentConfiguration &configuration) :
