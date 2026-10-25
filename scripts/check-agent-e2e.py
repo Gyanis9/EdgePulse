@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生产 Agent 端到端验收：临时控制面加真实 edgepulse-agent，覆盖注册、心跳、遥测、配置、诊断、签名固件、离线补报、重启与证书改绑。"""
+"""生产 Agent 端到端验收：临时控制面加真实 edgepulse-agent，覆盖注册、心跳、遥测、配置、诊断、签名固件、证书自动续期与重叠窗口、离线补报、重启与证书改绑。"""
 
 from __future__ import annotations
 
@@ -120,6 +120,18 @@ def client_context(certificate: Path | None = None, private_key: Path | None = N
 def certificate_fingerprint(certificate: Path) -> str:
     result = subprocess.run(["openssl", "x509", "-in", str(certificate), "-outform", "DER"], check=True, capture_output=True)
     return hashlib.sha256(result.stdout).hexdigest()
+
+
+def certificate_not_after(certificate: Path) -> int:
+    """取证书 notAfter 的 UTC 秒数；openssl 的 -enddate 输出形如 notAfter=Oct 26 01:29:20 2026 GMT。"""
+    result = subprocess.run(["openssl", "x509", "-in", str(certificate), "-noout", "-enddate"], check=True, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
+    return int(ssl.cert_time_to_seconds(result.stdout.strip().split("=", 1)[1]))
+
+
+def utc_text(seconds: int) -> str:
+    """把秒数写成节点 JSON 使用的 UTC DATETIME 文本。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(seconds))
 
 
 def read_log_tail(path: Path, maximum_bytes: int = 4000) -> str:
@@ -255,6 +267,18 @@ def wait_agent_state(database: Path, key: str, expected: str | None, timeout: fl
             return value
         time.sleep(0.3)
     return read_agent_state(database, key)
+
+
+def wait_agent_state_changed(database: Path, key: str, previous: str, timeout: float) -> str | None:
+    """等到状态库里的值离开 previous；续期循环在安装并重载 HTTP 身份之后才写新指纹。"""
+    deadline = time.time() + timeout
+    value = read_agent_state(database, key)
+    while time.time() < deadline:
+        value = read_agent_state(database, key)
+        if value is not None and value != previous:
+            return value
+        time.sleep(0.3)
+    return value
 
 
 def queue_depths(database: Path) -> tuple[int, int] | None:
@@ -453,8 +477,13 @@ class Session:
             (r"^(\s*)heartbeat_interval_seconds: 10\s*$", r"\g<1>heartbeat_interval_seconds: 5", "agent.heartbeat_interval_seconds"),
             (r"^(\s*)certificate_file: var/certs/ca\.pem\s*$", rf"\g<1>certificate_file: '{(CERTS / 'ca.pem').as_posix()}'", "agent_ca.certificate_file"),
             (r"^(\s*)key_file: var/certs/ca-key\.pem\s*$", rf"\g<1>key_file: '{(CERTS / 'ca-key.pem').as_posix()}'", "agent_ca.key_file"),
+            # 自动签发的证书只活两天：Agent 的续期提前量是 1 天，新证书剩余有效期必须大于它才会被安装
+            (r"^(\s*)validity_days: 30\s*$", r"\g<1>validity_days: 2", "agent_ca.validity_days"),
         ]
-        self.server_config.write_text(patch_lines(source, replacements), encoding="utf-8")
+        patched = patch_lines(source, replacements)
+        if re.search(r"^\s*agent_ca:\s*$(?:\r?\n\s*#[^\r\n]*)*\r?\n\s*enabled:\s*true\s*$", patched, re.MULTILINE) is None:
+            raise RuntimeError("config/dev.yaml 的 agent_ca 段必须启用，自动续期场景才有签发入口")
+        self.server_config.write_text(patched, encoding="utf-8")
 
     def write_agent_config(self, certificate: Path, private_key: Path) -> None:
         temporary = self.temp_root
@@ -472,6 +501,9 @@ class Session:
     command_poll_interval_seconds: 5
     websocket_enabled: true
     request_timeout_seconds: 10
+  certificate:
+    renew_before_days: 1
+    renewal_check_seconds: 60
   telemetry:
     interval_seconds: 5
     disk_path: "{'C:/' if os.name == 'nt' else '/'}"
@@ -809,9 +841,48 @@ def generate_rebind_certificate(session: Session) -> tuple[Path, Path] | None:
     return certificate_path, key_path
 
 
-def check_tokens_not_leaked(session: Session, enrollment_token: str, rebind_token: str) -> None:
+def generate_renewal_agent_certificate(session: Session) -> tuple[tuple[Path, Path] | None, str]:
+    """用开发 CA 在临时目录签发一张 1 天有效期的客户端证书，供自动续期场景切换到短期身份。"""
+    if shutil.which("bash") is None:
+        return None, "缺少 bash，无法调用 scripts/gen-agent-certs.sh 生成短期证书"
+    if shutil.which("openssl") is None:
+        return None, "缺少 openssl，无法生成短期证书"
+    directory = session.temp_root / "renewal-certs"
+    directory.mkdir(parents=True, exist_ok=True)
+    name = f"e2e-renewal-{RUN_ID}"
+    result = subprocess.run(["bash", "scripts/gen-agent-certs.sh", name, "--days", "1", "--out-dir", str(directory)], cwd=ROOT, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", check=False)
+    certificate_path = directory / f"{name}.pem"
+    key_path = directory / f"{name}-key.pem"
+    if result.returncode != 0 or not certificate_path.exists() or not key_path.exists():
+        detail = (result.stderr or result.stdout).strip()[-400:] or f"退出码 {result.returncode}"
+        return None, "scripts/gen-agent-certs.sh 未能生成短期证书：" + detail
+    return (certificate_path, key_path), ""
+
+
+def wait_log_message(session: Session, offsets: tuple[int, int], needle: str, timeout: float) -> str:
+    """只在 offsets 之后新增的日志里查找整行，避免把上一轮启动留下的同样文案当成证据。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for path, offset in zip((session.agent_log, session.agent_stdout), offsets):
+            try:
+                with open(path, "rb") as stream:
+                    stream.seek(offset)
+                    appended = stream.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            for line in appended.splitlines():
+                if needle in line:
+                    return line.strip()
+        time.sleep(0.5)
+    return ""
+
+
+def check_tokens_not_leaked(session: Session, enrollment_token: str, rebind_token: str, renewal_token: str = "") -> None:
     needles = [("管理员令牌", token.encode()) for token in admin_tokens if token]
     needles += [("注册令牌", enrollment_token.encode()), ("改绑令牌", rebind_token.encode()), ("运维令牌", session.ops_token.encode())]
+    if renewal_token:
+        needles.append(("续期改绑令牌", renewal_token.encode()))
     needles += [("PEM 私钥", marker) for marker in (b"BEGIN PRIVATE KEY", b"BEGIN OPENSSH PRIVATE KEY", b"BEGIN EC PRIVATE KEY")]
     logs = sorted(path for path in (session.temp_root / "logs").glob("*") if path.is_file())
     databases = [session.agent_database, session.server_database]
@@ -878,8 +949,14 @@ def run(session: Session) -> None:
         report("Agent 配置校验", False, f"找不到 Agent 二进制：{agent_binary}")
         return
 
+    # 续期场景会把临时证书文件原地换成新证书，吊销检查要用这份当前身份而不是仓库里的开发证书
+    active_certificate = CERTS / "agent.pem"
+    active_private_key = CERTS / "agent-key.pem"
+    previous_certificate: Path | None = None
+    renewal_token = ""
+
     session.write_server_config()
-    session.write_agent_config(CERTS / "agent.pem", CERTS / "agent-key.pem")
+    session.write_agent_config(active_certificate, active_private_key)
     configuration_check = subprocess.run([str(agent_binary), "--check-config", "--config", str(session.agent_config)], capture_output=True, text=True,
                                          encoding="utf-8", errors="replace", check=False)
     report("Agent 配置校验", configuration_check.returncode == 0,
@@ -1015,6 +1092,100 @@ def run(session: Session) -> None:
         else:
             report("签名固件下发命令创建", False, "上传未返回固件标识")
 
+    renewal_certificate, renewal_detail = generate_renewal_agent_certificate(session)
+    if renewal_certificate is None:
+        skip("自动续期：短期证书", renewal_detail)
+    else:
+        renewal_cert, renewal_key = renewal_certificate
+        initial_fingerprint = certificate_fingerprint(renewal_cert)
+        initial_not_after = certificate_not_after(renewal_cert)
+        previous_certificate = session.temp_root / "renewal-previous.pem"
+        previous_key = session.temp_root / "renewal-previous-key.pem"
+        shutil.copyfile(renewal_cert, previous_certificate)
+        shutil.copyfile(renewal_key, previous_key)
+        renewal_token_id, renewal_token = create_enrollment_token(token, "rebind")
+        report("自动续期：创建改绑令牌", renewal_token_id is not None and renewal_token.startswith("ep_enroll_"), f"id={renewal_token_id}")
+        if not renewal_token:
+            report("自动续期：切换到短期证书", False, "未取得改绑令牌")
+        else:
+            # 用 1 天证书重新入场；续期提前量也是 1 天，Agent 启动后第一轮检查就会触发自动续期
+            session.stop_agent()
+            session.write_agent_config(renewal_cert, renewal_key)
+            short_config_check = subprocess.run([str(agent_binary), "--check-config", "--config", str(session.agent_config)], capture_output=True, text=True,
+                                                encoding="utf-8", errors="replace", check=False)
+            report("自动续期：短期证书配置校验", short_config_check.returncode == 0,
+                   (short_config_check.stdout or short_config_check.stderr).strip() or f"退出码 {short_config_check.returncode}")
+            renewal_log_offsets = session.log_offsets()
+            renewal_environment = build_agent_environment({REBIND_ENV: renewal_token, HOOK_MARKER_ENV: str(session.hook_marker)})
+            if not session.start_agent(renewal_environment):
+                report("自动续期：短期证书 Agent 启动", False, "Agent 未启动")
+            else:
+                renewal_pid = session.agent_process.pid
+                active_certificate = renewal_cert
+                active_private_key = renewal_key
+                report("自动续期：短期证书 Agent 启动", True, f"PID {renewal_pid}，初始指纹 {initial_fingerprint}，到期 {utc_text(initial_not_after)}（UTC）")
+                rebound_to_short = wait_node_detail(
+                    token, session.node_id,
+                    lambda node: node.get("status") == "online" and node.get("certFingerprint") not in ("", session.agent_fingerprint), 60)
+                report("自动续期：短期证书注册上线", rebound_to_short is not None, f"指纹={(rebound_to_short or {}).get('certFingerprint')}")
+
+                # 状态库在安装并重载 HTTP 身份之后才写新指纹，因此它先变化，磁盘上的证书文件必定已是新的一对
+                state_fingerprint = wait_agent_state_changed(session.agent_database, "cert_fingerprint", initial_fingerprint, 120)
+                try:
+                    final_fingerprint = certificate_fingerprint(active_certificate)
+                    final_not_after = certificate_not_after(active_certificate)
+                except (OSError, subprocess.SubprocessError):
+                    final_fingerprint = ""
+                    final_not_after = 0
+                renewed_node = None
+                if final_fingerprint and final_fingerprint != initial_fingerprint and final_not_after > initial_not_after:
+                    renewed_node = wait_node_detail(
+                        token, session.node_id,
+                        lambda node: node.get("status") == "online" and node.get("certFingerprint") == final_fingerprint
+                        and str(node.get("certNotAfter", "")) == utc_text(final_not_after) and node.get("previousCertFingerprint") == initial_fingerprint,
+                        30)
+                report("自动续期：节点指纹与到期时间已更新", renewed_node is not None,
+                       f"{initial_fingerprint} @ {utc_text(initial_not_after)} -> {final_fingerprint or '未知'} @ {utc_text(final_not_after) if final_not_after else '未知'}")
+                report("自动续期：节点保留上一枚证书字段",
+                       renewed_node is not None and bool(renewed_node.get("previousCertNotAfter")),
+                       f"previous={(renewed_node or {}).get('previousCertFingerprint')}，截止={(renewed_node or {}).get('previousCertNotAfter')}")
+                same_pid = (session.agent_process is not None and session.agent_process.poll() is None and session.agent_process.pid == renewal_pid
+                            and process_alive(renewal_pid))
+                report("自动续期：进程未重启（PID 不变且存活）", same_pid, f"PID {renewal_pid}")
+                renewal_log = wait_log_message(session, renewal_log_offsets, "证书续期完成", 30)
+                report("自动续期：Agent 日志记录续期完成", bool(renewal_log), renewal_log or "新增日志未出现「证书续期完成」")
+                report("自动续期：状态库写入新指纹", bool(state_fingerprint) and state_fingerprint == final_fingerprint,
+                       f"状态库 {state_fingerprint}")
+
+                # 旧证书仍在服务端的重叠窗口里：旧指纹与新指纹都应能完成心跳
+                status, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat", {"nodeId": session.node_id, "agentVersion": session.agent_version},
+                                         context=client_context(previous_certificate, previous_key))
+                report("自动续期：重叠窗口内旧证书心跳可用", status == 200, f"HTTP {status}")
+                status, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat", {"nodeId": session.node_id, "agentVersion": session.agent_version},
+                                         context=client_context(active_certificate, active_private_key))
+                report("自动续期：新证书心跳可用", status == 200, f"HTTP {status}")
+
+                last_seen_after_renewal = str((renewed_node or {}).get("lastSeen", ""))
+                heartbeat_after_renewal = wait_node_detail(
+                    token, session.node_id,
+                    lambda node: node.get("status") == "online" and node.get("certFingerprint") == final_fingerprint and node.get("lastSeen") != last_seen_after_renewal,
+                    30)
+                report("自动续期：心跳继续刷新", heartbeat_after_renewal is not None,
+                       f"{last_seen_after_renewal} -> {(heartbeat_after_renewal or {}).get('lastSeen')}")
+                renewal_telemetry = server_telemetry_total(session.server_database, session.node_id)
+                deadline = time.time() + 30
+                telemetry_after_renewal = renewal_telemetry
+                while time.time() < deadline:
+                    telemetry_after_renewal = server_telemetry_total(session.server_database, session.node_id)
+                    if telemetry_after_renewal > renewal_telemetry:
+                        break
+                    time.sleep(0.5)
+                report("自动续期：遥测继续上报", telemetry_after_renewal > renewal_telemetry, f"{renewal_telemetry} -> {telemetry_after_renewal}")
+                renewal_command_id, renewal_command_status = create_command(token, session.node_id, "diagnostics.collect", {}, timeout_seconds=90)
+                renewal_command = wait_command_terminal(token, session.node_id, renewal_command_id, 90) if renewal_command_id else None
+                report("自动续期：命令通道仍可执行", renewal_command is not None and renewal_command.get("status") == "succeeded",
+                       f"HTTP {renewal_command_status}，commandId={renewal_command_id}")
+
     telemetry_before = server_telemetry_total(session.server_database, session.node_id)
     last_seen_before_outage = str(node_detail(token, session.node_id).get("lastSeen", ""))
     node_id_before_restart = read_agent_state(session.agent_database, "node_id") or str(session.node_id)
@@ -1100,10 +1271,14 @@ def run(session: Session) -> None:
     revoked_data = revoked.get("data") or {}
     report("吊销节点证书", revoke_status == 200 and not revoked_data.get("certFingerprint") and bool(revoked_data.get("certRevokedAt")),
            f"HTTP {revoke_status}，revokedAt={revoked_data.get('certRevokedAt')}")
-    old_context = client_context(CERTS / "agent.pem", CERTS / "agent-key.pem")
+    old_context = client_context(active_certificate, active_private_key)
     status, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat", {"nodeId": session.node_id, "agentVersion": session.agent_version},
                              context=old_context)
     report("吊销后旧证书心跳被拒", status == 403, f"HTTP {status}")
+    if previous_certificate is not None and previous_key.exists():
+        status, _ = request_json("POST", AGENT_BASE + "/api/agent/heartbeat", {"nodeId": session.node_id, "agentVersion": session.agent_version},
+                                 context=client_context(previous_certificate, previous_key))
+        report("吊销后重叠窗口旧证书同样被拒", status == 403, f"HTTP {status}")
     rejection_line = wait_heartbeat_rejection(session, agent_log_offsets, 25)
     report("运行中的 Agent 收到吊销拒绝", bool(rejection_line), ("Agent 日志：" + rejection_line) if rejection_line else "新增日志未出现心跳 HTTP 403")
     offline = wait_node_detail(token, session.node_id, lambda node: node.get("status") == "offline", 30)
@@ -1129,7 +1304,7 @@ def run(session: Session) -> None:
     else:
         skip("证书吊销后的改绑注册", "未取得改绑令牌或无法用开发 CA 签发新证书")
 
-    check_tokens_not_leaked(session, enrollment_token, rebind_token)
+    check_tokens_not_leaked(session, enrollment_token, rebind_token, renewal_token)
 
 
 def main() -> int:
