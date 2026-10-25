@@ -164,7 +164,18 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_task') WHERE name = 'idx_fw_task_rollout'"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_node') WHERE name = 'installed_firmware_version'"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 23"));
-        EXPECT_EQ(23, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 24"));
+        // 任务与命令的绑定必须唯一，重复派发才能被数据库兜底拒绝；未绑定行用负值占位后仍可建可移植索引
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_task') WHERE name = 'uq_fw_task_command'"));
+        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_task') AS il, pragma_index_info(il.name) AS ii "
+                                                     "WHERE il.\"unique\" = 1 AND ii.name IN ('firmware_id', 'node_id', 'command_id')"));
+        ASSERT_NE(nullptr, connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, command_id) VALUES (99001, 1, 1, 1, 'pending', 77)"));
+        EXPECT_EQ(nullptr, connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, command_id) VALUES (99002, 1, 1, 1, 'pending', 77)"))
+                << "同一固件与节点不能绑定同一个命令";
+        ASSERT_NE(nullptr, connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, command_id) VALUES (99003, 1, 1, 1, 'pending', -99003)"));
+        ASSERT_NE(nullptr, connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, command_id) VALUES (99004, 1, 1, 1, 'pending', -99004)"))
+                << "未绑定命令的任务用不同的负值占位，可以共存";
+        EXPECT_EQ(24, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }

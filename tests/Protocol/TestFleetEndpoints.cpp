@@ -90,12 +90,35 @@ namespace
     {
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
         const std::string                                               now        = EdgePulse::Common::nowDateTimeUtc();
+        // V24 之后未绑定命令的任务用唯一负值占位，测试数据按同一表示写入
+        const std::int64_t storedCommandId = commandId > 0 ? commandId : -taskId;
         const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result =
                 connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, previous_firmware_id, "
                                     "command_id) VALUES (" +
                                     std::to_string(taskId) + ", " + std::to_string(tenantId) + ", " + std::to_string(firmwareId) + ", " + std::to_string(nodeId) +
-                                    ", 'pending', 0, '', '" + now + "', '" + now + "', 0, " + std::to_string(commandId) + ")");
+                                    ", 'pending', 0, '', '" + now + "', '" + now + "', 0, " + std::to_string(storedCommandId) + ")");
         EXPECT_NE(nullptr, result) << connection->lastError();
+    }
+
+    void setFirmwareTaskStatus(const std::filesystem::path &databasePath, const std::int64_t taskId, const std::string &status, const std::string &message)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result     = connection->execute(
+                "UPDATE biz_firmware_task SET status = '" + status + "', message = '" + message + "' WHERE id = " + std::to_string(taskId));
+        EXPECT_NE(nullptr, result) << connection->lastError();
+    }
+
+    [[nodiscard]] std::string firmwareTaskStatus(const std::filesystem::path &databasePath, const std::int64_t taskId)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result     = connection->execute("SELECT status FROM biz_firmware_task WHERE id = " + std::to_string(taskId));
+        EXPECT_NE(nullptr, result) << connection->lastError();
+        if (result == nullptr || !result->next())
+        {
+            return {};
+        }
+        const auto value = result->getValue(0);
+        return std::holds_alternative<std::string>(value) ? std::get<std::string>(value) : std::string{};
     }
 
     [[nodiscard]] std::int64_t firmwareTaskCommandId(const std::filesystem::path &databasePath, const std::int64_t taskId)
@@ -1181,6 +1204,45 @@ TEST_F(FleetEndpointsTest, FirmwareStatusScopesTaskByCommandId)
     }
 }
 
+// 钉住：命令取消后任务已判失败，Agent 迟到的 installed 回报不能把终局改回已安装
+TEST_F(FleetEndpointsTest, FirmwareStatusCannotReviveCanceledTask)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "firmware-canceled-status-node");
+    const std::string  fingerprint(64, '6');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name                   = "Canceled OS";
+    record.version                = "5.4.0";
+    record.fileName               = "canceled-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, 'e');
+    record.storagePath            = (m_storage / "canceled-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    const std::int64_t taskId = 900000000000000209;
+    insertFirmwareTask(m_context->databasePath(), taskId, 1, firmwareId, nodeId, 71);
+    setFirmwareTaskStatus(m_context->databasePath(), taskId, "failed", "命令已取消");
+
+    // 取消只是服务端记账：Agent 可能仍在安装，迟到回报必须被终局挡住
+    const auto status = m_server->post(
+            "/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "迟到安装完成"}, {"commandId", 71}}).dump(),
+            "application/json", agentHeaders(fingerprint));
+    EXPECT_EQ(404, status.status) << status.body;
+    EXPECT_EQ("failed", firmwareTaskStatus(m_context->databasePath(), taskId));
+
+    const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
+    ASSERT_EQ(200, tasks.status) << tasks.body;
+    const auto json = tasks.json();
+    ASSERT_TRUE(json.has_value());
+    ASSERT_EQ(1, (*json)["data"].size());
+    EXPECT_EQ("failed", (*json)["data"][0]["status"].get<std::string>());
+    EXPECT_EQ("命令已取消", (*json)["data"][0]["message"].get<std::string>());
+}
+
 // 钉住：旧 Agent 不带 commandId 的状态回报保持原行为，按固件与节点更新全部任务
 TEST_F(FleetEndpointsTest, FirmwareStatusWithoutCommandIdKeepsLegacyTaskUpdate)
 {
@@ -1222,7 +1284,7 @@ TEST_F(FleetEndpointsTest, FirmwareStatusWithoutCommandIdKeepsLegacyTaskUpdate)
     }
 }
 
-// 钉住：带 commandId 的回报命中不到任务时只回退到 command_id=0 的在途旧任务，不能顺手改写别的命令
+// 钉住：带 commandId 的回报命中不到任务时只回退到 command_id 为负的旧任务，不能顺手改写别的命令
 TEST_F(FleetEndpointsTest, FirmwareStatusCommandIdFallsBackToLegacyTask)
 {
     const std::string  token  = login();
@@ -1269,7 +1331,7 @@ TEST_F(FleetEndpointsTest, FirmwareStatusCommandIdFallsBackToLegacyTask)
         } else
         {
             EXPECT_EQ(boundTask, taskId);
-            EXPECT_EQ("pending", task["status"].get<std::string>()) << "回退只能命中 command_id=0 的任务";
+            EXPECT_EQ("pending", task["status"].get<std::string>()) << "回退只能命中未绑定命令的旧任务";
         }
     }
 }

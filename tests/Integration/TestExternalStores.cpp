@@ -84,7 +84,7 @@ namespace
     }
 } // namespace
 
-// 钉住：MySQL 上能完整应用二十三版迁移，V7 归属列与 V15 至 V23 的注册、配置、签名、登录加固、企业身份、证书轮换、租约与灰度表生效，日志仓储按部门范围过滤
+// 钉住：MySQL 上能完整应用二十四版迁移，V7 归属列与 V15 至 V24 的注册、配置、签名、登录加固、企业身份、证书轮换、租约、灰度与任务命令唯一索引生效，日志仓储按部门范围过滤
 TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
 {
     const std::optional<std::string> host = environmentText("EDGEPULSE_TEST_MYSQL_HOST");
@@ -121,7 +121,7 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirect(options);
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
-        EXPECT_EQ(23, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
+        EXPECT_EQ(24, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
         EXPECT_EQ(11, queryCount(*connection,
                                  "SELECT COUNT(*) AS total FROM information_schema.tables WHERE table_schema = ? AND table_name IN "
                                  "('biz_agent_enrollment', 'biz_node_config', 'biz_node_config_revision', 'biz_agent_certificate', 'sys_api_token', 'sys_idempotency', "

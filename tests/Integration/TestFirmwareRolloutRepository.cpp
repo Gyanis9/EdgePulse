@@ -1,4 +1,5 @@
 #include "Base/Exception/EdgePulseException.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareRepository.h"
 #include "Core/Firmware/FirmwareRolloutRepository.h"
@@ -369,6 +370,86 @@ TEST(FirmwareRolloutRepository, TaskUpdatesScopeByCommandId)
         EXPECT_EQ("installed", row.status);
         EXPECT_EQ("旧调用", row.message);
     }
+}
+
+// 钉住：目标派发权由发布头版本、波次与目标状态共同约束，重复抢占只会成功一次
+TEST(FirmwareRolloutRepository, ClaimTargetFencesConcurrentDispatch)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
+    EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
+    const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.8");
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-claim");
+    const std::int64_t                             rolloutId  = runner.run(rollouts.create(runner.loop(), makeDraft(firmwareId, nodeIds)));
+
+    auto aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    const EdgePulse::Firmware::FirmwareRolloutTargetRecord target = aggregate->targets.front();
+    const std::string                                       staleBefore = EdgePulse::Common::nowDateTimeUtc();
+
+    EXPECT_EQ(EdgePulse::Firmware::FirmwareRolloutClaimResult::Claimed,
+              runner.run(rollouts.claimTarget(runner.loop(), rolloutId, target.id, aggregate->rollout.version, 0, "pending", 0, 0, false, "{}", staleBefore)));
+    EXPECT_EQ(EdgePulse::Firmware::FirmwareRolloutClaimResult::TargetNotClaimable,
+              runner.run(rollouts.claimTarget(runner.loop(), rolloutId, target.id, aggregate->rollout.version, 0, "pending", 0, 0, false, "{}", staleBefore)));
+    EXPECT_EQ(EdgePulse::Firmware::FirmwareRolloutClaimResult::RolloutChanged,
+              runner.run(rollouts.claimTarget(runner.loop(), rolloutId, target.id, aggregate->rollout.version + 1, 0, "dispatching", 0, 0, false, "{}", staleBefore)));
+
+    EdgePulse::Firmware::FirmwareRolloutTargetUpdate restore;
+    restore.status     = "pending";
+    restore.taskId     = 0;
+    restore.commandId  = 0;
+    restore.healthJson = "{}";
+    EXPECT_TRUE(runner.run(rollouts.releaseTarget(runner.loop(), target.id, "dispatching", restore)));
+    aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    EXPECT_EQ("pending", aggregate->targets.front().status);
+}
+
+// 钉住：同固件同节点的在途任务拒绝重复创建，安装完成后才允许下一次；迟到回报不能复活失败任务
+TEST(FirmwareRolloutRepository, TaskCreationAndTerminalStatusAreIdempotent)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Firmware::FirmwareRepository firmware(context.database);
+    EdgePulse::Device::NodeRepository       nodes(context.database);
+    const std::int64_t                      firmwareId = createFirmware(runner, firmware, "3.0.9");
+    const std::int64_t                      nodeId     = runner.run(nodes.create(runner.loop(), "rollout-task-idempotent", "{}")).id;
+
+    const std::int64_t first = runner.run(firmware.createTask(runner.loop(), firmwareId, nodeId, 0, 0, 0, 0));
+    ASSERT_GT(first, 0);
+    const auto firstRow = runner.run(firmware.findTask(runner.loop(), first));
+    ASSERT_TRUE(firstRow.has_value());
+    EXPECT_EQ(0, firstRow->commandId) << "未绑定命令在对外记录里仍按 0 表示";
+
+    EXPECT_EQ(0, runner.run(firmware.createTask(runner.loop(), firmwareId, nodeId, 0, 0, 0, 0))) << "pending 任务已占用节点";
+    ASSERT_TRUE(runner.run(firmware.updateTaskById(runner.loop(), first, "installing", 50, "安装中")));
+    EXPECT_EQ(0, runner.run(firmware.createTask(runner.loop(), firmwareId, nodeId, 0, 0, 0, 0))) << "installing 任务仍占用节点";
+
+    EXPECT_TRUE(runner.run(firmware.bindTaskCommand(runner.loop(), first, 501)));
+    EXPECT_TRUE(runner.run(firmware.bindTaskCommand(runner.loop(), first, 501))) << "同一命令重复绑定应当幂等";
+    EXPECT_FALSE(runner.run(firmware.bindTaskCommand(runner.loop(), first, 502))) << "已绑定的任务不能被换绑";
+    const auto bound = runner.run(firmware.findTask(runner.loop(), first));
+    ASSERT_TRUE(bound.has_value());
+    EXPECT_EQ(501, bound->commandId);
+
+    ASSERT_TRUE(runner.run(firmware.updateTaskById(runner.loop(), first, "installed", 100, "完成")));
+    const std::int64_t second = runner.run(firmware.createTask(runner.loop(), firmwareId, nodeId, 0, 0, 0, 0));
+    ASSERT_GT(second, 0) << "安装完成后允许下一次升级";
+    ASSERT_TRUE(runner.run(firmware.bindTaskCommand(runner.loop(), second, 502)));
+    ASSERT_TRUE(runner.run(firmware.updateTaskById(runner.loop(), second, "installed", 100, "完成")));
+    EXPECT_FALSE(runner.run(firmware.updateTaskById(runner.loop(), second, "failed", 0, "夜间维护失败"))) << "已安装任务不能被迟到的失败改写";
+
+    const std::int64_t third = runner.run(firmware.createTask(runner.loop(), firmwareId, nodeId, 0, 0, 0, 0));
+    ASSERT_GT(third, 0);
+    ASSERT_TRUE(runner.run(firmware.bindTaskCommand(runner.loop(), third, 503)));
+    ASSERT_TRUE(runner.run(firmware.updateTaskById(runner.loop(), third, "failed", 0, "命令已取消")));
+    EXPECT_FALSE(runner.run(firmware.updateTask(runner.loop(), firmwareId, nodeId, "installed", 100, "迟到回报", 503)).has_value())
+            << "取消后的任务不能被迟到 installed 回报复活";
+    const auto terminal = runner.run(firmware.findTask(runner.loop(), third));
+    ASSERT_TRUE(terminal.has_value());
+    EXPECT_EQ("failed", terminal->status);
 }
 
 // 钉住：心跳写入 Agent 上报的已安装固件版本，节点 JSON 同步透出；省略该参数时保留原值

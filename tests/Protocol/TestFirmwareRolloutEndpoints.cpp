@@ -1,6 +1,8 @@
 #include "Base/Config/ConfigValue.h"
+#include "Base/Database/Database.h"
 #include "Core/Auth/ApiTokenService.h"
 #include "Core/Auth/AuthService.h"
+#include "Core/Auth/DataScopeService.h"
 #include "Core/Alarm/AlarmRepository.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/NodeRepository.h"
@@ -55,6 +57,7 @@ namespace
             m_alarms    = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
             m_users     = std::make_shared<EdgePulse::System::UserRepository>(m_context->database);
             m_tokens    = std::make_shared<EdgePulse::Auth::ApiTokenService>(m_context->database, m_users, m_context->tenants);
+            m_scopes    = std::make_shared<EdgePulse::Auth::DataScopeService>(m_context->database);
             m_signing   = std::make_shared<EdgePulse::Firmware::FirmwareSigningPolicy>(EdgePulse::Firmware::FirmwareSigningPolicy{false, nullptr});
             m_storage   = std::filesystem::temp_directory_path() / ("edgepulse-rollout-api-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
             m_context->auth->setApiTokenService(m_tokens);
@@ -91,6 +94,7 @@ namespace
                         firmware.maximumUploadBytes = 8U * 1024U * 1024U;
                         firmware.signingPolicy      = m_signing;
                         firmware.rollouts           = m_service.get();
+                        firmware.dataScopes         = m_scopes.get();
                         EdgePulse::Firmware::registerFirmwareRoutes(router, loop, firmware);
                     });
         }
@@ -143,6 +147,47 @@ namespace
             return m_runner->run(m_nodes->create(m_runner->loop(), name, "{}")).id;
         }
 
+        std::int64_t createScopedNode(const std::string &name, const std::int64_t deptId, const std::int64_t createdBy)
+        {
+            return m_runner->run(m_nodes->create(m_runner->loop(), name, "{}", 200, deptId, createdBy)).id;
+        }
+
+        void executeSql(const std::string &sql)
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(m_context->databasePath().string());
+            ASSERT_NE(nullptr, connection);
+            ASSERT_NE(nullptr, connection->execute(sql)) << connection->lastError();
+        }
+
+        /**
+         * @brief 直接写入一个带数据范围的账号；密码哈希与种子管理员相同
+         */
+        void createScopedUser(const std::int64_t userId, const std::string &username, const std::int64_t deptId, const std::string &dataScope)
+        {
+            executeSql("INSERT INTO sys_dept (id, parent_id, name, tenant_id) VALUES (" + std::to_string(deptId == 0 ? 1 : deptId) + ", 0, '范围部门-" +
+                       std::to_string(deptId) + "', 1)");
+            executeSql("INSERT INTO sys_user (id, username, password, nickname, dept_id, status, deleted) VALUES (" + std::to_string(userId) + ", '" + username +
+                       "', 'pbkdf2_sha256$210000$nUwvGntuPFCBorPE1eb3CA==$cxCcCezVVbPzfukzjfcpWoTZpVyQ3AR1H9Z2V1QWObk=', '范围用户', " +
+                       std::to_string(deptId) + ", 1, 0)");
+            executeSql("INSERT INTO sys_role (id, role_name, role_code, data_scope, builtin, status, deleted, tenant_id) VALUES (" + std::to_string(userId) +
+                       ", '范围角色-" + std::to_string(userId) + "', 'scope_role_" + std::to_string(userId) + "', '" + dataScope + "', 0, 1, 0, 1)");
+            executeSql("INSERT INTO sys_user_role (user_id, role_id) VALUES (" + std::to_string(userId) + ", " + std::to_string(userId) + ")");
+            executeSql("INSERT INTO sys_role_menu (role_id, menu_id) VALUES (" + std::to_string(userId) + ", 1005), (" + std::to_string(userId) + ", 1015)");
+        }
+
+        std::string loginAs(const std::string &username)
+        {
+            const auto captcha = m_server->get("/api/auth/captcha");
+            EXPECT_EQ(200, captcha.status);
+            const auto json = captcha.json();
+            EXPECT_TRUE(json.has_value());
+            const auto response = m_server->post(
+                    "/api/auth/login",
+                    ConfigValue::object({{"username", username}, {"password", "admin123"}, {"captcha", (*json)["data"]["code"]}, {"captchaUuid", (*json)["data"]["uuid"]}}).dump());
+            EXPECT_EQ(200, response.status) << response.body;
+            return (*response.json())["data"]["token"].get<std::string>();
+        }
+
         static ConfigValue rolloutPolicy()
         {
             const std::optional<ConfigValue> parsed =
@@ -172,6 +217,7 @@ namespace
         std::shared_ptr<EdgePulse::Alarm::AlarmRepository>              m_alarms;
         std::shared_ptr<EdgePulse::System::UserRepository>              m_users;
         std::shared_ptr<EdgePulse::Auth::ApiTokenService>               m_tokens;
+        std::shared_ptr<EdgePulse::Auth::DataScopeService>              m_scopes;
         std::shared_ptr<EdgePulse::Firmware::FirmwareSigningPolicy>     m_signing;
         std::shared_ptr<EdgePulse::Firmware::FirmwareRolloutService>    m_service;
         std::unique_ptr<EdgePulse::TestSupport::ServerHarness>          m_server;
@@ -301,6 +347,78 @@ TEST_F(FirmwareRolloutEndpointsTest, RunsManualActions)
     EXPECT_EQ("rolling_back", (*rolledBack.json())["data"]["status"].get<std::string>());
 
     EXPECT_EQ(404, action(token, 999999999, "pause").status);
+}
+
+// 钉住：创建、列表、详情与动作都按节点数据范围过滤；DEPT 看部门，SELF 只看本人创建
+TEST_F(FirmwareRolloutEndpointsTest, ScopesRolloutsByDepartmentAndSelf)
+{
+    const std::string  admin     = login();
+    const std::int64_t deptA     = 7201;
+    const std::int64_t deptB     = 7202;
+    const std::int64_t deptUser  = 7301;
+    const std::int64_t selfUser  = 7302;
+    createScopedUser(deptUser, "scope-dept-user", deptA, "DEPT");
+    createScopedUser(selfUser, "scope-self-user", deptB, "SELF");
+
+    const std::int64_t deptNodeA = createScopedNode("rollout-scope-dept-a", deptA, deptUser);
+    const std::int64_t deptNodeB = createScopedNode("rollout-scope-dept-b", deptB, selfUser);
+    const std::int64_t selfNodeA = createScopedNode("rollout-scope-self-a", deptB, selfUser);
+    const std::int64_t selfNodeB = createScopedNode("rollout-scope-self-b", deptA, deptUser);
+    const std::int64_t firmwareId = createFirmware("4.0.0");
+
+    const auto mixed = createRollout(admin, firmwareId, "混合范围", {deptNodeA, deptNodeB});
+    ASSERT_EQ(200, mixed.status) << mixed.body;
+    const std::int64_t mixedId = (*mixed.json())["data"]["id"].get<std::int64_t>();
+    const auto         foreign = createRollout(admin, firmwareId, "范围外目标", {deptNodeB});
+    ASSERT_EQ(200, foreign.status) << foreign.body;
+    const std::int64_t foreignId = (*foreign.json())["data"]["id"].get<std::int64_t>();
+
+    const std::string deptToken = loginAs("scope-dept-user");
+    const auto        allowed   = createRollout(deptToken, firmwareId, "部门内目标", {deptNodeA});
+    ASSERT_EQ(200, allowed.status) << allowed.body;
+    const std::int64_t allowedId = (*allowed.json())["data"]["id"].get<std::int64_t>();
+    EXPECT_EQ(400, createRollout(deptToken, firmwareId, "部门外目标", {deptNodeB}).status);
+
+    const auto deptList = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/rollouts?pageNum=1&pageSize=10", bearer(deptToken));
+    ASSERT_EQ(200, deptList.status) << deptList.body;
+    EXPECT_EQ(2, (*deptList.json())["data"]["total"].get<std::int64_t>());
+    for (const ConfigValue &row: (*deptList.json())["data"]["rows"])
+    {
+        const std::int64_t listedId = row["id"].get<std::int64_t>();
+        EXPECT_TRUE(listedId == mixedId || listedId == allowedId) << listedId;
+    }
+
+    const auto deptDetail = m_server->get("/api/firmware/rollouts/" + std::to_string(mixedId), bearer(deptToken));
+    ASSERT_EQ(200, deptDetail.status) << deptDetail.body;
+    ASSERT_EQ(1U, (*deptDetail.json())["data"]["targets"].size());
+    EXPECT_EQ(deptNodeA, (*deptDetail.json())["data"]["targets"][0]["nodeId"].get<std::int64_t>());
+    EXPECT_EQ(404, m_server->get("/api/firmware/rollouts/" + std::to_string(foreignId), bearer(deptToken)).status);
+    EXPECT_EQ(403, action(deptToken, foreignId, "pause").status);
+    EXPECT_EQ(403, action(deptToken, mixedId, "pause").status);
+    EXPECT_EQ(200, action(deptToken, allowedId, "pause").status);
+
+    const std::string selfToken = loginAs("scope-self-user");
+    const auto        own       = createRollout(selfToken, firmwareId, "本人创建", {selfNodeA});
+    ASSERT_EQ(200, own.status) << own.body;
+    const std::int64_t ownId = (*own.json())["data"]["id"].get<std::int64_t>();
+    EXPECT_EQ(400, createRollout(selfToken, firmwareId, "他人创建", {selfNodeB}).status);
+
+    const auto selfList = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/rollouts?pageNum=1&pageSize=10", bearer(selfToken));
+    ASSERT_EQ(200, selfList.status) << selfList.body;
+    EXPECT_EQ(3, (*selfList.json())["data"]["total"].get<std::int64_t>());
+    for (const ConfigValue &row: (*selfList.json())["data"]["rows"])
+    {
+        const std::int64_t listedId = row["id"].get<std::int64_t>();
+        EXPECT_NE(allowedId, listedId) << "本人范围不能看到他人创建的目标";
+    }
+
+    const auto selfDetail = m_server->get("/api/firmware/rollouts/" + std::to_string(mixedId), bearer(selfToken));
+    ASSERT_EQ(200, selfDetail.status) << selfDetail.body;
+    ASSERT_EQ(1U, (*selfDetail.json())["data"]["targets"].size());
+    EXPECT_EQ(deptNodeB, (*selfDetail.json())["data"]["targets"][0]["nodeId"].get<std::int64_t>());
+    EXPECT_EQ(403, action(selfToken, mixedId, "pause").status);
+    EXPECT_EQ(200, action(selfToken, foreignId, "pause").status);
+    EXPECT_EQ(200, action(selfToken, ownId, "pause").status);
 }
 
 // 钉住：列表只需要 device:firmware:list，创建与动作还需要 device:firmware:upload
