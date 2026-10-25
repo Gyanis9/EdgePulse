@@ -36,6 +36,7 @@ add_library(edgepulse-core STATIC
         Device/NodeService.cpp
         Firmware/FirmwareFileWriter.cpp
         Firmware/FirmwareRepository.cpp
+        Firmware/FirmwareRolloutRepository.cpp
         Firmware/FirmwareSignatureVerifier.cpp
         Http/AgentWebSocket.cpp
         Http/AlarmEventStream.cpp

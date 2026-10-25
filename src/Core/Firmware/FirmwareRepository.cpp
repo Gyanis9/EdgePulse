@@ -25,7 +25,8 @@ namespace EdgePulse::Firmware
                 "SELECT id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, signature, signing_key_id, signature_algorithm, storage_path, created_by, "
                 "created_at FROM biz_firmware ";
         constexpr std::string_view kSelectTask =
-                "SELECT t.id, t.firmware_id, t.node_id, t.status, t.progress, t.message, t.created_at, t.updated_at, t.previous_firmware_id, COALESCE(n.name, '') AS node_name "
+                "SELECT t.id, t.firmware_id, t.node_id, t.status, t.progress, t.message, t.created_at, t.updated_at, t.previous_firmware_id, t.rollout_id, t.wave_id, "
+                "t.command_id, COALESCE(n.name, '') AS node_name "
                 "FROM biz_firmware_task t LEFT JOIN biz_node n ON n.id = t.node_id AND n.tenant_id = t.tenant_id ";
 
         [[nodiscard]] FirmwareRecord readFirmware(const DatabaseResult &result)
@@ -61,6 +62,9 @@ namespace EdgePulse::Firmware
             record.createdAt          = Sql::dateTimeText(result, "created_at");
             record.updatedAt          = Sql::dateTimeText(result, "updated_at");
             record.previousFirmwareId = Sql::integer(result, "previous_firmware_id");
+            record.rolloutId          = Sql::integer(result, "rollout_id");
+            record.waveId             = Sql::integer(result, "wave_id");
+            record.commandId          = Sql::integer(result, "command_id");
             return record;
         }
     } // namespace
@@ -88,9 +92,10 @@ namespace EdgePulse::Firmware
                     {
                         record.createdAt = Common::nowDateTimeUtc();
                     }
-                    const std::array<DatabaseValue, 15> parameters{record.id,       tenant.tenantId, record.name,       record.version,   record.fileName, record.contentType,
-                                                                   record.sizeBytes, record.sha256,   record.signature,  record.signingKeyId, record.signatureAlgorithm,
-                                                                   record.storagePath, record.createdBy, record.createdAt, std::int64_t{0}};
+                    const std::array<DatabaseValue, 15> parameters{
+                            record.id,        tenant.tenantId,  record.name,      record.version,      record.fileName,           record.contentType,
+                            record.sizeBytes, record.sha256,    record.signature, record.signingKeyId, record.signatureAlgorithm, record.storagePath,
+                            record.createdBy, record.createdAt, std::int64_t{0}};
                     Sql::executeOrThrowVoid(
                             connection,
                             "INSERT INTO biz_firmware (id, tenant_id, name, version, file_name, content_type, size_bytes, sha256, signature, signing_key_id, signature_algorithm, "
@@ -196,28 +201,29 @@ namespace EdgePulse::Firmware
 
     AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::unsignedCount(AsynGyanis::Core::EventLoop &loop)
     {
-        co_return co_await m_database->withConnection<std::int64_t>(
-                loop,
-                [tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
-                {
-                    std::string                filter = "WHERE deleted = 0 AND signature = ''";
-                    std::vector<DatabaseValue> parameters;
-                    if (!tenant.allTenants)
-                    {
-                        filter += " AND tenant_id = ?";
-                        parameters.emplace_back(tenant.tenantId);
-                    }
-                    const auto rows = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_firmware " + filter, parameters);
-                    return rows->next() ? Sql::integer(*rows, "total") : 0;
-                });
+        co_return co_await m_database->withConnection<std::int64_t>(loop,
+                                                                    [tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                                                                    {
+                                                                        std::string                filter = "WHERE deleted = 0 AND signature = ''";
+                                                                        std::vector<DatabaseValue> parameters;
+                                                                        if (!tenant.allTenants)
+                                                                        {
+                                                                            filter += " AND tenant_id = ?";
+                                                                            parameters.emplace_back(tenant.tenantId);
+                                                                        }
+                                                                        const auto rows =
+                                                                                Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_firmware " + filter, parameters);
+                                                                        return rows->next() ? Sql::integer(*rows, "total") : 0;
+                                                                    });
     }
 
     AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::createTask(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId, const std::int64_t nodeId,
-                                                                        const std::int64_t previousFirmwareId)
+                                                                        const std::int64_t previousFirmwareId, const std::int64_t rolloutId, const std::int64_t waveId,
+                                                                        const std::int64_t commandId)
     {
         co_return co_await m_database->withConnection<std::int64_t>(
                 loop,
-                [firmwareId, nodeId, previousFirmwareId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
+                [firmwareId, nodeId, previousFirmwareId, rolloutId, waveId, commandId, tenant = m_tenant](DatabaseConnection &connection) -> std::int64_t
                 {
                     // 任务与固件同租户：平台管理员跨租户下发时不能落到自身默认租户
                     std::vector<DatabaseValue> firmwareParameters{firmwareId};
@@ -244,11 +250,12 @@ namespace EdgePulse::Firmware
                     }
                     const std::int64_t                  id  = Common::nextIdentifier();
                     const std::string                   now = Common::nowDateTimeUtc();
-                    const std::array<DatabaseValue, 10> insertParameters{id,  ownerTenantId, firmwareId,        nodeId, std::string{"pending"}, std::int64_t{0}, std::string{},
-                                                                         now, now,           previousFirmwareId};
+                    const std::array<DatabaseValue, 13> insertParameters{
+                            id,        ownerTenantId, firmwareId, nodeId, std::string{"pending"}, std::int64_t{0}, std::string{}, now, now, previousFirmwareId,
+                            rolloutId, waveId,        commandId};
                     Sql::executeOrThrowVoid(connection,
                                             "INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, progress, message, created_at, updated_at, "
-                                            "previous_firmware_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            "previous_firmware_id, rollout_id, wave_id, command_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             insertParameters);
                     return id;
                 });
@@ -320,18 +327,25 @@ namespace EdgePulse::Firmware
     }
 
     AsynGyanis::Core::Task<std::optional<FirmwareTaskRecord>> FirmwareRepository::updateTask(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId,
-                                                                                             const std::int64_t nodeId, std::string status, const int progress, std::string message)
+                                                                                             const std::int64_t nodeId, std::string status, const int progress, std::string message,
+                                                                                             const std::int64_t commandId)
     {
         co_return co_await m_database->withConnection<std::optional<FirmwareTaskRecord>>(
                 loop,
-                [firmwareId, nodeId, status = std::move(status), progress, message = std::move(message),
+                [firmwareId, nodeId, status = std::move(status), progress, message = std::move(message), commandId,
                  tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareTaskRecord>
                 {
                     std::vector<DatabaseValue> updateParameters{status, static_cast<std::int64_t>(progress), message, Common::nowDateTimeUtc(), firmwareId, nodeId};
                     std::string                clause;
+                    if (commandId != 0)
+                    {
+                        // 灰度状态回报带命令号：只落对应任务，避免同节点同固件的旧任务被一并改写
+                        clause = " AND command_id = ?";
+                        updateParameters.emplace_back(commandId);
+                    }
                     if (!tenant.allTenants)
                     {
-                        clause = " AND tenant_id = ?";
+                        clause += " AND tenant_id = ?";
                         updateParameters.emplace_back(tenant.tenantId);
                     }
                     const auto update = Sql::executeOrThrow(
@@ -343,9 +357,14 @@ namespace EdgePulse::Firmware
                     }
                     std::vector<DatabaseValue> queryParameters{firmwareId, nodeId};
                     std::string                queryClause;
+                    if (commandId != 0)
+                    {
+                        queryClause = " AND t.command_id = ?";
+                        queryParameters.emplace_back(commandId);
+                    }
                     if (!tenant.allTenants)
                     {
-                        queryClause = " AND t.tenant_id = ?";
+                        queryClause += " AND t.tenant_id = ?";
                         queryParameters.emplace_back(tenant.tenantId);
                     }
                     const auto rows = Sql::executeOrThrow(

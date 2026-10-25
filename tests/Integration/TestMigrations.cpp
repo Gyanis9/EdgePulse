@@ -143,7 +143,24 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         // 种子行必须可被接手：holder 为空、fence 为 0、expires_at 为 NULL，updated_at 用纪元作哨兵
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM sys_lease WHERE name = 'control-plane' AND holder = '' AND fence = 0 "
                                                      "AND expires_at IS NULL AND updated_at = '1970-01-01 00:00:00'"));
-        EXPECT_EQ(21, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 22"));
+        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN "
+                                                     "('biz_firmware_rollout', 'biz_firmware_rollout_wave', 'biz_firmware_rollout_target')"));
+        // 聚合列与状态机一一对应，缺列会让协调器在运行期才发现
+        EXPECT_EQ(16, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_firmware_rollout')"));
+        EXPECT_EQ(11, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_firmware_rollout_wave')"));
+        EXPECT_EQ(11, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_firmware_rollout_target')"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout') WHERE name = 'idx_fw_rollout_tenant'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout_wave') WHERE name = 'idx_fw_rollout_wave'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout_target') WHERE name = 'idx_fw_rollout_target_wave'"));
+        // 同一节点在一个发布里只能出现一次，并发物化目标时靠这条唯一索引兜底
+        EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout_target') AS il, pragma_index_info(il.name) AS ii "
+                                                     "WHERE il.\"unique\" = 1 AND ii.name IN ('rollout_id', 'node_id')"));
+        EXPECT_EQ(3, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_firmware_task') "
+                                                     "WHERE name IN ('rollout_id', 'wave_id', 'command_id')"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_task') WHERE name = 'idx_fw_task_rollout'"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_node') WHERE name = 'installed_firmware_version'"));
+        EXPECT_EQ(22, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }

@@ -31,23 +31,24 @@ namespace EdgePulse::Device
      */
     struct NodeRecord
     {
-        std::int64_t id{0};                   ///< 主键
-        std::int64_t tenantId{1};             ///< 归属租户
-        std::string  name;                    ///< 节点名
-        std::string  status;                  ///< online / offline
-        std::string  agentVersion;            ///< Agent 版本
-        std::string  certFingerprint;         ///< 自报的证书 SHA-256，小写
-        std::string  certNotAfter;            ///< 叶证书到期时间，可空
-        std::string  certRevokedAt;           ///< 证书吊销时间，可空
-        std::string  previousCertFingerprint; ///< 上一枚证书的 SHA-256，可空
-        std::string  previousCertNotAfter;    ///< 上一枚证书退出重叠窗口的时间，可空
-        std::string  labelsJson;              ///< 标签 JSON 文本，可空
-        std::string  lastSeen;                ///< 最近心跳时间，可空
-        std::int64_t groupId{0};              ///< 所属分组
-        std::string  groupName;               ///< 分组名
-        std::int64_t ownerDeptId{0};          ///< 归属部门，供数据范围
-        std::int64_t createdBy{0};            ///< 创建人，供 SELF 范围
-        std::int64_t version{1};              ///< 乐观锁版本
+        std::int64_t id{0};                    ///< 主键
+        std::int64_t tenantId{1};              ///< 归属租户
+        std::string  name;                     ///< 节点名
+        std::string  status;                   ///< online / offline
+        std::string  agentVersion;             ///< Agent 版本
+        std::string  installedFirmwareVersion; ///< Agent 上报的已安装固件版本，可空
+        std::string  certFingerprint;          ///< 自报的证书 SHA-256，小写
+        std::string  certNotAfter;             ///< 叶证书到期时间，可空
+        std::string  certRevokedAt;            ///< 证书吊销时间，可空
+        std::string  previousCertFingerprint;  ///< 上一枚证书的 SHA-256，可空
+        std::string  previousCertNotAfter;     ///< 上一枚证书退出重叠窗口的时间，可空
+        std::string  labelsJson;               ///< 标签 JSON 文本，可空
+        std::string  lastSeen;                 ///< 最近心跳时间，可空
+        std::int64_t groupId{0};               ///< 所属分组
+        std::string  groupName;                ///< 分组名
+        std::int64_t ownerDeptId{0};           ///< 归属部门，供数据范围
+        std::int64_t createdBy{0};             ///< 创建人，供 SELF 范围
+        std::int64_t version{1};               ///< 乐观锁版本
     };
 
     /**
@@ -268,9 +269,11 @@ namespace EdgePulse::Device
          * @param loop 恢复协程用的事件循环
          * @param nodeId 节点标识
          * @param agentVersion Agent 版本；空表示不改
+         * @param installedFirmwareVersion Agent 上报的已安装固件版本；空表示不改，兼容未上报该字段的旧 Agent
          * @return 节点不存在时为空；becameOnline 表示更新前是否不在线
          */
-        AsynGyanis::Core::Task<std::optional<HeartbeatOutcome>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion);
+        AsynGyanis::Core::Task<std::optional<HeartbeatOutcome>> heartbeat(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId, std::string agentVersion,
+                                                                          std::string installedFirmwareVersion = {});
 
         /**
          * @brief 把超时未心跳的在线节点批量置为离线

@@ -25,8 +25,8 @@ namespace EdgePulse::Device
 {
     namespace
     {
-        constexpr const char *kNodeColumns = "id, tenant_id, name, status, agent_version, cert_fingerprint, cert_not_after, cert_revoked_at, previous_cert_fingerprint, "
-                                             "previous_cert_not_after, labels, last_seen, version, group_id, "
+        constexpr const char *kNodeColumns = "id, tenant_id, name, status, agent_version, installed_firmware_version, cert_fingerprint, cert_not_after, cert_revoked_at, "
+                                             "previous_cert_fingerprint, previous_cert_not_after, labels, last_seen, version, group_id, "
                                              "owner_dept_id, created_by, "
                                              "(SELECT name FROM biz_node_group g WHERE g.id = biz_node.group_id AND g.deleted = 0) AS group_name";
 
@@ -73,23 +73,24 @@ namespace EdgePulse::Device
         [[nodiscard]] NodeRecord readNode(const AsynGyanis::Database::DatabaseResult &result)
         {
             NodeRecord node;
-            node.id                      = readInteger(result.getValue("id"));
-            node.tenantId                = readInteger(result.getValue("tenant_id"));
-            node.name                    = readText(result.getValue("name"));
-            node.status                  = readText(result.getValue("status"));
-            node.agentVersion            = readText(result.getValue("agent_version"));
-            node.certFingerprint         = readText(result.getValue("cert_fingerprint"));
-            node.certNotAfter            = readText(result.getValue("cert_not_after"));
-            node.certRevokedAt           = readText(result.getValue("cert_revoked_at"));
-            node.previousCertFingerprint = readText(result.getValue("previous_cert_fingerprint"));
-            node.previousCertNotAfter    = readText(result.getValue("previous_cert_not_after"));
-            node.labelsJson              = readText(result.getValue("labels"));
-            node.lastSeen                = readText(result.getValue("last_seen"));
-            node.groupId                 = readInteger(result.getValue("group_id"));
-            node.groupName               = readText(result.getValue("group_name"));
-            node.ownerDeptId             = readInteger(result.getValue("owner_dept_id"));
-            node.createdBy               = readInteger(result.getValue("created_by"));
-            node.version                 = readInteger(result.getValue("version"));
+            node.id                       = readInteger(result.getValue("id"));
+            node.tenantId                 = readInteger(result.getValue("tenant_id"));
+            node.name                     = readText(result.getValue("name"));
+            node.status                   = readText(result.getValue("status"));
+            node.agentVersion             = readText(result.getValue("agent_version"));
+            node.installedFirmwareVersion = readText(result.getValue("installed_firmware_version"));
+            node.certFingerprint          = readText(result.getValue("cert_fingerprint"));
+            node.certNotAfter             = readText(result.getValue("cert_not_after"));
+            node.certRevokedAt            = readText(result.getValue("cert_revoked_at"));
+            node.previousCertFingerprint  = readText(result.getValue("previous_cert_fingerprint"));
+            node.previousCertNotAfter     = readText(result.getValue("previous_cert_not_after"));
+            node.labelsJson               = readText(result.getValue("labels"));
+            node.lastSeen                 = readText(result.getValue("last_seen"));
+            node.groupId                  = readInteger(result.getValue("group_id"));
+            node.groupName                = readText(result.getValue("group_name"));
+            node.ownerDeptId              = readInteger(result.getValue("owner_dept_id"));
+            node.createdBy                = readInteger(result.getValue("created_by"));
+            node.version                  = readInteger(result.getValue("version"));
             return node;
         }
 
@@ -780,11 +781,13 @@ namespace EdgePulse::Device
                 });
     }
 
-    AsynGyanis::Core::Task<std::optional<HeartbeatOutcome>> NodeRepository::heartbeat(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string agentVersion)
+    AsynGyanis::Core::Task<std::optional<HeartbeatOutcome>> NodeRepository::heartbeat(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string agentVersion,
+                                                                                      std::string installedFirmwareVersion)
     {
         co_return co_await m_database->withConnection<std::optional<HeartbeatOutcome>>(
                 loop,
-                [nodeId, agentVersion = std::move(agentVersion), tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<HeartbeatOutcome>
+                [nodeId, agentVersion = std::move(agentVersion), installedFirmwareVersion = std::move(installedFirmwareVersion),
+                 tenant = m_tenant](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<HeartbeatOutcome>
                 {
                     // 先读旧状态再更新：更新后的 status 恒为 online，转换与否只能从更新前的值判断
                     const std::optional<NodeRecord> current = findByIdOnConnection(connection, nodeId, tenant);
@@ -792,19 +795,21 @@ namespace EdgePulse::Device
                     {
                         return std::nullopt;
                     }
-                    const std::string                                now = Common::nowDateTimeUtc();
-                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{now, agentVersion, agentVersion, now, nodeId};
+                    const std::string now = Common::nowDateTimeUtc();
+                    // 已安装版本只由 Agent 上报推进；空值保留原值，旧 Agent 的心跳不会把版本清空
+                    std::vector<AsynGyanis::Database::DatabaseValue> parameters{now, agentVersion, agentVersion, installedFirmwareVersion, installedFirmwareVersion, now, nodeId};
                     std::string                                      clause;
                     if (!tenant.allTenants)
                     {
                         clause = " AND tenant_id = ?";
                         parameters.emplace_back(tenant.tenantId);
                     }
-                    const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection.execute(
-                            "UPDATE biz_node SET status = 'online', last_seen = ?, agent_version = CASE WHEN ? = '' THEN agent_version ELSE ? END, version = version + 1, "
-                            "updated_at = ? WHERE id = ? AND deleted = 0 AND cert_revoked_at IS NULL" +
-                                    clause,
-                            parameters);
+                    const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result =
+                            connection.execute("UPDATE biz_node SET status = 'online', last_seen = ?, agent_version = CASE WHEN ? = '' THEN agent_version ELSE ? END, "
+                                               "installed_firmware_version = CASE WHEN ? = '' THEN installed_firmware_version ELSE ? END, version = version + 1, "
+                                               "updated_at = ? WHERE id = ? AND deleted = 0 AND cert_revoked_at IS NULL" +
+                                                       clause,
+                                               parameters);
                     if (!result)
                     {
                         throw Common::DatabaseException("更新节点心跳失败：" + connection.lastError());
