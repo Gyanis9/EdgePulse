@@ -841,10 +841,15 @@ namespace EdgePulse::App
             if (firstProbe)
             {
                 firstProbe = false;
-                // 首轮探针完成后才置服务就绪；停机请求先到时不要把它翻回 true
+                // 首轮探针完成后才置服务就绪。停机请求可能正好落在检查与置位之间，置位后再查一次
+                // 并回滚，避免把已经开始排空的进程重新宣布为就绪
                 if (!m_stopRequested.load(std::memory_order_acquire))
                 {
                     m_readiness.setServiceReady(true);
+                    if (m_stopRequested.load(std::memory_order_acquire))
+                    {
+                        m_readiness.setServiceReady(false);
+                    }
                 }
             }
             // 每个实例都探测自己的缓存；Redis 启用时这是一次轻量 PING

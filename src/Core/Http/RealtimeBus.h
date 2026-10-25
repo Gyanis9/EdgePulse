@@ -28,15 +28,65 @@ namespace AsynGyanis::Core
 {
     class EventLoop;
 }
-namespace AsynGyanis::Database
-{
-    class RedisConnection;
-}
 
 namespace EdgePulse::Web
 {
     class BrowserWebSocket;
     class SseBroadcaster;
+
+    /**
+     * @brief 跨实例发布连接的抽象口
+     * @details 生产实现包住 Redis 连接；测试注入替身以观察重连、PING 与 PUBLISH。
+     *          连接与探针只在订阅线程持有发布连接锁时调用；publish() 由事件循环在
+     *          拿到同一把锁后调用。
+     */
+    class PublisherTransport
+    {
+    public:
+        PublisherTransport() = default;
+
+        virtual ~PublisherTransport() = default;
+
+        PublisherTransport(const PublisherTransport &)            = delete;
+        PublisherTransport &operator=(const PublisherTransport &) = delete;
+
+        /**
+         * @brief 建立连接
+         * @return bool 已连接为 true；失败原因见 lastError()
+         */
+        [[nodiscard]] virtual bool connect() = 0;
+
+        /**
+         * @brief 断开连接
+         */
+        virtual void disconnect() = 0;
+
+        /**
+         * @brief 本端是否仍标记为已连接
+         * @return bool 只读连接标志，不主动探测
+         */
+        [[nodiscard]] virtual bool isConnected() const = 0;
+
+        /**
+         * @brief 发一条 PING 并读回回复
+         * @return bool 收到回复为 true
+         */
+        [[nodiscard]] virtual bool probeAlive() noexcept = 0;
+
+        /**
+         * @brief 把一条事件发到跨实例频道
+         * @param channel 频道名
+         * @param envelope 已序列化的事件信封
+         * @return bool 服务端接受了 PUBLISH
+         */
+        [[nodiscard]] virtual bool publish(std::string_view channel, std::string_view envelope) = 0;
+
+        /**
+         * @brief 最近一次失败原因
+         * @return std::string 面向日志的错误文本；不含凭据
+         */
+        [[nodiscard]] virtual std::string lastError() const = 0;
+    };
 
     /**
      * @brief 生成跨实例信封
@@ -63,13 +113,20 @@ namespace EdgePulse::Web
 
         /// 本地投递覆盖口：为空时走 WebSocket/SSE；测试用它观察跨实例送达
         std::function<AsynGyanis::Core::Task<>(std::string_view, std::int64_t, std::string_view)> localDelivery;
+
+        /// 发布连接构造口：为空时构造真实 Redis 连接；测试注入替身以观察重连与发布
+        std::function<std::unique_ptr<PublisherTransport>()> publisherFactory;
+
+        /// 是否启动跨实例订阅线程；测试用 false 只验证发布路径，生产保持默认
+        bool startSubscriber{true};
     };
 
     /**
      * @brief 实时事件总线
      * @details publish() 先在本进程扇出（WebSocket 与告警 SSE），再把同一事件以带实例标识的信封发到 Redis；
      *          订阅线程收到其他实例的信封后投回本循环，只做本地扇出，不再二次发布。
-     * @note publish() 在服务器循环上调用；订阅线程只持有自己的 Redis 连接
+     * @note publish() 在服务器循环上调用，只做本地扇出与一次不等待的 PUBLISH 尝试，不重连也不 PING；
+     *       发布连接的恢复只由订阅线程在后台完成
      */
     class RealtimeBus
     {
@@ -96,8 +153,8 @@ namespace EdgePulse::Web
         /**
          * @brief 跨实例转发是否可用
          * @return bool 未启用 Redis 时恒为 true；启用时要求发布连接与订阅连接均处于可用状态
-         * @note 只读原子快照，可在任意线程调用；发布连接失效后由订阅线程按 5 秒周期重连并 PING，
-         *       恢复后无需重启进程
+         * @note 只读原子快照，可在任意线程调用；发布连接失效后由订阅线程在锁内重连并 PING，
+         *       重连冷却 5 秒，恢复后无需重启进程。发布路径本身不会改动健康标记，也不会触发恢复
          */
         [[nodiscard]] bool isHealthy() const noexcept;
 
@@ -113,6 +170,8 @@ namespace EdgePulse::Web
          * @param tenantId 归属租户
          * @param payload 已序列化的 JSON 文本
          * @return AsynGyanis::Core::Task<> 本地扇出完成的协程
+         * @note 跨实例转发只在发布连接已标为健康且发布锁可立即取得时尝试；不健康或锁被订阅线程
+         *       占住时跳过本轮，不等待、不重连、不 PING，也不改动健康标记
          */
         AsynGyanis::Core::Task<> publish(std::string_view base, std::int64_t tenantId, const std::string &payload);
 
@@ -138,8 +197,14 @@ namespace EdgePulse::Web
         void subscribeLoop(std::stop_token stopToken);
 
         /**
+         * @brief 按配置或注入的工厂构造发布连接
+         * @return std::unique_ptr<PublisherTransport> 发布连接；工厂返回空时为空
+         */
+        [[nodiscard]] std::unique_ptr<PublisherTransport> createPublisher();
+
+        /**
          * @brief 订阅线程到点后按需恢复发布连接
-         * @note 只在发布连接不健康时调用注入探针
+         * @note 只在发布连接不健康时持锁调用注入探针；恢复结果在锁内写回健康标记
          */
         void probePublisher();
 
@@ -149,24 +214,18 @@ namespace EdgePulse::Web
          */
         bool reconnectPublisherLocked();
 
-        /**
-         * @brief 自行加锁后恢复发布连接
-         * @return bool 恢复成功为 true
-         */
-        bool reconnectPublisher();
-
-        AsynGyanis::Core::EventLoop                           &m_loop;                       ///< 服务器循环
-        BrowserWebSocket                                      &m_webSocket;                  ///< 浏览器扇出
-        SseBroadcaster                                        &m_sse;                        ///< 告警 SSE
-        RealtimeBusOptions                                     m_options;                    ///< Redis 参数
-        std::string                                            m_instanceId;                 ///< 本实例标识
-        std::jthread                                           m_thread;                     ///< 订阅线程
-        std::unique_ptr<AsynGyanis::Database::RedisConnection> m_publisher;                  ///< 发布连接，只在循环线程使用
-        std::mutex                                             m_publisherMutex;             ///< 保护发布连接
-        PublisherHealth                                        m_publisherHealth;            ///< 发布连接健康状态与按需探针
-        std::chrono::steady_clock::time_point                  m_nextPublisherAttempt{};     ///< 下一次允许重连的时刻，和发布连接同锁
-        std::atomic<bool>                                      m_subscriberConnected{false}; ///< 订阅连接是否已订阅频道
-        std::atomic<bool>                                      m_stopping{false};            ///< 析构开始标记
+        AsynGyanis::Core::EventLoop          &m_loop;                       ///< 服务器循环
+        BrowserWebSocket                     &m_webSocket;                  ///< 浏览器扇出
+        SseBroadcaster                       &m_sse;                        ///< 告警 SSE
+        RealtimeBusOptions                    m_options;                    ///< Redis 参数
+        std::string                           m_instanceId;                 ///< 本实例标识
+        std::jthread                          m_thread;                     ///< 订阅线程
+        std::unique_ptr<PublisherTransport>   m_publisher;                  ///< 发布连接，只在发布连接锁内使用
+        std::mutex                            m_publisherMutex;             ///< 保护发布连接
+        PublisherHealth                       m_publisherHealth;            ///< 发布连接健康状态与按需探针
+        std::chrono::steady_clock::time_point m_nextPublisherAttempt{};     ///< 下一次允许重连的时刻，和发布连接同锁
+        std::atomic<bool>                     m_subscriberConnected{false}; ///< 订阅连接是否已订阅频道
+        std::atomic<bool>                     m_stopping{false};            ///< 析构开始标记
 
         struct RemoteEvent
         {

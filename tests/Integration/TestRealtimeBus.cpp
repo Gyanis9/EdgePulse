@@ -11,12 +11,92 @@
 #include <cstdint>
 #include <cstdlib>
 #include <future>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 
 namespace
 {
+    /**
+     * @brief 注入的发布连接观测点
+     * @details 用例在线程之间共享计数与闸门；发布连接的实现只读这块状态，不碰真实网络
+     */
+    struct FakePublisherState
+    {
+        std::atomic<int>   connectCalls{0};         ///< connect 调用次数
+        std::atomic<int>   probeCalls{0};           ///< PING 调用次数
+        std::atomic<int>   publishCalls{0};         ///< PUBLISH 调用次数
+        std::atomic<bool>  connectResult{true};     ///< 下一次 connect 的结论
+        std::atomic<bool>  publishResult{true};     ///< 下一次 PUBLISH 的结论
+        std::atomic<bool>  connected{false};        ///< 本端连接标志
+        std::atomic<bool>  blockNextPublish{false}; ///< 下一次 PUBLISH 是否在闸门处停住
+        std::promise<void> publishEntered;          ///< 已进入 PUBLISH 的闸门
+        std::future<void>  publishRelease;          ///< 用例放开 PUBLISH 的闸门
+    };
+
+    /**
+     * @brief 发布连接替身：按观测点的脚本返回，不执行任何网络往返
+     */
+    class FakePublisherTransport final : public EdgePulse::Web::PublisherTransport
+    {
+    public:
+        /**
+         * @brief 绑定共享观测点
+         * @param state 用例持有的观测点
+         */
+        explicit FakePublisherTransport(std::shared_ptr<FakePublisherState> state) : m_state(std::move(state))
+        {
+        }
+
+        bool connect() override
+        {
+            ++m_state->connectCalls;
+            m_state->connected.store(m_state->connectResult.load());
+            return m_state->connected.load();
+        }
+
+        void disconnect() override
+        {
+            m_state->connected.store(false);
+        }
+
+        [[nodiscard]] bool isConnected() const override
+        {
+            return m_state->connected.load();
+        }
+
+        [[nodiscard]] bool probeAlive() noexcept override
+        {
+            ++m_state->probeCalls;
+            return m_state->connected.load();
+        }
+
+        [[nodiscard]] bool publish(std::string_view, std::string_view) override
+        {
+            ++m_state->publishCalls;
+            if (m_state->blockNextPublish.exchange(false))
+            {
+                m_state->publishEntered.set_value();
+                m_state->publishRelease.wait();
+            }
+            if (!m_state->publishResult.load())
+            {
+                m_state->connected.store(false);
+                return false;
+            }
+            return true;
+        }
+
+        [[nodiscard]] std::string lastError() const override
+        {
+            return "注入的发布连接失败";
+        }
+
+    private:
+        std::shared_ptr<FakePublisherState> m_state; ///< 用例观测点
+    };
+
     [[nodiscard]] std::optional<std::string> environmentText(const char *name)
     {
 #if defined(_MSC_VER)
@@ -194,4 +274,137 @@ TEST(RealtimeBus, RedisPublisherRecoversAfterServerSideKill)
     ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{2}));
     EXPECT_EQ(payload, future.get());
     EXPECT_TRUE(busA.isHealthy()) << "发布连接被杀后健康状态没有恢复";
+}
+
+// 钉住：发布连接不健康时，事件循环上的 publish 不重连也不 PING，只做本地扇出；跳过的发布不改健康标记
+TEST(RealtimeBus, UnhealthyPublisherSkipsRedisWithoutReconnecting)
+{
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Web::BrowserWebSocket        webSocket;
+    EdgePulse::Web::SseBroadcaster          sse;
+
+    auto state           = std::make_shared<FakePublisherState>();
+    state->connectResult = false;
+    std::atomic<int> localDeliveries{0};
+
+    EdgePulse::Web::RealtimeBusOptions options;
+    options.enabled          = true;
+    options.startSubscriber  = false;
+    options.publisherFactory = [state] { return std::make_unique<FakePublisherTransport>(state); };
+    options.localDelivery    = [&localDeliveries](std::string_view, std::int64_t, std::string_view) -> AsynGyanis::Core::Task<>
+    {
+        ++localDeliveries;
+        co_return;
+    };
+
+    EdgePulse::Web::RealtimeBus bus(runner.loop(), webSocket, sse, std::move(options));
+    bus.start();
+    ASSERT_EQ(1, state->connectCalls.load(std::memory_order_relaxed));
+    ASSERT_FALSE(state->connected.load(std::memory_order_relaxed));
+
+    const std::string payload = R"({"type":"alarm","data":{"id":1}})";
+    runner.run(bus.publish("alarms", 7, payload));
+    EXPECT_EQ(1, localDeliveries.load(std::memory_order_relaxed));
+    EXPECT_EQ(1, state->connectCalls.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, state->probeCalls.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, state->publishCalls.load(std::memory_order_relaxed));
+
+    // 跳过的发布不能把状态改成健康：连接仍然失败时，第二次发布依旧不碰 PUBLISH
+    state->connectResult.store(true, std::memory_order_relaxed);
+    runner.run(bus.publish("alarms", 7, payload));
+    EXPECT_EQ(2, localDeliveries.load(std::memory_order_relaxed));
+    EXPECT_EQ(1, state->connectCalls.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, state->probeCalls.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, state->publishCalls.load(std::memory_order_relaxed));
+}
+
+// 钉住：发布锁被占住时，事件循环上的 publish 立即跳过跨实例转发，不等锁、不重连、不 PING
+TEST(RealtimeBus, BusyPublisherLockSkipsWithoutBlockingLoop)
+{
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Web::BrowserWebSocket        webSocket;
+    EdgePulse::Web::SseBroadcaster          sse;
+
+    auto state                = std::make_shared<FakePublisherState>();
+    auto release              = std::make_shared<std::promise<void>>();
+    state->publishRelease     = release->get_future();
+    std::future<void> entered = state->publishEntered.get_future();
+
+    EdgePulse::Web::RealtimeBusOptions options;
+    options.enabled          = true;
+    options.startSubscriber  = false;
+    options.publisherFactory = [state] { return std::make_unique<FakePublisherTransport>(state); };
+    options.localDelivery    = [](std::string_view, std::int64_t, std::string_view) -> AsynGyanis::Core::Task<> { co_return; };
+
+    EdgePulse::Web::RealtimeBus bus(runner.loop(), webSocket, sse, std::move(options));
+    bus.start();
+    ASSERT_TRUE(state->connected.load(std::memory_order_relaxed));
+
+    // publish 的载荷是引用参数，必须让字符串活过协程恢复；直接传字面量会在恢复前析构
+    const std::string payload = R"({"type":"alarm","data":{"id":3}})";
+    state->blockNextPublish.store(true, std::memory_order_relaxed);
+    // 持锁线程代表订阅线程的探针：它通过真实发布路径拿到发布锁后停在 PUBLISH 里。
+    // 这里用本地投递覆盖口，协程不碰事件循环，放在独立线程上运行不会与循环争用。
+    std::thread holder(
+            [&bus, &payload]
+            {
+                AsynGyanis::Core::Task<> task = bus.publish("alarms", 7, payload);
+                task.handle().resume();
+            });
+    // 断言中途失败也要先放开闸门再 join，避免把持锁线程留在运行中
+    struct HolderGuard
+    {
+        std::shared_ptr<std::promise<void>> release;
+        std::thread                        &thread;
+
+        void finish()
+        {
+            if (release)
+            {
+                try
+                {
+                    release->set_value();
+                } catch (...)
+                {
+                }
+                release.reset();
+            }
+            if (thread.joinable())
+            {
+                thread.join();
+            }
+        }
+
+        ~HolderGuard()
+        {
+            finish();
+        }
+    } guard{release, holder};
+
+    // 只等持锁线程进入 PUBLISH；闸门由用例自己造，超时只是防止用例本身挂死
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds{10}))
+            << "connectCalls=" << state->connectCalls.load() << " publishCalls=" << state->publishCalls.load() << " connected=" << state->connected.load();
+
+    const auto begin    = std::chrono::steady_clock::now();
+    bool       finished = true;
+    try
+    {
+        runner.run(bus.publish("alarms", 7, payload));
+    } catch (const std::exception &)
+    {
+        finished = false;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin);
+
+    EXPECT_TRUE(finished) << "发布路径在发布锁被占住时没有返回";
+    EXPECT_LT(elapsed, std::chrono::milliseconds{1000});
+    EXPECT_EQ(1, state->publishCalls.load(std::memory_order_relaxed));
+    EXPECT_EQ(1, state->connectCalls.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, state->probeCalls.load(std::memory_order_relaxed));
+
+    guard.finish();
+
+    // 锁释放后同一条发布路径仍能正常转发
+    runner.run(bus.publish("alarms", 7, payload));
+    EXPECT_EQ(2, state->publishCalls.load(std::memory_order_relaxed));
 }

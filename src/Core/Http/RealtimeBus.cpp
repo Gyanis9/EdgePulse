@@ -49,7 +49,7 @@ namespace EdgePulse::Web
             return options.host + ":" + std::to_string(options.port);
         }
 
-        /// 发布连接失效后的恢复检查周期
+        /// 发布连接重连的冷却窗口；健康检查本身由订阅线程按读推送周期触发
         constexpr std::chrono::seconds kPublisherProbeInterval{5};
 
         /**
@@ -61,6 +61,57 @@ namespace EdgePulse::Web
         {
             return options.instanceId.empty() ? Common::randomTokenHex(8) : options.instanceId;
         }
+
+        /**
+         * @brief 发布连接的生产实现：包住一条 Redis 连接
+         * @details PUBLISH 走 argv 接口，信封里的空白、引号与内嵌 NUL 都按字节送出，
+         *          不需要先拼成一行命令再切词
+         */
+        class RedisPublisherTransport final : public PublisherTransport
+        {
+        public:
+            /**
+             * @brief 绑定连接配置；此阶段不发生网络交互
+             * @param configuration Redis 连接配置
+             */
+            explicit RedisPublisherTransport(const AsynGyanis::Database::ConnectionConfig &configuration) : m_connection(configuration)
+            {
+            }
+
+            bool connect() override
+            {
+                return m_connection.connect();
+            }
+
+            void disconnect() override
+            {
+                m_connection.disconnect();
+            }
+
+            [[nodiscard]] bool isConnected() const override
+            {
+                return m_connection.isConnected();
+            }
+
+            [[nodiscard]] bool probeAlive() noexcept override
+            {
+                return m_connection.probeAlive();
+            }
+
+            [[nodiscard]] bool publish(const std::string_view channel, const std::string_view envelope) override
+            {
+                const std::vector<std::string_view> command{"PUBLISH", channel, envelope};
+                return m_connection.executeCommand(command) != nullptr;
+            }
+
+            [[nodiscard]] std::string lastError() const override
+            {
+                return m_connection.lastError();
+            }
+
+        private:
+            AsynGyanis::Database::RedisConnection m_connection; ///< 事件发布专用连接
+        };
     } // namespace
 
     std::string makeRealtimeEnvelope(const std::string_view instanceId, const std::string_view base, const std::int64_t tenantId, const std::string_view payload)
@@ -71,6 +122,12 @@ namespace EdgePulse::Web
     RealtimeBus::RealtimeBus(AsynGyanis::Core::EventLoop &loop, BrowserWebSocket &webSocket, SseBroadcaster &sse, RealtimeBusOptions options) :
         m_loop(loop), m_webSocket(webSocket), m_sse(sse), m_options(std::move(options)), m_instanceId(resolveInstanceId(m_options))
     {
+        // 构造只建对象、不连网；start() 才建立发布连接。启用时先建好对象，让健康标记与连接在
+        // 发布路径眼里始终成对存在（未连接就是未健康），也便于测试在 start 之外观察跳过行为
+        if (m_options.enabled)
+        {
+            m_publisher = createPublisher();
+        }
     }
 
     RealtimeBus::~RealtimeBus()
@@ -97,20 +154,26 @@ namespace EdgePulse::Web
             return;
         }
         {
-            std::lock_guard<std::mutex> lock(m_publisherMutex);
-            m_publisher = std::make_unique<AsynGyanis::Database::RedisConnection>(redisConfig(m_options));
-            if (!m_publisher->connect())
+            std::lock_guard<std::mutex> publisherLock(m_publisherMutex);
+            if (!m_publisher)
+            {
+                m_publisher = createPublisher();
+            }
+            if (!m_publisher || !m_publisher->connect())
             {
                 m_publisherHealth.markUnhealthy();
-                LOG_WARN_FMT("实时事件发布连接不可用：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options), m_publisher->lastError());
-                m_publisher.reset();
+                LOG_WARN_FMT("实时事件发布连接不可用：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options),
+                             m_publisher ? m_publisher->lastError() : std::string{"发布连接构造失败"});
             } else
             {
                 m_publisherHealth.markHealthy();
             }
         }
         LOG_INFO_FMT("实时事件跨实例转发已启用：instance={} channel={}", m_instanceId, m_options.channel);
-        m_thread = std::jthread([this](const std::stop_token token) { subscribeLoop(token); });
+        if (m_options.startSubscriber)
+        {
+            m_thread = std::jthread([this](const std::stop_token token) { subscribeLoop(token); });
+        }
     }
 
     bool RealtimeBus::isHealthy() const noexcept
@@ -134,27 +197,25 @@ namespace EdgePulse::Web
         {
             co_return;
         }
-        std::lock_guard<std::mutex> lock(m_publisherMutex);
-        if (!m_publisher || !m_publisher->isConnected())
+        // 事件循环上只读一次原子健康标记。未健康时直接跳过：重连与 PING 只由订阅线程在后台做
+        if (!m_publisherHealth.isHealthy())
         {
-            // 发布失败后的一次有界恢复：重连并 PING，不重发本轮事件，避免连接其实已送达时重复扇出
-            if (!m_publisherHealth.probe([this] { return reconnectPublisherLocked(); }, true))
-            {
-                co_return;
-            }
+            co_return;
         }
-        const std::string                   envelope = makeRealtimeEnvelope(m_instanceId, base, tenantId, payload);
-        const std::vector<std::string_view> command{"PUBLISH", m_options.channel, envelope};
-        if (!m_publisher->executeCommand(command))
+        // 探针正在重连或 PING 时不等锁：拿到就发，拿不到就跳过本轮跨实例转发。
+        // 跳过不是发布失败，因此不改健康标记——否则会把后台刚恢复成功的 true 覆盖成旧的 false
+        std::unique_lock<std::mutex> publisherLock(m_publisherMutex, std::try_to_lock);
+        if (!publisherLock.owns_lock() || !m_publisher)
         {
-            m_publisherHealth.markUnhealthy();
-            LOG_WARN_FMT("实时事件发布到 Redis 失败：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options), m_publisher->lastError());
-            // 下一拍发布前把连接恢复到可用状态；本轮不再重发，避免重复投递
-            static_cast<void>(m_publisherHealth.probe([this] { return reconnectPublisherLocked(); }, true));
-        } else
-        {
-            m_publisherHealth.markHealthy();
+            co_return;
         }
+        if (m_publisher->publish(m_options.channel, makeRealtimeEnvelope(m_instanceId, base, tenantId, payload)))
+        {
+            co_return;
+        }
+        // 真实尝试失败才标不健康；本轮不重发，避免连接其实已送达时重复扇出
+        m_publisherHealth.markUnhealthy();
+        LOG_WARN_FMT("实时事件发布到 Redis 失败：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options), m_publisher->lastError());
         co_return;
     }
 
@@ -204,10 +265,19 @@ namespace EdgePulse::Web
         co_return;
     }
 
+    std::unique_ptr<PublisherTransport> RealtimeBus::createPublisher()
+    {
+        if (m_options.publisherFactory)
+        {
+            return m_options.publisherFactory();
+        }
+        return std::make_unique<RedisPublisherTransport>(redisConfig(m_options));
+    }
+
     bool RealtimeBus::reconnectPublisherLocked()
     {
-        // 重连可能阻塞到连接超时；发布路径与订阅线程共用同一冷却窗口，避免 Redis 长时间不可用时
-        // 每次发布都在事件循环上再试一次
+        // 重连可能阻塞到连接超时，只允许订阅线程在锁内调用；冷却窗口避免 Redis 长时间不可用时
+        // 每五秒都重新建连
         const auto now = std::chrono::steady_clock::now();
         if (now < m_nextPublisherAttempt)
         {
@@ -216,7 +286,12 @@ namespace EdgePulse::Web
         m_nextPublisherAttempt = now + kPublisherProbeInterval;
         if (!m_publisher)
         {
-            m_publisher = std::make_unique<AsynGyanis::Database::RedisConnection>(redisConfig(m_options));
+            m_publisher = createPublisher();
+        }
+        if (!m_publisher)
+        {
+            LOG_WARN_FMT("实时事件发布连接构造失败：instance={} endpoint={}", m_instanceId, endpointOf(m_options));
+            return false;
         }
         if (!m_publisher->isConnected() && !m_publisher->connect())
         {
@@ -225,37 +300,47 @@ namespace EdgePulse::Web
         }
         if (!m_publisher->probeAlive())
         {
-            LOG_WARN_FMT("实时事件发布连接探针失败：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options), m_publisher->lastError());
+            LOG_WARN_FMT("实时事件发布连接探针失败，尝试重连：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options), m_publisher->lastError());
+            // PING 失败通常意味着服务端已丢弃这条连接，isConnected() 看不出来；与缓存探针同一口径，
+            // 断开后立刻重连一次再 PING，整个序列仍只占一个冷却窗口
             m_publisher->disconnect();
-            return false;
+            if (!m_publisher->connect())
+            {
+                LOG_WARN_FMT("实时事件发布连接重连失败：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options), m_publisher->lastError());
+                return false;
+            }
+            if (!m_publisher->probeAlive())
+            {
+                LOG_WARN_FMT("实时事件发布连接重连后探针仍失败：instance={} endpoint={} error={}", m_instanceId, endpointOf(m_options), m_publisher->lastError());
+                m_publisher->disconnect();
+                return false;
+            }
         }
         LOG_INFO_FMT("实时事件发布连接已恢复：instance={} endpoint={}", m_instanceId, endpointOf(m_options));
         return true;
     }
 
-    bool RealtimeBus::reconnectPublisher()
-    {
-        std::lock_guard<std::mutex> lock(m_publisherMutex);
-        return reconnectPublisherLocked();
-    }
-
     void RealtimeBus::probePublisher()
     {
-        // PublisherHealth 只在已判定不健康时调用探针；锁的作用域只覆盖一次重连与 PING
-        static_cast<void>(m_publisherHealth.probe([this] { return reconnectPublisher(); }));
+        // 快路径不取锁：健康时周期检查不与发布路径争同一把锁
+        if (m_publisherHealth.isHealthy())
+        {
+            return;
+        }
+        std::lock_guard<std::mutex> publisherLock(m_publisherMutex);
+        // 拿到锁后复查并在锁内写回：恢复结果与连接状态同属一个临界区，发布路径的失败标记
+        // 不会覆盖比它更新的恢复结果
+        static_cast<void>(m_publisherHealth.probe([this] { return reconnectPublisherLocked(); }));
     }
 
     void RealtimeBus::subscribeLoop(const std::stop_token stopToken)
     {
         AsynGyanis::Database::RedisConnection connection(redisConfig(m_options));
-        auto                                  nextPublisherProbe = std::chrono::steady_clock::now() + kPublisherProbeInterval;
         while (!stopToken.stop_requested() && !m_stopping.load())
         {
-            if (std::chrono::steady_clock::now() >= nextPublisherProbe)
-            {
-                probePublisher();
-                nextPublisherProbe = std::chrono::steady_clock::now() + kPublisherProbeInterval;
-            }
+            // 健康时这里只是一次原子读；不健康时每轮都尝试恢复，真正的重连仍受 5 秒冷却限制。
+            // 发布路径不再顺手重连，因此恢复延迟由这里的检查周期决定，最多约 500 毫秒
+            probePublisher();
             if (!connection.isConnected() && !connection.connect())
             {
                 m_subscriberConnected.store(false);
@@ -276,12 +361,8 @@ namespace EdgePulse::Web
             while (!stopToken.stop_requested() && !m_stopping.load())
             {
                 const auto reply = connection.readPushReply(std::chrono::milliseconds{500});
-                // 订阅连接空闲时也按周期检查发布连接；读推送最多等 500 毫秒，检查不会被长期推后
-                if (std::chrono::steady_clock::now() >= nextPublisherProbe)
-                {
-                    probePublisher();
-                    nextPublisherProbe = std::chrono::steady_clock::now() + kPublisherProbeInterval;
-                }
+                // 订阅连接空闲时也检查发布连接；读推送最多等 500 毫秒，检查不会被长期推后
+                probePublisher();
                 if (!reply.has_value())
                 {
                     if (!connection.lastError().empty())

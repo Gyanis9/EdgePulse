@@ -17,9 +17,9 @@ namespace EdgePulse::Web
         m_healthy.store(false, std::memory_order_release);
     }
 
-    bool PublisherHealth::probe(const Probe &probe, const bool force)
+    bool PublisherHealth::probe(const Probe &probe)
     {
-        if (!force && isHealthy())
+        if (isHealthy())
         {
             return true;
         }

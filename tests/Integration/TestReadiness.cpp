@@ -363,15 +363,6 @@ TEST(RealtimeBus, PublisherHealthProbesOnlyWhenUnhealthy)
                 return true;
             }));
     EXPECT_EQ(3, probes);
-
-    EXPECT_TRUE(health.probe(
-            [&probes]
-            {
-                ++probes;
-                return true;
-            },
-            true));
-    EXPECT_EQ(4, probes);
 }
 
 // 钉住：跨实例信封带配置的实例标识，缺省实例标识非空且不会把空串写进信封
