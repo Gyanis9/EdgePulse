@@ -213,6 +213,9 @@ namespace EdgePulse::Agent
 
         configuration.websocketEnabled = manager.getBool("agent.server.websocket_enabled", configuration.websocketEnabled);
 
+        // 外部 CA 部署关掉续期循环，避免每轮都向未启用内部 CA 的控制面换取 503
+        configuration.certificateRenewalEnabled = manager.getBool("agent.certificate.renewal_enabled", configuration.certificateRenewalEnabled);
+
         const auto renewBeforeDays = readInteger(manager, "agent.certificate.renew_before_days", configuration.certificateRenewBeforeDays);
         if (!renewBeforeDays)
         {

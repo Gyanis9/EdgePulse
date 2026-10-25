@@ -72,6 +72,7 @@ agent:
     private_key_file: agent-key.pem
     name: edge-01
   certificate:
+    renewal_enabled: false
     renew_before_days: 14
     renewal_check_seconds: 120
   state:
@@ -81,8 +82,30 @@ agent:
 )");
         const auto                      configuration = AgentConfiguration::load(path);
         ASSERT_TRUE(configuration.has_value()) << configuration.error();
+        EXPECT_FALSE(configuration->certificateRenewalEnabled);
         EXPECT_EQ(14, configuration->certificateRenewBeforeDays);
         EXPECT_EQ(120, configuration->certificateRenewalCheckSeconds);
+    }
+
+    TEST(AgentConfiguration, CertificateRenewalEnabledByDefault)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      path          = directory.write("agent.yaml", R"(
+agent:
+  server:
+    base_url: https://127.0.0.1:9443
+    ca_file: ca.pem
+    certificate_file: agent.pem
+    private_key_file: agent-key.pem
+    name: edge-01
+  state:
+    directory: state
+  logging:
+    file: state/agent.log
+)");
+        const auto                      configuration = AgentConfiguration::load(path);
+        ASSERT_TRUE(configuration.has_value()) << configuration.error();
+        EXPECT_TRUE(configuration->certificateRenewalEnabled);
     }
 
     TEST(AgentConfiguration, CertificateRenewalDefaultsWhenSectionMissing)

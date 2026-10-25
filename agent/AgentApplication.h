@@ -96,8 +96,8 @@ namespace EdgePulse::Agent
          * @return 协程任务
          * @details 每轮先比较到期时间与提前天数，未到点就等待下一次检查；到点后生成新密钥与 CSR，
          *          换回证书、校验安装、重载 HTTP 与 WebSocket，最后更新状态库。可重试失败按
-         *          dependencies.retryBackoff（默认 5、10、30、60、300 秒）退避后重试，HTTP 400 的
-         *          退避上限放宽到一小时；只有 403 与调用参数错误记录 ERROR 后终止本循环，注册、心跳、
+         *          dependencies.retryBackoff（默认 5、10、30、60、300 秒）退避后重试，HTTP 400 在默认
+         *          序列上放宽到 20 分钟（300 秒 × 4，自定义向量最多到 1 小时）；只有 403 与调用参数错误记录 ERROR 后终止本循环，注册、心跳、
          *          遥测与命令通道不受影响。WebSocket 重载失败时保留待重载标记，按
          *          dependencies.websocketReloadRetryInterval（默认 30 秒）复查直到成功，成功日志只在
          *          HTTP 与 WebSocket 都换好之后才写。循环体有异常兜底，依赖抛出的异常不会结束协程。

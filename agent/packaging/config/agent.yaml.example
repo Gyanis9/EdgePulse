@@ -18,6 +18,8 @@ agent:
     # 只供本地测试使用；生产环境必须保持 false
     allow_plaintext_for_tests: false
   certificate:
+    # 使用外部 CA 时置 false，Agent 不再启动自动续期循环；默认 true
+    renewal_enabled: true
     # 证书到期前多少天开始自动续期，允许 1 到 90
     renew_before_days: 7
     # 多久检查一次到期时间，允许 60 到 86400 秒

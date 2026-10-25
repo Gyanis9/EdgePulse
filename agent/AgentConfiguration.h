@@ -38,6 +38,7 @@ namespace EdgePulse::Agent
         int                   telemetryIntervalSeconds{30};                           ///< 遥测采集间隔，5 到 3600 秒
         bool                  websocketEnabled{true};                                 ///< 是否建立命令长连接
         int                   requestTimeoutSeconds{30};                              ///< 单次请求超时，单位秒
+        bool                  certificateRenewalEnabled{true};                        ///< 是否启动证书自动续期循环；使用外部 CA 时可关闭
         int                   certificateRenewBeforeDays{7};                          ///< 证书到期前多少天触发续期，1 到 90
         int                   certificateRenewalCheckSeconds{3600};                   ///< 续期检查间隔，60 到 86400 秒
         std::filesystem::path stateDirectory{"var/agent"};                            ///< 状态库与运行期文件的目录

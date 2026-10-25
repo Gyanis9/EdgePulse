@@ -1972,7 +1972,7 @@ agent:
         EXPECT_EQ(1, probe.renew.load(std::memory_order_acquire));
         const auto waits = probe.waitDurations();
         ASSERT_EQ(1U, waits.size());
-        EXPECT_EQ(std::chrono::hours{1}, waits.front()) << "400 的退避上限应放宽到一小时";
+        EXPECT_EQ(std::chrono::hours{1}, waits.front()) << "自定义退避向量在 400 时的上限应放宽到一小时";
         EXPECT_TRUE(sink->contains(AsynGyanis::Base::LogLevel::Error, "HTTP 400")) << "400 必须按 ERROR 记录";
     }
 

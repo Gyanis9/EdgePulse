@@ -1206,7 +1206,7 @@ namespace EdgePulse::Agent
                     const auto delay = nextFailureDelayFor(failure.httpStatus == 400);
                     if (failure.httpStatus == 400)
                     {
-                        LOG_ERROR_FMT("自动续期请求被服务端判定为非法（HTTP 400）：{}；{} 毫秒后重试，退避上限一小时", failure.message, delay.count());
+                        LOG_ERROR_FMT("自动续期请求被服务端判定为非法（HTTP 400）：{}；{} 毫秒后重试", failure.message, delay.count());
                     } else
                     {
                         LOG_WARN_FMT("自动续期失败：{}；{} 毫秒后重试", failure.message, delay.count());
@@ -1452,7 +1452,7 @@ namespace EdgePulse::Agent
             }
             frames.push_back(runPolling(loop, dispatcher, m_configuration.commandPollIntervalSeconds, flags, m_stopRequested));
             frames.push_back(runTelemetry(loop, telemetryCollector, telemetryPublisher, *nodeId, m_configuration.telemetryIntervalSeconds, m_stopRequested));
-            if (m_configuration.baseUrl.starts_with("https://"))
+            if (m_configuration.baseUrl.starts_with("https://") && m_configuration.certificateRenewalEnabled)
             {
                 CertificateRenewalDependencies renewal;
                 renewal.expiresAt          = identity->expiresAt;
@@ -1464,9 +1464,13 @@ namespace EdgePulse::Agent
                 renewal.reloadWebSocketIdentity = [&webSocket]() { return webSocket.reloadIdentityFromDisk(); };
                 renewal.commitInstalledIdentity = [certificateManager]() { certificateManager->commitInstalledIdentity(); };
                 frames.push_back(runCertificateRenewal(loop, *state, *nodeId, m_configuration, std::move(renewal), m_stopRequested));
-            } else
+            } else if (!m_configuration.baseUrl.starts_with("https://"))
             {
                 LOG_INFO("明文测试配置不启用证书自动续期");
+            } else
+            {
+                // 外部 CA 部署不需要内部续期入口；配置关闭后只在启动时记录一次
+                LOG_INFO("配置已关闭证书自动续期（agent.certificate.renewal_enabled=false），证书到期前需手工换证");
             }
             // 循环尚未开始运行，此时入本地就绪队列；帧由上面那个容器持有到 run() 结束
             for (auto &frame: frames)
