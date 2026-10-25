@@ -159,7 +159,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 
 | 配置键 | 开发档 | 生产样例 | 说明 |
 |---|---|---|---|
-| `edgepulse.instance_id` | 空（按 `hostname-pid-random` 生成） | 空；HA 必须显式唯一 | 实例标识，1–128 字符且不含空白；进入日志、租约 holder 与跨实例信封，同时存活的实例必须唯一 |
+| `edgepulse.instance_id` | 空（按 `hostname-pid-random` 生成） | 空；HA 必须显式唯一 | 实例标识，1–128 字符且不含空白；进入日志、租约 holder 与跨实例信封，同时存活的实例必须唯一。Compose 入口脚本还要求只含 `[A-Za-z0-9._-]` |
 | `edgepulse.ha.enabled` | `false` | `false`（多实例可改 `true`） | 只影响启动日志的 HA 标记；租约与单飞不依赖它 |
 | `edgepulse.agent.enrollment_mode` | `off` | `required` | `required` 时新节点必须持 `enroll` 令牌，换证书必须持 `rebind` 令牌 |
 | `edgepulse.agent.heartbeat_interval_seconds` | `10` | `30` | Agent 心跳周期 |
@@ -295,22 +295,22 @@ python scripts/check-ha-stack.py --require-docker
 - 远程 Linux 实测（阿里云 ECS，Ubuntu 24.04/systemd 255）：真实 `edgepulse-agent` 的 50 项端到端检查通过；`install-agent.sh` 安装后服务为 active，`systemctl stop/start` 正常，注册退避期间停止立即生效，`uninstall-agent.sh --purge` 清理二进制、unit、配置、状态与日志。
 - `ExternalStores.*`、`RealtimeBus.Redis*` 与 `AgentCommandBus.RedisFanout*` 需要真实 MySQL/Redis：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性容器并注入 `EDGEPULSE_TEST_MYSQL_*`、`EDGEPULSE_TEST_REDIS_*`，随后断言 7 项用例确实执行且输出不含 Skipped；镜像可用 `--mysql-image`/`--redis-image` 覆盖。直接跑 `ctest` 缺变量时仍 SKIP，不伪造通过。
 - 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
-- CI 跑 Windows/Linux 后端构建与 ctest、Linux 后端 MySQL 8.4/Redis 7 service 与 MySQL 备份往返、Agent 端到端、前端单测/构建、密钥扫描与 actionlint；Linux 后端任务单独断言外部用例没有被 Skip。Playwright 在本地用系统 Edge 运行。
+- CI 跑 Windows/Linux 后端构建与 ctest、Linux 后端 MySQL 8.4/Redis 7 service 与 MySQL 备份往返、Agent 端到端、前端单测/构建、密钥扫描与 actionlint；Linux 后端任务随后直接调用 `scripts/run-external-tests.py`，由脚本断言 7 项环境门控用例全部执行且没有 Skip。Playwright 在本地用系统 Edge 运行。
 - 验收证据与逐项输出见 [docs/验收.md](docs/验收.md)。
 
 ## 部署
 
 - Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌后 `docker compose up -d`；需要两步验证时再填入 `EDGEPULSE_MFA_KEY`（`openssl rand -base64 32`）。样例含 MySQL 8、Redis 7 与 Prometheus。
-- 双实例 HA：同一目录的 `docker-compose.ha.yml` 起 MySQL、Redis、`edgepulse-1/2` 与 nginx，两个实例共享配置、证书、固件卷与 Redis，只差 `EDGEPULSE_INSTANCE_ID`；见下文[高可用部署](#高可用部署)。
+- 双实例 HA：同一目录的 `docker-compose.ha.yml` 起 MySQL、Redis、`edgepulse-1/2` 与 nginx，两个实例共享 MySQL、Redis、只读配置与证书目录、固件卷，只差 `EDGEPULSE_INSTANCE_ID`；见下文[高可用部署](#高可用部署)。
 - systemd：`deploy/systemd/edgepulse.service` 是单实例模板，`edgepulse@.service` 是按实例名模板化的多实例单元（`/etc/edgepulse/<实例>.yaml` 与 `<实例>.env`）；二进制、`web/`、`migrations/` 与配置分目录放置，秘密走 `EnvironmentFile`。
 - 静态站点：`bash scripts/build-web.sh`，由后端直接托管。
 - 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、两步验证挑战与尝试计数、实时扇出与 Agent 命令路由）、每个实例唯一的 `edgepulse.instance_id`、共享固件目录、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流（HA 按实例计数，N 个实例各配总额的 1/N）、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、可用备份。
 
-备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。完整步骤见 [docs/部署.md](docs/部署.md)。
+备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。HA 双实例要先停两台、确认 `sys_lease` 不再续约并清掉残留 holder，再按“单台就绪后第二台”的顺序启动；完整步骤见 [docs/部署.md](docs/部署.md)（含 11.1 的 HA 备份与恢复）。
 
 ## 高可用部署
 
-控制面支持双实例 active/active：两个实例共享 MySQL、Redis 与固件目录，nginx 在前面分发浏览器流量，Agent 仍走 mTLS 9443。
+控制面支持双实例 active/active：两个实例共享 MySQL、Redis、只读配置与证书目录、固件目录，nginx 在前面分发浏览器流量，Agent 仍走 mTLS 9443。
 
 ```mermaid
 flowchart LR
@@ -326,11 +326,11 @@ flowchart LR
     B --> Firmware
 ```
 
-- 实例身份：每个实例显式配置唯一的 `edgepulse.instance_id`；Docker HA 编排用入口脚本按 `EDGEPULSE_INSTANCE_ID` 生成各自的配置副本，两个容器只共享一份只读 `prod.yaml`。
+- 实例身份：每个实例显式配置唯一的 `edgepulse.instance_id`；Docker HA 编排用入口脚本按 `EDGEPULSE_INSTANCE_ID` 生成各自的配置副本，两个容器挂同一份只读 `prod.yaml`。
 - 租约与单飞：`sys_lease` 的 `control-plane` 行是唯一协调点，TTL 15 秒、每 5 秒续约；条件 UPDATE 命中才算 leader，接管时 fence 递增。只有 leader 执行计划命令调度、保留期清理、离线扫描与离线告警；指标读数每个实例都刷新。旧 leader 恢复后不能续约；崩溃重启的实例要等一个 TTL 才能重新当选。
 - 迁移：MySQL 迁移前持有 `GET_LOCK('edgepulse:migrations:<库名>', 30)`，并发启动的实例串行迁移，拿不到锁的实例拒绝启动。SQLite 仍是单实例开发档。
 - Agent 命令：先在本地投递，再经 Redis 的 `target=agent` 信封转给持有该节点连接的实例；Agent 在已连接时仍每 60 秒轮询一次，断开时按 `command_poll_interval_seconds`（默认 15 秒）轮询，重复投递按命令标识去重。
-- 就绪：`/readyz` 依次检查数据库、启停状态、缓存探针、实时总线与固件目录可写，任一不就绪返回 503 和第一条原因；容器健康检查与 nginx 摘流都以它为准，`/api/health` 只表示进程存活。
+- 就绪：`/readyz` 依次检查数据库、启停状态、缓存探针、实时总线与固件目录可写，任一不就绪返回 503 和第一条原因；容器健康检查以它为准，`/api/health` 只表示进程存活。nginx 不读取 `/readyz`，只看 upstream 的 `max_fails`/`fail_timeout` 被动摘除失败实例，`fail_timeout` 到期后会重新尝试该上游。
 - 证书分工：应用证书目录只放 `ca.pem`、`server.pem` 与 `server-key.pem`；nginx 只拿 `server.pem` 与 `server-key.pem`；Agent CA 私钥走独立 Compose secret 与 0400 命名卷，nginx 与应用证书卷都看不到它。
 
 快速开始：
@@ -349,7 +349,7 @@ docker compose -f docker-compose.ha.yml exec -T mysql \
 
 - 优雅停机：向实例发 SIGTERM，`/readyz` 先变 503 并立即清空租约 holder，随后按 HTTP、HTTPS、mTLS、QUIC、Ops 顺序排空，容器 `stop_grace_period` 为 40 秒。实测停机后新 leader 在 1.75 秒内接管、fence 递增。
 - 崩溃切换：`SIGKILL` 后旧 holder 留在租约行直到 TTL 过期，新 leader 在 2 个 TTL（30 秒）内接管；实测 16.71 秒，fence 由 2 升到 3，重启的旧 leader 不抢占有效租约。
-- 滚动升级：一次只动一个实例，先摘流（或 `docker compose stop edgepulse-1`），等 `/readyz` 503 并退出，再用新镜像 `up -d edgepulse-1`；新实例 `/readyz` 200 后 nginx 自动接回。两个实例不要同时重启，否则 nginx 没有可用上游，Agent 长连接与在途请求都会中断。
+- 滚动升级：一次只动一个实例，先摘流（或 `docker compose stop edgepulse-1`），等 `/readyz` 503 并退出，再用新镜像 `up -d edgepulse-1`；新实例 `/readyz` 200 后，等 `fail_timeout`（5 秒）过去，nginx 会重新尝试该上游。nginx 不读 `/readyz`；容器重建换了 IP 时还要 `docker compose restart nginx` 或 `nginx -s reload` 让 Docker DNS 重新解析。两个实例不要同时重启，否则 nginx 没有可用上游，Agent 长连接与在途请求都会中断。
 - 全量门禁：`python scripts/check-ha-stack.py --require-docker` 覆盖跨实例会话、Agent 命令路由、nginx 8080/8443/9443、共享固件、CA 私钥权限、SIGTERM 与 SIGKILL 两条停机路径。
 
 已知限制：
