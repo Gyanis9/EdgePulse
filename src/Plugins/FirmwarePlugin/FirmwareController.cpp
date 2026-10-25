@@ -1265,6 +1265,7 @@ namespace EdgePulse::Firmware
                             fail(response, Common::kCodeNotFound, "固件任务不存在", traceId);
                             co_return;
                         }
+                        // 已处于终态的任务返回当前状态而不是 404：Agent 的迟到回报按幂等成功处理，不触发重试
                         Common::writeSuccess(response, taskJson(*task), traceId);
                         co_return;
                     });

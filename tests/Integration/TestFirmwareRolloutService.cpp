@@ -1058,9 +1058,9 @@ TEST(FirmwareRolloutService, AbortCancelsInstallingTasks)
     EXPECT_EQ("failed", targetOf(aggregate, nodeId)->status);
 
     // 已中止的任务已经判失败；旧 Agent 不带命令号的迟到 installed 也不能把它改回已安装
-    EXPECT_FALSE(harness.m_runner
-                         ->run(harness.m_firmware->updateTask(harness.m_runner->loop(), firmwareId, nodeId, "installed", 100, "迟到的安装结果", 0))
-                         .has_value());
+    const auto lateReport = harness.m_runner->run(harness.m_firmware->updateTask(harness.m_runner->loop(), firmwareId, nodeId, "installed", 100, "迟到的安装结果", 0));
+    ASSERT_TRUE(lateReport.has_value()) << "任务存在但因终态被忽略时仍应返回当前行";
+    EXPECT_EQ("failed", lateReport->status);
     const auto afterLateReport = harness.task(taskId);
     ASSERT_TRUE(afterLateReport.has_value());
     EXPECT_EQ("failed", afterLateReport->status);

@@ -375,7 +375,7 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 | GET | `/api/agent/nodes/{id}/config` | `{version,content,hash}`；从未下发时为 `{version:0,content:{},hash:""}` |
 | POST | `/api/agent/nodes/{id}/config/report` | `{version,content?,status:'applied'|'failed'|'pending',message?}`；返回完整配置视图与 `inSync` |
 | GET | `/api/agent/firmware/{id}/download?nodeId=` | 必须带 `nodeId`；支持 `ETag`/`If-None-Match` 与单段 `Range`；签名固件回传三个 `X-Firmware-*` 头 |
-| POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message,commandId?}`；`status` 取 `pending`、`downloading`、`installing`、`installed`、`failed`；`commandId` 只推进该命令关联的任务，缺省、负数或非整数按旧行为更新同固件同节点的全部任务；带命令号但命中不到任务时回退到 `command_id=0` 的在途旧任务 |
+| POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message,commandId?}`；`status` 取 `pending`、`downloading`、`installing`、`installed`、`failed`；`commandId` 只推进该命令关联的任务，缺省、负数或非整数按旧行为更新同固件同节点的全部任务；带命令号但命中不到任务时回退到 `command_id=0` 的在途旧任务；已 `installed` 的任务拒绝迟到的 `failed`，已 `failed` 的任务拒绝非 `failed` 回报，命中终态时返回 200 与当前任务而不是 404 |
 | GET | `/api/agent/ws` | WebSocket；首条 `{"type":"hello","nodeId":...}`；接收 `command.result` |
 
 注册模式由 `edgepulse.agent.enrollment_mode` 决定：`required` 时新节点必须带 `enroll` 令牌、已有节点换证书必须带 `rebind` 令牌，同指纹重注册不需要令牌；`off` 只校验 mTLS CA 链与可选指纹白名单。令牌条件还校验租户、动作与 `nodeName`，缺令牌或令牌不可用统一返回 403，不区分过期、已用或名字不符。

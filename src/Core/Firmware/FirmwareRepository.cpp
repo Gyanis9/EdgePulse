@@ -478,9 +478,12 @@ namespace EdgePulse::Firmware
                             clause += " AND tenant_id = ?";
                             parameters.emplace_back(tenant.tenantId);
                         }
-                        // 已判失败的任务（含发布中止或命令超时收尾）不能被迟到回报改回进行中或已安装；
-                        // 旧 Agent 不带命令号时同样适用，只有再次写入 failed 本身允许
-                        if (status != "failed")
+                        // 已安装的任务不接受迟到的 failed，已失败的任务不接受非 failed 回报；
+                        // 再次写入同一终态本身允许，便于重复回报幂等
+                        if (status == "failed")
+                        {
+                            clause += " AND status <> 'installed'";
+                        } else
                         {
                             clause += " AND status <> 'failed'";
                         }
@@ -490,39 +493,49 @@ namespace EdgePulse::Firmware
                         return update->affectedRowCount();
                     };
 
+                    const auto findLatest = [&](const bool legacyOnly) -> std::optional<FirmwareTaskRecord>
+                    {
+                        std::vector<DatabaseValue> queryParameters{firmwareId, nodeId};
+                        std::string                queryClause;
+                        if (commandId != 0)
+                        {
+                            queryClause = legacyOnly ? " AND t.command_id < 0" : " AND t.command_id = ?";
+                            if (!legacyOnly)
+                            {
+                                queryParameters.emplace_back(commandId);
+                            }
+                        }
+                        if (!tenant.allTenants)
+                        {
+                            queryClause += " AND t.tenant_id = ?";
+                            queryParameters.emplace_back(tenant.tenantId);
+                        }
+                        const auto rows = Sql::executeOrThrow(
+                                connection, std::string{kSelectTask} + "WHERE t.firmware_id = ? AND t.node_id = ?" + queryClause + " ORDER BY t.id DESC LIMIT 1", queryParameters);
+                        if (!rows->next())
+                        {
+                            return std::nullopt;
+                        }
+                        return readTask(*rows);
+                    };
+
                     auto matched        = applyUpdate(false);
                     bool legacyFallback = false;
                     if (matched == 0 && commandId != 0)
                     {
-                        matched        = applyUpdate(true);
-                        legacyFallback = matched > 0;
-                    }
-                    if (matched == 0)
-                    {
-                        return std::nullopt;
-                    }
-                    std::vector<DatabaseValue> queryParameters{firmwareId, nodeId};
-                    std::string                queryClause;
-                    if (commandId != 0)
-                    {
-                        queryClause = legacyFallback ? " AND t.command_id < 0" : " AND t.command_id = ?";
-                        if (!legacyFallback)
+                        // 命令号对应的任务已经存在但被终态保护挡住时，不能顺手回退到别的旧任务
+                        if (!findLatest(false).has_value())
                         {
-                            queryParameters.emplace_back(commandId);
+                            matched        = applyUpdate(true);
+                            legacyFallback = matched > 0;
                         }
                     }
-                    if (!tenant.allTenants)
-                    {
-                        queryClause += " AND t.tenant_id = ?";
-                        queryParameters.emplace_back(tenant.tenantId);
-                    }
-                    const auto rows = Sql::executeOrThrow(
-                            connection, std::string{kSelectTask} + "WHERE t.firmware_id = ? AND t.node_id = ?" + queryClause + " ORDER BY t.id DESC LIMIT 1", queryParameters);
-                    if (!rows->next())
+                    std::optional<FirmwareTaskRecord> task = findLatest(legacyFallback);
+                    if (!task.has_value())
                     {
                         return std::nullopt;
                     }
-                    return readTask(*rows);
+                    return task;
                 });
     }
 } // namespace EdgePulse::Firmware

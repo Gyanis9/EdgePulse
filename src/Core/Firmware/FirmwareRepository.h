@@ -220,9 +220,10 @@ namespace EdgePulse::Firmware
          * @param progress 进度
          * @param message 说明
          * @param commandId 只更新该命令关联的任务；0 表示按固件与节点更新全部任务
-         * @return std::optional<FirmwareTaskRecord> 更新后的任务
+         * @return std::optional<FirmwareTaskRecord> 命中的任务；任务不存在时为空。终态保护拒绝写入时仍返回当前任务
          * @note 指定 commandId 但命中不到任务时，只在 command_id 为 0 的在途旧任务上重试一次；
          *       旧任务建立在命令号写入任务之前，不带命令号则无法回报
+         * @note 已 installed 的任务不接受迟到的 failed；已 failed 的任务不接受非 failed 回报
          */
         AsynGyanis::Core::Task<std::optional<FirmwareTaskRecord>> updateTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t nodeId, std::string status,
                                                                              int progress, std::string message, std::int64_t commandId = 0);

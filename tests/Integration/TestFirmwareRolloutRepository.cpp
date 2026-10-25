@@ -453,8 +453,10 @@ TEST(FirmwareRolloutRepository, TaskCreationAndTerminalStatusAreIdempotent)
     ASSERT_GT(third, 0);
     ASSERT_TRUE(runner.run(firmware.bindTaskCommand(runner.loop(), third, 503)));
     ASSERT_TRUE(runner.run(firmware.updateTaskById(runner.loop(), third, "failed", 0, "命令已取消")));
-    EXPECT_FALSE(runner.run(firmware.updateTask(runner.loop(), firmwareId, nodeId, "installed", 100, "迟到回报", 503)).has_value())
-            << "取消后的任务不能被迟到 installed 回报复活";
+    const auto late = runner.run(firmware.updateTask(runner.loop(), firmwareId, nodeId, "installed", 100, "迟到回报", 503));
+    ASSERT_TRUE(late.has_value()) << "任务存在但已取消时必须返回当前行而不是 404 语义";
+    EXPECT_EQ("failed", late->status);
+    EXPECT_EQ("命令已取消", late->message);
     const auto terminal = runner.run(firmware.findTask(runner.loop(), third));
     ASSERT_TRUE(terminal.has_value());
     EXPECT_EQ("failed", terminal->status);

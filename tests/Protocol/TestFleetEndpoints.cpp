@@ -1226,12 +1226,14 @@ TEST_F(FleetEndpointsTest, FirmwareStatusCannotReviveCanceledTask)
     insertFirmwareTask(m_context->databasePath(), taskId, 1, firmwareId, nodeId, 71);
     setFirmwareTaskStatus(m_context->databasePath(), taskId, "failed", "命令已取消");
 
-    // 取消只是服务端记账：Agent 可能仍在安装，迟到回报必须被终局挡住
+    // 取消只是服务端记账：Agent 可能仍在安装，迟到回报被终态挡住，但仍返回当前任务而不是假装不存在
     const auto status = m_server->post(
             "/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
             AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "迟到安装完成"}, {"commandId", 71}}).dump(),
             "application/json", agentHeaders(fingerprint));
-    EXPECT_EQ(404, status.status) << status.body;
+    ASSERT_EQ(200, status.status) << status.body;
+    EXPECT_EQ("failed", (*status.json())["data"]["status"].get<std::string>());
+    EXPECT_EQ("命令已取消", (*status.json())["data"]["message"].get<std::string>());
     EXPECT_EQ("failed", firmwareTaskStatus(m_context->databasePath(), taskId));
 
     const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
@@ -1241,6 +1243,39 @@ TEST_F(FleetEndpointsTest, FirmwareStatusCannotReviveCanceledTask)
     ASSERT_EQ(1, (*json)["data"].size());
     EXPECT_EQ("failed", (*json)["data"][0]["status"].get<std::string>());
     EXPECT_EQ("命令已取消", (*json)["data"][0]["message"].get<std::string>());
+}
+
+// 钉住：已安装是终态，迟到的 failed 回报不能把任务改回失败；接口返回当前任务而不是 404
+TEST_F(FleetEndpointsTest, FirmwareStatusFailedCannotOverwriteInstalled)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "firmware-installed-status-node");
+    const std::string  fingerprint(64, '7');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name                   = "Installed OS";
+    record.version                = "5.5.0";
+    record.fileName               = "installed-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, 'f');
+    record.storagePath            = (m_storage / "installed-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    const std::int64_t taskId = 900000000000000210;
+    insertFirmwareTask(m_context->databasePath(), taskId, 1, firmwareId, nodeId, 81);
+    setFirmwareTaskStatus(m_context->databasePath(), taskId, "installed", "安装成功");
+
+    // 安装确认之后的失败回报（例如 Agent 收尾清理报错）不得把已安装改回 failed
+    const auto status = m_server->post(
+            "/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "failed"}, {"progress", 100}, {"message", "收尾失败"}, {"commandId", 81}}).dump(),
+            "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, status.status) << status.body;
+    EXPECT_EQ("installed", (*status.json())["data"]["status"].get<std::string>());
+    EXPECT_EQ("安装成功", (*status.json())["data"]["message"].get<std::string>());
+    EXPECT_EQ("installed", firmwareTaskStatus(m_context->databasePath(), taskId));
 }
 
 // 钉住：旧 Agent 不带 commandId 的状态回报保持原行为，按固件与节点更新全部任务
