@@ -9,6 +9,8 @@
 #include "Core/Device/AgentCertificateRepository.h"
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/CertificateBinding.h"
+#include "Core/Device/EnrollmentRepository.h"
+#include "Core/Device/EnrollmentService.h"
 #include "Core/Device/NodeRepository.h"
 #include "Core/System/TenantRepository.h"
 #include "Core/Telemetry/TelemetryRepository.h"
@@ -272,14 +274,16 @@ protected:
         m_caCertificateFile                   = certificateFile;
         m_caKeyFile                           = keyFile;
 
-        m_nodes     = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
-        m_tenants   = m_context->tenants;
-        m_registry  = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, EdgePulse::Device::AgentRegistry::Options{});
-        m_commands  = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
-        m_channels  = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
-        m_telemetry = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
-        m_alarmRepo = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
-        m_alarms    = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
+        m_nodes       = std::make_shared<EdgePulse::Device::NodeRepository>(m_context->database);
+        m_tenants     = m_context->tenants;
+        m_enrollRepo  = std::make_shared<EdgePulse::Device::EnrollmentRepository>(m_context->database);
+        m_enrollments = std::make_shared<EdgePulse::Device::EnrollmentService>(m_enrollRepo);
+        m_registry    = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, EdgePulse::Device::AgentRegistry::Options{});
+        m_commands    = std::make_shared<EdgePulse::Command::CommandRepository>(m_context->database);
+        m_channels    = std::make_shared<EdgePulse::Command::AgentChannelRegistry>();
+        m_telemetry   = std::make_shared<EdgePulse::Telemetry::TelemetryRepository>(m_context->database);
+        m_alarmRepo   = std::make_shared<EdgePulse::Alarm::AlarmRepository>(m_context->database);
+        m_alarms      = std::make_shared<EdgePulse::Alarm::AlarmService>(m_alarmRepo);
     }
 
     void TearDown() override
@@ -291,6 +295,8 @@ protected:
         m_channels.reset();
         m_commands.reset();
         m_registry.reset();
+        m_enrollments.reset();
+        m_enrollRepo.reset();
         m_nodes.reset();
         m_tenants.reset();
         m_context.reset();
@@ -302,9 +308,18 @@ protected:
      * @param caEnabled CA 是否启用
      * @param versionBumps 每次写入轮换前人为推进版本的次数，用于制造版本冲突
      * @param rotationHook 每次写入轮换前的附加动作，用于模拟改绑或租户停用等并发变化
+     * @param requiredMode required 模式下注册必须持一次性令牌
      */
-    void startServer(const bool caEnabled = true, const int versionBumps = 0, std::function<void(std::int64_t)> rotationHook = {})
+    void startServer(const bool caEnabled = true, const int versionBumps = 0, std::function<void(std::int64_t)> rotationHook = {}, const bool requiredMode = false)
     {
+        if (requiredMode)
+        {
+            EdgePulse::Device::AgentRegistry::Options options;
+            options.enrollmentMode = "required";
+            options.enrollments    = m_enrollments.get();
+            m_registry             = std::make_shared<EdgePulse::Device::AgentRegistry>(m_nodes, options);
+        }
+
         EdgePulse::Device::AgentCaOptions options;
         options.enabled         = caEnabled;
         options.certificateFile = m_caCertificateFile;
@@ -361,11 +376,15 @@ protected:
                                                               const std::string &serial, const std::string &subject, const std::string &notBefore)
     {
         EdgePulse::Device::AgentCertificateRotation rotation;
-        rotation.fingerprint = fingerprint;
-        rotation.notAfter    = notAfter;
-        rotation.serial      = serial;
-        rotation.subject     = subject;
-        rotation.notBefore   = notBefore;
+        rotation.fingerprint         = fingerprint;
+        rotation.notAfter            = notAfter;
+        rotation.previousFingerprint = created.certFingerprint;
+        // 有旧证书时给出一个仍在重叠窗口内的截止时间，没有旧证书时仓储会自行清空该字段
+        rotation.previousNotAfter =
+                created.certFingerprint.empty() ? std::string{} : EdgePulse::Common::formatDateTimeUtc(std::chrono::system_clock::now() + std::chrono::hours{24});
+        rotation.serial    = serial;
+        rotation.subject   = subject;
+        rotation.notBefore = notBefore;
         const auto rotated =
                 m_runner.run(m_nodes->rotateCertificate(m_runner.loop(), EdgePulse::System::TenantScope{created.tenantId, false}, created.id, created.version, rotation));
         EXPECT_TRUE(rotated.has_value()) << (rotated.has_value() ? std::string{} : rotated.error());
@@ -468,6 +487,24 @@ protected:
         return m_server->post("/api/agent/telemetry", body, "application/json", agentHeaders(fingerprint));
     }
 
+    /**
+     * @brief 发一次 Agent 注册
+     * @param name 节点名
+     * @param fingerprint 连接证书指纹
+     * @param token 注册/改绑令牌，可空
+     * @return EdgePulse::TestSupport::HttpResult 响应
+     */
+    [[nodiscard]] EdgePulse::TestSupport::HttpResult registerNode(const std::string &name, const std::string &fingerprint, const std::string &token = {})
+    {
+        AsynGyanis::Base::ConfigValue body = AsynGyanis::Base::ConfigValue::object(
+                {{"name", name}, {"agentVersion", "1.0.0"}, {"certFingerprint", fingerprint}, {"labels", AsynGyanis::Base::ConfigValue::object({})}});
+        if (!token.empty())
+        {
+            body["enrollmentToken"] = token;
+        }
+        return m_server->post("/api/agent/register", body.dump(), "application/json", agentHeaders(fingerprint));
+    }
+
     std::unique_ptr<EdgePulse::TestSupport::AuthTestContext>    m_context;
     EdgePulse::TestSupport::EventLoopRunner                     m_runner;
     std::unique_ptr<EdgePulse::TestSupport::TemporaryDirectory> m_directory;
@@ -476,6 +513,8 @@ protected:
     std::optional<EdgePulse::Device::AgentCertificateAuthority> m_authority;
     std::shared_ptr<EdgePulse::Device::NodeRepository>          m_nodes;
     std::shared_ptr<EdgePulse::System::TenantRepository>        m_tenants;
+    std::shared_ptr<EdgePulse::Device::EnrollmentRepository>    m_enrollRepo;
+    std::shared_ptr<EdgePulse::Device::EnrollmentService>       m_enrollments;
     std::shared_ptr<EdgePulse::Device::AgentRegistry>           m_registry;
     std::shared_ptr<EdgePulse::Command::CommandRepository>      m_commands;
     std::shared_ptr<EdgePulse::Command::AgentChannelRegistry>   m_channels;
@@ -792,6 +831,68 @@ TEST_F(AgentCertificateRenewalTest, ReturnsConflictAfterRepeatedVersionConflict)
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(node.certFingerprint, stored->certFingerprint);
     EXPECT_TRUE(stored->previousCertFingerprint.empty());
+}
+
+// 钉住：服务端已轮换而 Agent 没装上新证书时，重启出示上一枚证书应按同证书软重登记，
+// 不消费令牌、不把 previous 提回 active，且心跳与续期继续可用
+TEST_F(AgentCertificateRenewalTest, RestartWithPreviousCertificateRegistersWithoutToken)
+{
+    startServer(true, 0, {}, true);
+    const std::string fingerprintA(64, 'a');
+    const std::string fingerprintB(64, 'b');
+
+    const auto issued = m_runner.run(m_enrollments->create(m_runner.loop(), 1, "renew-restart", "enroll", 3600, 1));
+    ASSERT_TRUE(issued.has_value()) << issued.error();
+    const auto first = registerNode("renew-restart", fingerprintA, issued->plaintext);
+    ASSERT_EQ(200, first.status) << first.body;
+    const std::int64_t nodeId = (*first.json())["data"]["id"].get<std::int64_t>();
+
+    // 服务端已把 active 换成 B，并把 A 放进重叠窗口；Agent 死在装上新证书之前
+    const std::optional<EdgePulse::Device::NodeRecord> created = m_runner.run(m_nodes->findById(m_runner.loop(), nodeId));
+    ASSERT_TRUE(created.has_value());
+    const EdgePulse::Device::NodeRecord rotated = applyRotation(*created, fingerprintB, "2030-01-01 00:00:00", "serial-b", "CN=renew-restart", "2026-01-01 00:00:00");
+    ASSERT_EQ(fingerprintB, rotated.certFingerprint);
+    ASSERT_EQ(fingerprintA, rotated.previousCertFingerprint);
+
+    const auto restarted = registerNode("renew-restart", fingerprintA);
+    ASSERT_EQ(200, restarted.status) << restarted.body;
+
+    const std::optional<EdgePulse::Device::NodeRecord> stored = m_runner.run(m_nodes->findById(m_runner.loop(), nodeId));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(fingerprintB, stored->certFingerprint) << "上一枚证书不能被提回 active";
+    EXPECT_EQ(fingerprintA, stored->previousCertFingerprint) << "重叠窗口字段不能被软重登记清掉";
+    EXPECT_FALSE(stored->previousCertNotAfter.empty());
+    EXPECT_GT(stored->version, rotated.version);
+
+    EXPECT_EQ(200, heartbeat(nodeId, fingerprintA).status) << "上一枚证书在窗口内必须能心跳";
+
+    KeyHandle         newKey  = generateKey();
+    const std::string newCsr  = makeCertificateRequest(*newKey, "ignored-by-server");
+    const auto        renewed = renew(nodeId, newCsr, fingerprintA);
+    EXPECT_EQ(200, renewed.status) << renewed.body;
+}
+
+// 钉住：上一枚证书已出重叠窗口时不再享受软重登记，仍必须持改绑令牌
+TEST_F(AgentCertificateRenewalTest, ExpiredPreviousCertificateStillNeedsToken)
+{
+    startServer(true, 0, {}, true);
+    const std::string fingerprintA(64, 'a');
+    const std::string fingerprintB(64, 'b');
+
+    const auto issued = m_runner.run(m_enrollments->create(m_runner.loop(), 1, "renew-expired-previous", "enroll", 3600, 1));
+    ASSERT_TRUE(issued.has_value()) << issued.error();
+    const auto first = registerNode("renew-expired-previous", fingerprintA, issued->plaintext);
+    ASSERT_EQ(200, first.status) << first.body;
+    const std::int64_t nodeId = (*first.json())["data"]["id"].get<std::int64_t>();
+
+    const std::optional<EdgePulse::Device::NodeRecord> created = m_runner.run(m_nodes->findById(m_runner.loop(), nodeId));
+    ASSERT_TRUE(created.has_value());
+    ASSERT_EQ(fingerprintB, applyRotation(*created, fingerprintB, "2030-01-01 00:00:00", "serial-b", "CN=renew-expired-previous", "2026-01-01 00:00:00").certFingerprint);
+    blockOnSql("UPDATE biz_node SET previous_cert_not_after = '2000-01-01 00:00:00' WHERE id = " + std::to_string(nodeId));
+
+    const auto rejected = registerNode("renew-expired-previous", fingerprintA);
+    EXPECT_EQ(403, rejected.status) << rejected.body;
+    EXPECT_NE(std::string::npos, rejected.body.find("改绑令牌"));
 }
 
 // 钉住：节点 JSON 同时暴露上一枚证书的指纹与重叠截止时间

@@ -392,11 +392,23 @@ namespace EdgePulse::Device
                         try
                         {
                             Sql::executeOrThrowVoid(connection, "BEGIN");
-                            const std::string               now             = Common::nowDateTimeUtc();
-                            const std::optional<NodeRecord> current         = findByNameOnConnection(connection, registration.name, tenant);
-                            const bool                      revoked         = current.has_value() && !current->certRevokedAt.empty();
-                            const bool                      sameCertificate = current.has_value() && !revoked && current->certFingerprint == registration.certFingerprint;
-                            if (current.has_value() && current->certFingerprint != registration.certFingerprint && registration.enrollmentMode != "required")
+                            const std::string               now     = Common::nowDateTimeUtc();
+                            const std::optional<NodeRecord> current = findByNameOnConnection(connection, registration.name, tenant);
+                            const bool                      revoked = current.has_value() && !current->certRevokedAt.empty();
+                            // 本次出示的证书可能仍是重叠窗口内的上一枚：服务端已把 active 写成新证书，
+                            // Agent 却死在装上它之前。此时只软更新节点状态，不能把 previous 提回 active，
+                            // 否则旧证书会越过重叠窗口继续有效
+                            const std::optional<std::string> presented      = normalizeCertificateFingerprint(registration.certFingerprint);
+                            const std::optional<std::string> activeOnRecord = current.has_value() ? normalizeCertificateFingerprint(current->certFingerprint) : std::nullopt;
+                            const std::optional<std::string> previousOnRecord =
+                                    current.has_value() ? normalizeCertificateFingerprint(current->previousCertFingerprint) : std::nullopt;
+                            const bool matchesActive   = current.has_value() && !revoked && presented.has_value() && activeOnRecord.has_value() && *presented == *activeOnRecord;
+                            const bool matchesPrevious = current.has_value() && !revoked && presented.has_value() && previousOnRecord.has_value() &&
+                                                         !current->previousCertNotAfter.empty() && current->previousCertNotAfter > now && *presented == *previousOnRecord;
+                            const bool sameCertificate = matchesActive || matchesPrevious;
+                            // 只命中上一枚时保留 active/previous/revoked 与两枚到期时间，避免旧证书被提升
+                            const bool previousOnly = matchesPrevious && !matchesActive;
+                            if (current.has_value() && !sameCertificate && registration.enrollmentMode != "required")
                             {
                                 // off 模式没有令牌约束；改绑仍要留下可追溯的告警日志
                                 LOG_WARN_FMT("off 模式允许证书指纹改绑：node={} name={}", current->id, registration.name);
@@ -438,28 +450,41 @@ namespace EdgePulse::Device
                                 }
                                 return std::expected<AgentUpsertOutcome, AgentUpsertFailure>{AgentUpsertOutcome{std::move(node), true, true}};
                             }
-                            const bool                                                becameOnline = current->status != "online";
-                            const std::int64_t                                        keepPrevious = sameCertificate ? 1 : 0;
-                            const std::array<AsynGyanis::Database::DatabaseValue, 10> parameters{registration.agentVersion,
-                                                                                                 registration.certFingerprint,
-                                                                                                 nullableText(registration.certNotAfter),
-                                                                                                 keepPrevious,
-                                                                                                 keepPrevious,
-                                                                                                 nullableText(registration.labelsJson),
-                                                                                                 now,
-                                                                                                 now,
-                                                                                                 current->id,
-                                                                                                 current->version};
-                            // 走到这里说明本次出示的证书已被事务内确认允许写入（同指纹、已消费令牌或 off 模式），才清掉旧的吊销时间
-                            // 同指纹重注册发生在重叠窗口内，不能提前清掉 previous；改绑或重新入场才按新证书语义清空
-                            // 版本条件把读取与写入绑成一次比较交换：期间提交的吊销或改绑会让这次更新落空，而不是被覆盖
-                            const auto update = Sql::executeOrThrow(
-                                    connection,
-                                    "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
-                                    "previous_cert_fingerprint = CASE WHEN ? = 1 THEN previous_cert_fingerprint ELSE '' END, "
-                                    "previous_cert_not_after = CASE WHEN ? = 1 THEN previous_cert_not_after ELSE NULL END, "
-                                    "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0",
-                                    parameters);
+                            const bool                                            becameOnline = current->status != "online";
+                            const std::int64_t                                    keepPrevious = sameCertificate ? 1 : 0;
+                            std::unique_ptr<AsynGyanis::Database::DatabaseResult> update;
+                            if (previousOnly)
+                            {
+                                // 上一枚证书只能刷新在线状态与元数据；证书字段一律保持服务端最近一次轮换的结果
+                                const std::vector<AsynGyanis::Database::DatabaseValue> parameters{
+                                        registration.agentVersion, nullableText(registration.labelsJson), now, now, current->id, current->version};
+                                update = Sql::executeOrThrow(connection,
+                                                             "UPDATE biz_node SET status = 'online', agent_version = ?, labels = ?, last_seen = ?, "
+                                                             "version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0 AND cert_revoked_at IS NULL",
+                                                             parameters);
+                            } else
+                            {
+                                const std::array<AsynGyanis::Database::DatabaseValue, 10> parameters{registration.agentVersion,
+                                                                                                     registration.certFingerprint,
+                                                                                                     nullableText(registration.certNotAfter),
+                                                                                                     keepPrevious,
+                                                                                                     keepPrevious,
+                                                                                                     nullableText(registration.labelsJson),
+                                                                                                     now,
+                                                                                                     now,
+                                                                                                     current->id,
+                                                                                                     current->version};
+                                // 走到这里说明本次出示的证书已被事务内确认允许写入（同指纹、已消费令牌或 off 模式），才清掉旧的吊销时间
+                                // 同指纹重注册发生在重叠窗口内，不能提前清掉 previous；改绑或重新入场才按新证书语义清空
+                                // 版本条件把读取与写入绑成一次比较交换：期间提交的吊销或改绑会让这次更新落空，而不是被覆盖
+                                update = Sql::executeOrThrow(
+                                        connection,
+                                        "UPDATE biz_node SET status = 'online', agent_version = ?, cert_fingerprint = ?, cert_not_after = ?, cert_revoked_at = NULL, "
+                                        "previous_cert_fingerprint = CASE WHEN ? = 1 THEN previous_cert_fingerprint ELSE '' END, "
+                                        "previous_cert_not_after = CASE WHEN ? = 1 THEN previous_cert_not_after ELSE NULL END, "
+                                        "labels = ?, last_seen = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted = 0",
+                                        parameters);
+                            }
                             if (update->affectedRowCount() == 0)
                             {
                                 // 节点在读取后被软删除，或版本被吊销/改绑推进：回滚后整套判定重来，不能把旧快照写回去
@@ -483,12 +508,15 @@ namespace EdgePulse::Device
                             {
                                 LOG_INFO_FMT("消费注册令牌：tenant={} action={} node={}", registration.tenantId, consumedAction, registration.name);
                             }
-                            NodeRecord node      = *current;
-                            node.status          = "online";
-                            node.agentVersion    = registration.agentVersion;
-                            node.certFingerprint = registration.certFingerprint;
-                            node.certNotAfter    = registration.certNotAfter;
-                            node.certRevokedAt.clear();
+                            NodeRecord node   = *current;
+                            node.status       = "online";
+                            node.agentVersion = registration.agentVersion;
+                            if (!previousOnly)
+                            {
+                                node.certFingerprint = registration.certFingerprint;
+                                node.certNotAfter    = registration.certNotAfter;
+                                node.certRevokedAt.clear();
+                            }
                             if (!sameCertificate)
                             {
                                 node.previousCertFingerprint.clear();

@@ -2,6 +2,7 @@
 
 #include "Base/Config/ConfigValue.h"
 #include "Base/Log/LogMacros.h"
+#include "Base/Runtime/TimeFormat.h"
 #include "Core/Device/CertificateBinding.h"
 #include "Core/Device/EnrollmentService.h"
 
@@ -90,8 +91,11 @@ namespace EdgePulse::Device
         // 这里读到的快照可能已经过期，不能作为放行依据
         if (m_options.enrollmentMode == "required" && registration.enrollmentToken.empty())
         {
-            const std::optional<NodeRecord> current         = co_await m_repository->scoped({registration.tenantId, false})->findByName(loop, registration.name);
-            const bool                      sameCertificate = current.has_value() && current->certRevokedAt.empty() && current->certFingerprint == *fingerprint;
+            const std::optional<NodeRecord> current = co_await m_repository->scoped({registration.tenantId, false})->findByName(loop, registration.name);
+            // 进程在服务端轮换之后、装上新证书之前崩溃时，重启出示的是重叠窗口内的上一枚证书；
+            // 它仍能通过心跳与续期的身份校验，注册也必须按同证书处理，不能再要令牌
+            const bool sameCertificate = current.has_value() && current->certRevokedAt.empty() &&
+                                         (current->certFingerprint == *fingerprint || certificateMatchesNode(registration.connectionIdentity, *current, Common::nowDateTimeUtc()));
             if (!sameCertificate)
             {
                 const std::string message = current.has_value() ? "该节点已登记其他证书，请使用改绑令牌" : "该节点需要一次性注册令牌，请向管理员申请";
