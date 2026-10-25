@@ -552,6 +552,12 @@ namespace EdgePulse::Firmware
                             {
                                 continue;
                             }
+                            // 任务先于命令建立，命令号必须在发布前回填；否则升级后的 Agent 带 commandId 回报会找不到任务
+                            if (!co_await firmwareRepo->bindTaskCommand(loop, taskId, command->id))
+                            {
+                                LOG_WARN_FMT("固件任务 {} 绑定命令 {} 失败，跳过下发", taskId, command->id);
+                                continue;
+                            }
                             if (deps->realtimeBus != nullptr)
                             {
                                 co_await deps->realtimeBus->publishAgent(loop, Command::makeAgentCommandMessage(*command));
@@ -654,6 +660,12 @@ namespace EdgePulse::Firmware
                                     co_await commandRepo->create(loop, nodeId, "firmware.update", downloadPayload(rollbackTarget.firmware, nodeId), session->userId, 600);
                             if (!command.has_value())
                             {
+                                continue;
+                            }
+                            // 回滚同样要在发布前绑定命令号，否则升级后的 Agent 回报会被当成不存在的任务
+                            if (!co_await firmwareRepo->bindTaskCommand(loop, taskId, command->id))
+                            {
+                                LOG_WARN_FMT("固件任务 {} 绑定命令 {} 失败，跳过下发", taskId, command->id);
                                 continue;
                             }
                             if (deps->realtimeBus != nullptr)

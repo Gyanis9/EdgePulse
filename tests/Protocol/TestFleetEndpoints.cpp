@@ -98,6 +98,19 @@ namespace
         EXPECT_NE(nullptr, result) << connection->lastError();
     }
 
+    [[nodiscard]] std::int64_t firmwareTaskCommandId(const std::filesystem::path &databasePath, const std::int64_t taskId)
+    {
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::unique_ptr<AsynGyanis::Database::DatabaseResult> result = connection->execute("SELECT command_id FROM biz_firmware_task WHERE id = " + std::to_string(taskId));
+        EXPECT_NE(nullptr, result) << connection->lastError();
+        if (result == nullptr || !result->next())
+        {
+            return -1;
+        }
+        const auto value = result->getValue(0);
+        return std::holds_alternative<std::int64_t>(value) ? std::get<std::int64_t>(value) : -1;
+    }
+
     using PkeyPointer = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
 
     struct SigningKeyPair
@@ -1097,9 +1110,18 @@ TEST_F(FleetEndpointsTest, FirmwareUploadRangeAndDeploy)
     const auto downloadPayload = AsynGyanis::Base::parseConfigValue((*created)["payload"].get<std::string>());
     ASSERT_TRUE(downloadPayload.has_value());
     EXPECT_EQ("/api/agent/firmware/" + std::to_string(firmwareId) + "/download?nodeId=" + std::to_string(nodeId), (*downloadPayload)["downloadPath"].get<std::string>());
-    const auto status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
-                                       AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "ok"}}).dump(),
-                                       "application/json", agentHeaders(fingerprint));
+    // 新任务必须落上命令号：升级后的 Agent 带 commandId 回报时才能精确命中
+    EXPECT_EQ(commandId, firmwareTaskCommandId(m_context->databasePath(), taskId));
+    const auto downloading =
+            m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+                           AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "downloading"}, {"progress", 0}, {"commandId", commandId}}).dump(),
+                           "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, downloading.status) << downloading.body;
+    EXPECT_EQ(taskId, (*downloading.json())["data"]["id"].get<std::int64_t>());
+    const auto status = m_server->post(
+            "/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "ok"}, {"commandId", commandId}}).dump(),
+            "application/json", agentHeaders(fingerprint));
     ASSERT_EQ(200, status.status) << status.body;
     EXPECT_EQ(taskId, (*status.json())["data"]["id"].get<std::int64_t>());
 
@@ -1200,6 +1222,105 @@ TEST_F(FleetEndpointsTest, FirmwareStatusWithoutCommandIdKeepsLegacyTaskUpdate)
     }
 }
 
+// 钉住：带 commandId 的回报命中不到任务时只回退到 command_id=0 的在途旧任务，不能顺手改写别的命令
+TEST_F(FleetEndpointsTest, FirmwareStatusCommandIdFallsBackToLegacyTask)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "firmware-legacy-fallback-node");
+    const std::string  fingerprint(64, '4');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name                   = "Fallback OS";
+    record.version                = "5.2.0";
+    record.fileName               = "fallback-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, 'c');
+    record.storagePath            = (m_storage / "fallback-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    // 升级前建立的在途任务没有命令号；另一行属于命令 41，回退时不能被一并改写
+    const std::int64_t legacyTask = 900000000000000205;
+    const std::int64_t boundTask  = 900000000000000206;
+    insertFirmwareTask(m_context->databasePath(), legacyTask, 1, firmwareId, nodeId, 0);
+    insertFirmwareTask(m_context->databasePath(), boundTask, 1, firmwareId, nodeId, 41);
+
+    const auto status = m_server->post(
+            "/api/agent/firmware/" + std::to_string(firmwareId) + "/status",
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "旧任务收尾"}, {"commandId", 900000000000000999}})
+                    .dump(),
+            "application/json", agentHeaders(fingerprint));
+    ASSERT_EQ(200, status.status) << status.body;
+    EXPECT_EQ(legacyTask, (*status.json())["data"]["id"].get<std::int64_t>());
+
+    const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
+    ASSERT_EQ(200, tasks.status) << tasks.body;
+    const auto json = tasks.json();
+    ASSERT_TRUE(json.has_value());
+    ASSERT_EQ(2, (*json)["data"].size());
+    for (const auto &task: (*json)["data"])
+    {
+        const std::int64_t taskId = task["id"].get<std::int64_t>();
+        if (taskId == legacyTask)
+        {
+            EXPECT_EQ("installed", task["status"].get<std::string>());
+            EXPECT_EQ("旧任务收尾", task["message"].get<std::string>());
+        } else
+        {
+            EXPECT_EQ(boundTask, taskId);
+            EXPECT_EQ("pending", task["status"].get<std::string>()) << "回退只能命中 command_id=0 的任务";
+        }
+    }
+}
+
+// 钉住：缺失、负数、字符串与小数 commandId 都按旧行为处理，不能把 scoped 更新当成命中
+TEST_F(FleetEndpointsTest, FirmwareStatusTreatsInvalidCommandIdAsLegacy)
+{
+    const std::string  token  = login();
+    const std::int64_t nodeId = createNode(token, "firmware-invalid-command-node");
+    const std::string  fingerprint(64, '5');
+    setNodeFingerprint(nodeId, fingerprint);
+
+    EdgePulse::Firmware::FirmwareRecord record;
+    record.name                   = "Invalid Command OS";
+    record.version                = "5.3.0";
+    record.fileName               = "invalid-command-os.bin";
+    record.contentType            = "application/octet-stream";
+    record.sha256                 = std::string(64, 'd');
+    record.storagePath            = (m_storage / "invalid-command-os.bin").string();
+    const std::int64_t firmwareId = m_runner.run(m_firmware->create(m_runner.loop(), record));
+    ASSERT_GT(firmwareId, 0);
+
+    const std::int64_t firstTask  = 900000000000000207;
+    const std::int64_t secondTask = 900000000000000208;
+    insertFirmwareTask(m_context->databasePath(), firstTask, 1, firmwareId, nodeId, 61);
+    insertFirmwareTask(m_context->databasePath(), secondTask, 1, firmwareId, nodeId, 62);
+
+    const std::vector<AsynGyanis::Base::ConfigValue> bodies{
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "缺失命令号"}}),
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "负数命令号"}, {"commandId", -1}}),
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "字符串命令号"}, {"commandId", "41"}}),
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeId}, {"status", "installed"}, {"progress", 100}, {"message", "小数命令号"}, {"commandId", 41.5}})};
+    for (const AsynGyanis::Base::ConfigValue &body: bodies)
+    {
+        const auto status = m_server->post("/api/agent/firmware/" + std::to_string(firmwareId) + "/status", body.dump(), "application/json", agentHeaders(fingerprint));
+        ASSERT_EQ(200, status.status) << status.body;
+        EXPECT_EQ(secondTask, (*status.json())["data"]["id"].get<std::int64_t>()) << body.dump();
+    }
+
+    const auto tasks = m_server->get("/api/firmware/" + std::to_string(firmwareId) + "/tasks", bearer(token));
+    ASSERT_EQ(200, tasks.status) << tasks.body;
+    const auto json = tasks.json();
+    ASSERT_TRUE(json.has_value());
+    ASSERT_EQ(2, (*json)["data"].size());
+    for (const auto &task: (*json)["data"])
+    {
+        EXPECT_EQ("installed", task["status"].get<std::string>());
+        EXPECT_EQ("小数命令号", task["message"].get<std::string>());
+    }
+}
+
 // 钉住：心跳上报的已安装固件版本落到节点并随节点 JSON 返回；旧 Agent 不传或传空时保留原值
 TEST_F(FleetEndpointsTest, HeartbeatPersistsInstalledFirmwareVersion)
 {
@@ -1230,6 +1351,22 @@ TEST_F(FleetEndpointsTest, HeartbeatPersistsInstalledFirmwareVersion)
     const auto afterLegacy = m_server->get("/api/nodes/" + std::to_string(nodeId), bearer(token));
     ASSERT_EQ(200, afterLegacy.status) << afterLegacy.body;
     EXPECT_EQ("2.1.0", (*afterLegacy.json())["data"]["installedFirmwareVersion"].get<std::string>());
+
+    // WebSocket hello 复用同一条心跳写库路径但不带已安装版本，不能把 HTTP 心跳写下的版本清空
+    auto                              promise = std::make_shared<std::promise<WebSocketProbeResult>>();
+    std::future<WebSocketProbeResult> future  = promise->get_future();
+    AsynGyanis::Core::Task<>          probe   = performWebSocketProbe(m_server->loop(), m_server->port(), token, nodeId, promise);
+    m_server->loop().scheduler().scheduleRemote(probe.handle());
+    m_probeTasks.push_back(std::move(probe));
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{10})) << "WebSocket 探针未在时限内完成";
+    const WebSocketProbeResult socketResult = future.get();
+    ASSERT_TRUE(socketResult.error.empty()) << socketResult.error;
+    ASSERT_TRUE(socketResult.connected);
+
+    const auto afterWebSocket = m_server->get("/api/nodes/" + std::to_string(nodeId), bearer(token));
+    ASSERT_EQ(200, afterWebSocket.status) << afterWebSocket.body;
+    EXPECT_EQ("protocol-test", (*afterWebSocket.json())["data"]["agentVersion"].get<std::string>()) << "WS hello 心跳仍应更新 Agent 版本";
+    EXPECT_EQ("2.1.0", (*afterWebSocket.json())["data"]["installedFirmwareVersion"].get<std::string>()) << "WS hello 心跳不能清空已安装版本";
 }
 
 // 钉住：签名上传落库、下载下发签名头，策略端点读回信任键，篡改或缺 key id 都拒绝
@@ -1783,6 +1920,18 @@ TEST_F(FleetEndpointsTest, FirmwareCanaryAndRollback)
     ASSERT_TRUE(rollbackJson.has_value());
     ASSERT_EQ(1, (*rollbackJson)["data"].size());
     EXPECT_EQ(firstId, (*rollbackJson)["data"][0]["toFirmwareId"].get<std::int64_t>());
+    const std::int64_t rollbackTaskId    = (*rollbackJson)["data"][0]["taskId"].get<std::int64_t>();
+    const std::int64_t rollbackCommandId = (*rollbackJson)["data"][0]["commandId"].get<std::int64_t>();
+    EXPECT_EQ(rollbackCommandId, firmwareTaskCommandId(m_context->databasePath(), rollbackTaskId));
+
+    const auto rollbackStatus = m_server->post(
+            "/api/agent/firmware/" + std::to_string(firstId) + "/status",
+            AsynGyanis::Base::ConfigValue::object({{"nodeId", nodeA}, {"status", "installed"}, {"progress", 100}, {"message", "回滚完成"}, {"commandId", rollbackCommandId}})
+                    .dump(),
+            "application/json", agentHeaders(fingerprintA));
+    ASSERT_EQ(200, rollbackStatus.status) << rollbackStatus.body;
+    EXPECT_EQ(rollbackTaskId, (*rollbackStatus.json())["data"]["id"].get<std::int64_t>());
+    EXPECT_EQ("installed", (*rollbackStatus.json())["data"]["status"].get<std::string>());
 }
 
 // 钉住：平台管理员可把节点与固件建到指定租户，租户管理员只看到自己的

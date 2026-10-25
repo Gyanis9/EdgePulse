@@ -261,6 +261,28 @@ namespace EdgePulse::Firmware
                 });
     }
 
+    AsynGyanis::Core::Task<bool> FirmwareRepository::bindTaskCommand(AsynGyanis::Core::EventLoop &loop, const std::int64_t taskId, const std::int64_t commandId)
+    {
+        if (commandId <= 0)
+        {
+            co_return false;
+        }
+        co_return co_await m_database->withConnection<bool>(loop,
+                                                            [taskId, commandId, tenant = m_tenant](DatabaseConnection &connection) -> bool
+                                                            {
+                                                                std::vector<DatabaseValue> parameters{commandId, taskId};
+                                                                std::string                clause;
+                                                                if (!tenant.allTenants)
+                                                                {
+                                                                    clause = " AND tenant_id = ?";
+                                                                    parameters.emplace_back(tenant.tenantId);
+                                                                }
+                                                                const auto update = Sql::executeOrThrow(
+                                                                        connection, "UPDATE biz_firmware_task SET command_id = ? WHERE id = ?" + clause, parameters);
+                                                                return update->affectedRowCount() > 0;
+                                                            });
+    }
+
     AsynGyanis::Core::Task<std::int64_t> FirmwareRepository::latestOtherFirmware(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, const std::int64_t excludeFirmwareId)
     {
         co_return co_await m_database->withConnection<std::int64_t>(
@@ -335,23 +357,38 @@ namespace EdgePulse::Firmware
                 [firmwareId, nodeId, status = std::move(status), progress, message = std::move(message), commandId,
                  tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareTaskRecord>
                 {
-                    std::vector<DatabaseValue> updateParameters{status, static_cast<std::int64_t>(progress), message, Common::nowDateTimeUtc(), firmwareId, nodeId};
-                    std::string                clause;
-                    if (commandId != 0)
+                    const auto applyUpdate = [&](const bool legacyOnly)
                     {
-                        // 灰度状态回报带命令号：只落对应任务，避免同节点同固件的旧任务被一并改写
-                        clause = " AND command_id = ?";
-                        updateParameters.emplace_back(commandId);
-                    }
-                    if (!tenant.allTenants)
+                        std::vector<DatabaseValue> parameters{status, static_cast<std::int64_t>(progress), message, Common::nowDateTimeUtc(), firmwareId, nodeId};
+                        std::string                clause;
+                        if (commandId != 0)
+                        {
+                            // 升级前建立的任务没有命令号；只有在按命令更新落空时才回退到这些行
+                            clause = legacyOnly ? " AND command_id = 0" : " AND command_id = ?";
+                            if (!legacyOnly)
+                            {
+                                parameters.emplace_back(commandId);
+                            }
+                        }
+                        if (!tenant.allTenants)
+                        {
+                            clause += " AND tenant_id = ?";
+                            parameters.emplace_back(tenant.tenantId);
+                        }
+                        const auto update = Sql::executeOrThrow(
+                                connection, "UPDATE biz_firmware_task SET status = ?, progress = ?, message = ?, updated_at = ? WHERE firmware_id = ? AND node_id = ?" + clause,
+                                parameters);
+                        return update->affectedRowCount();
+                    };
+
+                    auto matched        = applyUpdate(false);
+                    bool legacyFallback = false;
+                    if (matched == 0 && commandId != 0)
                     {
-                        clause += " AND tenant_id = ?";
-                        updateParameters.emplace_back(tenant.tenantId);
+                        matched        = applyUpdate(true);
+                        legacyFallback = matched > 0;
                     }
-                    const auto update = Sql::executeOrThrow(
-                            connection, "UPDATE biz_firmware_task SET status = ?, progress = ?, message = ?, updated_at = ? WHERE firmware_id = ? AND node_id = ?" + clause,
-                            updateParameters);
-                    if (update->affectedRowCount() == 0)
+                    if (matched == 0)
                     {
                         return std::nullopt;
                     }
@@ -359,8 +396,11 @@ namespace EdgePulse::Firmware
                     std::string                queryClause;
                     if (commandId != 0)
                     {
-                        queryClause = " AND t.command_id = ?";
-                        queryParameters.emplace_back(commandId);
+                        queryClause = legacyFallback ? " AND t.command_id = 0" : " AND t.command_id = ?";
+                        if (!legacyFallback)
+                        {
+                            queryParameters.emplace_back(commandId);
+                        }
                     }
                     if (!tenant.allTenants)
                     {

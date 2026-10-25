@@ -106,7 +106,7 @@ Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、
 
 命令批量与计划：`POST /api/commands/batch`，正文 `{nodeIds[1-100],type,payload,timeoutSeconds,scheduledAt?}`，返回 `{batchId,commands}`；`scheduledAt` 为 `YYYY-MM-DD HH:MM:SS`（UTC），到点前 Agent 轮询取不到。
 
-固件灰度与回滚：`POST /api/firmware/{id}/deploy` 的正文可带 `batchSize`，返回 `{deployed,deferredNodeIds}`；不带 `batchSize` 时仍返回旧的数组形状。`POST /api/firmware/{id}/rollback` 正文 `{nodeIds}`，按任务记录的上一版本重新下发。
+固件灰度与回滚：`POST /api/firmware/{id}/deploy` 的正文可带 `batchSize`，返回 `{deployed,deferredNodeIds}`；不带 `batchSize` 时仍返回旧的数组形状。`POST /api/firmware/{id}/rollback` 正文 `{nodeIds}`，按任务记录的上一版本重新下发。两个接口的每个已下发条目都带 `taskId` 与 `commandId`，任务行在命令发布前绑定该命令号。
 
 ### 2.1 API 令牌
 
@@ -224,7 +224,7 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 | PUT/DELETE | `/api/node-groups/{id}` | `device:node:write`；仍有子分组或节点时 409 |
 | GET | `/api/ws` | WebSocket；升级后首条消息认证 |
 
-节点字段：`id,name,status,agentVersion,certFingerprint,certNotAfter,previousCertFingerprint,previousCertNotAfter,certRevokedAt,labels,lastSeen,groupId,groupName,version`。`status` 为 `online` 或 `offline`；证书字段可空，吊销后当前与上一枚指纹都为空且 `certRevokedAt` 有值。`previousCertFingerprint` 与 `previousCertNotAfter` 是自动续期留下的重叠窗口；`previousCertNotAfter` 已过或为空时旧指纹不再被接受。
+节点字段：`id,name,status,agentVersion,installedFirmwareVersion,certFingerprint,certNotAfter,previousCertFingerprint,previousCertNotAfter,certRevokedAt,labels,lastSeen,groupId,groupName,version`。`status` 为 `online` 或 `offline`；`installedFirmwareVersion` 由 Agent 心跳上报，空串表示尚未安装或旧 Agent 未上报，空值不会清空已记录版本。证书字段可空，吊销后当前与上一枚指纹都为空且 `certRevokedAt` 有值。`previousCertFingerprint` 与 `previousCertNotAfter` 是自动续期留下的重叠窗口；`previousCertNotAfter` 已过或为空时旧指纹不再被接受。
 
 节点生命周期：超过 `edgepulse.agent.heartbeat_timeout_seconds` 未心跳的在线节点会被后台扫描置为 `offline`，并生成 `metric=node.online`、级别 `critical` 的系统告警；恢复心跳后节点回到 `online`，告警自动置为 `resolved`。手工建节点在首次心跳前不参与离线扫描。
 
@@ -294,14 +294,14 @@ curl -X POST http://127.0.0.1:8080/api/commands \
 |---|---|---|
 | POST | `/api/agent/register` | `{name,agentVersion,certFingerprint,labels?,tenantCode?,enrollmentToken?}`；tenantCode 缺省 `default`；`certFingerprint` 必须与这条 mTLS 连接出示的叶证书一致 |
 | POST | `/api/agent/certificate/renew` | `{nodeId,csrPem}` → `{certificatePem,fingerprint,notBefore,notAfter,serial}`；见 6.1 |
-| POST | `/api/agent/heartbeat` | `{nodeId,agentVersion}`；响应是节点记录并加 `desiredConfigVersion` 与 `heartbeatIntervalSeconds` |
+| POST | `/api/agent/heartbeat` | `{nodeId,agentVersion,installedFirmwareVersion?}`；`installedFirmwareVersion` 缺省或空串保留节点原值；响应是节点记录并加 `desiredConfigVersion` 与 `heartbeatIntervalSeconds` |
 | POST | `/api/agent/telemetry` | `{nodeId,samples:[{metric,value,unit?,collectedAt?,labels?}]}`，1–500 条 |
 | GET | `/api/agent/commands/next?nodeId=` | 取最早待执行命令并置 running；无命令时 data 为 null |
 | POST | `/api/agent/commands/{id}/result` | `{nodeId,status,result,message}` |
 | GET | `/api/agent/nodes/{id}/config` | `{version,content,hash}`；从未下发时为 `{version:0,content:{},hash:""}` |
 | POST | `/api/agent/nodes/{id}/config/report` | `{version,content?,status:'applied'|'failed'|'pending',message?}`；返回完整配置视图与 `inSync` |
 | GET | `/api/agent/firmware/{id}/download?nodeId=` | 必须带 `nodeId`；支持 `ETag`/`If-None-Match` 与单段 `Range`；签名固件回传三个 `X-Firmware-*` 头 |
-| POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message}` |
+| POST | `/api/agent/firmware/{id}/status` | `{nodeId,status,progress,message,commandId?}`；`status` 取 `pending`、`downloading`、`installing`、`installed`、`failed`；`commandId` 只推进该命令关联的任务，缺省、负数或非整数按旧行为更新同固件同节点的全部任务；带命令号但命中不到任务时回退到 `command_id=0` 的在途旧任务 |
 | GET | `/api/agent/ws` | WebSocket；首条 `{"type":"hello","nodeId":...}`；接收 `command.result` |
 
 注册模式由 `edgepulse.agent.enrollment_mode` 决定：`required` 时新节点必须带 `enroll` 令牌、已有节点换证书必须带 `rebind` 令牌，同指纹重注册不需要令牌；`off` 只校验 mTLS CA 链与可选指纹白名单。令牌条件还校验租户、动作与 `nodeName`，缺令牌或令牌不可用统一返回 403，不区分过期、已用或名字不符。

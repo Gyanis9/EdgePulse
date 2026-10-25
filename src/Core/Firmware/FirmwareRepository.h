@@ -139,6 +139,16 @@ namespace EdgePulse::Firmware
                                                         std::int64_t rolloutId = 0, std::int64_t waveId = 0, std::int64_t commandId = 0);
 
         /**
+         * @brief 把任务绑定到下发它的命令
+         * @param loop 恢复协程用的事件循环
+         * @param taskId 任务标识
+         * @param commandId 命令标识，必须大于 0
+         * @return bool 任务存在且写入成功时为 true
+         * @note 手动下发与回滚先建任务再建命令，命令标识只能在这一步回填，且必须早于发布命令
+         */
+        AsynGyanis::Core::Task<bool> bindTaskCommand(AsynGyanis::Core::EventLoop &loop, std::int64_t taskId, std::int64_t commandId);
+
+        /**
          * @brief 节点最近一次安装过的其他版本
          * @param loop 恢复协程用的事件循环
          * @param nodeId 节点
@@ -174,6 +184,8 @@ namespace EdgePulse::Firmware
          * @param message 说明
          * @param commandId 只更新该命令关联的任务；0 表示按固件与节点更新全部任务
          * @return std::optional<FirmwareTaskRecord> 更新后的任务
+         * @note 指定 commandId 但命中不到任务时，只在 command_id 为 0 的在途旧任务上重试一次；
+         *       旧任务建立在命令号写入任务之前，不带命令号则无法回报
          */
         AsynGyanis::Core::Task<std::optional<FirmwareTaskRecord>> updateTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t nodeId, std::string status,
                                                                              int progress, std::string message, std::int64_t commandId = 0);
