@@ -162,7 +162,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `edgepulse.agent.heartbeat_timeout_seconds` | `30` | `90` | 超过该时长未心跳即转离线 |
 | `edgepulse.agent.offline_sweep_seconds` | `5` | `30` | 离线扫描周期，必须小于心跳超时 |
 | `edgepulse.agent_ca.enabled` | `true` | `false` | 启用控制面内部 CA，Agent 可用 `POST /api/agent/certificate/renew` 提交 CSR 换证 |
-| `edgepulse.agent_ca.certificate_file` | `var/certs/ca.pem` | `/etc/edgepulse/tls/ca.pem` | 签发 CA；必须就是 9443 的信任锚（或包含在拼接信任包里），启动按 SHA-256 指纹核对 |
+| `edgepulse.agent_ca.certificate_file` | `var/certs/ca.pem` | `/etc/edgepulse/tls/ca.pem` | 签发 CA；9443 监听开启时必须就是它的信任锚（或包含在拼接信任包里），启动按 SHA-256 指纹核对；监听关闭时不做这项比对 |
 | `edgepulse.agent_ca.key_file` | `var/certs/ca-key.pem` | `/etc/edgepulse/agent-ca-key.pem` | CA 私钥独立路径，POSIX 上要求 0600，不要放进公开证书卷、镜像或版本库 |
 | `edgepulse.agent_ca.validity_days` / `overlap_hours` | `30` / `24` | `30` / `24` | 新证书有效期（1–3650 天）与旧指纹重叠窗口（1–168 小时） |
 | `edgepulse.firmware.require_signature` | `false` | `true` | 开启后未签名固件不能上传、部署或回滚 |
@@ -304,7 +304,7 @@ python scripts/check-docker-stack.py --build
 Linux 节点侧准备：
 
 - 节点证书、私钥与 CA 默认读取 `/etc/edgepulse/agent.pem`、`/etc/edgepulse/agent-key.pem` 与 `/etc/edgepulse/ca.pem`，私钥权限保持 0600。开发环境可先运行 `bash scripts/dev-certs.sh`，再用 `bash scripts/gen-agent-certs.sh <节点名> [--days <天数>] [--out-dir <目录>]` 为单个节点签发证书。
-- 自动续期由 `agent.certificate.renew_before_days`（默认 7，1–90）与 `renewal_check_seconds`（默认 3600，60–86400）控制：剩余有效期进入提前窗口后生成新私钥与 CSR 调续期端点，校验服务端签回的链与有效期，原子替换证书后热切换 HTTP 与 WebSocket，进程不重启。控制面返回 403 时停止自动续期，需要重新签发 `rebind` 令牌并重新入场；其余可重试失败按 5/10/30/60/300 秒退避，HTTP 400 的退避上限放宽到一小时。
+- 自动续期由 `agent.certificate.renewal_enabled`（默认 true）、`renew_before_days`（默认 7，1–90）与 `renewal_check_seconds`（默认 3600，60–86400）控制：剩余有效期进入提前窗口后生成新私钥与 CSR 调续期端点，校验服务端签回的链与有效期，原子替换证书后热切换 HTTP 与 WebSocket，进程不重启。使用外部 CA 时把 `renewal_enabled` 置 false，Agent 不启动续期循环，证书到期前按 `rebind` 流程手工换证。控制面返回 403 时停止自动续期，需要重新签发 `rebind` 令牌并重新入场；其余可重试失败按 5/10/30/60/300 秒退避，HTTP 400 在默认序列上最长等待 20 分钟（300 秒 × 4）。
 - 在控制台签发一次性的 `enroll` 令牌（已有节点更换证书时签发 `rebind`），安装后写入 `/etc/edgepulse-agent/agent.env`，例如 `EDGEPULSE_AGENT_ENROLLMENT_TOKEN=...`。令牌只从环境变量读取，不写 YAML、不写日志。
 
 安装与卸载（Linux）：

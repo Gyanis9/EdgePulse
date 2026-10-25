@@ -336,7 +336,7 @@ Agent 请求没有会话：命令、固件任务、遥测都按目标节点/固�
 | 500 | 签发失败或轮换写库失败 |
 | 503 | `edgepulse.agent_ca.enabled=false` 或 CA 未加载 |
 
-窗口内旧指纹可以继续完成心跳、遥测、命令与续期；`previousCertNotAfter` 到期后立即 403。吊销 `POST /api/nodes/{id}/certificate/revoke` 会同时清空当前与重叠指纹，并把历史里的 active/previous 行标为 `revoked`。节点详情返回 `previousCertFingerprint` 与 `previousCertNotAfter` 供排障。
+窗口内旧指纹可以继续完成心跳、遥测、命令与续期；`previousCertNotAfter` 到期后立即 403。吊销 `POST /api/nodes/{id}/certificate/revoke` 会同时清空当前与重叠指纹，并把历史里的 active/previous 行标为 `revoked`。节点详情返回 `previousCertFingerprint` 与 `previousCertNotAfter` 供排障。控制面未启用内部 CA（签发返回 503）或使用外部 CA 时，Agent 应设置 `agent.certificate.renewal_enabled: false`，按 `rebind` 流程手工换证。
 
 ### UDP 遥测数据报
 

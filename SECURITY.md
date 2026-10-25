@@ -64,12 +64,12 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 - 数据库、Redis、运维口、UDP 遥测、OIDC、两步验证与初始口令提示只从环境变量读取：`EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`、`EDGEPULSE_MFA_KEY`、`EDGEPULSE_INITIAL_PASSWORD`。`EDGEPULSE_MFA_KEY` 用 `openssl rand -base64 32` 生成，同一数据库的所有实例共用同一值，与数据库备份分开保管。
 - 固件签名私钥留在签名工作站或密钥管理系统，只把公钥分发到各实例的 `trusted_keys_dir`；不要复用历史 key id 覆盖公钥，轮换时使用新文件名并在确认旧固件不再需要后移除旧公钥。
 - 服务器证书与私钥放在 `cert_dir` 指向的目录，Agent 客户端证书的信任锚是同一目录的 `ca.pem`。证书文件权限只给服务账号读取。
-- `edgepulse.agent_ca.key_file` 是签发 Agent 证书的 CA 私钥，必须放在公开证书卷之外的独立路径、仅服务账号可读（POSIX 上启动时要求 0600 或更严），不要与 `cert_dir` 一起挂进容器、写进镜像或提交到版本库。`edgepulse.agent_ca.certificate_file` 必须与 9443 的信任锚一致：`ca.pem` 是拼接信任包时，签发 CA 必须包含在其中，启动时按 SHA-256 指纹核对。
+- `edgepulse.agent_ca.key_file` 是签发 Agent 证书的 CA 私钥，必须放在公开证书卷之外的独立路径、仅服务账号可读（POSIX 上启动时要求 0600 或更严），不要与 `cert_dir` 一起挂进容器、写进镜像或提交到版本库。`edgepulse.agent_ca.certificate_file` 在 9443 监听开启时必须与它的信任锚一致：`ca.pem` 是拼接信任包时，签发 CA 必须包含在其中，启动时按 SHA-256 指纹核对；9443 监听关闭时不做这项比对。
 - CA 轮换：先把新旧两张 CA 一起放进 9443 的信任包，再切换 `agent_ca.certificate_file` 与 `key_file`，用续期或 `rebind` 确认新证书能通过握手；旧 CA 签发的 Agent 全部换证后再移除旧信任锚。CA 私钥泄露时按事故处理：立即停用内部 CA、吊销受影响节点证书，并要求重新入场。
 
 ### 证书轮换
 
-日常到期优先使用自动续期：Agent 按 `agent.certificate.renew_before_days` 进入提前窗口后生成新私钥与 CSR，调用 `POST /api/agent/certificate/renew`，服务端签发后把新指纹写成当前值、旧指纹写成重叠值；Agent 安装并热切换 HTTP 与 WebSocket，进程不重启。自动续期不是 rebind：节点标识、租户、注册令牌状态与历史记录都保留，旧证书只在 `overlap_hours` 内可用；吊销会同时清空当前与重叠指纹。
+日常到期优先使用自动续期：Agent 按 `agent.certificate.renew_before_days` 进入提前窗口后生成新私钥与 CSR，调用 `POST /api/agent/certificate/renew`，服务端签发后把新指纹写成当前值、旧指纹写成重叠值；Agent 安装并热切换 HTTP 与 WebSocket，进程不重启。自动续期不是 rebind：节点标识、租户、注册令牌状态与历史记录都保留，旧证书只在 `overlap_hours` 内可用；吊销会同时清空当前与重叠指纹。使用外部 CA 或控制面未启用内部 CA 时，Agent 侧应设置 `agent.certificate.renewal_enabled: false`，不启动续期循环，按下面的手工流程换证。
 
 下列手工流程用于关闭内部 CA、Agent 收到 403（证书已吊销或需要重新准入）或需要更换外部 CA 的情况：
 
