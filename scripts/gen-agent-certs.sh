@@ -3,7 +3,7 @@
 # 用法：scripts/gen-agent-certs.sh <agent-name> [--days <有效期天数>] [--out-dir <输出目录>]
 # 省略有效期时按 825 天签发；省略输出目录时写入 var/certs。
 set -euo pipefail
-# 中间文件与私钥默认只对当前用户可读；证书最终权限由下面显式收紧
+# 中间文件与私钥从创建起就只对当前用户可读；证书是公开材料，下面显式放开到 0644
 umask 077
 
 
@@ -107,6 +107,17 @@ if ! chmod 600 "${key_file}" 2>/dev/null; then
             ;;
         *)
             echo "无法把私钥权限收紧到 0600：${key_file}" >&2
+            exit 1
+            ;;
+    esac
+fi
+# 证书不含私密材料，与私钥分开设置，便于 Agent 服务账号或其他工具读取
+if ! chmod 644 "${certificate_file}" 2>/dev/null; then
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            ;;
+        *)
+            echo "无法把证书权限设置为 0644：${certificate_file}" >&2
             exit 1
             ;;
     esac

@@ -1323,6 +1323,18 @@ def run(session: Session) -> None:
     check_tokens_not_leaked(session, enrollment_token, rebind_token, renewal_token)
 
 
+def renewal_summary() -> str:
+    """汇总自动续期场景的最终状态；只有本轮无失败、无跳过时才报告已执行。"""
+    renewal_skips = [name for name in skips if name.startswith("自动续期")]
+    if renewal_skips:
+        return "已跳过（--allow-missing-renewal）" if allow_missing_renewal else "已跳过（未允许，计为失败）"
+    if failures:
+        return "未通过，见失败项"
+    if skips:
+        return "通过（其余场景有跳过）"
+    return "已执行"
+
+
 def main() -> int:
     global allow_missing_renewal
     parser = ArgumentParser(description="生产 Agent 端到端验收；自动续期默认必跑。")
@@ -1364,7 +1376,7 @@ def main() -> int:
     if not allow_missing_renewal and renewal_skips:
         failures.append("自动续期场景被跳过（未显式允许）：" + "、".join(renewal_skips))
     print(f"Agent 端到端验收：通过 {passed} 项，失败 {len(failures)} 项，跳过 {len(skips)} 项")
-    print(f"自动续期场景：{'已跳过（--allow-missing-renewal）' if renewal_skips else '已执行'}")
+    print(f"自动续期场景：{renewal_summary()}")
     if failures:
         print("失败项：" + "、".join(failures))
         return 1
