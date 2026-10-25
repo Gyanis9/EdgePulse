@@ -102,7 +102,7 @@
 
 Webhook 地址在创建与修改时做 SSRF 校验：解析到私网、回环、CGNAT、组播、保留或文档示例段默认拒绝；云元数据主机名、已知元数据端点与 IPv4/IPv6 链路本地段始终拒绝。`allow_private_webhooks=true` 会跳过整个私网/保留段分类，普通私网、回环、CGNAT、组播、保留与文档示例段（含 IPv6 唯一本地地址）都会放行，云元数据与链路本地地址仍拒绝；它只适合受信的自托管网关，不是只放行 RFC1918 的窄开关。命中校验返回 400，错误文案说明命中的地址或主机。
 
-命令批次取消：`PUT /api/commands/batch/{batchId}/cancel`，取消批次内 pending/running 命令并返回被取消列表。
+命令批次取消：`PUT /api/commands/batch/{batchId}/cancel`，取消批次内 pending/running 命令并返回被取消列表。取消只做服务端记账，已经取走的命令不会被 Agent 中断；Agent 迟到的 `installed` 回报不能把已取消或已失败的任务改回已安装。
 
 命令批量与计划：`POST /api/commands/batch`，正文 `{nodeIds[1-100],type,payload,timeoutSeconds,scheduledAt?}`，返回 `{batchId,commands}`；`scheduledAt` 为 `YYYY-MM-DD HH:MM:SS`（UTC），到点前 Agent 轮询取不到。
 

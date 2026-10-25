@@ -284,7 +284,7 @@ running/paused/failed -> rolling_back -> rolled_back | rollback_unavailable | fa
 - 命令必须 `succeeded`；任务必须绑定同一 `commandId` 并进入 `installed`，任务自身的 `failed` 或命令 `failed/timeout/canceled` 直接判失败。
 - 节点在线，且 `lastSeen` 不早于沉降窗口结束；观察窗口结束时仍未覆盖则判失败。
 - `requireInstalledVersion=true` 时 `installedFirmwareVersion` 必须非空且等于目标版本；不一致保持等待，直到观察结束或超时。
-- 最新遥测的接收时间不早于本波派发，年龄不超过 `requiredFreshTelemetrySeconds`，采集时间不能早于派发前 300 秒。
+- 最新遥测的接收时间不早于沉降窗口结束，年龄不超过 `requiredFreshTelemetrySeconds`；接收与采集时间取同一条样本，采集时间不能早于派发前 300 秒。
 - 本波派发后新增的告警判失败，`exemptAlarmMetrics` 中的指标除外。
 - 单波/累计成功率与 `maxFailures` 同时满足才通过；乐观估计已无法达标时提前失败，观察结束仍有未定目标时失败，到达 `maxWaveSeconds` 按超时处理。
 
@@ -293,15 +293,18 @@ running/paused/failed -> rolling_back -> rolled_back | rollback_unavailable | fa
 自动回滚只重新下发历史版本，不依赖 Agent 本地槽位：
 
 - 回滚命令是新的 `firmware.update`，目标为每个目标记录的 `previousFirmwareId`，必须重新下载、验签、安装并上报版本；没有 A/B 分区、差分下载或本地快照。
-- 未下发过安装命令、没有历史版本、历史固件不存在或强制签名下历史固件未签名时，目标记为 `failed` 且 `gate=rollback_unavailable`。
+- 未下发过安装命令的目标没有可回滚现场，目标记为 `skipped`；没有历史版本、历史固件不存在或强制签名下历史固件未签名时，目标记为 `failed` 且 `gate=rollback_unavailable`。
 - 命令失败、任务失败或超时记为 `gate=rollback_failed`；全部目标确认安装历史版本后发布进入 `rolled_back`，部分无法回滚进入 `failed`，全部无法回滚进入 `rollback_unavailable`。
 - 回滚确认要求命令成功、任务 `installed` 且节点 `installedFirmwareVersion` 等于历史版本；回滚期限从进入 `rolling_back` 起算，最长 `maxWaveSeconds`。
+- 回滚覆盖整笔发布：已通过的波次一并进入 `rolling_back`，后续未派发的波次落 `skipped`；期限到达仍未确认的目标落 `failed` 且 `gate=rollback_failed`，不会悬在 `rolling_back`。
 - 进程在回滚中途重启会沿用已绑定的回滚任务与命令，不重复建单；仍在执行的安装命令与在途任务在回滚派发前会被取消，已完成的目标直接进入回滚。
+
+命令取消只做服务端记账：已经取走的命令不会被 Agent 中断，Agent 迟到的 `installed` 回报不能把 `canceled`/`failed` 任务改回已安装，服务端按终局拒绝该回报。
 
 协调与限制：
 
 - 只有 leader 的 `LeaderTick` 每 5 秒调用一次推进，服务自身不判断领导权；每个发布以头部 `version` 做比较交换，follower 不推进。leader 切换可能让某一拍或一次租约过期的推进延后。
-- V22 新增 `biz_firmware_rollout`、`biz_firmware_rollout_wave`、`biz_firmware_rollout_target`，并给任务加 `rollout_id/wave_id/command_id`、给节点加 `installed_firmware_version`；V23 增加 `(rollout_id,wave_index)` 唯一索引。迁移只追加，升级前照常备份。
+- V22 新增 `biz_firmware_rollout`、`biz_firmware_rollout_wave`、`biz_firmware_rollout_target`，并给任务加 `rollout_id/wave_id/command_id`、给节点加 `installed_firmware_version`；V23 增加 `(rollout_id,wave_index)` 唯一索引，V24 把未绑定命令的任务改成唯一负值占位并增加 `(firmware_id,node_id,command_id)` 唯一索引。迁移只追加，升级前照常备份。
 - 已知限制：目标只接受节点标识，界面没有分组选择；波次与目标的多次写入和发布头 CAS 不在同一事务，崩溃后由下一拍按目标状态继续；`listDueRollouts` 固定 `LIMIT 20`，大批积压时较新的发布会排队，已登记为 P11 审计项。
 
 节点通过心跳上报 `installedFirmwareVersion`，空值不会清空已有版本；Agent 的固件状态上报可带 `commandId`，只推进该命令绑定的任务，避免不同波次或手工下发的任务互相覆盖。
@@ -510,7 +513,7 @@ src/
 agent/        生产 Agent 源码与 Linux/Windows 打包脚本
 frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
 3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
-migrations/    SQL 迁移 V1–V23，已应用文件不可修改
+migrations/    SQL 迁移 V1–V24，已应用文件不可修改
 config/        非敏感配置样例；生产配置与信任键目录不入库
 deploy/        Docker（含 HA 编排）、nginx、systemd、Prometheus
 scripts/       证书、开发运行、固件签名、备份恢复、HA 与验收

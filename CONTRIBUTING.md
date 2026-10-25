@@ -106,7 +106,7 @@ python scripts/check-actions-status.py
 
 ## 迁移规则
 
-- 迁移文件只追加，不修改已应用文件。当前最高是 `V23__firmware_rollout_wave_unique.sql`，下一个新迁移从 `V24__*.sql` 开始。
+- 迁移文件只追加，不修改已应用文件。当前最高是 `V24__firmware_task_command_unique.sql`，下一个新迁移从 `V25__*.sql` 开始。
 - 不要改历史迁移的 SQL、文件名或校验和：`schema_migrations` 记录 SHA-256，不一致会拒绝启动。
 - 新增迁移必须同时更新 `tests/Integration/TestMigrations.cpp` 里对该版本的断言与总版本数，并在 SQLite 用例上通过；涉及 MySQL 的 DDL 还要在真机 MySQL 用例或 `scripts/check-docker-stack.py` 中验证。
 - 迁移里不写环境相关路径、明文凭据或只对单一驱动生效的语法；需要区分驱动时先确认现有迁移的做法。
