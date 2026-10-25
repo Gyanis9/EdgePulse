@@ -39,7 +39,7 @@ namespace EdgePulse::Agent
         bool                  websocketEnabled{true};                                 ///< 是否建立命令长连接
         int                   requestTimeoutSeconds{30};                              ///< 单次请求超时，单位秒
         bool                  certificateRenewalEnabled{true};                        ///< 是否启动证书自动续期循环；使用外部 CA 时可关闭
-        int                   certificateRenewBeforeDays{7};                          ///< 证书到期前多少天触发续期，1 到 90
+        int                   certificateRenewBeforeDays{0};                          ///< 续期提前量覆盖值，0 表示按规范 max(25% 生命周期, 24h)，允许 0 到 90 天
         int                   certificateRenewalCheckSeconds{3600};                   ///< 续期检查间隔，60 到 86400 秒
         std::filesystem::path stateDirectory{"var/agent"};                            ///< 状态库与运行期文件的目录
         std::filesystem::path logFile{"var/agent/agent.log"};                         ///< 日志文件路径

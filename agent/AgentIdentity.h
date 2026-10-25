@@ -23,6 +23,7 @@ namespace EdgePulse::Agent
     {
         std::string fingerprint; ///< 叶证书 SHA-256 指纹，64 位小写十六进制
         std::string expiresAt;   ///< 到期时间，形如 2026-10-24T12:00:00Z
+        std::string notBefore;   ///< 生效时间，形如 2026-10-24T12:00:00Z；与 expiresAt 一起决定生命周期
 
         /**
          * @brief 读取配置里的 CA、证书与私钥并提取身份信息

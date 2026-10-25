@@ -12,12 +12,42 @@
 #include "AgentConfiguration.h"
 #include "AgentIdentity.h"
 
+#include <chrono>
 #include <expected>
 #include <string>
 #include <string_view>
 
 namespace EdgePulse::Agent
 {
+    /// 续期窗口下限：生命周期再短也至少提前这么多开始续期
+    inline constexpr std::chrono::hours kMinimumRenewalWindow{24};
+
+    /**
+     * @brief 按证书生命周期计算续期提前窗口
+     * @param lifetime 当前证书的生命周期，未知时传 0
+     * @param renewBeforeDaysOverride 配置的覆盖天数；0 表示按规范公式
+     * @return std::chrono::seconds 提前窗口，取 max(25% 生命周期, 24h)；
+     *         覆盖值只在大于 0 且小于生命周期时生效，否则回退到规范公式
+     */
+    [[nodiscard]] std::chrono::seconds renewalWindow(std::chrono::seconds lifetime, int renewBeforeDaysOverride);
+
+    /**
+     * @brief 判断配置的续期提前量能否用于给定生命周期
+     * @param lifetime 证书生命周期，未知时传 0
+     * @param renewBeforeDaysOverride 配置的覆盖天数；0 表示自动
+     * @return bool 未配置覆盖值、或覆盖值小于生命周期时为 true
+     */
+    [[nodiscard]] bool renewalWindowOverrideValid(std::chrono::seconds lifetime, int renewBeforeDaysOverride);
+
+    /**
+     * @brief 判断一次证书安装失败是否属于不可重试的服务端签发参数错误
+     * @param reason install() 返回的中文原因
+     * @return bool 证书链、密钥配对、有效期或提前量不匹配时为 true
+     * @note 这些原因不会因为重试同一份证书而变化；继续重新签发只会把服务端
+     *       active 证书反复挤掉，必须停下来等运维修正配置
+     */
+    [[nodiscard]] bool permanentInstallFailure(std::string_view reason);
+
     /**
      * @brief 一次生成的续期材料
      */
@@ -65,17 +95,9 @@ namespace EdgePulse::Agent
         [[nodiscard]] std::expected<AgentIdentity, std::string> install(std::string_view certificatePem);
 
         /**
-         * @brief 把最近一次 install 之前的证书与私钥写回配置路径
-         * @return 成功为空；没有可恢复的上一份或写入失败时返回中文原因
-         * @note 供上层在 HTTP 通道装载新身份失败时回退；恢复成功后清空内存备份并删除磁盘备份，
-         *       重复调用返回错误
-         */
-        [[nodiscard]] std::expected<void, std::string> restorePrevious();
-
-        /**
          * @brief 丢弃本次安装留下的回退材料
-         * @details HTTP 与 WebSocket 两条通道都已装载新身份后调用：删除磁盘上的 .bak 并清空内存备份，
-         *          此后 restorePrevious() 不再可用。删除失败只记录 WARN，不影响已经生效的身份。
+         * @details HTTP 与 WebSocket 两条通道都已装载新身份后调用：删除磁盘上的 .bak 并清空内存备份。
+         *          删除失败只记录 WARN，不影响已经生效的身份。
          */
         void commitInstalledIdentity();
 

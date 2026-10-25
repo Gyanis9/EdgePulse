@@ -2,6 +2,7 @@
 
 #include "Platform/FileSystem/AtomicFileWriter.h"
 #include "Platform/FileSystem/FileSystem.h"
+#include "Platform/System/ProcessInfo.h"
 
 #include "Core/Tls/TlsContext.h"
 #include "Core/Tls/TlsPolicy.h"
@@ -17,8 +18,10 @@
 #include <openssl/x509.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -285,34 +288,63 @@ namespace EdgePulse::Agent
         }
 
         /**
-         * @brief 检查证书剩余有效期是否超过续期提前窗口
-         * @param certificate 叶证书
-         * @param renewBeforeDays 续期提前天数
-         * @return 成功为空；剩余有效期不足以跨过窗口时返回中文原因
-         * @details 新证书的剩余有效期不比续期窗口长时，装好后立刻又会进入续期判定，形成换证循环；
-         *          这种情况按服务端签发参数错误处理，留在旧证书上等下一轮退避
+         * @brief 把 ASN.1 时间转成 UTC 时间戳
+         * @param value 证书里的时间字段
+         * @return 成功返回时间戳；格式无法解析或换算失败时为空
          */
-        [[nodiscard]] std::expected<void, std::string> verifyLifetimeBeyondRenewWindow(X509 &certificate, const int renewBeforeDays)
+        [[nodiscard]] std::optional<std::time_t> utcTimeOf(const ASN1_TIME *value)
         {
-            tm expires{};
-            if (ASN1_TIME_to_tm(X509_get0_notAfter(&certificate), &expires) != 1)
+            tm parsed{};
+            if (value == nullptr || ASN1_TIME_to_tm(value, &parsed) != 1)
             {
-                return std::unexpected("服务端返回的证书到期时间无法解析");
+                return std::nullopt;
             }
 #ifdef _WIN32
-            const std::time_t seconds = _mkgmtime(&expires);
+            const std::time_t seconds = _mkgmtime(&parsed);
 #else
-            const std::time_t seconds = timegm(&expires);
+            const std::time_t seconds = timegm(&parsed);
 #endif
             if (seconds == static_cast<std::time_t>(-1))
             {
-                return std::unexpected("服务端返回的证书到期时间无法转换成时钟时刻");
+                return std::nullopt;
             }
-            const auto remaining = std::chrono::system_clock::from_time_t(seconds) - std::chrono::system_clock::now();
-            const auto window    = std::chrono::days{std::clamp(renewBeforeDays, 1, 90)};
+            return seconds;
+        }
+
+        /**
+         * @brief 检查证书剩余有效期是否超过续期提前窗口
+         * @param certificate 叶证书
+         * @param renewBeforeDays 配置的续期提前天数覆盖值，0 表示按规范公式
+         * @return 成功为空；剩余有效期不足以跨过窗口时返回中文原因
+         * @details 窗口取 max(25% 生命周期, 24h)，生命周期由证书自身的 notBefore 与 notAfter 决定；
+         *          配置的覆盖值只在小于生命周期时生效。覆盖值不小于生命周期说明服务端有效期与
+         *          Agent 配置互相矛盾，按不可重试的配置错误拒绝安装，避免装好后立刻又进入续期窗口。
+         */
+        [[nodiscard]] std::expected<void, std::string> verifyLifetimeBeyondRenewWindow(X509 &certificate, const int renewBeforeDays)
+        {
+            const auto start = utcTimeOf(X509_get0_notBefore(&certificate));
+            const auto end   = utcTimeOf(X509_get0_notAfter(&certificate));
+            if (!start.has_value() || !end.has_value())
+            {
+                return std::unexpected("服务端返回的证书生效或到期时间无法解析");
+            }
+            const auto lifetime = std::chrono::seconds{*end - *start};
+            if (lifetime <= std::chrono::seconds::zero())
+            {
+                return std::unexpected("服务端返回的证书有效期不是正数，拒绝安装");
+            }
+            if (renewBeforeDays > 0 && !renewalWindowOverrideValid(lifetime, renewBeforeDays))
+            {
+                const auto lifetimeHours = std::chrono::duration_cast<std::chrono::hours>(lifetime).count();
+                return std::unexpected("服务端返回的证书有效期 " + std::to_string(lifetimeHours) + " 小时，不大于配置的续期提前量 " + std::to_string(renewBeforeDays) +
+                                       " 天（agent.certificate.renew_before_days）；请把它设为 0 或小于证书有效期");
+            }
+            const auto window    = renewalWindow(lifetime, renewBeforeDays);
+            const auto remaining = std::chrono::system_clock::from_time_t(*end) - std::chrono::system_clock::now();
             if (remaining <= window)
             {
-                return std::unexpected("服务端返回的证书剩余有效期不超过续期提前量（" + std::to_string(window.count()) + " 天），拒绝安装");
+                const auto windowHours = std::chrono::duration_cast<std::chrono::hours>(window).count();
+                return std::unexpected("服务端返回的证书剩余有效期不超过续期提前量（" + std::to_string(windowHours) + " 小时），拒绝安装");
             }
             return {};
         }
@@ -454,7 +486,102 @@ namespace EdgePulse::Agent
             }
             return {};
         }
+
+        /**
+         * @brief 原子写入私钥，避免临时文件在设置权限前被其他账户读到
+         * @param targetPath 正式私钥路径
+         * @param privateKeyPem 私钥 PEM 正文
+         * @return 成功为空；失败返回中文原因
+         * @details AtomicFileWriter 先按进程默认权限创建临时文件，写完才改成 0600。
+         *          POSIX 上目录若允许同组读取，这段窗口里私钥可被读到。这里先在同级建 0700
+         *          暂存目录，在目录内完成临时写入与改名，再把结果改名到正式路径；暂存目录本身
+         *          挡住其他账户，写入结束后递归删除。Windows 的目录 ACL 已限定服务账户，直接写。
+         */
+        [[nodiscard]] std::expected<void, std::string> writePrivateKeyFile(const std::filesystem::path &targetPath, const std::string &privateKeyPem)
+        {
+            std::string writeError;
+#ifdef _WIN32
+            if (!AsynGyanis::Platform::AtomicFileWriter::writeText(targetPath, privateKeyPem, kPrivateKeyPermissions, &writeError))
+            {
+                return std::unexpected(writeError);
+            }
+            return {};
+#else
+            static std::atomic<std::uint32_t> stagingCounter{0};
+            const auto stagingDirectory       = targetPath.parent_path() / (".private-key-stage." + std::to_string(AsynGyanis::Platform::ProcessInfo::currentProcessId()) + "." +
+                                                                            std::to_string(stagingCounter.fetch_add(1, std::memory_order_relaxed)));
+            const auto removeStagingDirectory = [&stagingDirectory]()
+            {
+                std::error_code cleanupError;
+                std::filesystem::remove_all(stagingDirectory, cleanupError);
+            };
+
+            std::error_code directoryError;
+            std::filesystem::create_directories(stagingDirectory, directoryError);
+            if (directoryError)
+            {
+                return std::unexpected("创建私钥暂存目录失败：" + AsynGyanis::Platform::FileSystem::utf8FromPath(stagingDirectory) + "：" + directoryError.message());
+            }
+            std::filesystem::permissions(stagingDirectory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, directoryError);
+            if (directoryError)
+            {
+                removeStagingDirectory();
+                return std::unexpected("设置私钥暂存目录权限失败：" + AsynGyanis::Platform::FileSystem::utf8FromPath(stagingDirectory) + "：" + directoryError.message());
+            }
+
+            const auto stagedPath = stagingDirectory / targetPath.filename();
+            if (!AsynGyanis::Platform::AtomicFileWriter::writeText(stagedPath, privateKeyPem, kPrivateKeyPermissions, &writeError))
+            {
+                removeStagingDirectory();
+                return std::unexpected(writeError);
+            }
+            std::filesystem::rename(stagedPath, targetPath, directoryError);
+            removeStagingDirectory();
+            if (directoryError)
+            {
+                return std::unexpected("替换私钥文件失败：" + AsynGyanis::Platform::FileSystem::utf8FromPath(targetPath) + "：" + directoryError.message());
+            }
+            return {};
+#endif
+        }
     } // namespace
+
+    std::chrono::seconds renewalWindow(const std::chrono::seconds lifetime, const int renewBeforeDaysOverride)
+    {
+        if (renewBeforeDaysOverride > 0)
+        {
+            const auto configured = std::chrono::hours{24} * renewBeforeDaysOverride;
+            // 生命周期未知时无法比较，仍按配置执行；已知且覆盖值不小于生命周期时退回规范公式
+            if (lifetime <= std::chrono::seconds::zero() || configured < lifetime)
+            {
+                return configured;
+            }
+        }
+        if (lifetime <= std::chrono::seconds::zero())
+        {
+            return std::chrono::seconds{kMinimumRenewalWindow};
+        }
+        // 规范窗口：max(25% 生命周期, 24h)
+        return std::max(lifetime / 4, std::chrono::seconds{kMinimumRenewalWindow});
+    }
+
+    bool renewalWindowOverrideValid(const std::chrono::seconds lifetime, const int renewBeforeDaysOverride)
+    {
+        if (renewBeforeDaysOverride <= 0)
+        {
+            return true;
+        }
+        // 生命周期未知时没有比较依据，按配置执行；已知时覆盖值必须严格小于生命周期
+        return lifetime <= std::chrono::seconds::zero() || std::chrono::hours{24} * renewBeforeDaysOverride < lifetime;
+    }
+
+    bool permanentInstallFailure(const std::string_view reason)
+    {
+        return reason.find("无法链接到配置的 CA") != std::string_view::npos || reason.find("与本次生成的私钥不匹配") != std::string_view::npos ||
+               reason.find("剩余有效期不超过续期提前量") != std::string_view::npos || reason.find("不大于配置的续期提前量") != std::string_view::npos ||
+               reason.find("生效或到期时间无法解析") != std::string_view::npos || reason.find("有效期不是正数") != std::string_view::npos ||
+               reason.find("已过期") != std::string_view::npos || reason.find("证书或私钥路径为空") != std::string_view::npos;
+    }
 
     AgentCertificateManager::AgentCertificateManager(AgentConfiguration configuration) : m_configuration(std::move(configuration))
     {
@@ -597,11 +724,15 @@ namespace EdgePulse::Agent
             std::filesystem::remove(temporaryCertificate, cleanupError);
             std::filesystem::remove(temporaryPrivateKey, cleanupError);
         };
-        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(temporaryCertificate, *encodedChain, std::nullopt, &writeError) ||
-            !AsynGyanis::Platform::AtomicFileWriter::writeText(temporaryPrivateKey, m_pending.privateKeyPem, kPrivateKeyPermissions, &writeError))
+        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(temporaryCertificate, *encodedChain, std::nullopt, &writeError))
         {
             removeTemporary();
             return std::unexpected("写入待验证的证书材料失败：" + writeError);
+        }
+        if (const auto privateKeyWritten = writePrivateKeyFile(temporaryPrivateKey, m_pending.privateKeyPem); !privateKeyWritten)
+        {
+            removeTemporary();
+            return std::unexpected("写入待验证的证书材料失败：" + privateKeyWritten.error());
         }
         const auto tlsVerified = verifyTlsIdentity(m_configuration, temporaryCertificate, temporaryPrivateKey);
         removeTemporary();
@@ -638,9 +769,12 @@ namespace EdgePulse::Agent
         {
             return std::unexpected("备份现有证书失败：" + writeError);
         }
-        if (!previousPrivateKey.empty() && !AsynGyanis::Platform::AtomicFileWriter::writeText(privateKeyBackup, previousPrivateKey, kPrivateKeyPermissions, &writeError))
+        if (!previousPrivateKey.empty())
         {
-            return std::unexpected("备份现有私钥失败：" + writeError);
+            if (const auto backupWritten = writePrivateKeyFile(privateKeyBackup, previousPrivateKey); !backupWritten)
+            {
+                return std::unexpected("备份现有私钥失败：" + backupWritten.error());
+            }
         }
 
         // 标记写在两份正式文件被替换之前：进程若死在两次替换之间，下次启动按它找回上一对材料
@@ -664,14 +798,14 @@ namespace EdgePulse::Agent
         };
 
         // 先写私钥再写证书：证书是服务端认可的身份凭据，私钥没落好之前先换上证书只会留下半对材料
-        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(privateKeyFile, m_pending.privateKeyPem, kPrivateKeyPermissions, &writeError))
+        if (const auto keyWritten = writePrivateKeyFile(privateKeyFile, m_pending.privateKeyPem); !keyWritten)
         {
             const auto restored = rollback();
             if (!restored)
             {
                 LOG_ERROR_FMT("安装新私钥失败后回退旧材料也失败：{}", restored.error());
             }
-            return std::unexpected("写入新私钥失败：" + writeError);
+            return std::unexpected("写入新私钥失败：" + keyWritten.error());
         }
         if (!AsynGyanis::Platform::AtomicFileWriter::writeText(certificateFile, *encodedChain, std::nullopt, &writeError))
         {
@@ -701,37 +835,6 @@ namespace EdgePulse::Agent
         }
         m_pending = CertificateRequestMaterial{};
         return *identity;
-    }
-
-    std::expected<void, std::string> AgentCertificateManager::restorePrevious()
-    {
-        if (!m_hasPrevious)
-        {
-            return std::unexpected("没有可恢复的上一份证书");
-        }
-        const auto restored = restoreFromMemory();
-        if (!restored)
-        {
-            return restored;
-        }
-        const auto removeBackups = [this]()
-        {
-            const auto certificateBackup = std::filesystem::path{m_configuration.certificateFile.string() + ".bak"};
-            const auto privateKeyBackup  = std::filesystem::path{m_configuration.privateKeyFile.string() + ".bak"};
-            if (const auto removed = removeFileChecked(certificateBackup, "证书备份"); !removed)
-            {
-                LOG_WARN_FMT("{}", removed.error());
-            }
-            if (const auto removed = removeFileChecked(privateKeyBackup, "私钥备份"); !removed)
-            {
-                LOG_WARN_FMT("{}", removed.error());
-            }
-        };
-        removeBackups();
-        m_hasPrevious = false;
-        m_previousCertificatePem.clear();
-        m_previousPrivateKeyPem.clear();
-        return {};
     }
 
     void AgentCertificateManager::commitInstalledIdentity()
@@ -799,9 +902,9 @@ namespace EdgePulse::Agent
         }
 
         std::string writeError;
-        if (!AsynGyanis::Platform::AtomicFileWriter::writeText(configuration.privateKeyFile, *privateKeyBackupText, kPrivateKeyPermissions, &writeError))
+        if (const auto privateKeyWritten = writePrivateKeyFile(configuration.privateKeyFile, *privateKeyBackupText); !privateKeyWritten)
         {
-            return std::unexpected("恢复上一份私钥失败：" + writeError);
+            return std::unexpected("恢复上一份私钥失败：" + privateKeyWritten.error());
         }
         if (!AsynGyanis::Platform::AtomicFileWriter::writeText(configuration.certificateFile, *certificateBackupText, std::nullopt, &writeError))
         {
@@ -839,9 +942,9 @@ namespace EdgePulse::Agent
             {
                 return removed;
             }
-        } else if (!AsynGyanis::Platform::AtomicFileWriter::writeText(m_configuration.privateKeyFile, m_previousPrivateKeyPem, kPrivateKeyPermissions, &writeError))
+        } else if (const auto privateKeyWritten = writePrivateKeyFile(m_configuration.privateKeyFile, m_previousPrivateKeyPem); !privateKeyWritten)
         {
-            return std::unexpected("恢复上一份私钥失败：" + writeError);
+            return std::unexpected("恢复上一份私钥失败：" + privateKeyWritten.error());
         }
         if (m_previousCertificatePem.empty())
         {

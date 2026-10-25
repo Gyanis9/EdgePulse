@@ -56,6 +56,10 @@ namespace EdgePulse::Agent
         EXPECT_TRUE(isLowerHex(identity->fingerprint));
         EXPECT_EQ(material.fingerprint, identity->fingerprint);
         EXPECT_EQ(material.expiresAt, identity->expiresAt);
+        ASSERT_FALSE(identity->notBefore.empty()) << "续期窗口依赖证书自身的生效时间";
+        EXPECT_EQ(20U, identity->notBefore.size());
+        EXPECT_EQ('Z', identity->notBefore.back());
+        EXPECT_LT(identity->notBefore, identity->expiresAt);
     }
 
     TEST(AgentIdentity, AllowsExpiredCertificate)

@@ -232,6 +232,11 @@ namespace EdgePulse::Agent
         ASSERT_TRUE(reloaded.has_value()) << reloaded.error();
         EXPECT_EQ(issued.fingerprint, reloaded->fingerprint);
 
+        for (const auto &entry: std::filesystem::directory_iterator(directory.path()))
+        {
+            EXPECT_EQ(std::string::npos, entry.path().filename().string().find(".private-key-stage.")) << "私钥暂存目录必须在安装结束后清理";
+        }
+
 #ifndef _WIN32
         struct stat metadata{};
         ASSERT_EQ(0, ::stat((directory.path() / "agent-key.pem").string().c_str(), &metadata));
@@ -258,6 +263,13 @@ namespace EdgePulse::Agent
         EXPECT_NE(std::string::npos, installed.error().find("CA"));
         EXPECT_EQ(initialCertificate, readText(initial.certificateFile));
         EXPECT_EQ(initialKey, readText(initial.privateKeyFile));
+
+        // 一次安装失败不能丢掉待装私钥：上层用同一份 CSR 与证书重试时不需要重新生成密钥
+        const auto retried        = Testing::signCertificateRequest(trustedAuthority, request->csrPem, 90L * 24L * 60L * 60L);
+        const auto retriedInstall = manager.install(retried.certificatePem);
+        ASSERT_TRUE(retriedInstall.has_value()) << retriedInstall.error();
+        EXPECT_EQ(retried.fingerprint, retriedInstall->fingerprint);
+        EXPECT_NE(initialKey, readText(initial.privateKeyFile));
     }
 
     TEST(AgentCertificateManager, RejectsCertificateMismatchingPendingKeyAndKeepsFiles)
@@ -280,6 +292,7 @@ namespace EdgePulse::Agent
         const auto installed = manager.install(issued.certificatePem);
         ASSERT_FALSE(installed.has_value());
         EXPECT_NE(std::string::npos, installed.error().find("私钥"));
+        EXPECT_TRUE(permanentInstallFailure(installed.error())) << "证书与待装私钥不配对属于不可重试错误";
         EXPECT_EQ(initialCertificate, readText(initial.certificateFile));
         EXPECT_EQ(initialKey, readText(initial.privateKeyFile));
     }
@@ -326,33 +339,6 @@ namespace EdgePulse::Agent
         EXPECT_EQ(initialKey, readText(initial.privateKeyFile));
     }
 
-    TEST(AgentCertificateManager, RestoresPreviousMaterialAfterSuccessfulInstall)
-    {
-        TestSupport::TemporaryDirectory directory;
-        const auto                      authority          = Testing::writeCertificateAuthority(directory, "ca");
-        const auto                      initial            = Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent");
-        const std::string               initialCertificate = readText(initial.certificateFile);
-        const std::string               initialKey         = readText(initial.privateKeyFile);
-
-        AgentCertificateManager manager(managerConfiguration(directory, authority.certificateFile));
-        const auto              request = manager.generateKeyAndCsr();
-        ASSERT_TRUE(request.has_value()) << request.error();
-        const auto issued = Testing::signCertificateRequest(authority, request->csrPem, 90L * 24L * 60L * 60L);
-
-        const auto installed = manager.install(issued.certificatePem);
-        ASSERT_TRUE(installed.has_value()) << installed.error();
-        EXPECT_NE(initialCertificate, readText(initial.certificateFile));
-
-        const auto restored = manager.restorePrevious();
-        ASSERT_TRUE(restored.has_value()) << restored.error();
-        EXPECT_EQ(initialCertificate, readText(initial.certificateFile));
-        EXPECT_EQ(initialKey, readText(initial.privateKeyFile));
-
-        const auto reloaded = AgentIdentity::reload(managerConfiguration(directory, authority.certificateFile));
-        ASSERT_TRUE(reloaded.has_value()) << reloaded.error();
-        EXPECT_EQ(initial.fingerprint, reloaded->fingerprint);
-    }
-
     TEST(AgentCertificateManager, InstallsLeafWithIntermediateChain)
     {
         TestSupport::TemporaryDirectory directory;
@@ -397,8 +383,58 @@ namespace EdgePulse::Agent
         const auto installed = manager.install(issued.certificatePem);
         ASSERT_FALSE(installed.has_value());
         EXPECT_NE(std::string::npos, installed.error().find("提前量"));
+        EXPECT_NE(std::string::npos, installed.error().find("renew_before_days")) << "错误必须点名要改的配置键";
+        EXPECT_TRUE(permanentInstallFailure(installed.error())) << "提前量不小于生命周期属于不可重试的配置错误";
         EXPECT_EQ(initialCertificate, readText(initial.certificateFile));
         EXPECT_EQ(initialKey, readText(initial.privateKeyFile));
+    }
+
+    TEST(AgentCertificateManager, AcceptsTwoDayCertificateWithSpecWindow)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      authority = Testing::writeCertificateAuthority(directory, "ca");
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        AgentConfiguration configuration         = managerConfiguration(directory, authority.certificateFile);
+        configuration.certificateRenewBeforeDays = 0;
+        AgentCertificateManager manager(configuration);
+        const auto              request = manager.generateKeyAndCsr();
+        ASSERT_TRUE(request.has_value()) << request.error();
+
+        // 2 天证书的规范窗口是 max(25% × 2d, 24h) = 24h，剩余 2 天足以安装
+        const auto issued    = Testing::signCertificateRequest(authority, request->csrPem, 2L * 24L * 60L * 60L);
+        const auto installed = manager.install(issued.certificatePem);
+        ASSERT_TRUE(installed.has_value()) << installed.error();
+        EXPECT_EQ(issued.fingerprint, installed->fingerprint);
+        EXPECT_FALSE(installed->notBefore.empty()) << "安装结果必须带出生效时间，供下一轮计算窗口";
+    }
+
+    TEST(AgentCertificateManager, TrustsSeparateServerAndAgentCaInBundle)
+    {
+        TestSupport::TemporaryDirectory directory;
+        const auto                      serverCa = Testing::writeCertificateAuthority(directory, "server");
+        const auto                      agentCa  = Testing::writeCertificateAuthority(directory, "agent-ca");
+        static_cast<void>(Testing::writeSelfSignedCertificate(directory, 30L * 24L * 60L * 60L, "agent"));
+
+        // 独立 CA 部署：ca_file 同时装 9443 服务器链根与签发 Agent 证书的 CA
+        const auto              bundle = directory.write("bundle.pem", readText(serverCa.certificateFile) + readText(agentCa.certificateFile));
+        AgentCertificateManager manager(managerConfiguration(directory, bundle));
+        const auto              request = manager.generateKeyAndCsr();
+        ASSERT_TRUE(request.has_value()) << request.error();
+        const auto issued    = Testing::signCertificateRequest(agentCa, request->csrPem, 90L * 24L * 60L * 60L);
+        const auto installed = manager.install(issued.certificatePem);
+        ASSERT_TRUE(installed.has_value()) << installed.error();
+        EXPECT_EQ(issued.fingerprint, installed->fingerprint);
+
+        // 只放服务器根时续期证书链无法落地，必须按永久安装错误停下
+        AgentCertificateManager serverOnlyManager(managerConfiguration(directory, serverCa.certificateFile));
+        const auto              nextRequest = serverOnlyManager.generateKeyAndCsr();
+        ASSERT_TRUE(nextRequest.has_value()) << nextRequest.error();
+        const auto nextIssued = Testing::signCertificateRequest(agentCa, nextRequest->csrPem, 90L * 24L * 60L * 60L);
+        const auto rejected   = serverOnlyManager.install(nextIssued.certificatePem);
+        ASSERT_FALSE(rejected.has_value());
+        EXPECT_NE(std::string::npos, rejected.error().find("无法链接到配置的 CA"));
+        EXPECT_TRUE(permanentInstallFailure(rejected.error()));
     }
 
     TEST(AgentCertificateManager, RejectsResponseWithNonCertificatePemBlock)
@@ -511,6 +547,5 @@ namespace EdgePulse::Agent
         manager.commitInstalledIdentity();
         EXPECT_FALSE(std::filesystem::exists(certificateBackup));
         EXPECT_FALSE(std::filesystem::exists(privateKeyBackup));
-        EXPECT_FALSE(manager.restorePrevious().has_value()) << "提交后不再保留回退材料";
     }
 } // namespace EdgePulse::Agent

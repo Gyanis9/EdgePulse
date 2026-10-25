@@ -126,7 +126,7 @@ agent:
 )");
         const auto                      configuration = AgentConfiguration::load(path);
         ASSERT_TRUE(configuration.has_value()) << configuration.error();
-        EXPECT_EQ(7, configuration->certificateRenewBeforeDays);
+        EXPECT_EQ(0, configuration->certificateRenewBeforeDays) << "缺省按规范窗口自动计算";
         EXPECT_EQ(3600, configuration->certificateRenewalCheckSeconds);
     }
 
@@ -142,7 +142,7 @@ agent:
     private_key_file: agent-key.pem
     name: edge-01
   certificate:
-    renew_before_days: 0
+    renew_before_days: -1
   state:
     directory: state
   logging:
@@ -151,6 +151,26 @@ agent:
         const auto                      days     = AgentConfiguration::load(daysPath);
         ASSERT_FALSE(days.has_value());
         EXPECT_NE(std::string::npos, days.error().find("renew_before_days"));
+
+        // 0 表示按规范 max(25% 生命周期, 24h) 自动计算，必须接受并原样保留
+        const auto autoPath  = directory.write("auto.yaml", R"(
+agent:
+  server:
+    base_url: https://127.0.0.1:9443
+    ca_file: ca.pem
+    certificate_file: agent.pem
+    private_key_file: agent-key.pem
+    name: edge-01
+  certificate:
+    renew_before_days: 0
+  state:
+    directory: state
+  logging:
+    file: state/agent.log
+)");
+        const auto automatic = AgentConfiguration::load(autoPath);
+        ASSERT_TRUE(automatic.has_value()) << automatic.error();
+        EXPECT_EQ(0, automatic->certificateRenewBeforeDays);
 
         const auto intervalPath = directory.write("interval.yaml", R"(
 agent:

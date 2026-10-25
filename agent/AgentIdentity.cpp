@@ -131,6 +131,24 @@ namespace EdgePulse::Agent
         }
 
         /**
+         * @brief 把证书生效时间写成 UTC 文本
+         * @param certificate 已解析的证书
+         * @return 成功返回形如 2026-10-24T12:00:00Z 的文本；失败返回中文原因
+         */
+        [[nodiscard]] std::expected<std::string, std::string> notBeforeOf(X509 &certificate)
+        {
+            tm start{};
+            if (ASN1_TIME_to_tm(X509_get0_notBefore(&certificate), &start) != 1)
+            {
+                return std::unexpected("证书生效时间解析失败：notBefore 不是可识别的时间格式");
+            }
+            char buffer[32]{};
+            std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ", start.tm_year + 1900, start.tm_mon + 1, start.tm_mday, start.tm_hour, start.tm_min,
+                          start.tm_sec);
+            return std::string{buffer};
+        }
+
+        /**
          * @brief 把 UTC 日历时间转成 time_t
          * @param value UTC 日历时间
          * @return std::time_t 对应时刻；转换失败返回 -1
@@ -185,6 +203,11 @@ namespace EdgePulse::Agent
         {
             return std::unexpected(expiresAt.error());
         }
+        const auto notBefore = notBeforeOf(*certificate);
+        if (!notBefore)
+        {
+            return std::unexpected(notBefore.error());
+        }
 
         tm expires{};
         if (ASN1_TIME_to_tm(X509_get0_notAfter(certificate.get()), &expires) == 1)
@@ -207,6 +230,7 @@ namespace EdgePulse::Agent
         AgentIdentity identity;
         identity.fingerprint = *fingerprint;
         identity.expiresAt   = *expiresAt;
+        identity.notBefore   = *notBefore;
         return identity;
     }
 

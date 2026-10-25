@@ -28,7 +28,7 @@ namespace EdgePulse::Agent
         constexpr int kMaximumPollSeconds         = 600;   ///< 命令轮询间隔上限
         constexpr int kMinimumTelemetrySeconds    = 5;     ///< 遥测间隔下限
         constexpr int kMaximumTelemetrySeconds    = 3600;  ///< 遥测间隔上限
-        constexpr int kMinimumRenewBeforeDays     = 1;     ///< 续期提前天数下限
+        constexpr int kMinimumRenewBeforeDays     = 0;     ///< 续期提前天数下限，0 表示按规范窗口自动计算
         constexpr int kMaximumRenewBeforeDays     = 90;    ///< 续期提前天数上限
         constexpr int kMinimumRenewalCheckSeconds = 60;    ///< 续期检查间隔下限
         constexpr int kMaximumRenewalCheckSeconds = 86400; ///< 续期检查间隔上限

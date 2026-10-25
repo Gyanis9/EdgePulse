@@ -43,6 +43,7 @@ namespace EdgePulse::Agent
     struct CertificateRenewalDependencies
     {
         std::string                                                             expiresAt;       ///< 当前证书到期时间（UTC，形如 2027-01-01T00:00:00Z）
+        std::string                                                             notBefore;       ///< 当前证书生效时间，与 expiresAt 一起决定续期窗口；空表示生命周期未知
         std::function<std::expected<CertificateRequestMaterial, std::string>()> generateRequest; ///< 生成新私钥与 CSR
         std::function<AsynGyanis::Core::Task<std::expected<RenewedCertificate, CertificateRenewalFailure>>(std::int64_t, std::string)> renew;              ///< 提交 CSR
         std::function<std::expected<AgentIdentity, std::string>(std::string_view)>                                                     install;            ///< 安装新证书
@@ -94,13 +95,17 @@ namespace EdgePulse::Agent
          * @param dependencies 生成、续期、安装与重载动作
          * @param stopRequested 停止标记；等待按一秒切片，置位后最迟一秒内退出
          * @return 协程任务
-         * @details 每轮先比较到期时间与提前天数，未到点就等待下一次检查；到点后生成新密钥与 CSR，
-         *          换回证书、校验安装、重载 HTTP 与 WebSocket，最后更新状态库。可重试失败按
-         *          dependencies.retryBackoff（默认 5、10、30、60、300 秒）退避后重试，HTTP 400 在默认
-         *          序列上放宽到 20 分钟（300 秒 × 4，自定义向量最多到 1 小时）；只有 403 与调用参数错误记录 ERROR 后终止本循环，注册、心跳、
-         *          遥测与命令通道不受影响。WebSocket 重载失败时保留待重载标记，按
-         *          dependencies.websocketReloadRetryInterval（默认 30 秒）复查直到成功，成功日志只在
-         *          HTTP 与 WebSocket 都换好之后才写。循环体有异常兜底，依赖抛出的异常不会结束协程。
+         * @details 每轮先按当前证书的 notBefore/notAfter 计算续期窗口 max(25% 生命周期, 24h)，
+         *          未到点就等待下一次检查；到点后生成新密钥与 CSR，换回证书并校验安装。签发结果与
+         *          待装私钥会保留到安装成功：瞬时安装失败按依赖退避重试同一份材料，不会重新签发，
+         *          避免服务端 active 被反复轮换而挤掉 Agent 实际持有的证书；证书链、密钥配对或
+         *          有效期这类不可重试的安装错误记录可操作原因后停止续期。安装成功后重载 HTTP 与
+         *          WebSocket；任一通道失败都不回退文件，而是保留新证书并按
+         *          dependencies.websocketReloadRetryInterval（默认 30 秒）复查两条通道，成功日志只在
+         *          两条通道都换好之后才写。只有 403 与调用参数错误记录 ERROR 后终止本循环，注册、
+         *          心跳、遥测与命令通道不受影响。循环体有异常兜底，依赖抛出的异常不会结束协程。
+         *          配置的 renew_before_days 是可选覆盖值，只在小于证书生命周期时生效，否则记录
+         *          ERROR 并回退到规范窗口。
          * @note 日志只写指纹、到期时间与失败原因，不写私钥与 CSR 正文
          */
         static AsynGyanis::Core::Task<> runCertificateRenewal(AsynGyanis::Core::EventLoop &loop, AgentState &state, std::int64_t nodeId, const AgentConfiguration &configuration,
