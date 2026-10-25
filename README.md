@@ -164,7 +164,7 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 | `edgepulse.agent_ca.enabled` | `true` | `false` | 启用控制面内部 CA，Agent 可用 `POST /api/agent/certificate/renew` 提交 CSR 换证 |
 | `edgepulse.agent_ca.certificate_file` | `var/certs/ca.pem` | `/etc/edgepulse/tls/ca.pem` | 签发 CA；9443 监听开启时必须就是它的信任锚（或包含在拼接信任包里），启动按 SHA-256 指纹核对；监听关闭时不做这项比对 |
 | `edgepulse.agent_ca.key_file` | `var/certs/ca-key.pem` | `/etc/edgepulse/agent-ca-key.pem` | CA 私钥独立路径，POSIX 上要求 0600，不要放进公开证书卷、镜像或版本库 |
-| `edgepulse.agent_ca.validity_days` / `overlap_hours` | `30` / `24` | `30` / `24` | 新证书有效期（1–3650 天）与旧指纹重叠窗口（1–168 小时） |
+| `edgepulse.agent_ca.validity_days` / `overlap_hours` | `30` / `24` | `30` / `24` | 新证书有效期（1–3650 天）与旧指纹重叠窗口（1–168 小时）；Agent 配置固定 `renew_before_days` 时必须小于有效期 |
 | `edgepulse.firmware.require_signature` | `false` | `true` | 开启后未签名固件不能上传、部署或回滚 |
 | `edgepulse.firmware.trusted_keys_dir` | `config/firmware-keys` | `/etc/edgepulse/firmware-keys` | 只放公钥；启用签名时不能为空，生产样例使用绝对路径 |
 | `edgepulse.security.password_min_length` | `8` | `10` | 建号、重置与改密共用 |
@@ -281,7 +281,7 @@ python scripts/check-docker-stack.py --build
 
 - 2026-10-24 全量回归（`feat/p6-production-agent` @ `bca5b24`）：`ctest --preset debug` 注册 306 项，通过 302，跳过 4，失败 0，耗时 102.95 秒；`npm run test:unit` 30 项、`npm run test:e2e` 9 项全部通过，`npm run build` 类型检查与构建通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0；`python scripts/backup_restore_test.py` 6 项中 5 项通过，1 项 Windows 文件权限位用例按平台跳过；`python scripts/run-external-tests.py` 三项门控用例全部通过、无跳过；`python scripts/backup_restore_mysql_test.py` 完成 MySQL 备份与恢复往返。
 - 2026-10-25 P7 门禁（代码基线 `8e3885c`，只含文档改动）：`cmake --build --preset debug` 无待编译目标；`ctest --preset debug` 注册 401 项，通过 397，跳过 4，失败 0，耗时 143.85 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42 项、E2E 18 项全部通过，`npm run build` 通过且产物含 `openapi.json`；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0。
-- 2026-10-25 P8 门禁（`feat/enterprise-hardening`，基线 `30c546b`）：`cmake --build --preset debug` 退出 0；`ctest --preset debug` 注册 504 项，通过 499，跳过 5，失败 0，耗时 167.57 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42/42、E2E 20/20 通过（38.8 秒），`npm run build` 通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 65 项、失败 0、跳过 0，覆盖短期证书自动续期、PID 不变、旧指纹重叠窗口与续期后的心跳/遥测/命令。
+- 2026-10-25 P8 门禁（`feat/enterprise-hardening`，最终评审修复后）：`cmake --build --preset debug` 退出 0；`ctest --preset debug` 注册 512 项，通过 507，跳过 5，失败 0，耗时 167.96 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42/42、E2E 20/20 通过（38.8 秒），`npm run build` 通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 66 项、失败 0、跳过 0，覆盖短期证书自动续期、PID 不变、旧指纹重叠窗口、WebSocket 命令通道与续期后的心跳/遥测/命令。
 - 远程 Linux 实测（阿里云 ECS，Ubuntu 24.04/systemd 255）：真实 `edgepulse-agent` 的 50 项端到端检查通过；`install-agent.sh` 安装后服务为 active，`systemctl stop/start` 正常，注册退避期间停止立即生效，`uninstall-agent.sh --purge` 清理二进制、unit、配置、状态与日志。
 - `ExternalStores.*` 与 `RealtimeBus.*` 需要真实 MySQL/Redis：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性容器并注入 `EDGEPULSE_TEST_MYSQL_*`、`EDGEPULSE_TEST_REDIS_*`，随后断言三项用例确实执行且输出不含 Skipped；镜像可用 `--mysql-image`/`--redis-image` 覆盖。直接跑 `ctest` 缺变量时仍 SKIP，不伪造通过。
 - 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
@@ -303,8 +303,8 @@ python scripts/check-docker-stack.py --build
 
 Linux 节点侧准备：
 
-- 节点证书、私钥与 CA 默认读取 `/etc/edgepulse/agent.pem`、`/etc/edgepulse/agent-key.pem` 与 `/etc/edgepulse/ca.pem`，私钥权限保持 0600。开发环境可先运行 `bash scripts/dev-certs.sh`，再用 `bash scripts/gen-agent-certs.sh <节点名> [--days <天数>] [--out-dir <目录>]` 为单个节点签发证书。
-- 自动续期由 `agent.certificate.renewal_enabled`（默认 true）、`renew_before_days`（默认 7，1–90）与 `renewal_check_seconds`（默认 3600，60–86400）控制：剩余有效期进入提前窗口后生成新私钥与 CSR 调续期端点，校验服务端签回的链与有效期，原子替换证书后热切换 HTTP 与 WebSocket，进程不重启。使用外部 CA 时把 `renewal_enabled` 置 false，Agent 不启动续期循环，证书到期前按 `rebind` 流程手工换证。控制面返回 403 时停止自动续期，需要重新签发 `rebind` 令牌并重新入场；其余可重试失败按 5/10/30/60/300 秒退避，HTTP 400 在默认序列上最长等待 20 分钟（300 秒 × 4）。
+- 节点证书、私钥与 CA 默认读取 `/etc/edgepulse/agent.pem`、`/etc/edgepulse/agent-key.pem` 与 `/etc/edgepulse/ca.pem`，私钥权限保持 0600。`ca_file` 同时用于验证 9443 服务器证书链与续期返回的 Agent 证书链；独立 CA 部署时必须把服务器链根与所有 Agent CA 拼成一个信任包，缺一项会导致握手或续期安装失败。开发环境可先运行 `bash scripts/dev-certs.sh`，再用 `bash scripts/gen-agent-certs.sh <节点名> [--days <天数>] [--out-dir <目录>]` 为单个节点签发证书。
+- 自动续期由 `agent.certificate.renewal_enabled`（默认 true）、`renew_before_days`（默认 0，0–90）与 `renewal_check_seconds`（默认 3600，60–86400）控制：窗口按 `max(25% 当前证书生命周期, 24h)` 计算，`0` 表示使用该公式；非 0 覆盖值只在小于证书有效期时生效，否则记录 ERROR 并回退公式。进入窗口后生成新私钥与 CSR 调续期端点，校验服务端签回的链与有效期，原子替换证书后热切换 HTTP 与 WebSocket，进程不重启。安装失败会用同一份签发结果重试，不会重新申请；HTTP/WebSocket 重载失败保留新证书并持续复查，进程重启直接加载新的一对。使用外部 CA 时把 `renewal_enabled` 置 false，Agent 不启动续期循环，证书到期前按 `rebind` 流程手工换证。控制面返回 403 时停止自动续期，需要重新签发 `rebind` 令牌并重新入场；其余可重试失败按 5/10/30/60/300 秒退避，HTTP 400 在默认序列上最长等待 20 分钟（300 秒 × 4）。
 - 在控制台签发一次性的 `enroll` 令牌（已有节点更换证书时签发 `rebind`），安装后写入 `/etc/edgepulse-agent/agent.env`，例如 `EDGEPULSE_AGENT_ENROLLMENT_TOKEN=...`。令牌只从环境变量读取，不写 YAML、不写日志。
 
 安装与卸载（Linux）：
