@@ -4,7 +4,9 @@ global:
 
 scrape_configs:
   # 两个实例都暴露 9100/metrics；HA 下分别抓取，便于区分单实例故障与集群故障。
-  # 运维令牌与单实例样例共用 deploy/prometheus/ops-token（不进版本库）。
+  # 运维令牌与单实例样例共用 deploy/prometheus/ops-token（不进版本库）。该文件由运维从
+  # EDGEPULSE_OPS_BEARER_TOKEN 生成，权限 0444（属主 root 也可 0644）：Prometheus 容器
+  # 以 uid 65534 运行，0600 或 0400 会让 credentials_file 读取失败。
   - job_name: edgepulse
     metrics_path: /metrics
     authorization:

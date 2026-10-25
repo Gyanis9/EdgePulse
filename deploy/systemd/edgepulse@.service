@@ -29,6 +29,10 @@ KillSignal=SIGTERM
 
 # 秘密来自 EnvironmentFile（权限 0600，不进版本库）；运行目录只放开固件与数据库。
 # 固件目录必须与其它实例共享，否则 HA 下固件上传与下载会落到不同机器。
+# 共享固件必须挂在 /var/lib/edgepulse/firmware（默认 firmware_dir）或其子目录，才落在
+# 下面的 ReadWritePaths 内。必须挂到别处时，用 drop-in 追加
+# ReadWritePaths=<firmware_dir>，并把配置里的 firmware_dir 改成同一路径；只改配置不加
+# ReadWritePaths 会被 ProtectSystem=strict 拒绝写入。
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

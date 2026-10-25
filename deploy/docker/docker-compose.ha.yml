@@ -12,12 +12,20 @@
 # secret 的 uid/gid/mode，Windows 绑定挂载还会把文件显示成 0555/0777，因此不能直接把
 # 宿主机文件当 0400 秘密挂进容器：应用启动时的私钥权限检查会拒绝。
 #
+# ca-key-init 属于可选的 agent-ca profile：使用外部 CA、不开启 edgepulse.agent_ca 时，
+# 不带 profile 直接 up 即可，不需要准备私钥文件；启用控制面内部 CA 时加
+# --profile agent-ca。应用对 ca-key-init 的依赖是 required: false，profile 关闭时不会阻塞启动。
+#
+# 浏览器 Origin：nginx 把 8443 发布到宿主机，控制台 Origin 是
+# https://console.example.com:8443，config/prod.yaml 的 security.allowed_origins 必须列出
+# 该值（样例已包含）；只走外层 443 负载均衡时改列 https://console.example.com。
+#
 # 使用前：
 #   1. cp .env.example .env，填入 MYSQL_ROOT_PASSWORD、EDGEPULSE_DB_PASSWORD、
 #      EDGEPULSE_REDIS_PASSWORD、EDGEPULSE_OPS_BEARER_TOKEN。
 #   2. 按上面的分工准备两个证书目录与 config/prod.yaml；config/prod.yaml.example 里有
 #      HA、限流与 Agent CA 的说明。
-#   3. CA 私钥宿主机权限 0400，且不要放进证书目录或版本库。旧部署把私钥放在
+#   3. 启用内部 CA 时，CA 私钥宿主机权限 0400，且不要放进证书目录或版本库。旧部署把私钥放在
 #      var/certs/ca-key.pem 或 /etc/edgepulse/agent-ca-key.pem 时，迁移到
 #      EDGEPULSE_AGENT_CA_KEY_FILE，并确认应用证书目录里不再有 ca-key.pem。
 #   4. 固件信任公钥放 config/firmware-keys；HA 必须使用共享固件卷，不能按实例各挂一份。
@@ -48,9 +56,11 @@ x-edgepulse-service: &edgepulse-service
       condition: service_healthy
     redis:
       condition: service_healthy
-    # 私钥先复制成容器用户可读的 0400 文件，应用才启动；失败时应用不会带半个秘密启动
+    # 启用内部 CA 时，私钥先复制成容器用户可读的 0400 文件，应用才启动；失败时应用不会
+    # 带半个秘密启动。外部 CA 部署不启动 ca-key-init，这条依赖按 required: false 跳过。
     ca-key-init:
       condition: service_completed_successfully
+      required: false
   environment: *edgepulse-environment
   volumes:
     - type: bind
@@ -125,11 +135,13 @@ services:
   # 一次性初始化服务：读取 Compose secret，把私钥复制到命名卷并收紧到应用用户的 0400。
   # 这样无论宿主机是 Linux（设 0400 root）还是 Windows（绑定挂载恒为 0555/0777），
   # 应用看到的都是普通文件、属主自己、权限 0400。
+  # 只在 --profile agent-ca 下启动；外部 CA 部署不需要这个服务与私钥文件。
   ca-key-init:
     image: ${EDGEPULSE_HA_IMAGE:-edgepulse:ha}
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+    profiles: ["agent-ca"]
     user: "0:0"
     restart: "no"
     entrypoint: ["/bin/sh", "-c"]

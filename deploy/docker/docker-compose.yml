@@ -1,3 +1,5 @@
+# 单实例编排：用于开发与非 HA 验收，不提供故障切换。HA 请用同目录的
+# docker-compose.ha.yml；那份编排把证书按应用/nginx 分工拆开，并有独立的 Agent CA 私钥卷。
 services:
   mysql:
     image: mysql:8.4
@@ -45,7 +47,11 @@ services:
       EDGEPULSE_INITIAL_PASSWORD: ${EDGEPULSE_INITIAL_PASSWORD:-}
     volumes:
       - ../../config:/app/config:ro
-      - ../../var/certs:/etc/edgepulse/tls:ro
+      # 只挂应用实际读取的三个文件；var/certs 里的 ca-key.pem 不进入容器。
+      # 启用 Agent 内部 CA 时再按 docs/部署.md 第 7 节单独挂私钥。
+      - ../../var/certs/ca.pem:/etc/edgepulse/tls/ca.pem:ro
+      - ../../var/certs/server.pem:/etc/edgepulse/tls/server.pem:ro
+      - ../../var/certs/server-key.pem:/etc/edgepulse/tls/server-key.pem:ro
       - firmware-data:/var/lib/edgepulse/firmware
     ports:
       - "8080:8080"

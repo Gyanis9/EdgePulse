@@ -58,8 +58,10 @@ edgepulse:
   session:
     ttl_seconds: 7200
   security:
-    # 浏览器直接访问负载均衡地址；HA 下不要写成某个实例的地址。
-    allowed_origins: https://console.example.com
+    # 浏览器实际访问的 Origin，含端口。HA 样例把 nginx 8443 发布到宿主机，控制台地址是
+    # https://console.example.com:8443，必须列出；只走外层 443 负载均衡时改成
+    # https://console.example.com。HA 下不要写成某个实例的地址。
+    allowed_origins: https://console.example.com,https://console.example.com:8443
     # 打开后跳过整个私网/保留段分类：普通私网、回环、CGNAT、组播、保留与文档示例段（含 IPv6 唯一本地）
     # 都会放行；云元数据与链路本地地址始终拒绝
     allow_private_webhooks: false
