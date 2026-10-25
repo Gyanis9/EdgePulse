@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生产 Agent 端到端验收：临时控制面加真实 edgepulse-agent，覆盖注册、心跳、遥测、配置、诊断、签名固件、证书自动续期与重叠窗口、离线补报、重启与证书改绑。"""
+"""生产 Agent 端到端验收：临时控制面加真实 edgepulse-agent，覆盖注册、心跳、遥测、配置、诊断、签名固件、双节点灰度与自动回滚、证书自动续期与重叠窗口、离线补报、重启与证书改绑。"""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ AGENT_BASE = "https://127.0.0.1:9443"
 SERVER_PORTS = (8080, 8443, 9100, 9443)
 RUN_ID = str(time.time_ns())[-8:]
 AGENT_NAME = f"e2e-agent-{RUN_ID}"
+SECOND_AGENT_NAME = f"{AGENT_NAME}-b"
 ENROLLMENT_ENV = "EDGEPULSE_AGENT_E2E_ENROLLMENT_TOKEN"
 REBIND_ENV = "EDGEPULSE_AGENT_E2E_REBIND_TOKEN"
 HOOK_MARKER_ENV = "EDGEPULSE_AGENT_TEST_HOOK_MARKER"
@@ -432,6 +433,55 @@ class FirmwareSigning:
         self.signature = signature
 
 
+def render_agent_config(name: str, certificate: Path, private_key: Path, state_directory: Path, log_path: Path, applied_config_path: Path,
+                        trusted_keys_directory: Path, staging_directory: Path, update_directory: Path, package_keys_directory: Path) -> str:
+    """按同一模板生成 Agent 配置；两个 Agent 只替换名称、证书与各自的可写目录。"""
+    return f"""agent:
+  server:
+    base_url: "https://127.0.0.1:9443"
+    ca_file: "{(CERTS / 'ca.pem').as_posix()}"
+    certificate_file: "{certificate.as_posix()}"
+    private_key_file: "{private_key.as_posix()}"
+    tenant_code: "default"
+    name: "{name}"
+    enrollment_token_env: "{ENROLLMENT_ENV}"
+    rebind_token_env: "{REBIND_ENV}"
+    heartbeat_interval_seconds: 5
+    command_poll_interval_seconds: 5
+    websocket_enabled: true
+    request_timeout_seconds: 10
+  certificate:
+    renew_before_days: 0
+    renewal_check_seconds: 60
+  telemetry:
+    interval_seconds: 5
+    disk_path: "{'C:/' if os.name == 'nt' else '/'}"
+  state:
+    directory: "{state_directory.as_posix()}"
+  logging:
+    file: "{log_path.as_posix()}"
+    level: info
+    max_size_mb: 8
+    max_backup: 2
+  executors:
+    config:
+      path: "{applied_config_path.as_posix()}"
+      apply_hook: ""
+      maximum_bytes: 65536
+    firmware:
+      install_hook: "{executable(ROOT / 'build' / 'debug' / 'bin' / 'edgepulse-agent-test-hook').as_posix()}"
+      trusted_keys_dir: "{trusted_keys_directory.as_posix()}"
+      staging_directory: "{staging_directory.as_posix()}"
+    diagnostics:
+      log_tail_bytes: 65536
+  update:
+    package_trusted_keys_dir: "{package_keys_directory.as_posix()}"
+    installer_script: ""
+    health_timeout_seconds: 60
+    staging_directory: "{update_directory.as_posix()}"
+"""
+
+
 class Session:
     """持有本次运行的服务端与 Agent 进程、临时路径与日志句柄。"""
 
@@ -441,19 +491,28 @@ class Session:
         self.agent_database = temp_root / "state" / "agent.db"
         self.agent_log = temp_root / "logs" / "agent.log"
         self.agent_stdout = temp_root / "logs" / "agent-stdout.log"
+        self.second_agent_database = temp_root / "state-b" / "agent.db"
+        self.second_agent_log = temp_root / "logs" / "agent-b.log"
+        self.second_agent_stdout = temp_root / "logs" / "agent-b-stdout.log"
         self.server_log = temp_root / "logs" / "server.log"
         self.hook_marker = temp_root / "hook-marker.txt"
+        self.second_hook_marker = temp_root / "hook-marker-b.txt"
         self.server_config = temp_root / "server.yaml"
         self.agent_config = temp_root / "agent.yaml"
+        self.second_agent_config = temp_root / "agent-b.yaml"
         self.ops_token = secrets.token_hex(32)
         remember_secret(self.ops_token)
         self.server_process: subprocess.Popen | None = None
         self.server_stream = None
         self.agent_process: subprocess.Popen | None = None
         self.agent_stream = None
+        self.second_agent_process: subprocess.Popen | None = None
+        self.second_agent_stream = None
         self.started_pids: list[int] = []
         self.server_ports_released = True
         self.node_id = 0
+        self.second_node_id = 0
+        self.second_enrollment_token = ""
         self.agent_version = ""
         self.agent_fingerprint = ""
         (temp_root / "logs").mkdir(parents=True, exist_ok=True)
@@ -462,8 +521,13 @@ class Session:
         (temp_root / "server-firmware-keys").mkdir(parents=True, exist_ok=True)
         (temp_root / "agent-firmware-keys").mkdir(parents=True, exist_ok=True)
         (temp_root / "agent-firmware").mkdir(parents=True, exist_ok=True)
+        (temp_root / "agent-firmware-b").mkdir(parents=True, exist_ok=True)
         (temp_root / "agent-update").mkdir(parents=True, exist_ok=True)
+        (temp_root / "agent-update-b").mkdir(parents=True, exist_ok=True)
+        (temp_root / "agent-package-keys").mkdir(parents=True, exist_ok=True)
+        (temp_root / "agent-package-keys-b").mkdir(parents=True, exist_ok=True)
         (temp_root / "state").mkdir(parents=True, exist_ok=True)
+        (temp_root / "state-b").mkdir(parents=True, exist_ok=True)
         (temp_root / "web").mkdir(parents=True, exist_ok=True)
 
     def write_server_config(self) -> None:
@@ -491,51 +555,18 @@ class Session:
 
     def write_agent_config(self, certificate: Path, private_key: Path) -> None:
         temporary = self.temp_root
-        text = f"""agent:
-  server:
-    base_url: "https://127.0.0.1:9443"
-    ca_file: "{(CERTS / 'ca.pem').as_posix()}"
-    certificate_file: "{certificate.as_posix()}"
-    private_key_file: "{private_key.as_posix()}"
-    tenant_code: "default"
-    name: "{AGENT_NAME}"
-    enrollment_token_env: "{ENROLLMENT_ENV}"
-    rebind_token_env: "{REBIND_ENV}"
-    heartbeat_interval_seconds: 5
-    command_poll_interval_seconds: 5
-    websocket_enabled: true
-    request_timeout_seconds: 10
-  certificate:
-    renew_before_days: 0
-    renewal_check_seconds: 60
-  telemetry:
-    interval_seconds: 5
-    disk_path: "{'C:/' if os.name == 'nt' else '/'}"
-  state:
-    directory: "{(temporary / 'state').as_posix()}"
-  logging:
-    file: "{(temporary / 'logs' / 'agent.log').as_posix()}"
-    level: info
-    max_size_mb: 8
-    max_backup: 2
-  executors:
-    config:
-      path: "{(temporary / 'agent-config.json').as_posix()}"
-      apply_hook: ""
-      maximum_bytes: 65536
-    firmware:
-      install_hook: "{executable(ROOT / 'build' / 'debug' / 'bin' / 'edgepulse-agent-test-hook').as_posix()}"
-      trusted_keys_dir: "{(temporary / 'agent-firmware-keys').as_posix()}"
-      staging_directory: "{(temporary / 'agent-firmware').as_posix()}"
-    diagnostics:
-      log_tail_bytes: 65536
-  update:
-    package_trusted_keys_dir: "{(temporary / 'agent-package-keys').as_posix()}"
-    installer_script: ""
-    health_timeout_seconds: 60
-    staging_directory: "{(temporary / 'agent-update').as_posix()}"
-"""
+        text = render_agent_config(AGENT_NAME, certificate, private_key, temporary / "state", temporary / "logs" / "agent.log",
+                                   temporary / "agent-config.json", temporary / "agent-firmware-keys", temporary / "agent-firmware",
+                                   temporary / "agent-update", temporary / "agent-package-keys")
         self.agent_config.write_text(text, encoding="utf-8")
+
+    def write_second_agent_config(self, certificate: Path, private_key: Path) -> None:
+        """第二个 Agent 使用独立状态、日志与固件暂存目录；信任键与 CA 只读共享。"""
+        temporary = self.temp_root
+        text = render_agent_config(SECOND_AGENT_NAME, certificate, private_key, temporary / "state-b", temporary / "logs" / "agent-b.log",
+                                   temporary / "agent-config-b.json", temporary / "agent-firmware-keys", temporary / "agent-firmware-b",
+                                   temporary / "agent-update-b", temporary / "agent-package-keys-b")
+        self.second_agent_config.write_text(text, encoding="utf-8")
 
     def server_environment(self) -> dict:
         environment = os.environ.copy()
@@ -590,6 +621,24 @@ class Session:
         close_stream(self.agent_stream)
         self.agent_stream = None
 
+    def start_second_agent(self, environment: dict) -> bool:
+        binary = executable(ROOT / "build" / "debug" / "bin" / "edgepulse-agent")
+        if not binary.exists():
+            report("第二 Agent 启动", False, f"找不到 Agent 二进制：{binary}")
+            return False
+        close_stream(self.second_agent_stream)
+        self.second_agent_stream = None
+        self.second_agent_process, self.second_agent_stream = start_logged_process(
+            [str(binary), "--config", str(self.second_agent_config), "--console"], self.temp_root, environment, self.second_agent_stdout)
+        self.started_pids.append(self.second_agent_process.pid)
+        return True
+
+    def stop_second_agent(self) -> None:
+        stop_process(self.second_agent_process)
+        self.second_agent_process = None
+        close_stream(self.second_agent_stream)
+        self.second_agent_stream = None
+
     def log_offsets(self) -> tuple[int, int]:
         def size(path: Path) -> int:
             try:
@@ -599,6 +648,7 @@ class Session:
         return size(self.agent_log), size(self.agent_stdout)
 
     def close(self) -> None:
+        self.stop_second_agent()
         self.stop_agent()
         self.stop_server()
         for _ in range(10):
@@ -674,9 +724,9 @@ def login(label: str = "管理员登录") -> str | None:
     return token or None
 
 
-def create_enrollment_token(token: str, action: str) -> tuple[int | None, str]:
+def create_enrollment_token(token: str, action: str, node_name: str = AGENT_NAME) -> tuple[int | None, str]:
     status, created = request_json("POST", HTTP_BASE + "/api/enrollment-tokens",
-                                    {"action": action, "expiresInSeconds": 3600, "nodeName": AGENT_NAME}, token=token)
+                                    {"action": action, "expiresInSeconds": 3600, "nodeName": node_name}, token=token)
     data = created.get("data") or {}
     token_id = data.get("id")
     plaintext = str(data.get("token", ""))
@@ -684,17 +734,25 @@ def create_enrollment_token(token: str, action: str) -> tuple[int | None, str]:
     return (token_id if status == 200 else None), plaintext
 
 
-def wait_registration(session: Session, timeout: float = 60.0) -> bool:
+def wait_agent_registration(database: Path, process: subprocess.Popen | None, timeout: float = 60.0) -> int:
+    """等待指定状态库写入 node_id；进程提前退出时立即返回 0，避免把崩溃当成未注册。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if session.agent_process is not None and session.agent_process.poll() is not None:
-            return False
-        text = read_agent_state(session.agent_database, "node_id")
+        if process is not None and process.poll() is not None:
+            return 0
+        text = read_agent_state(database, "node_id")
         if text and text.isdigit() and int(text) > 0:
-            session.node_id = int(text)
-            return True
+            return int(text)
         time.sleep(0.5)
-    return False
+    return 0
+
+
+def wait_registration(session: Session, timeout: float = 60.0) -> bool:
+    node_id = wait_agent_registration(session.agent_database, session.agent_process, timeout)
+    if node_id <= 0:
+        return False
+    session.node_id = node_id
+    return True
 
 
 def node_detail(token: str, node_id: int) -> dict:
@@ -710,6 +768,30 @@ def wait_node_detail(token: str, node_id: int, predicate, timeout: float, interv
         if predicate(last):
             return last
         time.sleep(interval)
+    return None
+
+
+def wait_node_installed_version(token: str, node_id: int, version: str, timeout: float) -> dict | None:
+    return wait_node_detail(token, node_id, lambda node: node.get("installedFirmwareVersion") == version, timeout)
+
+
+def command_detail(token: str, node_id: int, command_id: int) -> dict | None:
+    status, payload = request_json("GET", HTTP_BASE + f"/api/commands?pageNum=1&pageSize=100&nodeId={node_id}", token=token)
+    if status != 200:
+        return None
+    for row in (payload.get("data") or {}).get("rows", []):
+        if row.get("id") == command_id:
+            return row
+    return None
+
+
+def firmware_task_detail(token: str, firmware_id: int, task_id: int) -> dict | None:
+    status, payload = request_json("GET", HTTP_BASE + f"/api/firmware/{firmware_id}/tasks", token=token)
+    if status != 200:
+        return None
+    for task in payload.get("data") or []:
+        if task.get("id") == task_id:
+            return task
     return None
 
 
@@ -819,6 +901,59 @@ def wait_firmware_task(token: str, firmware_id: int, node_id: int, status: str, 
     return None
 
 
+def create_rollout(token: str, firmware_id: int, name: str, node_ids: list[int], policy: dict) -> dict | None:
+    status, payload = request_json("POST", HTTP_BASE + f"/api/firmware/{firmware_id}/rollouts",
+                                   {"name": name, "nodeIds": node_ids, "policy": policy}, token=token)
+    data = payload.get("data") or {}
+    return data if status == 200 and data.get("id") else None
+
+
+def rollout_detail(token: str, rollout_id: int) -> dict | None:
+    status, payload = request_json("GET", HTTP_BASE + f"/api/firmware/rollouts/{rollout_id}", token=token)
+    return (payload.get("data") or {}) if status == 200 else None
+
+
+def wait_rollout(token: str, rollout_id: int, predicate, timeout: float, interval: float = 0.5) -> dict | None:
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        last = rollout_detail(token, rollout_id) or {}
+        if last and predicate(last):
+            return last
+        time.sleep(interval)
+    return None
+
+
+def rollout_wave(rollout: dict, wave_index: int) -> dict:
+    for wave in rollout.get("waves") or []:
+        if wave.get("waveIndex") == wave_index:
+            return wave
+    return {}
+
+
+def rollout_target(rollout: dict, node_id: int) -> dict:
+    for target in rollout.get("targets") or []:
+        if target.get("nodeId") == node_id:
+            return target
+    return {}
+
+
+def generate_second_agent_certificate(session: Session) -> tuple[Path, Path] | None:
+    """用开发 CA 为第二个 Agent 签发独立客户端证书；缺工具链时返回 None 交给调用方报失败。"""
+    if shutil.which("bash") is None or shutil.which("openssl") is None:
+        return None
+    directory = session.temp_root / "second-certs"
+    directory.mkdir(parents=True, exist_ok=True)
+    name = f"e2e-rollout-b-{RUN_ID}"
+    result = subprocess.run(["bash", "scripts/gen-agent-certs.sh", name, "--days", "2", "--out-dir", str(directory)], cwd=ROOT, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", check=False)
+    certificate_path = directory / f"{name}.pem"
+    key_path = directory / f"{name}-key.pem"
+    if result.returncode != 0 or not certificate_path.exists() or not key_path.exists():
+        return None
+    return certificate_path, key_path
+
+
 def generate_rebind_certificate(session: Session) -> tuple[Path, Path] | None:
     """用开发 CA 在临时目录签发一张新的客户端证书，不触碰仓库里的证书文件。"""
     if shutil.which("openssl") is None:
@@ -894,14 +1029,18 @@ def wait_log_message(session: Session, offsets: tuple[int, int], needle: str, ti
     return ""
 
 
-def check_tokens_not_leaked(session: Session, enrollment_token: str, rebind_token: str, renewal_token: str = "") -> None:
+def check_tokens_not_leaked(session: Session, enrollment_token: str, rebind_token: str, renewal_token: str = "", extra_token: str = "") -> None:
     needles = [("管理员令牌", token.encode()) for token in admin_tokens if token]
     needles += [("注册令牌", enrollment_token.encode()), ("改绑令牌", rebind_token.encode()), ("运维令牌", session.ops_token.encode())]
     if renewal_token:
         needles.append(("续期改绑令牌", renewal_token.encode()))
+    if extra_token:
+        needles.append(("第二节点注册令牌", extra_token.encode()))
     needles += [("PEM 私钥", marker) for marker in (b"BEGIN PRIVATE KEY", b"BEGIN OPENSSH PRIVATE KEY", b"BEGIN EC PRIVATE KEY")]
     logs = sorted(path for path in (session.temp_root / "logs").glob("*") if path.is_file())
     databases = [session.agent_database, session.server_database]
+    if session.second_agent_database.exists():
+        databases.insert(1, session.second_agent_database)
     missing = [path.name for path in (session.agent_log, session.agent_stdout, session.server_log, *databases) if not path.exists()]
     scanned = logs + [path for database in databases for path in database_family(database) if path.exists()]
     findings: list[str] = ["缺失文件：" + "、".join(missing)] if missing else []
@@ -941,6 +1080,184 @@ def verify_cleanup(session: Session) -> None:
         leftovers.append("临时目录未删除 " + str(session.temp_root))
     report("清理后无残留进程、端口与临时目录", not leftovers,
            "；".join(leftovers) if leftovers else f"{len(session.started_pids)} 个进程已退出，端口全部空闲，临时目录已删除")
+
+
+def run_firmware_rollout(session: Session, token: str, signing: FirmwareSigning, base_firmware: dict, base_version: str) -> None:
+    """双真实 Agent 的 1→2 波灰度：第一波健康推进，第二波注入安装失败后自动回滚并确认。
+
+    第二 Agent 先安装基线固件，再换用固定失败的测试钩子启动；第二波失败上报后换回正常钩子，
+    让回滚命令能真正安装基线版本，从而断言 rolled_back、回滚命令结果与节点版本。
+    """
+    prefix = "灰度："
+    second_certificate = generate_second_agent_certificate(session)
+    if second_certificate is None:
+        report(prefix + "第二 Agent 证书", False, "缺少 bash/openssl，无法为第二节点签发客户端证书；双节点灰度未执行")
+        return
+    second_cert, second_key = second_certificate
+    session.write_second_agent_config(second_cert, second_key)
+    agent_binary = executable(ROOT / "build" / "debug" / "bin" / "edgepulse-agent")
+    configuration = subprocess.run([str(agent_binary), "--check-config", "--config", str(session.second_agent_config)], capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", check=False)
+    report(prefix + "第二 Agent 配置校验", configuration.returncode == 0,
+           (configuration.stdout or configuration.stderr).strip() or f"退出码 {configuration.returncode}")
+    if configuration.returncode != 0:
+        return
+
+    enrollment_token_id, second_enrollment_token = create_enrollment_token(token, "enroll", SECOND_AGENT_NAME)
+    remember_secret(second_enrollment_token)
+    session.second_enrollment_token = second_enrollment_token
+    report(prefix + "第二 Agent 注册令牌", enrollment_token_id is not None and second_enrollment_token.startswith("ep_enroll_"),
+           f"id={enrollment_token_id}")
+    if not second_enrollment_token:
+        return
+    second_environment = build_agent_environment({ENROLLMENT_ENV: second_enrollment_token, HOOK_MARKER_ENV: str(session.second_hook_marker)})
+    if not session.start_second_agent(second_environment):
+        return
+    try:
+        second_node_id = wait_agent_registration(session.second_agent_database, session.second_agent_process)
+        session.second_node_id = second_node_id
+        report(prefix + "第二 Agent 注册", 0 < second_node_id != session.node_id, f"nodeId={second_node_id}")
+        if second_node_id <= 0:
+            return
+        second_online = wait_node_detail(token, second_node_id, lambda node: node.get("status") == "online", 30)
+        report(prefix + "第二节点上线", second_online is not None, f"nodeId={second_node_id}")
+        if second_online is None:
+            return
+
+        base_firmware_id = int(base_firmware.get("id") or 0)
+        status, deployed = request_json("POST", HTTP_BASE + f"/api/firmware/{base_firmware_id}/deploy", {"nodeIds": [second_node_id]}, token=token)
+        results = (deployed.get("data") or []) if status == 200 else []
+        install_command_id = int(results[0]["commandId"]) if results and results[0].get("commandId") else None
+        report(prefix + "第二节点基线固件下发", install_command_id is not None, f"HTTP {status}，commandId={install_command_id}")
+        install_command = wait_command_terminal(token, second_node_id, install_command_id, 120) if install_command_id else None
+        install_task = wait_firmware_task(token, base_firmware_id, second_node_id, "installed", 60)
+        base_installed = wait_node_installed_version(token, second_node_id, base_version, 30)
+        report(prefix + "第二节点基线安装完成",
+               install_command is not None and install_command.get("status") == "succeeded" and install_task is not None and base_installed is not None,
+               f"command={(install_command or {}).get('status')}，task={(install_task or {}).get('status')}，"
+               f"installed={(base_installed or {}).get('installedFirmwareVersion')}")
+        if install_command is None or install_command.get("status") != "succeeded" or install_task is None or base_installed is None:
+            return
+
+        # 固定失败的安装钩子只作用于新固件；第二波失败上报后再换回正常钩子执行回滚。
+        session.stop_second_agent()
+        failing_environment = build_agent_environment({HOOK_MARKER_ENV: str(session.second_hook_marker), "EDGEPULSE_AGENT_TEST_HOOK_EXIT": "1"})
+        if not session.start_second_agent(failing_environment):
+            report(prefix + "第二 Agent 注入失败钩子", False, "Agent 未启动")
+            return
+        rebound_node = wait_agent_registration(session.second_agent_database, session.second_agent_process)
+        rebound_online = wait_node_detail(token, second_node_id, lambda node: node.get("status") == "online", 30)
+        report(prefix + "第二 Agent 注入失败钩子", rebound_node == second_node_id and rebound_online is not None,
+               f"nodeId={rebound_node}，status={(rebound_online or {}).get('status')}")
+        if rebound_node != second_node_id or rebound_online is None:
+            return
+
+        rollout_version = f"10.{RUN_ID}"
+        rollout_firmware = upload_signed_firmware(token, signing, rollout_version)
+        rollout_firmware_id = int(rollout_firmware["id"]) if rollout_firmware and rollout_firmware.get("id") else 0
+        report(prefix + "灰度固件上传", rollout_firmware_id > 0,
+               f"id={rollout_firmware_id}，signed={(rollout_firmware or {}).get('signed')}")
+        if rollout_firmware_id <= 0:
+            return
+
+        # settle 15 秒覆盖三个 5 秒心跳；观察 20 秒、单波上限 90 秒，给失败注入与回滚留出余量。
+        policy = {
+            "waves": [{"size": 1}, {"size": 1}],
+            "maxConcurrentPerWave": 0,
+            "settleSeconds": 15,
+            "observeSeconds": 20,
+            "maxWaveSeconds": 90,
+            "minWaveSuccessRatio": 1,
+            "minCumulativeSuccessRatio": 1,
+            "maxFailures": 0,
+            "autoRollback": True,
+            "onTimeout": "pause",
+            "requiredFreshTelemetrySeconds": 300,
+            "exemptAlarmMetrics": [],
+            "requireInstalledVersion": True,
+        }
+        rollout = create_rollout(token, rollout_firmware_id, f"E2E 双节点灰度 {RUN_ID}", [session.node_id, second_node_id], policy)
+        rollout_id = int(rollout["id"]) if rollout and rollout.get("id") else 0
+        report(prefix + "创建两波灰度发布", rollout_id > 0 and rollout.get("totalWaves") == 2 and rollout.get("status") == "scheduled",
+               f"id={rollout_id}，status={(rollout or {}).get('status')}，waves={(rollout or {}).get('totalWaves')}")
+        if rollout_id <= 0:
+            return
+
+        def second_wave_dispatched(aggregate: dict) -> bool:
+            first = rollout_wave(aggregate, 0)
+            second = rollout_wave(aggregate, 1)
+            return first.get("status") == "passed" and bool(second.get("dispatchedAt")) and int(aggregate.get("currentWave") or 0) >= 1
+
+        dispatched = wait_rollout(token, rollout_id, second_wave_dispatched, 180)
+        report(prefix + "第一波通过后第二波派发", dispatched is not None,
+               f"status={(dispatched or {}).get('status')}，currentWave={(dispatched or {}).get('currentWave')}，"
+               f"wave2={(rollout_wave(dispatched or {}, 1) or {}).get('status')}")
+        if dispatched is None:
+            return
+        first_target = rollout_target(dispatched, session.node_id)
+        second_target = rollout_target(dispatched, second_node_id)
+        first_node = node_detail(token, session.node_id)
+        first_gate = rollout_wave(dispatched, 0).get("gate") or []
+        report(prefix + "第一波安装并健康",
+               first_target.get("status") == "healthy" and first_node.get("installedFirmwareVersion") == rollout_version and bool(first_gate),
+               f"target={first_target.get('status')}，installed={first_node.get('installedFirmwareVersion')}，gate={first_gate}")
+        second_wave = rollout_wave(dispatched, 1)
+        report(prefix + "第二波已派发",
+               int(second_target.get("commandId") or 0) > 0 and bool(second_wave.get("dispatchedAt")) and second_wave.get("targetCount") == 1,
+               f"commandId={second_target.get('commandId')}，dispatchedAt={second_wave.get('dispatchedAt')}")
+        second_install_task_id = int(second_target.get("taskId") or 0)
+        second_install_command_id = int(second_target.get("commandId") or 0)
+        failed_task = wait_firmware_task(token, rollout_firmware_id, second_node_id, "failed", 60)
+        report(prefix + "第二波安装失败已上报", failed_task is not None and int((failed_task or {}).get("id") or 0) == second_install_task_id,
+               f"task={(failed_task or {}).get('id')}，status={(failed_task or {}).get('status')}，message={(failed_task or {}).get('message')}")
+
+        # 自动回滚只重新下发历史版本；失败钩子必须换回正常钩子，回滚才能真实安装并确认。
+        session.stop_second_agent()
+        healthy_environment = build_agent_environment({HOOK_MARKER_ENV: str(session.second_hook_marker)})
+        if not session.start_second_agent(healthy_environment):
+            report(prefix + "第二 Agent 恢复正常钩子", False, "Agent 未启动")
+        else:
+            recovered_node = wait_agent_registration(session.second_agent_database, session.second_agent_process)
+            recovered_online = wait_node_detail(token, second_node_id, lambda node: node.get("status") == "online", 30)
+            report(prefix + "第二 Agent 恢复正常钩子", recovered_node == second_node_id and recovered_online is not None,
+                   f"nodeId={recovered_node}，status={(recovered_online or {}).get('status')}")
+
+        terminal = wait_rollout(token, rollout_id, lambda aggregate: aggregate.get("status") in ("rolled_back", "rollback_unavailable", "failed", "completed"), 180)
+        report(prefix + "失败触发自动回滚并确认", terminal is not None and terminal.get("status") == "rolled_back",
+               f"status={(terminal or {}).get('status')}，lastError={(terminal or {}).get('lastError')}")
+        if terminal is None or terminal.get("status") != "rolled_back":
+            return
+        rollback_gate = next((entry for entry in (rollout_wave(terminal, 1).get("gate") or []) if entry.get("rollback")), {})
+        report(prefix + "回滚门控记录派发数", rollback_gate.get("issued") == 2, f"gate={rollback_gate}")
+        rollback_details: list[str] = []
+        rollback_ok = True
+        for node_id, install_task_id, install_command_id in ((session.node_id, int(first_target.get("taskId") or 0),
+                                                              int(first_target.get("commandId") or 0)),
+                                                             (second_node_id, second_install_task_id, second_install_command_id)):
+            target = rollout_target(terminal, node_id)
+            rollback_task_id = int(target.get("taskId") or 0)
+            rollback_command_id = int(target.get("commandId") or 0)
+            health = target.get("health") or {}
+            command = command_detail(token, node_id, rollback_command_id) if rollback_command_id else None
+            task = firmware_task_detail(token, int(target.get("previousFirmwareId") or base_firmware_id), rollback_task_id) if rollback_task_id else None
+            result_version = ""
+            if command is not None:
+                try:
+                    parsed = json.loads(str(command.get("result") or "{}"))
+                    result_version = str(parsed.get("version") or "") if isinstance(parsed, dict) else ""
+                except json.JSONDecodeError:
+                    result_version = ""
+            node_ok = node_detail(token, node_id).get("installedFirmwareVersion") == base_version
+            target_ok = (target.get("status") == "rolled_back" and health.get("gate") == "rolled_back" and health.get("version") == base_version
+                         and rollback_task_id > 0 and rollback_command_id > 0 and rollback_task_id != install_task_id
+                         and rollback_command_id != install_command_id and command is not None and command.get("status") == "succeeded"
+                         and result_version == base_version and task is not None and task.get("status") == "installed" and node_ok)
+            rollback_ok = rollback_ok and target_ok
+            rollback_details.append(f"node={node_id} target={target.get('status')} command={rollback_command_id}:{(command or {}).get('status')} "
+                                    f"version={result_version or health.get('version')} task={rollback_task_id}:{(task or {}).get('status')} installed={node_ok}")
+        report(prefix + "回滚命令成功且任务确认", rollback_ok, "；".join(rollback_details))
+    finally:
+        session.stop_second_agent()
 
 
 def run(session: Session) -> None:
@@ -1109,6 +1426,8 @@ def run(session: Session) -> None:
             marker_ok = len(marker_lines) >= 3 and marker_lines[1] == firmware_version and marker_lines[2] == hashlib.sha256(signing.payload).hexdigest()
             report("安装 hook 收到文件、版本与 SHA-256", marker_ok,
                    "；".join(marker_lines[:3]) if marker_lines else "标记文件为空")
+            if firmware is not None:
+                run_firmware_rollout(session, token, signing, firmware, firmware_version)
         else:
             report("签名固件下发命令创建", False, "上传未返回固件标识")
 
@@ -1325,7 +1644,7 @@ def run(session: Session) -> None:
     else:
         skip("证书吊销后的改绑注册", "未取得改绑令牌或无法用开发 CA 签发新证书")
 
-    check_tokens_not_leaked(session, enrollment_token, rebind_token, renewal_token)
+    check_tokens_not_leaked(session, enrollment_token, rebind_token, renewal_token, session.second_enrollment_token)
 
 
 def renewal_summary() -> str:

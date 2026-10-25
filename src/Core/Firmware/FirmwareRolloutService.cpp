@@ -602,19 +602,29 @@ namespace EdgePulse::Firmware
         {
             co_return std::unexpected(FirmwareRolloutError{FirmwareRolloutErrorKind::Internal, "灰度波次不存在"});
         }
-        for (const FirmwareRolloutTargetRecord &target: targetsOf(*aggregate, wave->id))
+        // GCC 13 在协程里对 co_await 表达式中的临时 std::string 会触发编译器 ICE；所有传给仓储的
+        // 字符串参数都先落成具名局部变量，不把临时对象留在挂起点上。
+        const std::vector<FirmwareRolloutTargetRecord> targets = targetsOf(*aggregate, wave->id);
+        const std::string                              skipReason = forced ? "强制提升跳过：" + reason : "人工提升跳过";
+        for (const FirmwareRolloutTargetRecord &target: targets)
         {
             if (target.status == "healthy" || target.status == "failed" || target.status == "rolled_back")
             {
                 continue;
             }
-            co_await cancelTarget(loop, target, forced ? "强制提升跳过：" + reason : "人工提升跳过");
+            co_await cancelTarget(loop, target, skipReason);
         }
-        static_cast<void>(co_await repo->setWave(loop, wave->id, "passed", {}, {}, sqlTime(now)));
-        static_cast<void>(co_await repo->appendGate(loop, wave->id, ConfigValue::object({{"passed", true}, {"forced", forced}, {"reason", reason}, {"at", sqlTime(now)}}).dump()));
-        const std::string nextStatus = waveIndex + 1 >= aggregate->waves.size() ? "completed" : "running";
+        const std::string passedStatus = "passed";
+        const std::string emptyTimestamp;
+        const std::string gateTimestamp = sqlTime(now);
+        const std::string gateJson      = ConfigValue::object({{"passed", true}, {"forced", forced}, {"reason", reason}, {"at", gateTimestamp}}).dump();
+        const std::string nextStatus    = waveIndex + 1 >= aggregate->waves.size() ? "completed" : "running";
+        const std::string pauseReason;
+        const std::string lastError = forced ? reason : "";
+        static_cast<void>(co_await repo->setWave(loop, wave->id, passedStatus, emptyTimestamp, emptyTimestamp, gateTimestamp));
+        static_cast<void>(co_await repo->appendGate(loop, wave->id, gateJson));
         const bool updated = co_await repo->updateStatus(loop, rolloutId, aggregate->rollout.version, nextStatus, nextStatus == "completed" ? -1 : static_cast<int>(waveIndex + 1),
-                                                         "", forced ? reason : "");
+                                                         pauseReason, lastError);
         if (!updated)
         {
             co_return std::unexpected(FirmwareRolloutError{FirmwareRolloutErrorKind::Conflict, "灰度发布状态已被其他操作修改，请刷新后重试"});

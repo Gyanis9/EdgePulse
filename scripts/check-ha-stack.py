@@ -922,6 +922,56 @@ def main() -> int:
         report("实例 B 下载实例 A 上传的固件", status == 200 and downloaded == firmware_payload,
                f"HTTP {status}，{len(downloaded)}/{len(firmware_payload)} 字节")
 
+        # 灰度单飞：两个实例都在跑 5 秒推进循环，只有 leader 能落库；同一目标跨多个 tick
+        # 也只能有一条任务与一条命令。策略只要求派发，不让门控在本次检查内收尾。
+        rollout_policy = {
+            "waves": [{"percent": 100}],
+            "maxConcurrentPerWave": 0,
+            "settleSeconds": 60,
+            "observeSeconds": 0,
+            "maxWaveSeconds": 120,
+            "minWaveSuccessRatio": 1,
+            "minCumulativeSuccessRatio": 1,
+            "maxFailures": 0,
+            "autoRollback": False,
+            "onTimeout": "pause",
+            "requiredFreshTelemetrySeconds": 300,
+            "exemptAlarmMetrics": [],
+            "requireInstalledVersion": False,
+        }
+        status, created = request_json(
+            "POST", f"http://{HOST}:{INSTANCES['edgepulse-1']['http']}/api/firmware/{firmware_id}/rollouts",
+            {"name": "ha-rollout-single-flight", "nodeIds": [node_id], "policy": rollout_policy}, token=token,
+        )
+        rollout_id = int((created.get("data") or {}).get("id") or 0)
+        report("实例 A 创建灰度发布", status == 200 and rollout_id > 0, f"HTTP {status}，rolloutId={rollout_id}")
+        if rollout_id <= 0:
+            return 1
+
+        def dispatched_targets() -> int | None:
+            row = mysql_scalar(f"SELECT COUNT(*) FROM biz_firmware_rollout_target WHERE rollout_id={rollout_id} AND command_id>0")
+            return int(row) if row is not None and row.isdigit() else None
+
+        def wait_dispatched() -> int | None:
+            count = dispatched_targets()
+            return count if count is not None and count >= 1 else None
+
+        dispatched = wait_until(wait_dispatched, 30.0, 0.5)
+        report("灰度目标已由 leader 派发命令", dispatched is not None, f"commandCount={dispatched_targets()}")
+        # 覆盖至少两个 5 秒 tick 与一次租约续约窗口；若 follower 也推进，会多出任务或命令。
+        time.sleep(12.0)
+        task_count = mysql_scalar(f"SELECT COUNT(*) FROM biz_firmware_task WHERE rollout_id={rollout_id} AND node_id={node_id}")
+        target_count = mysql_scalar(f"SELECT COUNT(*) FROM biz_firmware_rollout_target WHERE rollout_id={rollout_id}")
+        command_count = mysql_scalar(f"SELECT COUNT(DISTINCT command_id) FROM biz_firmware_rollout_target WHERE rollout_id={rollout_id} AND command_id>0")
+        lease = lease_state()
+        report("灰度单飞：单目标只有一条任务与一条命令",
+               task_count == "1" and target_count == "1" and command_count == "1",
+               f"tasks={task_count}，targets={target_count}，commands={command_count}，"
+               f"holder={lease[0] if lease else '无'}")
+        status, aborted = request_json("POST", f"http://{HOST}:{INSTANCES['edgepulse-1']['http']}/api/firmware/rollouts/{rollout_id}/abort", {}, token=token)
+        abort_status = (aborted.get("data") or {}).get("status")
+        report("中止 HA 灰度发布", status == 200 and abort_status == "aborted", f"HTTP {status}，status={abort_status}")
+
         # 启用 agent_ca 后，经 nginx 9443 走一次真实续期：应用必须能读取 0400 私钥并完成签发。
         csr = create_csr()
         status, renewal = request_json(
