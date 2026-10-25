@@ -175,7 +175,7 @@ namespace EdgePulse::Firmware
         AsynGyanis::Core::Task<FirmwareRolloutResult<bool>> abort(AsynGyanis::Core::EventLoop &loop, System::TenantScope scope, std::int64_t rolloutId,
                                                                   std::chrono::system_clock::time_point now = std::chrono::system_clock::now());
 
-        /// 人工回滚；允许 running、paused 与 failed，实际命令由下一次 tick 下发
+        /// 人工回滚；允许 running、paused 与 failed，下一次 tick 下发历史版本，确认安装后才落 rolled_back
         AsynGyanis::Core::Task<FirmwareRolloutResult<bool>> rollback(AsynGyanis::Core::EventLoop &loop, System::TenantScope scope, std::int64_t rolloutId);
 
         /**
@@ -210,7 +210,8 @@ namespace EdgePulse::Firmware
                                               TimePoint now);
         AsynGyanis::Core::Task<> gateWave(AsynGyanis::Core::EventLoop &loop, FirmwareRolloutAggregate aggregate, std::size_t waveIndex, const FirmwareRolloutPolicy &policy,
                                           TimePoint now);
-        AsynGyanis::Core::Task<> dispatchRollback(AsynGyanis::Core::EventLoop &loop, FirmwareRolloutAggregate aggregate);
+        AsynGyanis::Core::Task<> dispatchRollback(AsynGyanis::Core::EventLoop &loop, FirmwareRolloutAggregate aggregate, const FirmwareRolloutPolicy &policy, TimePoint now);
+        AsynGyanis::Core::Task<> evaluateRollback(AsynGyanis::Core::EventLoop &loop, FirmwareRolloutAggregate aggregate, const FirmwareRolloutPolicy &policy, TimePoint now);
         AsynGyanis::Core::Task<FirmwareRolloutResult<bool>> transition(AsynGyanis::Core::EventLoop &loop, System::TenantScope scope, std::int64_t rolloutId,
                                                                        const std::vector<std::string> &allowed, std::string status, std::string pauseReason = {},
                                                                        std::string lastError = {});
@@ -221,6 +222,8 @@ namespace EdgePulse::Firmware
                                                                 const FirmwareRecord &targetFirmware, const FirmwareRolloutPolicy &policy, TimePoint gateStart, TimePoint settleEnd,
                                                                 TimePoint observeEnd, TimePoint now);
         AsynGyanis::Core::Task<>                 persistGate(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, const TargetGateResult &result);
+        AsynGyanis::Core::Task<>                 cancelInFlight(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, std::string reason);
+        AsynGyanis::Core::Task<>                 cancelTarget(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, std::string reason);
 
         AsynGyanis::Core::Task<std::int64_t> resolvePreviousFirmware(AsynGyanis::Core::EventLoop &loop, const FirmwareRecord &firmware, const Device::NodeRecord &node);
         AsynGyanis::Core::Task<bool>         failTarget(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, std::string reason);

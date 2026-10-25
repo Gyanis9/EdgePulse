@@ -502,3 +502,38 @@ TEST(FirmwareRolloutRepository, UpdatesWaveTargetGateAndListsDue)
     ASSERT_GT(runner.run(rollouts.create(runner.loop(), draftOnly)), 0);
     EXPECT_EQ(1U, runner.run(rollouts.listDueRollouts(runner.loop(), 10)).size());
 }
+
+// 钉住：原因文本按列上限截断，且不会切断 UTF-8 多字节字符
+TEST(FirmwareRolloutRepository, TruncatesReasonsAtColumnLimits)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
+    EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
+    const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.7");
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-reason-truncate");
+    const std::int64_t                             rolloutId  = runner.run(rollouts.create(runner.loop(), makeDraft(firmwareId, nodeIds)));
+
+    const std::string unit = "中";
+    std::string       pauseReason;
+    for (int index = 0; index < 200; ++index)
+    {
+        pauseReason += unit;
+    }
+    std::string lastError = "a";
+    for (int index = 0; index < 200; ++index)
+    {
+        lastError += unit;
+    }
+    ASSERT_TRUE(runner.run(rollouts.updateStatus(runner.loop(), rolloutId, 1, "paused", 0, pauseReason, lastError)));
+    const auto aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    EXPECT_EQ(240U, aggregate->rollout.pauseReason.size());
+    EXPECT_EQ(80U * unit.size(), aggregate->rollout.pauseReason.size());
+    EXPECT_EQ(unit, aggregate->rollout.pauseReason.substr(237));
+    EXPECT_EQ(478U, aggregate->rollout.lastError.size());
+    EXPECT_EQ(1U + 159U * unit.size(), aggregate->rollout.lastError.size());
+    EXPECT_EQ('a', aggregate->rollout.lastError.front());
+    EXPECT_EQ(unit, aggregate->rollout.lastError.substr(aggregate->rollout.lastError.size() - unit.size()));
+}

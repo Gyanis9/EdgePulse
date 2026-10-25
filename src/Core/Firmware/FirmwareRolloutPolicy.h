@@ -57,7 +57,7 @@ namespace EdgePulse::Firmware
         int                                             requiredFreshTelemetrySeconds{300}; ///< 遥测最大可接受年龄秒数
         std::vector<std::string>                        exemptAlarmMetrics;                 ///< 不计入门控的告警指标
         std::optional<FirmwareRolloutMaintenanceWindow> maintenanceWindow;                  ///< 可选的维护窗口
-        bool                                            requireInstalledVersion{false};     ///< 节点未上报已安装版本时是否判失败
+        bool                                            requireInstalledVersion{true};      ///< 是否要求节点上报已安装版本；已上报的版本始终要与目标一致
 
         /**
          * @brief 解析并校验策略 JSON

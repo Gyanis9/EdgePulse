@@ -60,7 +60,7 @@ namespace EdgePulse::Firmware
         std::int64_t id{0};          ///< 主键
         std::int64_t rolloutId{0};   ///< 所属发布
         int          waveIndex{0};   ///< 波次下标，从 0 开始
-        std::string  status;         ///< pending/dispatching/observing/passed/failed/skipped
+        std::string  status;         ///< pending/dispatching/observing/passed/failed/skipped/rolling_back/rolled_back
         int          targetCount{0}; ///< 本波目标数
         std::string  dispatchedAt;   ///< 派发时间，可空
         std::string  deadlineAt;     ///< 观察截止时间，可空
@@ -83,7 +83,7 @@ namespace EdgePulse::Firmware
         std::int64_t previousFirmwareId{0}; ///< 下发前已安装固件，0 表示未知
         std::int64_t taskId{0};             ///< 关联的固件任务
         std::int64_t commandId{0};          ///< 关联的固件命令
-        std::string  status;                ///< pending/dispatching/installing/healthy/failed/rolled_back
+        std::string  status;                ///< pending/dispatching/installing/healthy/failed/rolling_back/rolled_back
         std::string  healthJson;            ///< 最近一次健康快照 JSON
         std::string  updatedAt;             ///< 更新时间
     };
@@ -188,6 +188,7 @@ namespace EdgePulse::Firmware
          * @return true 状态已推进且版本加一
          * @return false 发布不存在、不在租户边界内或版本已变
          * @note 终止状态记录 finished_at；活动状态与回滚清空 finished_at，避免复用上一次终止时间
+         * @note 暂停原因与失败原因分别按 240 与 480 字节截断，不切断 UTF-8 字符
          */
         AsynGyanis::Core::Task<bool> updateStatus(AsynGyanis::Core::EventLoop &loop, std::int64_t rolloutId, std::int64_t expectedVersion, std::string status, int currentWave = -1,
                                                   std::string pauseReason = {}, std::string lastError = {});

@@ -332,7 +332,7 @@ namespace EdgePulse::Firmware
             !readInteger(*root, "requiredFreshTelemetrySeconds", 1, kMaximumSeconds, 300, policy.requiredFreshTelemetrySeconds, error) ||
             !readRatio(*root, "minWaveSuccessRatio", 1.0, policy.minWaveSuccessRatio, error) ||
             !readRatio(*root, "minCumulativeSuccessRatio", 1.0, policy.minCumulativeSuccessRatio, error) ||
-            !readBoolean(*root, "autoRollback", false, policy.autoRollback, error) || !readBoolean(*root, "requireInstalledVersion", false, policy.requireInstalledVersion, error))
+            !readBoolean(*root, "autoRollback", false, policy.autoRollback, error) || !readBoolean(*root, "requireInstalledVersion", true, policy.requireInstalledVersion, error))
         {
             return std::unexpected(error);
         }
@@ -455,7 +455,13 @@ namespace EdgePulse::Firmware
         const std::tm utc     = utcTime(now);
         const int     minute  = utc.tm_hour * 60 + utc.tm_min;
         const int     weekday = utc.tm_wday == 0 ? 7 : utc.tm_wday;
-        if (!maintenanceWindow->days.empty() && std::find(maintenanceWindow->days.begin(), maintenanceWindow->days.end(), weekday) == maintenanceWindow->days.end())
+        // 跨午夜窗口的后半段属于前一天开启的窗口，星期过滤要按起始日判断
+        int windowDay = weekday;
+        if (maintenanceWindow->startMinute > maintenanceWindow->endMinute && minute < maintenanceWindow->endMinute)
+        {
+            windowDay = weekday == 1 ? 7 : weekday - 1;
+        }
+        if (!maintenanceWindow->days.empty() && std::find(maintenanceWindow->days.begin(), maintenanceWindow->days.end(), windowDay) == maintenanceWindow->days.end())
         {
             return false;
         }
@@ -508,6 +514,10 @@ namespace EdgePulse::Firmware
             }
             assigned = desiredCumulative;
             plan.push_back(std::move(waveNodes));
+        }
+        if (assigned != total)
+        {
+            return std::unexpected("最后一个波次必须覆盖全部目标节点：已分配 " + std::to_string(assigned) + "/" + std::to_string(total));
         }
         return plan;
     }

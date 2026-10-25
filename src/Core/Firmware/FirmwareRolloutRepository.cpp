@@ -44,6 +44,23 @@ namespace EdgePulse::Firmware
         }
 
         /**
+         * @brief 按字节上限截断 UTF-8 文本，不切断多字节字符
+         */
+        [[nodiscard]] std::string truncateUtf8(const std::string &text, const std::size_t maximumBytes)
+        {
+            if (text.size() <= maximumBytes)
+            {
+                return text;
+            }
+            std::size_t cut = maximumBytes;
+            while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0U) == 0x80U)
+            {
+                --cut;
+            }
+            return text.substr(0, cut);
+        }
+
+        /**
          * @brief 回滚当前事务；回滚本身失败时不盖过真正的失败原因
          */
         void rollbackQuietly(DatabaseConnection &connection)
@@ -453,7 +470,7 @@ namespace EdgePulse::Firmware
                     } else if (status == "paused")
                     {
                         current->pausedAt    = now;
-                        current->pauseReason = pauseReason;
+                        current->pauseReason = truncateUtf8(pauseReason, 240);
                     }
                     const bool terminal = status == "completed" || status == "rolled_back" || status == "rollback_unavailable" || status == "aborted" || status == "failed";
                     if (terminal)
@@ -471,7 +488,7 @@ namespace EdgePulse::Firmware
                     }
                     if (!lastError.empty())
                     {
-                        current->lastError = lastError;
+                        current->lastError = truncateUtf8(lastError, 480);
                     }
 
                     std::vector<DatabaseValue> parameters{current->status,
