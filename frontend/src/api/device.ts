@@ -6,6 +6,7 @@ export interface NodeRow {
   name: string
   status: 'online' | 'offline'
   agentVersion: string
+  installedFirmwareVersion?: string
   certFingerprint: string
   labels: Record<string, string> | null
   lastSeen: string

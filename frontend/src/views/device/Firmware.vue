@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { Checkbox, DataTable, Drawer, Field, Select, Tag, TextInput, type Column } from '@/components/ui'
-import { FormDialog, ListPage, PermissionButton } from '@/components/business'
-import { deviceApi, fleetApi, systemApi, type FirmwarePolicy, type FirmwareRow, type FirmwareTaskRow, type NodeRow } from '@/api'
+import { FirmwareRolloutDetail, FirmwareRolloutDialog, FormDialog, ListPage, PermissionButton } from '@/components/business'
+import { deviceApi, fleetApi, systemApi, type FirmwarePolicy, type FirmwareRolloutAggregate, type FirmwareRow, type FirmwareTaskRow, type NodeRow } from '@/api'
 import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
@@ -16,7 +16,7 @@ const columns: Column[] = [
   { key: 'sizeBytes', title: '大小', width: 110, align: 'right' },
   { key: 'sha256', title: 'SHA-256', minWidth: 260 },
   { key: 'createdAt', title: '上传时间', width: 170 },
-  { key: 'actions', title: '操作', width: 220, className: 'col-actions' },
+  { key: 'actions', title: '操作', width: 320, className: 'col-actions' },
 ]
 
 const list = useListPage<FirmwareRow, { keyword: string }>({
@@ -175,6 +175,36 @@ async function submitRollback() {
   }
 }
 
+/* ── 灰度发布 ── */
+const rolloutOpen = ref(false)
+const rolloutFirmware = ref<FirmwareRow | null>(null)
+const rolloutNodesLoading = ref(false)
+const rolloutDetailOpen = ref(false)
+const rolloutDetailId = ref<number | null>(null)
+
+async function loadNodes() {
+  rolloutNodesLoading.value = true
+  try {
+    nodes.value = (await deviceApi.nodes.list({ pageNum: 1, pageSize: 100 })).rows
+  } catch (error) {
+    toastError(error, '节点加载失败')
+  } finally {
+    rolloutNodesLoading.value = false
+  }
+}
+
+async function openRollout(row: FirmwareRow) {
+  rolloutFirmware.value = row
+  rolloutOpen.value = true
+  if (!nodes.value.length) await loadNodes()
+}
+
+function openRolloutDetail(rollout: FirmwareRolloutAggregate) {
+  rolloutOpen.value = false
+  rolloutDetailId.value = rollout.id
+  rolloutDetailOpen.value = true
+}
+
 /* ── 任务 ── */
 const tasksOpen = ref(false)
 const tasks = ref<FirmwareTaskRow[]>([])
@@ -249,6 +279,7 @@ onMounted(async () => {
       <template #cell-createdAt="{ row }"><span class="mono soft">{{ formatLocalDateTime(row.createdAt) }}</span></template>
       <template #cell-actions="{ row }">
         <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="send" label="下发" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openDeploy(row)" />
+        <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="layers" label="灰度发布" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openRollout(row)" />
         <PermissionButton perm="device:firmware:upload" variant="text" size="sm" icon="refresh" label="回滚" :disabled="Boolean(policy?.requireSignature && !row.signed)" @click="openRollback(row)" />
         <PermissionButton perm="device:firmware:list" variant="text" size="sm" icon="activity" label="任务" @click="openTasks(row)" />
         <PermissionButton perm="device:firmware:remove" variant="text" size="sm" danger icon="trash" label="删除" @click="remove(row)" />
@@ -311,6 +342,16 @@ onMounted(async () => {
         </div>
       </Field>
     </FormDialog>
+
+    <FirmwareRolloutDialog
+      :open="rolloutOpen"
+      :firmware="rolloutFirmware"
+      :nodes="nodes"
+      :nodes-loading="rolloutNodesLoading"
+      @close="rolloutOpen = false"
+      @created="openRolloutDetail"
+    />
+    <FirmwareRolloutDetail :open="rolloutDetailOpen" :rollout-id="rolloutDetailId" @close="rolloutDetailOpen = false" />
 
     <Drawer :open="tasksOpen" title="下发任务" :sub="deployTarget ? `${deployTarget.name} ${deployTarget.version}` : ''" :width="820" @close="tasksOpen = false">
       <DataTable :columns="taskColumns" :data="tasks" :loading="tasksLoading" :min-width="760" empty-text="还没有下发任务">

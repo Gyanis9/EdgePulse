@@ -133,6 +133,157 @@ export interface FirmwareTaskRow {
   updatedAt: string
 }
 
+export type FirmwareRolloutStatus =
+  | 'draft'
+  | 'scheduled'
+  | 'preparing'
+  | 'running'
+  | 'observing'
+  | 'paused'
+  | 'rolling_back'
+  | 'rollback_observing'
+  | 'rolled_back'
+  | 'completed'
+  | 'aborted'
+  | 'failed'
+  | 'rollback_unavailable'
+
+export type FirmwareRolloutWaveStatus =
+  | 'pending'
+  | 'dispatching'
+  | 'observing'
+  | 'passed'
+  | 'failed'
+  | 'skipped'
+  | 'rolling_back'
+  | 'rolled_back'
+
+export type FirmwareRolloutTargetStatus =
+  | 'pending'
+  | 'dispatching'
+  | 'dispatched'
+  | 'downloading'
+  | 'installing'
+  | 'installed'
+  | 'healthy'
+  | 'failed'
+  | 'unreachable'
+  | 'rolling_back'
+  | 'rolled_back'
+  | 'rollback_failed'
+  | 'rollback_unavailable'
+
+/** 波次规模：percent 与 size 二选一；percent 表示累计覆盖比例 */
+export interface FirmwareRolloutWaveSpec {
+  percent?: number
+  size?: number
+}
+
+export interface FirmwareRolloutMaintenanceWindow {
+  start: string
+  end: string
+  days?: number[]
+}
+
+export interface FirmwareRolloutPolicy {
+  waves: FirmwareRolloutWaveSpec[]
+  maxConcurrentPerWave: number
+  settleSeconds: number
+  observeSeconds: number
+  maxWaveSeconds: number
+  minWaveSuccessRatio: number
+  minCumulativeSuccessRatio: number
+  maxFailures: number
+  autoRollback: boolean
+  onTimeout: 'pause' | 'fail'
+  requiredFreshTelemetrySeconds: number
+  exemptAlarmMetrics: string[]
+  maintenanceWindow?: FirmwareRolloutMaintenanceWindow | null
+  requireInstalledVersion: boolean
+}
+
+export interface FirmwareRolloutGateEntry {
+  reason?: string
+  passed?: boolean
+  forced?: boolean
+  timeout?: boolean
+  healthy?: number
+  failed?: number
+  total?: number
+  at?: string
+  [key: string]: unknown
+}
+
+export interface FirmwareRolloutWave {
+  id: number
+  rolloutId: number
+  waveIndex: number
+  status: FirmwareRolloutWaveStatus
+  targetCount: number
+  dispatchedAt: string
+  deadlineAt: string
+  settledAt: string
+  gate: FirmwareRolloutGateEntry[]
+  createdAt: string
+  updatedAt: string
+}
+
+export interface FirmwareRolloutTargetHealth {
+  gate?: string
+  reason?: string
+  installedVersion?: string
+  nodeOnline?: boolean
+  commandStatus?: string
+  taskStatus?: string
+  lastSeen?: string
+  alarmMetric?: string
+  [key: string]: unknown
+}
+
+export interface FirmwareRolloutTarget {
+  id: number
+  rolloutId: number
+  waveId: number
+  tenantId: number
+  nodeId: number
+  previousFirmwareId: number
+  taskId: number
+  commandId: number
+  status: FirmwareRolloutTargetStatus
+  health: FirmwareRolloutTargetHealth
+  updatedAt: string
+}
+
+export interface FirmwareRolloutRow {
+  id: number
+  tenantId: number
+  firmwareId: number
+  name: string
+  policy: FirmwareRolloutPolicy
+  status: FirmwareRolloutStatus
+  currentWave: number
+  totalWaves: number
+  createdBy: number
+  createdAt: string
+  startedAt: string
+  finishedAt: string
+  pausedAt: string
+  pauseReason: string
+  lastError: string
+  version: number
+}
+
+export interface FirmwareRolloutAggregate extends FirmwareRolloutRow {
+  waves: FirmwareRolloutWave[]
+  targets: FirmwareRolloutTarget[]
+}
+
+export interface FirmwareRolloutCreateRequest {
+  name: string
+  nodeIds: number[]
+  policy: FirmwareRolloutPolicy
+}
+
 export interface OpsSummary {
   nodes: { total: number; online: number }
   alarms: { open: number }
@@ -180,6 +331,17 @@ export function createFleetApi(client: HttpClient) {
       rollback: (id: number, nodeIds: number[]) =>
         client.post<Array<{ nodeId: number; fromFirmwareId: number; toFirmwareId: number; taskId: number; commandId: number }>>(`/firmware/${id}/rollback`, { nodeIds }),
       upload: (file: File, name: string, version: string, options?: FirmwareUploadOptions) => uploadFirmware(file, name, version, options),
+      rollouts: (id: number, query?: QueryParams) => client.get<PageResult<FirmwareRolloutRow>>(`/firmware/${id}/rollouts`, query),
+      rollout: (rolloutId: number) => client.get<FirmwareRolloutAggregate>(`/firmware/rollouts/${rolloutId}`),
+      createRollout: (id: number, body: FirmwareRolloutCreateRequest) => client.post<FirmwareRolloutAggregate>(`/firmware/${id}/rollouts`, body),
+      pauseRollout: (rolloutId: number, reason?: string) =>
+        client.post<FirmwareRolloutAggregate>(`/firmware/rollouts/${rolloutId}/pause`, reason ? { reason } : {}),
+      resumeRollout: (rolloutId: number) => client.post<FirmwareRolloutAggregate>(`/firmware/rollouts/${rolloutId}/resume`, {}),
+      promoteRollout: (rolloutId: number) => client.post<FirmwareRolloutAggregate>(`/firmware/rollouts/${rolloutId}/promote`, {}),
+      forcePromoteRollout: (rolloutId: number, reason: string) =>
+        client.post<FirmwareRolloutAggregate>(`/firmware/rollouts/${rolloutId}/force-promote`, { reason }),
+      abortRollout: (rolloutId: number) => client.post<FirmwareRolloutAggregate>(`/firmware/rollouts/${rolloutId}/abort`, {}),
+      rollbackRollout: (rolloutId: number) => client.post<FirmwareRolloutAggregate>(`/firmware/rollouts/${rolloutId}/rollback`, {}),
     },
     ops: {
       summary: () => client.get<OpsSummary>('/ops/summary'),

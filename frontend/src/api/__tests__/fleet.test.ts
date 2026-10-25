@@ -45,3 +45,59 @@ test('fleet api maps telemetry alarm command firmware and ops endpoints', async 
   assert.equal(calls[12].url, '/api/firmware/policy')
   assert.equal(calls[13].url, '/api/ops/summary')
 })
+
+test('fleet api maps firmware rollout create list get and actions', async () => {
+  const calls: Array<{ url: string; method: string; body?: string }> = []
+  const fetcher = async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body as string | undefined })
+    return new Response(JSON.stringify({ code: 200, message: 'ok', data: { id: 31, rows: [], total: 0 }, traceId: 't' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  const api = createFleetApi(createHttpClient({ baseUrl: '/api', tokenProvider: () => 'token', fetcher }))
+  const policy = {
+    waves: [{ percent: 5 }, { percent: 25 }, { percent: 100 }],
+    maxConcurrentPerWave: 10,
+    settleSeconds: 60,
+    observeSeconds: 120,
+    maxWaveSeconds: 1800,
+    minWaveSuccessRatio: 1,
+    minCumulativeSuccessRatio: 0.95,
+    maxFailures: 2,
+    autoRollback: true,
+    onTimeout: 'fail' as const,
+    requiredFreshTelemetrySeconds: 300,
+    exemptAlarmMetrics: ['cpu.usage'],
+    requireInstalledVersion: true,
+  }
+
+  await api.firmware.rollouts(5, { pageNum: 1, pageSize: 20 })
+  await api.firmware.rollout(31)
+  await api.firmware.createRollout(5, { name: '生产灰度', nodeIds: [7, 8], policy })
+  await api.firmware.pauseRollout(31, '维护窗口')
+  await api.firmware.resumeRollout(31)
+  await api.firmware.promoteRollout(31)
+  await api.firmware.forcePromoteRollout(31, '现场确认')
+  await api.firmware.abortRollout(31)
+  await api.firmware.rollbackRollout(31)
+
+  assert.equal(calls[0].url, '/api/firmware/5/rollouts?pageNum=1&pageSize=20')
+  assert.equal(calls[0].method, 'GET')
+  assert.equal(calls[1].url, '/api/firmware/rollouts/31')
+  assert.equal(calls[1].method, 'GET')
+  assert.equal(calls[2].url, '/api/firmware/5/rollouts')
+  assert.equal(calls[2].method, 'POST')
+  assert.deepEqual(JSON.parse(calls[2].body ?? '{}'), { name: '生产灰度', nodeIds: [7, 8], policy })
+  assert.equal(calls[3].url, '/api/firmware/rollouts/31/pause')
+  assert.equal(calls[3].method, 'POST')
+  assert.deepEqual(JSON.parse(calls[3].body ?? '{}'), { reason: '维护窗口' })
+  assert.deepEqual(calls.slice(4, 9).map(call => [call.url, call.method]), [
+    ['/api/firmware/rollouts/31/resume', 'POST'],
+    ['/api/firmware/rollouts/31/promote', 'POST'],
+    ['/api/firmware/rollouts/31/force-promote', 'POST'],
+    ['/api/firmware/rollouts/31/abort', 'POST'],
+    ['/api/firmware/rollouts/31/rollback', 'POST'],
+  ])
+  assert.deepEqual(calls.slice(4, 9).map(call => JSON.parse(call.body ?? '{}')), [{}, {}, { reason: '现场确认' }, {}, {}])
+})
