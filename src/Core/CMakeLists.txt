@@ -14,6 +14,7 @@ add_library(edgepulse-core STATIC
         Auth/OidcService.cpp
         Cache/MemoryKeyValueStore.cpp
         Cache/RedisKeyValueStore.cpp
+        Cache/RedisProbe.cpp
         Alarm/AlarmRepository.cpp
         Alarm/AlarmService.cpp
         Command/AgentChannelRegistry.cpp
@@ -42,6 +43,7 @@ add_library(edgepulse-core STATIC
         Http/IdempotencyRepository.cpp
         Http/MiddlewareSetup.cpp
         Http/RealtimeBus.cpp
+        Http/PublisherHealth.cpp
         Http/ReadinessState.cpp
         Http/ReverseProxy.cpp
         Http/RequestId.cpp
@@ -55,6 +57,7 @@ add_library(edgepulse-core STATIC
         Ops/OpsRepository.cpp
         System/DictionaryRepository.cpp
         System/LeaderGate.cpp
+        System/LeaderTick.cpp
         System/LeaderLease.cpp
         System/LogRepository.cpp
         System/MenuRepository.cpp

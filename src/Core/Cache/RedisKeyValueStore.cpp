@@ -1,7 +1,9 @@
 #include "Core/Cache/RedisKeyValueStore.h"
 
 #include "Base/Exception/EdgePulseException.h"
+#include "Base/Log/LogMacros.h"
 
+#include "Core/Cache/RedisProbe.h"
 #include "Core/Coroutine/AsyncExecutor.h"
 #include "Database/Common/DatabaseFactory.h"
 #include "Database/Common/DatabaseResult.h"
@@ -19,19 +21,30 @@ namespace EdgePulse::Cache
     RedisKeyValueStore::RedisKeyValueStore(std::string host, const std::uint16_t port, std::string password, const int database) :
         m_host(std::move(host)), m_port(port), m_password(std::move(password)), m_database(database)
     {
+        m_connection = std::make_unique<AsynGyanis::Database::RedisConnection>(connectionConfig());
+        if (!m_connection->connect())
+        {
+            throw Common::DatabaseException("连接 Redis 失败：" + endpoint() + "：" + m_connection->lastError());
+        }
+    }
+
+    RedisKeyValueStore::~RedisKeyValueStore() = default;
+
+    AsynGyanis::Database::ConnectionConfig RedisKeyValueStore::connectionConfig() const
+    {
         AsynGyanis::Database::ConnectionConfig configuration = AsynGyanis::Database::ConnectionConfig::redisDefault();
         configuration.host                                   = m_host;
         configuration.port                                   = m_port;
         configuration.password                               = m_password;
         configuration.database                               = std::to_string(m_database);
-        m_connection                                         = std::make_unique<AsynGyanis::Database::RedisConnection>(configuration);
-        if (!m_connection->connect())
-        {
-            throw Common::DatabaseException("连接 Redis 失败：" + m_host + ":" + std::to_string(m_port) + "：" + m_connection->lastError());
-        }
+        return configuration;
     }
 
-    RedisKeyValueStore::~RedisKeyValueStore() = default;
+    std::string RedisKeyValueStore::endpoint() const
+    {
+        // 只报主机与端口：口令不进日志，也不进异常文本
+        return m_host + ":" + std::to_string(m_port);
+    }
 
     std::unique_ptr<AsynGyanis::Database::DatabaseResult> RedisKeyValueStore::executeLocked(const std::string_view command, const std::vector<std::string> &arguments)
     {
@@ -156,20 +169,26 @@ namespace EdgePulse::Cache
 
     AsynGyanis::Core::Task<bool> RedisKeyValueStore::probe(AsynGyanis::Core::EventLoop &loop)
     {
-        co_return co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(loop, std::function<bool()>(
-                                                                                                [this]() -> bool
-                                                                                                {
-                                                                                                    try
-                                                                                                    {
-                                                                                                        std::lock_guard<std::mutex> lock(m_mutex);
-                                                                                                        const auto                  result = executeLocked("PING", {});
-                                                                                                        return result->next();
-                                                                                                    } catch (const std::exception &)
-                                                                                                    {
-                                                                                                        // 探针只回答可用性；具体错误由常规缓存操作记录，避免就绪探针刷屏
-                                                                                                        return false;
-                                                                                                    }
-                                                                                                }));
+        co_return co_await AsynGyanis::Core::AsyncExecutor::shared().submit<bool>(
+                loop, std::function<bool()>(
+                              [this]() -> bool
+                              {
+                                  try
+                                  {
+                                      std::lock_guard<std::mutex> lock(m_mutex);
+                                      if (!m_connection)
+                                      {
+                                          m_connection = std::make_unique<AsynGyanis::Database::RedisConnection>(connectionConfig());
+                                      }
+                                      // 探针是唯一的恢复路径：常规缓存操作遇到断连仍然直接失败
+                                      return probeRedisConnection(*m_connection, endpoint());
+                                  } catch (const std::exception &failure)
+                                  {
+                                      // 原因只带端点与异常文本，口令不进入日志
+                                      LOG_WARN_FMT("缓存探针异常：endpoint={} error={}", endpoint(), failure.what());
+                                      return false;
+                                  }
+                              }));
     }
 
     std::string_view RedisKeyValueStore::backendName() const noexcept

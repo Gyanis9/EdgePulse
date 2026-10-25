@@ -43,6 +43,7 @@
 #include "Core/Device/NodeService.h"
 #include "Core/Metrics/BusinessMetrics.h"
 #include "Core/System/LeaderGate.h"
+#include "Core/System/LeaderTick.h"
 #include "Core/System/LeaderLease.h"
 #include "Core/System/MigrationLock.h"
 #include "Core/System/MigrationRunner.h"
@@ -159,6 +160,11 @@ namespace EdgePulse::App
         {
             m_healthProbe.request_stop();
             m_healthProbe.join();
+        }
+        if (m_firmwareProbe.joinable())
+        {
+            m_firmwareProbe.request_stop();
+            m_firmwareProbe.join();
         }
         if (m_metricsExporter)
         {
@@ -387,17 +393,27 @@ namespace EdgePulse::App
             m_healthProbe = std::jthread(
                     [this](const std::stop_token stopToken)
                     {
-                        std::uint64_t tick = 0;
                         while (!stopToken.stop_requested())
                         {
                             m_readiness.setDatabaseReady(m_database->probe());
-                            // 目录探针涉及一次磁盘写入，每十秒做一次即可，不能跟着 /readyz 的抓取频率跑
-                            if (tick % 5 == 0)
-                            {
-                                m_readiness.setFirmwareDirectoryReady(Web::probeDirectoryWritable(m_configuration.firmwareDirectory));
-                            }
-                            ++tick;
                             for (int slice = 0; slice < 20 && !stopToken.stop_requested(); ++slice)
+                            {
+                                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                            }
+                        }
+                    });
+            // 目录探针涉及磁盘写入，单独一条线程：数据库探针卡住时固件目录结论仍按十秒周期更新
+            m_firmwareProbe = std::jthread(
+                    [this](const std::stop_token stopToken)
+                    {
+                        for (int slice = 0; slice < 100 && !stopToken.stop_requested(); ++slice)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                        }
+                        while (!stopToken.stop_requested())
+                        {
+                            m_readiness.setFirmwareDirectoryReady(Web::probeDirectoryWritable(m_configuration.firmwareDirectory));
+                            for (int slice = 0; slice < 100 && !stopToken.stop_requested(); ++slice)
                             {
                                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
                             }
@@ -668,7 +684,7 @@ namespace EdgePulse::App
         {
             LOG_WARN("遥测、日志与投递记录的保留天数都不是正数，三类记录不做过期清理；幂等记录仍按 TTL 清理");
         }
-        m_readiness.setServiceReady(true);
+        // serviceReady 由首轮缓存探针置位：先探测再对外宣布就绪，/readyz 不会把「尚未探测」误报成「缓存探针失败」
         return true;
     }
 
@@ -679,60 +695,61 @@ namespace EdgePulse::App
         System::LeaderGate                                leaderGate(
                 "计划命令调度", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
                 [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
+        // follower 只等待：计划命令是控制面单飞工作，多实例同时推进会把同一条命令重复下发
+        System::LeaderTick leaderTick(
+                leaderGate, [this, &loop, allCommands]() -> AsynGyanis::Core::Task<>
+                {
+                    std::vector<Command::CommandRecord> due;
+                    try
+                    {
+                        due = co_await allCommands->listDue(loop, 100);
+                    } catch (const std::exception &failure)
+                    {
+                        LOG_WARN_FMT("计划命令扫描失败：{}", failure.what());
+                        co_return;
+                    }
+                    for (const Command::CommandRecord &command: due)
+                    {
+                        if (!m_agentChannels->isConnected(command.nodeId))
+                        {
+                            continue;
+                        }
+                        try
+                        {
+                            const AsynGyanis::Base::ConfigValue commandValue = AsynGyanis::Base::ConfigValue::object(
+                                    {{"id", command.id}, {"nodeId", command.nodeId}, {"type", command.type}, {"payload", command.payload}, {"timeoutSeconds", command.timeoutSeconds}});
+                            const std::string message = AsynGyanis::Base::ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
+                            if (!co_await m_agentChannels->send(command.nodeId, message))
+                            {
+                                continue;
+                            }
+                            if (!co_await allCommands->markDispatched(loop, command.id))
+                            {
+                                continue;
+                            }
+                            const auto updated = co_await allCommands->find(loop, command.id);
+                            if (!updated.has_value())
+                            {
+                                continue;
+                            }
+                            const std::string statusPayload = AsynGyanis::Base::ConfigValue::object({{"type", "command.status"},
+                                                                                                     {"data", AsynGyanis::Base::ConfigValue::object({{"id", updated->id},
+                                                                                                                                                     {"nodeId", updated->nodeId},
+                                                                                                                                                     {"type", updated->type},
+                                                                                                                                                     {"status", updated->status},
+                                                                                                                                                     {"message", updated->message}})}})
+                                                                      .dump();
+                            co_await m_realtimeBus->publish("commands", updated->tenantId, statusPayload);
+                        } catch (const std::exception &failure)
+                        {
+                            LOG_WARN_FMT("计划命令下发失败：command={} error={}", command.id, failure.what());
+                        }
+                    }
+                });
         while (true)
         {
             co_await ticker.waitFor(std::chrono::seconds{2});
-            // follower 只等待：计划命令是控制面单飞工作，多实例同时推进会把同一条命令重复下发
-            if (!leaderGate.allowsWork())
-            {
-                continue;
-            }
-            std::vector<Command::CommandRecord> due;
-            try
-            {
-                due = co_await allCommands->listDue(loop, 100);
-            } catch (const std::exception &failure)
-            {
-                LOG_WARN_FMT("计划命令扫描失败：{}", failure.what());
-                continue;
-            }
-            for (const Command::CommandRecord &command: due)
-            {
-                if (!m_agentChannels->isConnected(command.nodeId))
-                {
-                    continue;
-                }
-                try
-                {
-                    const AsynGyanis::Base::ConfigValue commandValue = AsynGyanis::Base::ConfigValue::object(
-                            {{"id", command.id}, {"nodeId", command.nodeId}, {"type", command.type}, {"payload", command.payload}, {"timeoutSeconds", command.timeoutSeconds}});
-                    const std::string message = AsynGyanis::Base::ConfigValue::object({{"type", "command"}, {"command", commandValue}}).dump();
-                    if (!co_await m_agentChannels->send(command.nodeId, message))
-                    {
-                        continue;
-                    }
-                    if (!co_await allCommands->markDispatched(loop, command.id))
-                    {
-                        continue;
-                    }
-                    const auto updated = co_await allCommands->find(loop, command.id);
-                    if (!updated.has_value())
-                    {
-                        continue;
-                    }
-                    const std::string statusPayload = AsynGyanis::Base::ConfigValue::object({{"type", "command.status"},
-                                                                                             {"data", AsynGyanis::Base::ConfigValue::object({{"id", updated->id},
-                                                                                                                                             {"nodeId", updated->nodeId},
-                                                                                                                                             {"type", updated->type},
-                                                                                                                                             {"status", updated->status},
-                                                                                                                                             {"message", updated->message}})}})
-                                                              .dump();
-                    co_await m_realtimeBus->publish("commands", updated->tenantId, statusPayload);
-                } catch (const std::exception &failure)
-                {
-                    LOG_WARN_FMT("计划命令下发失败：command={} error={}", command.id, failure.what());
-                }
-            }
+            co_await leaderTick.run();
         }
     }
 
@@ -744,58 +761,60 @@ namespace EdgePulse::App
         System::LeaderGate                                          leaderGate(
                 "数据保留期清理", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
                 [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
-        bool firstRun = true;
+        bool             firstRun = true;
+        System::LeaderTick retentionTick(
+                leaderGate, [this, &loop, &firstRun, allTelemetry, allDeliveries]() -> AsynGyanis::Core::Task<>
+                {
+                    firstRun = false;
+                    // 三张表各自兜底，一张失败不拖住其余清理
+                    try
+                    {
+                        static_cast<void>(co_await allTelemetry->prune(loop, m_configuration.telemetryRetentionDays));
+                    } catch (const std::exception &failure)
+                    {
+                        LOG_WARN_FMT("遥测清理失败：{}", failure.what());
+                    }
+                    try
+                    {
+                        static_cast<void>(co_await m_logRepository->prune(loop, m_configuration.logRetentionDays));
+                    } catch (const std::exception &failure)
+                    {
+                        LOG_WARN_FMT("日志清理失败：{}", failure.what());
+                    }
+                    try
+                    {
+                        static_cast<void>(co_await allDeliveries->prune(loop, m_configuration.deliveryRetentionDays));
+                    } catch (const std::exception &failure)
+                    {
+                        LOG_WARN_FMT("投递记录清理失败：{}", failure.what());
+                    }
+                    try
+                    {
+                        const std::size_t pruned = co_await m_idempotencyRepository->pruneExpired(loop);
+                        if (pruned > 0)
+                        {
+                            LOG_INFO_FMT("幂等记录清理完成：删除 {} 条到期记录", pruned);
+                        }
+                    } catch (const std::exception &failure)
+                    {
+                        LOG_WARN_FMT("幂等记录清理失败：{}", failure.what());
+                    }
+                    LOG_INFO_FMT("数据清理完成（保留天数，0 表示关闭）：遥测 {}、日志 {}、投递记录 {}", m_configuration.telemetryRetentionDays, m_configuration.logRetentionDays,
+                                 m_configuration.deliveryRetentionDays);
+                });
         while (true)
         {
             // 重启后先尽快清一次，避免积压等到首个六小时周期；尚未当选时保持首轮标记，当选后一分钟内补跑
             co_await ticker.waitFor(firstRun ? std::chrono::minutes{1} : std::chrono::hours{6});
-            if (!leaderGate.allowsWork())
-            {
-                continue;
-            }
-            firstRun = false;
-            // 三张表各自兜底，一张失败不拖住其余清理
-            try
-            {
-                static_cast<void>(co_await allTelemetry->prune(loop, m_configuration.telemetryRetentionDays));
-            } catch (const std::exception &failure)
-            {
-                LOG_WARN_FMT("遥测清理失败：{}", failure.what());
-            }
-            try
-            {
-                static_cast<void>(co_await m_logRepository->prune(loop, m_configuration.logRetentionDays));
-            } catch (const std::exception &failure)
-            {
-                LOG_WARN_FMT("日志清理失败：{}", failure.what());
-            }
-            try
-            {
-                static_cast<void>(co_await allDeliveries->prune(loop, m_configuration.deliveryRetentionDays));
-            } catch (const std::exception &failure)
-            {
-                LOG_WARN_FMT("投递记录清理失败：{}", failure.what());
-            }
-            try
-            {
-                const std::size_t pruned = co_await m_idempotencyRepository->pruneExpired(loop);
-                if (pruned > 0)
-                {
-                    LOG_INFO_FMT("幂等记录清理完成：删除 {} 条到期记录", pruned);
-                }
-            } catch (const std::exception &failure)
-            {
-                LOG_WARN_FMT("幂等记录清理失败：{}", failure.what());
-            }
-            LOG_INFO_FMT("数据清理完成（保留天数，0 表示关闭）：遥测 {}、日志 {}、投递记录 {}", m_configuration.telemetryRetentionDays, m_configuration.logRetentionDays,
-                         m_configuration.deliveryRetentionDays);
+            co_await retentionTick.run();
         }
     }
 
     AsynGyanis::Core::Task<> Application::runReadinessProbe(AsynGyanis::Core::EventLoop &loop)
     {
         AsynGyanis::Core::Timer ticker(loop);
-        bool                    lastReady = true;
+        bool                    lastReady  = true;
+        bool                    firstProbe = true;
         while (true)
         {
             bool ready = false;
@@ -819,6 +838,15 @@ namespace EdgePulse::App
                 lastReady = ready;
             }
             m_readiness.setCacheReady(ready);
+            if (firstProbe)
+            {
+                firstProbe = false;
+                // 首轮探针完成后才置服务就绪；停机请求先到时不要把它翻回 true
+                if (!m_stopRequested.load(std::memory_order_acquire))
+                {
+                    m_readiness.setServiceReady(true);
+                }
+            }
             // 每个实例都探测自己的缓存；Redis 启用时这是一次轻量 PING
             co_await ticker.waitFor(std::chrono::seconds{10});
         }
@@ -834,36 +862,42 @@ namespace EdgePulse::App
                 "离线扫描与告警评估", m_configuration.instanceId, [this] { return m_leaderLease != nullptr && m_leaderLease->isLeader(); },
                 [this] { return m_leaderLease != nullptr ? m_leaderLease->fence() : 0; });
         bool firstRun = true;
+        // 离线判定与离线告警只由 leader 执行；指标读数便宜，follower 也刷新，面板能看到每台实例的最新视图
+        System::LeaderTick fleetTick(
+                sweepGate,
+                [this, &loop]() -> AsynGyanis::Core::Task<>
+                {
+                    try
+                    {
+                        const std::string cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{m_configuration.heartbeatTimeoutSeconds});
+                        co_await m_lifecycle->sweep(loop, cutoff);
+                    } catch (const std::exception &failure)
+                    {
+                        // 单轮失败（数据库抖动、临时锁冲突）不能终止周期任务，否则服务会永久停止判离线
+                        LOG_WARN_FMT("离线扫描失败：{}", failure.what());
+                    }
+                },
+                [this, &loop, allAlarms, allCommands, allFirmware]() -> AsynGyanis::Core::Task<>
+                {
+                    try
+                    {
+                        const Device::NodeStatusCounts counts = co_await m_fleetNodes->countByStatus(loop);
+                        Metrics::BusinessMetrics::instance().setNodeCounts(counts.online, counts.offline);
+                        Metrics::BusinessMetrics::instance().setAgentCertificatesExpiring(co_await m_fleetNodes->countExpiringCertificates(loop, 7));
+                        Metrics::BusinessMetrics::instance().setAlarmsOpen(co_await allAlarms->openCount(loop));
+                        Metrics::BusinessMetrics::instance().setCommandsPending(co_await allCommands->pendingCount(loop));
+                        Metrics::BusinessMetrics::instance().setUnsignedFirmware(co_await allFirmware->unsignedCount(loop));
+                    } catch (const std::exception &failure)
+                    {
+                        LOG_WARN_FMT("业务指标刷新失败：{}", failure.what());
+                    }
+                });
         while (true)
         {
             // 首次延后十秒：给启动中的 Agent 留出重连窗口，避免把正在恢复的节点误判离线
             co_await ticker.waitFor(firstRun ? std::chrono::seconds{10} : std::chrono::seconds{m_configuration.offlineSweepSeconds});
             firstRun = false;
-            // 离线判定与离线告警只由 leader 执行；指标读数便宜，follower 也刷新，面板能看到每台实例的最新视图
-            if (sweepGate.allowsWork())
-            {
-                try
-                {
-                    const std::string cutoff = Common::formatDateTimeUtc(std::chrono::system_clock::now() - std::chrono::seconds{m_configuration.heartbeatTimeoutSeconds});
-                    co_await m_lifecycle->sweep(loop, cutoff);
-                } catch (const std::exception &failure)
-                {
-                    // 单轮失败（数据库抖动、临时锁冲突）不能终止周期任务，否则服务会永久停止判离线
-                    LOG_WARN_FMT("离线扫描失败：{}", failure.what());
-                }
-            }
-            try
-            {
-                const Device::NodeStatusCounts counts = co_await m_fleetNodes->countByStatus(loop);
-                Metrics::BusinessMetrics::instance().setNodeCounts(counts.online, counts.offline);
-                Metrics::BusinessMetrics::instance().setAgentCertificatesExpiring(co_await m_fleetNodes->countExpiringCertificates(loop, 7));
-                Metrics::BusinessMetrics::instance().setAlarmsOpen(co_await allAlarms->openCount(loop));
-                Metrics::BusinessMetrics::instance().setCommandsPending(co_await allCommands->pendingCount(loop));
-                Metrics::BusinessMetrics::instance().setUnsignedFirmware(co_await allFirmware->unsignedCount(loop));
-            } catch (const std::exception &failure)
-            {
-                LOG_WARN_FMT("业务指标刷新失败：{}", failure.what());
-            }
+            co_await fleetTick.run();
         }
     }
 

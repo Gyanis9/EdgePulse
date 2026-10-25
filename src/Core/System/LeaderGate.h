@@ -16,6 +16,8 @@
 
 namespace EdgePulse::System
 {
+    class LeaderTick;
+
     /**
      * @brief 每 tick 判定本实例是否该执行单飞工作
      * @details leader 丢失时只在切换的那一拍记一条日志，之后保持静默；重新当选时同样只记一次。
@@ -35,19 +37,22 @@ namespace EdgePulse::System
         LeaderGate(std::string taskName, std::string instanceId, std::function<bool()> isLeader, std::function<std::int64_t()> fence = {});
 
         /**
-         * @brief 判定本 tick 是否执行工作
-         * @return bool 回调返回 true 时才允许执行
-         * @note follower 返回 false；leader 与 follower 的切换各记一条日志，不按 tick 重复
-         */
-        [[nodiscard]] bool allowsWork();
-
-        /**
          * @brief 任务名
          * @return const std::string & 构造时传入的名字
          */
         [[nodiscard]] const std::string &taskName() const noexcept;
 
     private:
+        friend class LeaderTick;
+
+        /**
+         * @brief 判定本 tick 是否执行工作
+         * @return bool 回调返回 true 时才允许执行
+         * @note follower 返回 false；leader 与 follower 的切换各记一条日志，不按 tick 重复。
+         *       只交给 LeaderTick 调用，周期循环不得绕过它直接判定。
+         */
+        [[nodiscard]] bool allowsWork();
+
         /**
          * @brief 组装日志里的实例与 fence 描述
          * @return std::string 形如 instance=node-a fence=3

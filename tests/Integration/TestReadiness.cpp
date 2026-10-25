@@ -1,9 +1,14 @@
+#include "Base/Config/ConfigValue.h"
 #include "Core/Cache/MemoryKeyValueStore.h"
+#include "Core/Cache/RedisProbe.h"
+#include "Core/Http/PublisherHealth.h"
 #include "Core/Http/ReadinessState.h"
 #include "Core/Http/RealtimeBus.h"
 #include "Core/Http/SseBroadcaster.h"
 #include "Core/Http/WebSocketEndpoints.h"
 #include "Core/System/LeaderGate.h"
+#include "Core/System/LeaderTick.h"
+#include "Database/Redis/RedisConnection.h"
 #include "TestSupport/EventLoopRunner.h"
 #include "TestSupport/TemporaryDirectory.h"
 
@@ -11,6 +16,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <stdexcept>
 
 using EdgePulse::TestSupport::EventLoopRunner;
 using EdgePulse::TestSupport::TemporaryDirectory;
@@ -31,6 +38,86 @@ namespace
         dependencies.firmwareDirectoryReady = true;
         return dependencies;
     }
+
+    /**
+     * @brief 只实现探针用到的那几个虚函数的 Redis 连接替身
+     * @details connect/probeAlive 按脚本返回，用来驱动「未连接 -> 连接」「PING 失败 -> 重连」
+     *          两条恢复路径；不执行任何网络往返
+     */
+    class FakeRedisConnection final : public AsynGyanis::Database::RedisConnection
+    {
+    public:
+        FakeRedisConnection() : RedisConnection(AsynGyanis::Database::ConnectionConfig::redisDefault())
+        {
+        }
+
+        bool             connectResult{true};     ///< 下一次 connect 的结论
+        bool             sessionConnected{false}; ///< 本端连接标志
+        int              connectCalls{0};         ///< connect 调用次数
+        int              disconnectCalls{0};      ///< disconnect 调用次数
+        std::deque<bool> pingResults;             ///< 每次 probeAlive 的脚本结论
+
+        /**
+         * @brief 按脚本建立连接
+         * @return bool connectResult
+         */
+        bool connect() override
+        {
+            ++connectCalls;
+            if (!connectResult)
+            {
+                return false;
+            }
+            sessionConnected = true;
+            return true;
+        }
+
+        /**
+         * @brief 断开并清掉本端标志
+         */
+        void disconnect() override
+        {
+            ++disconnectCalls;
+            sessionConnected = false;
+        }
+
+        /**
+         * @brief 只读本端连接标志，和真实驱动一样不主动探测
+         * @return bool 本端是否仍标记为已连接
+         */
+        [[nodiscard]] bool isConnected() const override
+        {
+            return sessionConnected;
+        }
+
+        /**
+         * @brief 消耗一条 PING 脚本结论；失败时模拟驱动断开
+         * @return bool 这一次 PING 是否收到回复
+         */
+        [[nodiscard]] bool probeAlive() noexcept override
+        {
+            if (pingResults.empty())
+            {
+                return false;
+            }
+            const bool alive = pingResults.front();
+            pingResults.pop_front();
+            if (!alive)
+            {
+                sessionConnected = false;
+            }
+            return alive;
+        }
+
+        /**
+         * @brief 固定报告 Redis 类型
+         * @return AsynGyanis::Database::DatabaseType Redis
+         */
+        [[nodiscard]] AsynGyanis::Database::DatabaseType databaseType() const override
+        {
+            return AsynGyanis::Database::DatabaseType::Redis;
+        }
+    };
 } // namespace
 
 // 钉住：五格依赖全绿时才就绪，reason 为空
@@ -141,54 +228,218 @@ TEST(Readiness, RealtimeBusHealthRequiresConnectionsWhenEnabled)
     EXPECT_FALSE(enabledBus.isHealthy());
 }
 
-// 钉住：follower 的每个周期 tick 都不执行工作，只有当选后计数才前进
+// 钉住：LeaderTick 在每个 tick 都询问门控；follower 不执行工作，当选后计数才前进
 TEST(LeaderOnlyLoops, FollowerSkipsWorkUntilLeader)
 {
+    EventLoopRunner               runner;
     std::atomic<bool>             leader{false};
-    std::atomic<int>              workCount{0};
-    EdgePulse::System::LeaderGate gate("测试周期任务", "test-node", [&leader] { return leader.load(std::memory_order_acquire); }, [] { return std::int64_t{7}; });
+    std::atomic<int>              gateCalls{0};
+    int                           workCount = 0;
+    EdgePulse::System::LeaderGate gate(
+            "测试周期任务", "test-node",
+            [&leader, &gateCalls]
+            {
+                gateCalls.fetch_add(1, std::memory_order_relaxed);
+                return leader.load(std::memory_order_acquire);
+            },
+            [] { return std::int64_t{7}; });
+    EdgePulse::System::LeaderTick tick(gate,
+                                       [&workCount]() -> AsynGyanis::Core::Task<>
+                                       {
+                                           ++workCount;
+                                           co_return;
+                                       });
 
-    for (int tick = 0; tick < 3; ++tick)
+    for (int round = 0; round < 3; ++round)
     {
-        if (gate.allowsWork())
-        {
-            workCount.fetch_add(1, std::memory_order_relaxed);
-        }
+        runner.run(tick.run());
     }
-    EXPECT_EQ(0, workCount.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, workCount);
+    EXPECT_EQ(3, gateCalls.load(std::memory_order_relaxed));
 
     leader.store(true, std::memory_order_release);
-    for (int tick = 0; tick < 2; ++tick)
+    for (int round = 0; round < 2; ++round)
     {
-        if (gate.allowsWork())
-        {
-            workCount.fetch_add(1, std::memory_order_relaxed);
-        }
+        runner.run(tick.run());
     }
-    EXPECT_EQ(2, workCount.load(std::memory_order_relaxed));
+    EXPECT_EQ(2, workCount);
+    EXPECT_EQ(5, gateCalls.load(std::memory_order_relaxed));
 
     leader.store(false, std::memory_order_release);
-    for (int tick = 0; tick < 2; ++tick)
+    for (int round = 0; round < 2; ++round)
     {
-        if (gate.allowsWork())
-        {
-            workCount.fetch_add(1, std::memory_order_relaxed);
-        }
+        runner.run(tick.run());
     }
-    EXPECT_EQ(2, workCount.load(std::memory_order_relaxed));
+    EXPECT_EQ(2, workCount);
+    EXPECT_EQ(7, gateCalls.load(std::memory_order_relaxed));
 }
 
-// 钉住：同一个 gate 只在状态切换时改变判定，follower 期间重复判定不产生工作
-TEST(LeaderOnlyLoops, RepeatedTicksAreIdempotentForFollowers)
+// 钉住：fleet 的离线扫描只在 leader 上执行，指标刷新作为每个 tick 都执行的工作保留在 follower 上
+TEST(LeaderOnlyLoops, FleetSweepIsLeaderOnlyButMetricsRunEverywhere)
+{
+    EventLoopRunner               runner;
+    std::atomic<bool>             leader{false};
+    int                           sweepCount  = 0;
+    int                           metricCount = 0;
+    EdgePulse::System::LeaderGate gate("离线扫描与告警评估", "test-node", [&leader] { return leader.load(std::memory_order_acquire); });
+    EdgePulse::System::LeaderTick tick(
+            gate,
+            [&sweepCount]() -> AsynGyanis::Core::Task<>
+            {
+                ++sweepCount;
+                co_return;
+            },
+            [&metricCount]() -> AsynGyanis::Core::Task<>
+            {
+                ++metricCount;
+                co_return;
+            });
+
+    for (int round = 0; round < 3; ++round)
+    {
+        runner.run(tick.run());
+    }
+    EXPECT_EQ(0, sweepCount);
+    EXPECT_EQ(3, metricCount);
+
+    leader.store(true, std::memory_order_release);
+    runner.run(tick.run());
+    EXPECT_EQ(1, sweepCount);
+    EXPECT_EQ(4, metricCount);
+
+    leader.store(false, std::memory_order_release);
+    runner.run(tick.run());
+    EXPECT_EQ(1, sweepCount);
+    EXPECT_EQ(5, metricCount);
+}
+
+// 钉住：没有 leader 工作体的 tick 构造即拒绝，避免门控被空实现绕过
+TEST(LeaderOnlyLoops, RejectsEmptyLeaderWork)
 {
     std::atomic<bool>             leader{false};
     EdgePulse::System::LeaderGate gate("测试周期任务", "test-node", [&leader] { return leader.load(std::memory_order_acquire); });
+    EXPECT_THROW(EdgePulse::System::LeaderTick(gate, {}), std::invalid_argument);
+}
 
-    for (int tick = 0; tick < 10; ++tick)
-    {
-        EXPECT_FALSE(gate.allowsWork());
-    }
-    leader.store(true, std::memory_order_release);
-    EXPECT_TRUE(gate.allowsWork());
-    EXPECT_TRUE(gate.allowsWork());
+// 钉住：发布连接只在已判定不健康时探针；恢复后周期检查不再触发网络往返，失败标记后重新开始
+TEST(RealtimeBus, PublisherHealthProbesOnlyWhenUnhealthy)
+{
+    EdgePulse::Web::PublisherHealth health;
+    int                             probes    = 0;
+    bool                            reachable = false;
+
+    EXPECT_FALSE(health.isHealthy());
+    EXPECT_FALSE(health.probe(
+            [&probes, &reachable]
+            {
+                ++probes;
+                return reachable;
+            }));
+    EXPECT_EQ(1, probes);
+
+    reachable = true;
+    EXPECT_TRUE(health.probe(
+            [&probes, &reachable]
+            {
+                ++probes;
+                return reachable;
+            }));
+    EXPECT_EQ(2, probes);
+    EXPECT_TRUE(health.isHealthy());
+
+    EXPECT_TRUE(health.probe(
+            [&probes]
+            {
+                ++probes;
+                return false;
+            }));
+    EXPECT_EQ(2, probes);
+
+    health.markUnhealthy();
+    EXPECT_TRUE(health.probe(
+            [&probes]
+            {
+                ++probes;
+                return true;
+            }));
+    EXPECT_EQ(3, probes);
+
+    EXPECT_TRUE(health.probe(
+            [&probes]
+            {
+                ++probes;
+                return true;
+            },
+            true));
+    EXPECT_EQ(4, probes);
+}
+
+// 钉住：跨实例信封带配置的实例标识，缺省实例标识非空且不会把空串写进信封
+TEST(RealtimeBus, EnvelopeCarriesConfiguredInstanceId)
+{
+    EventLoopRunner                  runner;
+    EdgePulse::Web::BrowserWebSocket webSocket;
+    EdgePulse::Web::SseBroadcaster   sse;
+
+    EdgePulse::Web::RealtimeBusOptions options;
+    options.instanceId = "node-a";
+    EdgePulse::Web::RealtimeBus bus(runner.loop(), webSocket, sse, options);
+    EXPECT_EQ("node-a", bus.instanceId());
+
+    const std::string envelope = EdgePulse::Web::makeRealtimeEnvelope(bus.instanceId(), "nodes", 9, R"({"type":"node.status"})");
+    const auto        parsed   = AsynGyanis::Base::parseConfigValue(envelope);
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_TRUE(parsed->is_object());
+    EXPECT_EQ("node-a", parsed->value("instance", std::string{}));
+    EXPECT_EQ("nodes", parsed->value("base", std::string{}));
+    EXPECT_EQ(9, parsed->value("tenantId", std::int64_t{0}));
+    EXPECT_EQ(R"({"type":"node.status"})", parsed->value("payload", std::string{}));
+
+    EdgePulse::Web::RealtimeBusOptions randomOptions;
+    EdgePulse::Web::RealtimeBus        randomBus(runner.loop(), webSocket, sse, randomOptions);
+    EXPECT_FALSE(randomBus.instanceId().empty());
+    EXPECT_NE("node-a", randomBus.instanceId());
+}
+
+// 钉住：未连接时探针自己建立连接并 PING，成功后报告可用
+TEST(RedisCacheProbe, ConnectsAndPingsDisconnectedStore)
+{
+    FakeRedisConnection connection;
+    connection.pingResults = {true};
+    EXPECT_TRUE(EdgePulse::Cache::probeRedisConnection(connection, "127.0.0.1:6379"));
+    EXPECT_EQ(1, connection.connectCalls);
+    EXPECT_EQ(0, connection.disconnectCalls);
+}
+
+// 钉住：PING 失败（连接已被服务端丢弃）时断开并只重连一次，重连后的 PING 成功即恢复
+TEST(RedisCacheProbe, ReconnectsAfterPingFailure)
+{
+    FakeRedisConnection connection;
+    connection.sessionConnected = true;
+    connection.pingResults      = {false, true};
+    EXPECT_TRUE(EdgePulse::Cache::probeRedisConnection(connection, "127.0.0.1:6379"));
+    EXPECT_EQ(1, connection.connectCalls);
+    ASSERT_EQ(1, connection.disconnectCalls);
+}
+
+// 钉住：重连失败返回 false；探针不能抛异常
+TEST(RedisCacheProbe, ReportsFailureWhenReconnectFails)
+{
+    FakeRedisConnection connection;
+    connection.sessionConnected = true;
+    connection.pingResults      = {false};
+    connection.connectResult    = false;
+    EXPECT_FALSE(EdgePulse::Cache::probeRedisConnection(connection, "127.0.0.1:6379"));
+    EXPECT_EQ(1, connection.connectCalls);
+    EXPECT_EQ(1, connection.disconnectCalls);
+}
+
+// 钉住：首次建连失败同样返回 false，不再重复尝试
+TEST(RedisCacheProbe, ReportsFailureWhenInitialConnectFails)
+{
+    FakeRedisConnection connection;
+    connection.connectResult = false;
+    EXPECT_FALSE(EdgePulse::Cache::probeRedisConnection(connection, "127.0.0.1:6379"));
+    EXPECT_EQ(1, connection.connectCalls);
+    EXPECT_EQ(0, connection.disconnectCalls);
 }

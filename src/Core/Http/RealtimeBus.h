@@ -10,8 +10,10 @@
 #pragma once
 
 #include <Core/Coroutine/Task.h>
+#include "Core/Http/PublisherHealth.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -35,6 +37,16 @@ namespace EdgePulse::Web
 {
     class BrowserWebSocket;
     class SseBroadcaster;
+
+    /**
+     * @brief 生成跨实例信封
+     * @param instanceId 发布实例标识
+     * @param base 主题基名
+     * @param tenantId 归属租户
+     * @param payload 已序列化的 JSON 文本
+     * @return std::string 形如 {"instance":...,"base":...,"tenantId":...,"payload":...} 的 JSON
+     */
+    [[nodiscard]] std::string makeRealtimeEnvelope(std::string_view instanceId, std::string_view base, std::int64_t tenantId, std::string_view payload);
 
     /**
      * @brief Redis 转发参数
@@ -84,9 +96,16 @@ namespace EdgePulse::Web
         /**
          * @brief 跨实例转发是否可用
          * @return bool 未启用 Redis 时恒为 true；启用时要求发布连接与订阅连接均处于可用状态
-         * @note 只读原子快照，可在任意线程调用；连接状态由发布路径与订阅线程自行维护
+         * @note 只读原子快照，可在任意线程调用；发布连接失效后由订阅线程按 5 秒周期重连并 PING，
+         *       恢复后无需重启进程
          */
         [[nodiscard]] bool isHealthy() const noexcept;
+
+        /**
+         * @brief 本实例标识
+         * @return std::string_view 配置值；配置为空时为构造期生成的随机值
+         */
+        [[nodiscard]] std::string_view instanceId() const noexcept;
 
         /**
          * @brief 发布一条事件到本进程与其它实例
@@ -118,6 +137,24 @@ namespace EdgePulse::Web
          */
         void subscribeLoop(std::stop_token stopToken);
 
+        /**
+         * @brief 订阅线程到点后按需恢复发布连接
+         * @note 只在发布连接不健康时调用注入探针
+         */
+        void probePublisher();
+
+        /**
+         * @brief 在已持有发布连接锁时断开并重连，再 PING
+         * @return bool 恢复成功为 true
+         */
+        bool reconnectPublisherLocked();
+
+        /**
+         * @brief 自行加锁后恢复发布连接
+         * @return bool 恢复成功为 true
+         */
+        bool reconnectPublisher();
+
         AsynGyanis::Core::EventLoop                           &m_loop;                       ///< 服务器循环
         BrowserWebSocket                                      &m_webSocket;                  ///< 浏览器扇出
         SseBroadcaster                                        &m_sse;                        ///< 告警 SSE
@@ -126,7 +163,8 @@ namespace EdgePulse::Web
         std::jthread                                           m_thread;                     ///< 订阅线程
         std::unique_ptr<AsynGyanis::Database::RedisConnection> m_publisher;                  ///< 发布连接，只在循环线程使用
         std::mutex                                             m_publisherMutex;             ///< 保护发布连接
-        std::atomic<bool>                                      m_publisherHealthy{false};    ///< 发布连接最近一次已知状态
+        PublisherHealth                                        m_publisherHealth;            ///< 发布连接健康状态与按需探针
+        std::chrono::steady_clock::time_point                  m_nextPublisherAttempt{};     ///< 下一次允许重连的时刻，和发布连接同锁
         std::atomic<bool>                                      m_subscriberConnected{false}; ///< 订阅连接是否已订阅频道
         std::atomic<bool>                                      m_stopping{false};            ///< 析构开始标记
 

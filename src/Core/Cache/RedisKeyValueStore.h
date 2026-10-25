@@ -22,6 +22,7 @@
 
 namespace AsynGyanis::Database
 {
+    struct ConnectionConfig;
     class DatabaseResult;
     class RedisConnection;
 } // namespace AsynGyanis::Database
@@ -115,6 +116,18 @@ namespace EdgePulse::Cache
          * @throws Common::DatabaseException 连接或命令失败
          */
         [[nodiscard]] std::unique_ptr<AsynGyanis::Database::DatabaseResult> executeLocked(const std::string_view command, const std::vector<std::string> &arguments);
+
+        /**
+         * @brief 按构造参数生成连接配置
+         * @return AsynGyanis::Database::ConnectionConfig Redis 连接配置
+         */
+        [[nodiscard]] AsynGyanis::Database::ConnectionConfig connectionConfig() const;
+
+        /**
+         * @brief 日志用的连接端点
+         * @return std::string 形如 host:port，不含口令
+         */
+        [[nodiscard]] std::string endpoint() const;
 
         std::string   m_host;     ///< 主机
         std::uint16_t m_port;     ///< 端口

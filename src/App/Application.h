@@ -299,6 +299,7 @@ namespace EdgePulse::App
         std::optional<AsynGyanis::Core::Task<>>                   m_shutdownTask;           ///< 排空协程，活到应用析构
         std::optional<std::jthread>                               m_stopThread;             ///< 从池外叫停 IoContext 的线程
         std::jthread                                              m_healthProbe;            ///< 数据库健康探针
+        std::jthread                                              m_firmwareProbe;          ///< 固件目录可写探针，与数据库探针互不阻塞
         std::unique_ptr<AsynGyanis::Net::OtlpHttpMetricsExporter> m_metricsExporter;        ///< OTLP 读数出口
         std::optional<AsynGyanis::Core::ProcessMetricHandle>      m_buildInfoMetric;        ///< 构建信息读数
         Web::ReadinessState                                       m_readiness;              ///< /readyz 的依赖快照

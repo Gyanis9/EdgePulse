@@ -12,6 +12,7 @@
 #include "Core/System/LogRepository.h"
 #include "Core/System/MigrationLock.h"
 #include "Core/System/MigrationRunner.h"
+#include "Database/Redis/RedisConnection.h"
 #include "TestSupport/EventLoopRunner.h"
 
 #include <gtest/gtest.h>
@@ -248,4 +249,46 @@ TEST(ExternalStores, RedisKeyValueStoreRoundTrip)
     EXPECT_TRUE(runner.run(store.erase(runner.loop(), base)));
     EXPECT_FALSE(runner.run(store.get(runner.loop(), base)).has_value());
     EXPECT_TRUE(runner.run(store.erase(runner.loop(), counter)));
+}
+
+// 钉住：连接被服务端单方面丢弃后，probe 会重连并重新 PING，随后普通缓存操作照常可用
+TEST(ExternalStores, RedisCacheProbeRecoversAfterConnectionLoss)
+{
+    const std::optional<std::string> host = environmentText("EDGEPULSE_TEST_REDIS_HOST");
+    if (!host.has_value())
+    {
+        GTEST_SKIP() << "缺少 EDGEPULSE_TEST_REDIS_HOST，跳过真实 Redis 用例";
+    }
+    const std::optional<std::string> password = environmentText("EDGEPULSE_TEST_REDIS_PASSWORD");
+    const std::uint16_t              port     = environmentPort("EDGEPULSE_TEST_REDIS_PORT", 6379);
+
+    EdgePulse::Cache::RedisKeyValueStore    store(*host, port, password.value_or(""), 15);
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    ASSERT_TRUE(runner.run(store.probe(runner.loop())));
+
+    AsynGyanis::Database::ConnectionConfig adminConfig = AsynGyanis::Database::ConnectionConfig::redisDefault();
+    adminConfig.host                                   = *host;
+    adminConfig.port                                   = port;
+    adminConfig.password                               = password.value_or("");
+    adminConfig.database                               = "15";
+    AsynGyanis::Database::RedisConnection admin(adminConfig);
+    ASSERT_TRUE(admin.connect()) << admin.lastError();
+
+    // SKIPME 保住管理连接本身，只踢掉同一服务端上的普通客户端，也就是缓存存储那条连接
+    const std::unique_ptr<AsynGyanis::Database::DatabaseResult> killed = admin.executeCommand({"CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes"});
+    ASSERT_NE(nullptr, killed) << admin.lastError();
+    ASSERT_TRUE(killed->next());
+    const auto  killedValue = killed->getValue(0);
+    const auto *killedCount = std::get_if<std::int64_t>(&killedValue);
+    ASSERT_NE(nullptr, killedCount);
+    EXPECT_GE(*killedCount, 1);
+
+    EXPECT_TRUE(runner.run(store.probe(runner.loop()))) << "探针没有在连接丢失后恢复";
+
+    const std::string key = "edgepulse:probe-recovery:" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    ASSERT_TRUE(runner.run(store.set(runner.loop(), key, "恢复后", std::chrono::seconds{30})));
+    const auto stored = runner.run(store.get(runner.loop(), key));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ("恢复后", *stored);
+    EXPECT_TRUE(runner.run(store.erase(runner.loop(), key)));
 }
