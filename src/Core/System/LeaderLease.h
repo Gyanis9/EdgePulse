@@ -42,8 +42,10 @@ namespace EdgePulse::System
      *          无法继续延长或写回租约。获取条件不接受 holder=自己，两个实例配了同一个
      *          instanceId 时后来者不会与先来者共享同一行，必须等 TTL 过期；代价是进程
      *          崩溃后重启最长要等一个 TTL 才能重新成为 leader。
-     *          每次成功获取或续约都按完成时刻刷新本地单调截止，isLeader 在截止过后立即变 false，
-     *          即使下一次续约还没跑，被暂停或拖慢的循环也不会继续执行只允许 leader 做的工作。
+     *          每次成功获取或续约，数据库工作线程在读到授权与库内到期的同一段执行里就把本地
+     *          单调截止算好并随结果交回；isLeader 在截止过后立即变 false，即使下一次续约还没跑，
+     *          被暂停或拖慢的循环也不会继续执行只允许 leader 做的工作。
+     *          截止是绝对刻度，事件循环恢复得再晚也不会把 leadership 延长到库内到期之后。
      *          续约遇到数据库异常时，只要本地截止未到就保留最后已知的 leadership 并重试；
      *          获取异常与续约 CAS 失败仍立即降为 follower。
      * @note 所有实例的系统时钟必须由 NTP 对齐：expires_at 的写入与比较都取本机 UTC 时间，
@@ -80,7 +82,8 @@ namespace EdgePulse::System
         /**
          * @brief 在事件循环上先尝试获取一次，再启动周期续约循环
          * @param loop 事件循环
-         * @return true 首次获取成功；false 首次未获取到、数据库报错或循环调度被拒
+         * @return true 首次获取成功且返回时本地截止仍在未来；false 首次未获取到、数据库报错、
+         *         事件循环停摆到截止之后才恢复或循环调度被拒
          * @note 只能在事件循环线程上 co_await；重复调用返回当前 leader 状态，不会启动第二个循环。
          *       首次未获取或数据库报错时循环仍会按续约周期重试；本地调度被拒时收回半启动状态
          *       并返回 false，已写入的 holder 会在 TTL 后自然失效。
@@ -99,7 +102,8 @@ namespace EdgePulse::System
         /**
          * @brief 最近一次观察到的 leader 状态
          * @return true 最近一次获取或续约成功、未收到停止请求且本地单调截止尚未到
-         * @note 截止由成功获取或续约的完成时刻加 TTL 得到，不依赖数据库时钟；
+         * @note 截止由数据库工作线程按读取授权/到期的同一时刻换算成绝对单调刻度，
+         *       与事件循环何时恢复无关，也不依赖数据库时钟；
          *       截止过后即使续约循环还没醒也返回 false
          */
         [[nodiscard]] bool isLeader() const noexcept;
@@ -147,11 +151,11 @@ namespace EdgePulse::System
         AsynGyanis::Core::Task<> releaseHolder(AsynGyanis::Core::EventLoop &loop, std::int64_t fence);
 
         /**
-         * @brief 记录一次成功的获取或续约并刷新本地截止
+         * @brief 记录一次成功的获取或续约并发布本地截止
          * @param fence 数据库返回的 fence
-         * @param remainingTtl 按库内到期时间算出的剩余有效期
+         * @param deadlineNanoseconds 数据库工作线程按授权时刻锚定的绝对单调截止（steady_clock 纳秒），原样发布
          */
-        void markLeader(std::int64_t fence, std::chrono::milliseconds remainingTtl) noexcept;
+        void markLeader(std::int64_t fence, std::int64_t deadlineNanoseconds) noexcept;
 
         /**
          * @brief 标记当前不再是 leader

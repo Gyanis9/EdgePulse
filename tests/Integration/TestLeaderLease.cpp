@@ -1,6 +1,7 @@
 #include "Base/Database/Database.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/System/LeaderLease.h"
+#include "Core/System/LeaseDeadline.h"
 #include "Core/System/MigrationLock.h"
 #include "Core/System/MigrationRunner.h"
 #include "TestSupport/EventLoopRunner.h"
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -119,7 +121,129 @@ namespace
         }
         return predicate();
     }
+
+    /**
+     * @brief 把惰性任务的布尔结果转交给 promise，供不经过 EventLoopRunner::run 的用例等待
+     * @param task 待执行的任务
+     * @param promise 结果出口，异常同样经它交回
+     * @return AsynGyanis::Core::Task<> 包装协程，活到结果就位之后
+     */
+    AsynGyanis::Core::Task<> forwardBooleanResult(AsynGyanis::Core::Task<bool> task, std::shared_ptr<std::promise<bool>> promise)
+    {
+        try
+        {
+            promise->set_value(co_await task);
+        } catch (...)
+        {
+            promise->set_exception(std::current_exception());
+        }
+    }
+
+    /**
+     * @brief 在事件循环线程上占住循环，等到数据库出现指定 holder 后再继续占住一段时间
+     * @param databasePath SQLite 文件路径
+     * @param holder 期望出现在 sys_lease 里的 holder
+     * @param hold 看到 holder 之后继续占用循环的时长
+     * @return AsynGyanis::Core::Task<> 占住期间循环上的协程恢复全部被推迟
+     * @note 故意在循环线程上做阻塞查询与睡眠：本函数模拟的正是事件循环停摆，
+     *       让授权在工作线程算完之后、恢复之前隔开一段可观测的延迟
+     */
+    AsynGyanis::Core::Task<> stallLoopAfterGrant(const std::filesystem::path &databasePath, const std::string &holder, const std::chrono::milliseconds hold)
+    {
+        const auto giveUp  = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+        bool       granted = false;
+        while (std::chrono::steady_clock::now() < giveUp)
+        {
+            bool matched = false;
+            try
+            {
+                const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+                const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result     = connection->execute("SELECT holder FROM sys_lease WHERE name = 'control-plane'");
+                if (result && result->next())
+                {
+                    const auto value = result->getValue(0);
+                    if (const auto *text = std::get_if<std::string>(&value); text != nullptr)
+                    {
+                        matched = *text == holder;
+                    }
+                }
+                connection->disconnect();
+            } catch (const std::exception &)
+            {
+                matched = false;
+            }
+            if (matched)
+            {
+                granted = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        if (granted)
+        {
+            std::this_thread::sleep_for(hold);
+        }
+        co_return;
+    }
 } // namespace
+
+// 钉住：本地截止锚定在工作线程取到授权的同一时刻，恢复延迟多久都不会把它推后
+TEST(LeaseDeadline, AnchorsToWorkerInstantInsteadOfResume)
+{
+    using namespace std::chrono;
+    const auto         wallNow   = system_clock::time_point{seconds{1'800'000'000}} + milliseconds{700};
+    const auto         rowExpiry = wallNow + seconds{2};
+    const std::int64_t steadyNow = 1'000'000'000;
+
+    const auto deadline = EdgePulse::System::leaseDeadlineNanoseconds(steadyNow, wallNow, rowExpiry, seconds{2});
+
+    // 库内到期只到秒：wallNow 的 700 毫秒被截掉，截止距取到授权的时刻 1.3 秒
+    EXPECT_EQ(steadyNow + 1'300'000'000LL, deadline);
+    EXPECT_LE(deadline, steadyNow + duration_cast<nanoseconds>(seconds{2}).count()) << "本地截止不能超过 TTL";
+
+    // 授权后循环停摆两秒才恢复：截止早已过去，isLeader 的判据必须为 false
+    const std::int64_t resumeAt = steadyNow + duration_cast<nanoseconds>(seconds{2}).count();
+    EXPECT_LT(deadline, resumeAt) << "恢复时刻晚于截止时仍被判为 leader";
+}
+
+// 钉住：任意亚秒起点的截断都只会让截止更早，不会越过行到期
+TEST(LeaseDeadline, TruncationNeverExtendsPastRowExpiry)
+{
+    using namespace std::chrono;
+    const auto         wallBase  = system_clock::time_point{seconds{1'800'000'000}};
+    const std::int64_t steadyNow = 5'000'000'000;
+    for (int offset = 0; offset < 1000; ++offset)
+    {
+        const auto wallNow   = wallBase + milliseconds{offset};
+        const auto rowExpiry = wallNow + seconds{2};
+        const auto deadline  = EdgePulse::System::leaseDeadlineNanoseconds(steadyNow, wallNow, rowExpiry, seconds{2});
+        const auto anchored  = steadyNow + duration_cast<nanoseconds>(floor<seconds>(rowExpiry) - wallNow).count();
+        EXPECT_LE(deadline, anchored) << "offset=" << offset << " 的截止越过了行到期";
+    }
+}
+
+// 钉住：取到授权时行已过期，截止就是取到授权的时刻，判据当场为 false
+TEST(LeaseDeadline, ExpiredRowYieldsCaptureInstant)
+{
+    using namespace std::chrono;
+    const auto         wallNow   = system_clock::time_point{seconds{1'800'000'000}} + milliseconds{250};
+    const std::int64_t steadyNow = 42;
+
+    const auto expired = EdgePulse::System::leaseDeadlineNanoseconds(steadyNow, wallNow, wallNow - milliseconds{1}, seconds{2});
+    EXPECT_EQ(steadyNow, expired);
+    EXPECT_FALSE(steadyNow < expired) << "行已过期时仍被判为 leader";
+    EXPECT_FALSE(steadyNow + 1 < expired);
+}
+
+// 钉住：行到期远在 TTL 之外（时钟回拨一类）时截止被夹在 TTL 内，不会拉长 leadership
+TEST(LeaseDeadline, ClampsToTtlWhenRowExpiryIsFarAhead)
+{
+    using namespace std::chrono;
+    const auto         wallNow   = system_clock::time_point{seconds{1'800'000'000}} + milliseconds{400};
+    const std::int64_t steadyNow = 7;
+    const auto         deadline  = EdgePulse::System::leaseDeadlineNanoseconds(steadyNow, wallNow, wallNow + seconds{30}, seconds{2});
+    EXPECT_EQ(steadyNow + duration_cast<nanoseconds>(seconds{2}).count(), deadline);
+}
 
 // 钉住：同一份 sys_lease 上只有一个 leader；A 释放后 B 才能接手并拿到 fence+1
 TEST(LeaderLease, AcquiresAndTransfersOnlyAfterRelease)
@@ -331,6 +455,52 @@ TEST(LeaderLease, LocalDeadlineDemotesWithoutRenewTick)
     removeDatabaseFiles(databasePath);
 }
 
+// 钉住：授权在工作线程算完后事件循环被拖住，恢复时本地截止不得越过库内到期
+TEST(LeaderLease, DeferredResumeCannotExtendLocalDeadline)
+{
+    const std::filesystem::path databasePath = makeTemporaryDatabasePath();
+    applyMigrations(databasePath);
+
+    std::shared_ptr<EdgePulse::Common::Database> database = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    EdgePulse::TestSupport::EventLoopRunner      runner;
+    {
+        // TTL 2 秒、续约 30 秒：测试期间不会再有续约刷新截止，只看首次授权
+        EdgePulse::System::LeaderLease lease(database, "instance-a", "control-plane", std::chrono::seconds{2}, std::chrono::seconds{30});
+
+        // 先按住写锁，保证授权 SQL 一定在循环被拖住之后才落库：恢复必然晚于授权
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> writer = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        ASSERT_NE(nullptr, writer->execute("BEGIN IMMEDIATE")) << writer->lastError();
+
+        const auto                   promise   = std::make_shared<std::promise<bool>>();
+        std::future<bool>            future    = promise->get_future();
+        AsynGyanis::Core::Task<bool> startTask = lease.start(runner.loop());
+        AsynGyanis::Core::Task<>     forward   = forwardBooleanResult(std::move(startTask), promise);
+        // 占住循环 2.6 秒，超过 TTL 与一秒的时间截断余量，恢复点一定落在行到期之后
+        AsynGyanis::Core::Task<> stall = stallLoopAfterGrant(databasePath, "instance-a", std::chrono::milliseconds{2600});
+        runner.loop().scheduler().scheduleRemote(forward.handle());
+        runner.loop().scheduler().scheduleRemote(stall.handle());
+
+        std::this_thread::sleep_for(std::chrono::milliseconds{300});
+        ASSERT_NE(nullptr, writer->execute("COMMIT")) << writer->lastError();
+        writer->disconnect();
+
+        ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds{8})) << "租约协程未在时限内恢复";
+        const bool acquired = future.get();
+
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+            EXPECT_EQ("instance-a", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'")) << "授权没有落库，用例没有走到延迟恢复的场景";
+        }
+
+        // start 的返回值来自恢复时刻的 isLeader()：旧实现把剩余有效期加在恢复时刻上，
+        // 这里会报告成功；本地截止若已锚定在授权时刻，恢复时必然已经过去
+        EXPECT_FALSE(acquired) << "恢复晚于库内到期时 start 仍报告获取成功，说明本地截止被延长到了行到期之后";
+        lease.stop();
+    }
+    database.reset();
+    removeDatabaseFiles(databasePath);
+}
+
 // 钉住：行已被改成过期后，延迟到达的续约不能延长它；只能重新获取并递增 fence
 TEST(LeaderLease, DelayedRenewCannotExtendExpiredRow)
 {
@@ -388,14 +558,14 @@ TEST(LeaderLease, StopWithStaleFenceDoesNotClearDuplicateHolder)
         ASSERT_TRUE(waitUntil([&leaseB] { return leaseB.isLeader(); }, std::chrono::seconds{8})) << "A 过期后 B 未接手";
         EXPECT_EQ(2, leaseB.fence());
 
-        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection       = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
         const std::string                                               expiryBeforeStop = queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'");
 
         leaseA.stop();
         EXPECT_EQ("shared-instance", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'")) << "A 的 stop 清掉了 B 同 instance_id 的行";
         EXPECT_EQ(2, queryInteger(*connection, "SELECT fence FROM sys_lease WHERE name = 'control-plane'"));
-        ASSERT_TRUE(waitUntil([&connection, &expiryBeforeStop] { return queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'") > expiryBeforeStop; },
-                              std::chrono::seconds{3}))
+        ASSERT_TRUE(waitUntil([&connection, &expiryBeforeStop]
+                              { return queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'") > expiryBeforeStop; }, std::chrono::seconds{3}))
                 << "A 停止后 B 的续约没有继续";
         EXPECT_TRUE(leaseB.isLeader());
         EXPECT_EQ(2, leaseB.fence());
@@ -422,7 +592,7 @@ TEST(LeaderLease, TransientRenewFailureKeepsLeaderUntilDeadline)
         EXPECT_EQ(1, lease.fence());
 
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
-        const std::string                                               expiryBeforeFailure = queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'");
+        const std::string expiryBeforeFailure                                      = queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'");
 
         // 表暂时不可见，期间至少跨过两个续约周期，续约只可能抛异常
         ASSERT_NE(nullptr, connection->execute("ALTER TABLE sys_lease RENAME TO sys_lease_offline")) << connection->lastError();
@@ -431,8 +601,8 @@ TEST(LeaderLease, TransientRenewFailureKeepsLeaderUntilDeadline)
         EXPECT_EQ(1, lease.fence());
 
         ASSERT_NE(nullptr, connection->execute("ALTER TABLE sys_lease_offline RENAME TO sys_lease")) << connection->lastError();
-        ASSERT_TRUE(waitUntil([&connection, &expiryBeforeFailure] { return queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'") > expiryBeforeFailure; },
-                              std::chrono::seconds{5}))
+        ASSERT_TRUE(waitUntil([&connection, &expiryBeforeFailure]
+                              { return queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'") > expiryBeforeFailure; }, std::chrono::seconds{5}))
                 << "异常恢复后续约没有继续";
         EXPECT_TRUE(lease.isLeader());
         EXPECT_EQ(1, lease.fence()) << "续约异常后不应重新走获取流程";

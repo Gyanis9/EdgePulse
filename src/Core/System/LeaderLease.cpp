@@ -11,6 +11,7 @@
 #include "Core/Coroutine/Scheduler.h"
 #include "Core/EventLoop/EventLoop.h"
 #include "Core/EventLoop/Timer.h"
+#include "Core/System/LeaseDeadline.h"
 
 #include <algorithm>
 #include <array>
@@ -47,8 +48,8 @@ namespace EdgePulse::System
          */
         struct LeaseGrant
         {
-            std::int64_t              fence{0};        ///< 行内 fence
-            std::chrono::milliseconds remainingTtl{0}; ///< 按库内到期时间算出的剩余有效期
+            std::int64_t fence{0};               ///< 行内 fence
+            std::int64_t deadlineNanoseconds{0}; ///< 按授权时刻锚定的本地单调截止（steady_clock 纳秒）
         };
 
         /**
@@ -61,19 +62,18 @@ namespace EdgePulse::System
         }
 
         /**
-         * @brief 按库内到期时间算剩余有效期，并夹在 TTL 之内
-         * @param expiresAt 库内到期时刻
-         * @param ttl 本次获取或续约写入的有效期
-         * @return std::chrono::milliseconds 剩余毫秒；已过期返回 0
+         * @brief 按本地绝对截止算出剩余毫秒，供日志使用
+         * @param deadlineNanoseconds 绝对单调截止（steady_clock 纳秒）
+         * @return std::int64_t 剩余毫秒；截止已过返回 0
          */
-        [[nodiscard]] std::chrono::milliseconds leaseRemainingTtl(const std::chrono::system_clock::time_point expiresAt, const std::chrono::seconds ttl) noexcept
+        [[nodiscard]] std::int64_t remainingMilliseconds(const std::int64_t deadlineNanoseconds) noexcept
         {
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(expiresAt - std::chrono::system_clock::now());
-            if (remaining <= std::chrono::milliseconds::zero())
+            const auto remaining = std::chrono::nanoseconds{deadlineNanoseconds - steadyNanoseconds()};
+            if (remaining <= std::chrono::nanoseconds::zero())
             {
-                return std::chrono::milliseconds::zero();
+                return 0;
             }
-            return std::min(remaining, std::chrono::duration_cast<std::chrono::milliseconds>(ttl));
+            return std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
         }
 
         /**
@@ -192,8 +192,8 @@ namespace EdgePulse::System
         try
         {
             const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirect(m_database->options());
-            const std::array<AsynGyanis::Database::DatabaseValue, 4>         parameters{Common::nowDateTimeUtc(), m_name, m_instanceId, m_fence.load(std::memory_order_acquire)};
-            const std::unique_ptr<AsynGyanis::Database::DatabaseResult>      result = connection->execute(kClearSql, parameters);
+            const std::array<AsynGyanis::Database::DatabaseValue, 4>        parameters{Common::nowDateTimeUtc(), m_name, m_instanceId, m_fence.load(std::memory_order_acquire)};
+            const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result = connection->execute(kClearSql, parameters);
             if (!result)
             {
                 LOG_WARN_FMT("停止时清空控制面租约失败：instance={} error={}", m_instanceId, connection->lastError());
@@ -293,30 +293,34 @@ namespace EdgePulse::System
                     [instanceId, name, ttl](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<LeaseGrant>
                     {
                         // 时间在数据库线程上按执行时刻生成，排队等待连接或线程调度不会把到期时间写成过去
-                        const auto        acquiredAt = std::chrono::system_clock::now();
-                        const std::string nowText    = Common::formatDateTimeUtc(acquiredAt);
-                        const std::string expiresAt  = Common::formatDateTimeUtc(acquiredAt + ttl);
+                        const auto                                               acquiredAt = std::chrono::system_clock::now();
+                        const std::string                                        nowText    = Common::formatDateTimeUtc(acquiredAt);
+                        const std::string                                        expiresAt  = Common::formatDateTimeUtc(acquiredAt + ttl);
                         const std::array<AsynGyanis::Database::DatabaseValue, 5> parameters{instanceId, expiresAt, nowText, name, nowText};
-                        const auto update = Sql::executeOrThrow(connection, kAcquireSql, parameters);
+                        const auto                                               update = Sql::executeOrThrow(connection, kAcquireSql, parameters);
                         if (update->affectedRowCount() <= 0)
                         {
                             return std::nullopt;
                         }
 
                         // 回读要求库内到期时间仍在未来，只有 UPDATE 命中不足以承认 leader
-                        const std::string verifyAt = Common::formatDateTimeUtc(std::chrono::system_clock::now());
+                        const std::string                                        verifyAt = Common::formatDateTimeUtc(std::chrono::system_clock::now());
                         const std::array<AsynGyanis::Database::DatabaseValue, 3> selectParameters{name, instanceId, verifyAt};
-                        const auto row = Sql::executeOrThrow(connection, kReadBackSql, selectParameters);
+                        const auto                                               row = Sql::executeOrThrow(connection, kReadBackSql, selectParameters);
                         if (!row->next())
                         {
                             return std::nullopt;
                         }
-                        const auto remaining = leaseRemainingTtl(acquiredAt + ttl, ttl);
-                        if (remaining <= std::chrono::milliseconds::zero())
+                        // 截止锚定在取到授权的同一段工作线程执行里：先取单调刻度再取墙上时间，
+                        // 换算只会更早；协程此后多久才恢复都不再参与计算
+                        const std::int64_t workerSteady = steadyNanoseconds();
+                        const auto         workerWall   = std::chrono::system_clock::now();
+                        const auto         deadline     = leaseDeadlineNanoseconds(workerSteady, workerWall, acquiredAt + ttl, ttl);
+                        if (deadline <= workerSteady)
                         {
                             return std::nullopt;
                         }
-                        return LeaseGrant{Sql::integer(*row, "fence"), remaining};
+                        return LeaseGrant{Sql::integer(*row, "fence"), deadline};
                     });
             if (!grant.has_value())
             {
@@ -330,7 +334,7 @@ namespace EdgePulse::System
                 markFollower();
                 co_return false;
             }
-            markLeader(grant->fence, grant->remainingTtl);
+            markLeader(grant->fence, grant->deadlineNanoseconds);
             // 停止请求与这次获取交错时，stop 的清理可能早于 m_fence 更新；这里再按取得的 fence 收口
             if (m_stopped.load(std::memory_order_acquire))
             {
@@ -338,8 +342,9 @@ namespace EdgePulse::System
                 markFollower();
                 co_return false;
             }
-            LOG_INFO_FMT("获得控制面租约：instance={} fence={} 剩余有效期={}ms", m_instanceId, grant->fence, grant->remainingTtl.count());
-            co_return true;
+            LOG_INFO_FMT("获得控制面租约：instance={} fence={} 剩余有效期={}ms", m_instanceId, grant->fence, remainingMilliseconds(grant->deadlineNanoseconds));
+            // 事件循环可能停摆到截止之后才恢复：此时授权行已过期，不能报告获取成功
+            co_return isLeader();
         } catch (const std::exception &failure)
         {
             markFollower();
@@ -361,21 +366,24 @@ namespace EdgePulse::System
                     [instanceId, name, ttl, currentFence](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<LeaseGrant>
                     {
                         // 时间同样在执行时刻生成；AND expires_at > ? 让延迟到达的续约无法延长已过期的行
-                        const auto        renewedAt = std::chrono::system_clock::now();
-                        const std::string nowText   = Common::formatDateTimeUtc(renewedAt);
-                        const std::string expiresAt = Common::formatDateTimeUtc(renewedAt + ttl);
+                        const auto                                               renewedAt = std::chrono::system_clock::now();
+                        const std::string                                        nowText   = Common::formatDateTimeUtc(renewedAt);
+                        const std::string                                        expiresAt = Common::formatDateTimeUtc(renewedAt + ttl);
                         const std::array<AsynGyanis::Database::DatabaseValue, 6> parameters{expiresAt, nowText, name, instanceId, currentFence, nowText};
-                        const auto update = Sql::executeOrThrow(connection, kRenewSql, parameters);
+                        const auto                                               update = Sql::executeOrThrow(connection, kRenewSql, parameters);
                         if (update->affectedRowCount() <= 0)
                         {
                             return std::nullopt;
                         }
-                        const auto remaining = leaseRemainingTtl(renewedAt + ttl, ttl);
-                        if (remaining <= std::chrono::milliseconds::zero())
+                        // 与获取同一条口径：续约结果落库后立刻在工作线程上锚定本地截止
+                        const std::int64_t workerSteady = steadyNanoseconds();
+                        const auto         workerWall   = std::chrono::system_clock::now();
+                        const auto         deadline     = leaseDeadlineNanoseconds(workerSteady, workerWall, renewedAt + ttl, ttl);
+                        if (deadline <= workerSteady)
                         {
                             return std::nullopt;
                         }
-                        return LeaseGrant{currentFence, remaining};
+                        return LeaseGrant{currentFence, deadline};
                     });
             if (!grant.has_value())
             {
@@ -390,14 +398,15 @@ namespace EdgePulse::System
                 markFollower();
                 co_return false;
             }
-            markLeader(grant->fence, grant->remainingTtl);
+            markLeader(grant->fence, grant->deadlineNanoseconds);
             // 停止请求可能落在前一次检查之后，markLeader 之后再确认一次，避免 stop 后又被抬成 leader
             if (m_stopped.load(std::memory_order_acquire))
             {
                 markFollower();
                 co_return false;
             }
-            co_return true;
+            // 恢复晚于本地截止时续约结果已经作废，如实报告当前状态
+            co_return isLeader();
         } catch (const std::exception &failure)
         {
             // 数据库短暂不可用不等于租约丢失：本地截止未到就保留最后已知的 leadership，下一轮重试
@@ -433,12 +442,12 @@ namespace EdgePulse::System
         co_return;
     }
 
-    void LeaderLease::markLeader(const std::int64_t fence, const std::chrono::milliseconds remainingTtl) noexcept
+    void LeaderLease::markLeader(const std::int64_t fence, const std::int64_t deadlineNanoseconds) noexcept
     {
-        // 先写 fence 与本地截止再放开 leader，读侧看到 true 时两者一定已经就位
-        const std::int64_t deadline = steadyNanoseconds() + std::chrono::duration_cast<std::chrono::nanoseconds>(remainingTtl).count();
+        // 截止已由数据库工作线程锚定在取到授权的那一刻，这里只原样发布，
+        // 不再叠加事件循环恢复时刻；先写 fence 与截止再放开 leader，读侧看到 true 时两者一定就位
         m_fence.store(fence, std::memory_order_relaxed);
-        m_leaderDeadline.store(deadline, std::memory_order_relaxed);
+        m_leaderDeadline.store(deadlineNanoseconds, std::memory_order_relaxed);
         m_leader.store(true, std::memory_order_release);
     }
 
