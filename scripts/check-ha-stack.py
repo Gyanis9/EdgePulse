@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""EdgePulse 双实例 HA 验收：Compose 启栈、跨实例会话、Agent 命令路由、选主与优雅停机。
+"""EdgePulse 双实例 HA 验收：Compose 启栈、跨实例会话、Agent 命令路由、选主与两种停机。
 
 默认复用已构建的 edgepulse:ha 镜像；加 --build 先按仓库 Dockerfile 构建。
-测试专用配置把验证码设为可见、关闭固件签名，只存在 build/gate/ha，不进入交付镜像。
-Docker 或 Compose 不可用时打印 SKIP 并以 0 退出；栈一旦启动，任何断言失败都以 1 退出。
+测试专用配置把验证码设为可见、关闭固件签名并启用 Agent 内部 CA，只存在 build/gate/ha，
+不进入交付镜像。Docker 或 Compose 不可用时打印 SKIP 并以 0 退出；加 --require-docker
+则改为失败。栈一旦启动，任何断言失败都以 1 退出。
 """
 
 from __future__ import annotations
@@ -39,8 +40,13 @@ ENV_FILE = GATE / "ha.env"
 OVERRIDE = GATE / "docker-compose.ha.test.yml"
 CONFIG_DIR = GATE / "config"
 FIRMWARE_KEYS = GATE / "firmware-keys"
+GATE_CERTS = GATE / "certs"
+APP_CERTS = GATE_CERTS / "app"
+NGINX_CERTS = GATE_CERTS / "nginx"
+CA_KEY = GATE / "secrets" / "agent-ca-key.pem"
+OPS_TOKEN = GATE / "ops-token"
 LOG_PATH = GATE / "ha-stack.log"
-CA_KEY = GATE / "agent-ca-key.pem"
+APP_LOG = "/app/var/logs/ha-check.log"
 PROJECT = "edgepulse-ha-check"
 IMAGE = "edgepulse:ha"
 HOST = "127.0.0.1"
@@ -53,7 +59,6 @@ INSTANCES = {
 NGINX_HTTP = 18080
 NGINX_HTTPS = 18443
 NGINX_AGENT = 19445
-PROMETHEUS_PORT = 19090
 LEASE_TTL_SECONDS = 15
 LEADER_TAKEOVER_LIMIT = 2 * LEASE_TTL_SECONDS
 
@@ -88,17 +93,18 @@ def skip(name: str, detail: str) -> None:
     print("SKIP " + name + "：" + redact(detail))
 
 
-def remove_ca_key() -> None:
-    """验收用的临时 CA 私钥副本不留在工作树里；Windows 上 0400 是只读属性，先恢复可写。"""
-    try:
-        if CA_KEY.exists():
-            os.chmod(CA_KEY, 0o600)
-        CA_KEY.unlink()
-    except OSError:
-        pass
+def remove_gate_secrets() -> None:
+    """验收生成的私钥、口令文件不留在工作树；Windows 上只读属性先恢复可写再删。"""
+    for path in (CA_KEY, APP_CERTS / "server-key.pem", NGINX_CERTS / "server-key.pem", ENV_FILE, OPS_TOKEN):
+        try:
+            if path.exists():
+                os.chmod(path, 0o600)
+            path.unlink()
+        except OSError:
+            pass
 
 
-atexit.register(remove_ca_key)
+atexit.register(remove_gate_secrets)
 
 
 def docker_blocker() -> str:
@@ -116,7 +122,7 @@ def docker_blocker() -> str:
     return ""
 
 
-def compose(*arguments: str, check: bool = True, timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+def compose(*arguments: str, check: bool = True, timeout: float = 600.0, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     command = [
         "docker", "compose", "-p", PROJECT,
         "--project-directory", str(COMPOSE_DIR),
@@ -125,7 +131,7 @@ def compose(*arguments: str, check: bool = True, timeout: float = 600.0) -> subp
         "-f", str(OVERRIDE),
         *arguments,
     ]
-    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=check)
+    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=check, input=input_text)
 
 
 def compose_base_config() -> subprocess.CompletedProcess[str]:
@@ -160,10 +166,36 @@ def patch_line(text: str, pattern: str, replacement: str, label: str) -> str:
     return updated
 
 
+def patch_section_line(text: str, section: str, key: str, old: str, new: str, label: str) -> str:
+    """只替换顶层 section 内的一行，避免误改其它段里同名的 enabled。"""
+    lines = text.splitlines(keepends=True)
+    in_section = False
+    replaced = 0
+    for index, line in enumerate(lines):
+        stripped = line.rstrip("\r\n")
+        if not in_section:
+            if re.match(rf"^  {re.escape(section)}:\s*$", stripped):
+                in_section = True
+            continue
+        # edgepulse 下的子段都缩进两格；遇到下一个子段或顶层键就结束
+        if re.match(r"^  \S", stripped) or re.match(r"^\S", stripped):
+            break
+        match = re.match(rf"^(\s+){re.escape(key)}:\s*{re.escape(old)}\s*$", stripped)
+        if match:
+            lines[index] = f"{match.group(1)}{key}: {new}\n"
+            replaced += 1
+    if replaced != 1:
+        raise RuntimeError(f"config/prod.yaml.example 中 {label} 的匹配次数为 {replaced}，无法生成验收配置")
+    return "".join(lines)
+
+
 def prepare() -> dict[str, str]:
     GATE.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     FIRMWARE_KEYS.mkdir(parents=True, exist_ok=True)
+    APP_CERTS.mkdir(parents=True, exist_ok=True)
+    NGINX_CERTS.mkdir(parents=True, exist_ok=True)
+    CA_KEY.parent.mkdir(parents=True, exist_ok=True)
 
     required_certificates = ("ca.pem", "ca-key.pem", "server.pem", "server-key.pem", "agent.pem", "agent-key.pem")
     if not all((CERTS / name).exists() for name in required_certificates):
@@ -174,6 +206,15 @@ def prepare() -> dict[str, str]:
         if result.returncode != 0 or missing:
             raise RuntimeError("生成开发证书失败：" + ((result.stderr or result.stdout).strip()[-400:] or "产物缺失 " + ", ".join(missing)))
 
+    # 应用只拿 ca.pem/server.pem/server-key.pem，nginx 只拿 server.pem/server-key.pem。
+    # 旧版本把整个 var/certs 挂给两边，这里先清掉可能残留的 CA 私钥与 ca.pem。
+    for stale in (APP_CERTS / "ca-key.pem", NGINX_CERTS / "ca-key.pem", NGINX_CERTS / "ca.pem"):
+        stale.unlink(missing_ok=True)
+    for name in ("ca.pem", "server.pem", "server-key.pem"):
+        shutil.copyfile(CERTS / name, APP_CERTS / name)
+    for name in ("server.pem", "server-key.pem"):
+        shutil.copyfile(CERTS / name, NGINX_CERTS / name)
+
     source = (ROOT / "config" / "prod.yaml.example").read_text(encoding="utf-8")
     source = patch_line(source, r"^(\s*)https_port:\s*8443\s*$", r"\g<1>https_port: 0", "https_port")
     source = patch_line(source, r"^(\s*)expose_code:\s*false\s*$", r"\g<1>expose_code: true", "captcha.expose_code")
@@ -181,12 +222,21 @@ def prepare() -> dict[str, str]:
     source = patch_line(source, r"^(\s*)allowed_origins:.*$",
                         r"\g<1>allowed_origins: http://127.0.0.1:%d,https://127.0.0.1:%d" % (NGINX_HTTP, NGINX_HTTPS),
                         "security.allowed_origins")
+    source = patch_section_line(source, "agent_ca", "enabled", "false", "true", "agent_ca.enabled")
     (CONFIG_DIR / "prod.yaml").write_text(source, encoding="utf-8")
-    logging_config = ROOT / "config" / "logging.yaml"
-    if logging_config.exists():
-        shutil.copyfile(logging_config, CONFIG_DIR / "logging.yaml")
 
-    # CA 私钥单独放置并收紧权限；容器内 agent_ca 默认关闭，这里仍验证挂载与 0400 文件可读。
+    # 入口脚本会把 logging.yaml 复制到运行时配置目录；改用独有文件名，能区分
+    # 「配置被载入」与「内置日志器碰巧也写了文件」。
+    logging_source = (ROOT / "config" / "logging.yaml")
+    if not logging_source.exists():
+        raise RuntimeError("缺少 config/logging.yaml，无法验证日志 sink")
+    logging_text = logging_source.read_text(encoding="utf-8")
+    logging_text = logging_text.replace("base_filename: edgepulse.log", "base_filename: ha-check.log")
+    if "ha-check.log" not in logging_text or "formatter: json" not in logging_text:
+        raise RuntimeError("config/logging.yaml 的滚动文件或 JSON 版式已变化，无法生成验收日志配置")
+    (CONFIG_DIR / "logging.yaml").write_text(logging_text, encoding="utf-8")
+
+    # CA 私钥单独放置并收紧权限；ca-key-init 会以 root 读取并复制成应用用户的 0400 文件。
     # Windows 上 0400 是只读属性，重复运行前先恢复可写，否则复制会失败。
     if CA_KEY.exists():
         try:
@@ -206,20 +256,25 @@ def prepare() -> dict[str, str]:
     }
     for secret in values.values():
         remember_secret(secret)
-    (ROOT / "deploy" / "prometheus" / "ops-token").write_text(values["EDGEPULSE_OPS_BEARER_TOKEN"] + "\n", encoding="utf-8")
+
+    # 运维令牌只写 build/gate，不覆盖 deploy/prometheus/ops-token；Prometheus 由测试覆盖
+    # 单独挂载这个文件，profile 打开时也能用。
+    OPS_TOKEN.write_text(values["EDGEPULSE_OPS_BEARER_TOKEN"] + "\n", encoding="utf-8")
 
     env_lines = [f"{key}={value}" for key, value in values.items()]
     env_lines += [
         f"EDGEPULSE_HA_IMAGE={IMAGE}",
         f"EDGEPULSE_HA_CONFIG_DIR={CONFIG_DIR.as_posix()}",
-        f"EDGEPULSE_HA_CERT_DIR={CERTS.as_posix()}",
+        f"EDGEPULSE_HA_CERT_DIR={APP_CERTS.as_posix()}",
+        f"EDGEPULSE_HA_NGINX_CERT_DIR={NGINX_CERTS.as_posix()}",
         f"EDGEPULSE_HA_FIRMWARE_KEYS_DIR={FIRMWARE_KEYS.as_posix()}",
         f"EDGEPULSE_AGENT_CA_KEY_FILE={CA_KEY.as_posix()}",
-        f"EDGEPULSE_HA_BIND_ADDRESS={HOST}",
+        f"EDGEPULSE_HA_HTTP_BIND_ADDRESS={HOST}",
+        f"EDGEPULSE_HA_HTTPS_BIND_ADDRESS={HOST}",
+        f"EDGEPULSE_HA_AGENT_BIND_ADDRESS={HOST}",
         f"EDGEPULSE_HA_HTTP_PORT={NGINX_HTTP}",
         f"EDGEPULSE_HA_HTTPS_PORT={NGINX_HTTPS}",
         f"EDGEPULSE_HA_AGENT_PORT={NGINX_AGENT}",
-        f"EDGEPULSE_HA_PROMETHEUS_PORT={PROMETHEUS_PORT}",
     ]
     ENV_FILE.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
 
@@ -227,17 +282,34 @@ def prepare() -> dict[str, str]:
     for instance, ports in INSTANCES.items():
         override_lines += [
             f"  {instance}:",
+            # 复用旧镜像时也验证工作树里的入口脚本；CI 的 --build 会把它烘进镜像。
+            # 用 sh 显式执行，避免 Windows 绑定挂载丢掉可执行位。
+            "    entrypoint: [\"/bin/sh\", \"/app/entrypoint.sh\"]",
+            "    volumes:",
+            "      - type: bind",
+            f"        source: {(COMPOSE_DIR / 'entrypoint.sh').as_posix()}",
+            "        target: /app/entrypoint.sh",
+            "        read_only: true",
             "    ports:",
             f"      - \"{HOST}:{ports['http']}:8080\"",
             f"      - \"{HOST}:{ports['ops']}:9100\"",
             f"      - \"{HOST}:{ports['agent']}:9443\"",
         ]
+    override_lines += [
+        "  prometheus:",
+        "    volumes:",
+        "      - type: bind",
+        f"        source: {OPS_TOKEN.as_posix()}",
+        "        target: /etc/prometheus/ops-token",
+        "        read_only: true",
+    ]
     OVERRIDE.write_text("\n".join(override_lines) + "\n", encoding="utf-8")
     return values
 
 
-def request_json(method: str, url: str, payload: dict | None = None, token: str | None = None,
-                 context: ssl.SSLContext | None = None, timeout: float = 15.0) -> tuple[int, dict]:
+def request_raw(method: str, url: str, data: bytes | None = None, token: str | None = None,
+                context: ssl.SSLContext | None = None, timeout: float = 15.0,
+                headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
     parts = urllib.parse.urlsplit(url)
     target = parts.path or "/"
     if parts.query:
@@ -246,21 +318,28 @@ def request_json(method: str, url: str, payload: dict | None = None, token: str 
         connection = http.client.HTTPSConnection(parts.hostname, parts.port, context=context, timeout=timeout)
     else:
         connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
-    body = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"} if body is not None else {}
+    request_headers = dict(headers or {})
     if token:
-        headers["Authorization"] = "Bearer " + token
+        request_headers["Authorization"] = "Bearer " + token
     try:
-        connection.request(method, target, body=body, headers=headers)
+        connection.request(method, target, body=data, headers=request_headers)
         response = connection.getresponse()
-        raw = response.read().decode("utf-8", "replace")
-        try:
-            parsed = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            parsed = {}
-        return response.status, parsed
+        return response.status, dict(response.getheaders()), response.read()
     finally:
         connection.close()
+
+
+def request_json(method: str, url: str, payload: dict | None = None, token: str | None = None,
+                 context: ssl.SSLContext | None = None, timeout: float = 15.0) -> tuple[int, dict]:
+    body = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if body is not None else None
+    status, _, raw = request_raw(method, url, data=body, token=token, context=context, timeout=timeout, headers=headers)
+    text = raw.decode("utf-8", "replace")
+    try:
+        parsed = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    return status, parsed
 
 
 def readyz(port: int) -> tuple[int, dict]:
@@ -305,8 +384,7 @@ def login(port: int) -> str | None:
     return token or None
 
 
-def lease_state() -> tuple[str, int] | None:
-    sql = "SELECT holder, fence FROM sys_lease WHERE name='control-plane'"
+def mysql_scalar(sql: str) -> str | None:
     command = 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -N -B edgepulse -e "' + sql + '"'
     try:
         result = compose("exec", "-T", "mysql", "sh", "-c", command, timeout=30)
@@ -315,14 +393,26 @@ def lease_state() -> tuple[str, int] | None:
     if result.returncode != 0:
         return None
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 1:
+    return lines[0] if len(lines) == 1 else None
+
+
+def lease_state() -> tuple[str, int] | None:
+    row = mysql_scalar("SELECT holder, fence FROM sys_lease WHERE name='control-plane'")
+    if row is None:
         return None
-    fields = lines[0].split("\t")
+    fields = row.split("\t")
     if len(fields) != 2:
-        fields = lines[0].split()
+        fields = row.split()
     if len(fields) != 2 or not fields[1].isdigit():
         return None
     return fields[0], int(fields[1])
+
+
+def lease_remaining_seconds() -> int | None:
+    row = mysql_scalar("SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), expires_at) FROM sys_lease WHERE name='control-plane'")
+    if row is None or not re.fullmatch(r"-?\d+", row):
+        return None
+    return int(row)
 
 
 def wait_leader(timeout: float = 120.0) -> tuple[str, int] | None:
@@ -337,33 +427,34 @@ def wait_leader(timeout: float = 120.0) -> tuple[str, int] | None:
 class WebSocketConnection:
     """最小 RFC 6455 客户端：只需握手、文本帧与 ping/pong，避免引入第三方依赖。"""
 
-    def __init__(self, port: int, context: ssl.SSLContext):
-        raw = socket.create_connection((HOST, port), timeout=15.0)
-        self.socket = context.wrap_socket(raw, server_hostname=HOST)
+    def __init__(self, host: str, port: int, path: str, origin: str | None, context: ssl.SSLContext | None = None):
+        raw = socket.create_connection((host, port), timeout=15.0)
+        self.socket = context.wrap_socket(raw, server_hostname=host) if context is not None else raw
         self.buffer = b""
         key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
         request = (
-            "GET /api/agent/ws HTTP/1.1\r\n"
-            f"Host: {HOST}:{port}\r\n"
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n"
-            f"Origin: https://{HOST}:{NGINX_HTTPS}\r\n"
-            "\r\n"
         )
+        if origin:
+            request += f"Origin: {origin}\r\n"
+        request += "\r\n"
         self.socket.sendall(request.encode("ascii"))
         header = self._read_until(b"\r\n\r\n")
         status_line = header.split(b"\r\n", 1)[0].decode("latin-1")
         if " 101 " not in status_line:
-            raise RuntimeError("Agent WebSocket 握手失败：" + status_line)
+            raise RuntimeError("WebSocket 握手失败：" + status_line)
         self.buffer = header.split(b"\r\n\r\n", 1)[1]
 
     def _read_until(self, marker: bytes) -> bytes:
         while marker not in self.buffer:
             chunk = self.socket.recv(4096)
             if not chunk:
-                raise RuntimeError("Agent WebSocket 在握手阶段断开")
+                raise RuntimeError("WebSocket 在握手阶段断开")
             self.buffer += chunk
         head, self.buffer = self.buffer.split(marker, 1)
         return head + marker
@@ -372,7 +463,7 @@ class WebSocketConnection:
         while len(self.buffer) < count:
             chunk = self.socket.recv(4096)
             if not chunk:
-                raise RuntimeError("Agent WebSocket 连接已关闭")
+                raise RuntimeError("WebSocket 连接已关闭")
             self.buffer += chunk
         data, self.buffer = self.buffer[:count], self.buffer[count:]
         return data
@@ -442,6 +533,53 @@ class WebSocketConnection:
             pass
 
 
+def check_browser_websocket(port: int, token: str) -> tuple[bool, str]:
+    connection: WebSocketConnection | None = None
+    try:
+        connection = WebSocketConnection(HOST, port, "/api/ws", f"http://{HOST}:{port}")
+        connection.send_text(json.dumps({"type": "auth", "token": token}))
+        acknowledgement = connection.wait_for_text(10.0) or ""
+        if not acknowledgement:
+            return False, "10 秒内没有认证回执"
+        try:
+            parsed = json.loads(acknowledgement)
+        except json.JSONDecodeError:
+            return False, acknowledgement
+        return parsed.get("type") == "auth" and bool(parsed.get("ok")), acknowledgement
+    except (OSError, RuntimeError, ssl.SSLError, http.client.HTTPException) as failure:
+        return False, str(failure)
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def app_log(service: str) -> str:
+    try:
+        result = compose("exec", "-T", service, "sh", "-c", f"cat {APP_LOG} 2>/dev/null || true", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout
+
+
+def wait_app_log(service: str, needle: str, timeout: float = 30.0) -> bool:
+    def probe() -> bool:
+        return needle in app_log(service)
+    return bool(wait_until(probe, timeout, 1.0))
+
+
+def wait_json_log_record(service: str, timeout: float = 30.0) -> dict | None:
+    def probe():
+        lines = [line.strip() for line in app_log(service).splitlines() if line.strip()]
+        if not lines:
+            return None
+        try:
+            record = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            return None
+        return record if {"timestamp", "level", "message"} <= set(record) else None
+    return wait_until(probe, timeout, 1.0)
+
+
 def inspect_exit_code(service: str) -> str:
     container = compose("ps", "-aq", service, timeout=30).stdout.strip().splitlines()
     if not container:
@@ -451,17 +589,44 @@ def inspect_exit_code(service: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else "inspect-failed"
 
 
+def container_id(service: str) -> str:
+    lines = compose("ps", "-aq", service, timeout=30).stdout.strip().splitlines()
+    return lines[0] if lines else ""
+
+
+def set_restart_policy(container: str, policy: str) -> bool:
+    result = subprocess.run(["docker", "update", f"--restart={policy}", container], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=30, check=False)
+    return result.returncode == 0
+
+
+def create_csr() -> str:
+    """在应用容器里生成临时密钥与 CSR；密钥只留在容器 /tmp 并在命令末尾删除。"""
+    result = compose(
+        "exec", "-T", "edgepulse-1", "sh", "-c",
+        "openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=ha-check-renew "
+        "-keyout /tmp/ha-check-key.pem -out /tmp/ha-check.csr 2>/dev/null && cat /tmp/ha-check.csr; "
+        "rc=$?; rm -f /tmp/ha-check-key.pem /tmp/ha-check.csr; exit $rc",
+        timeout=60,
+    )
+    return result.stdout
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="EdgePulse 双实例 HA 验收（Docker Compose）。")
     parser.add_argument("--build", action="store_true", help="先按仓库 Dockerfile 构建 edgepulse:ha")
+    parser.add_argument("--require-docker", action="store_true", help="Docker 不可用时失败而不是 SKIP")
     arguments = parser.parse_args()
 
     blocker = docker_blocker()
     if blocker:
+        if arguments.require_docker:
+            report("HA 双实例验收", False, f"{blocker}；--require-docker 要求 Docker 必须可用")
+            return 1
         skip("HA 双实例验收", f"{blocker}；安装并启动 Docker Engine 与 Compose v2 后重跑")
         return 0
 
-    busy = [str(port) for port in [item for ports in INSTANCES.values() for item in ports.values()] + [NGINX_HTTP, NGINX_HTTPS, NGINX_AGENT, PROMETHEUS_PORT]
+    busy = [str(port) for port in [item for ports in INSTANCES.values() for item in ports.values()] + [NGINX_HTTP, NGINX_HTTPS, NGINX_AGENT]
             if not free_port(port)]
     if busy:
         report("验收端口空闲", False, "被占用：" + ", ".join(busy))
@@ -469,7 +634,7 @@ def main() -> int:
     report("验收端口空闲", True)
 
     try:
-        values = prepare()
+        prepare()
     except Exception as failure:  # noqa: BLE001
         report("准备验收配置与证书", False, f"{type(failure).__name__}: {failure}")
         return 1
@@ -505,17 +670,20 @@ def main() -> int:
     if base_config.returncode != 0 or config.returncode != 0:
         return 1
 
-    started = False
+    # 先置 started：compose up 中途失败也要把已创建的容器、网络与卷清掉
+    started = True
     try:
         try:
-            up = compose("up", "-d", "--no-build", "mysql", "redis", "edgepulse-1", "edgepulse-2", "nginx", timeout=600)
+            up = compose("up", "-d", "--no-build", "mysql", "redis", "ca-key-init", "edgepulse-1", "edgepulse-2", "nginx", timeout=600)
         except subprocess.TimeoutExpired:
             report("compose 启动 HA 栈", False, "600 秒内未完成启动")
+            return 1
+        except (OSError, subprocess.SubprocessError) as failure:
+            report("compose 启动 HA 栈", False, str(failure))
             return 1
         report("compose 启动 HA 栈", up.returncode == 0, (up.stderr or up.stdout).strip()[-800:])
         if up.returncode != 0:
             return 1
-        started = True
 
         ready_a = wait_ready(INSTANCES["edgepulse-1"]["ops"])
         ready_b = wait_ready(INSTANCES["edgepulse-2"]["ops"])
@@ -524,12 +692,34 @@ def main() -> int:
         if not (ready_a and ready_b):
             return 1
 
-        logs_a = compose("logs", "--no-color", "edgepulse-1", timeout=60).stdout
-        logs_b = compose("logs", "--no-color", "edgepulse-2", timeout=60).stdout
-        report("实例 A 使用显式 instance_id", "instance=edgepulse-1" in logs_a)
-        report("实例 B 使用显式 instance_id", "instance=edgepulse-2" in logs_b)
-        if "instance=edgepulse-1" not in logs_a or "instance=edgepulse-2" not in logs_b:
+        # 应用日志断言不用 entrypoint 的打印：入口脚本同样会输出 instance=...，
+        # 只有应用自己启动时写下的租约装配行才能证明配置真的传到了进程。
+        instance_a_ok = wait_app_log("edgepulse-1", "控制面租约已装配：instance=edgepulse-1")
+        instance_b_ok = wait_app_log("edgepulse-2", "控制面租约已装配：instance=edgepulse-2")
+        sink_a_ok = wait_json_log_record("edgepulse-1") is not None
+        sink_b_ok = wait_json_log_record("edgepulse-2") is not None
+        report("实例 A 使用显式 instance_id（应用日志）", instance_a_ok)
+        report("实例 B 使用显式 instance_id（应用日志）", instance_b_ok)
+        report("实例 A 日志写入配置的 JSON 滚动文件", sink_a_ok, APP_LOG)
+        report("实例 B 日志写入配置的 JSON 滚动文件", sink_b_ok, APP_LOG)
+        if not (instance_a_ok and instance_b_ok and sink_a_ok and sink_b_ok):
             return 1
+
+        report("实例 A 的 Agent 内部 CA 已启用", wait_app_log("edgepulse-1", "Agent 内部 CA：已启用"))
+        report("实例 B 的 Agent 内部 CA 已启用", wait_app_log("edgepulse-2", "Agent 内部 CA：已启用"))
+        uid_result = compose("exec", "-T", "edgepulse-1", "id", "-u", timeout=30)
+        uid = uid_result.stdout.strip()
+        key_stat = compose("exec", "-T", "edgepulse-1", "stat", "-c", "%a %u", "/run/secrets/agent_ca_key", timeout=30)
+        fields = key_stat.stdout.split()
+        report("Agent CA 私钥在应用容器内为 0400 且属主匹配",
+               len(fields) == 2 and fields[0] == "400" and fields[1] == uid,
+               f"stat={key_stat.stdout.strip() or '无输出'}，uid={uid}")
+        report("应用证书目录不含 CA 私钥",
+               compose("exec", "-T", "edgepulse-1", "sh", "-c", "test ! -e /etc/edgepulse/tls/ca-key.pem", timeout=30, check=False).returncode == 0)
+        report("nginx 看不到 ca-key.pem、ca.pem 或 CA 私钥卷",
+               compose("exec", "-T", "nginx", "sh", "-c",
+                       "for p in /etc/nginx/certs/ca-key.pem /etc/nginx/certs/ca.pem /run/secrets/agent_ca_key; "
+                       "do if [ -e \"$p\" ]; then echo \"$p\"; exit 1; fi; done", timeout=30, check=False).returncode == 0)
 
         token = login(INSTANCES["edgepulse-1"]["http"])
         if token is None:
@@ -537,15 +727,20 @@ def main() -> int:
         status, me = request_json("GET", f"http://{HOST}:{INSTANCES['edgepulse-2']['http']}/api/auth/me", token=token)
         report("实例 A 登录的令牌在实例 B 可用", status == 200 and (me.get("data") or {}).get("username") == "admin", f"HTTP {status}")
 
-        redis_password = values["EDGEPULSE_REDIS_PASSWORD"]
         try:
-            stored = compose("exec", "-T", "redis", "redis-cli", "--no-auth-warning", "-a", redis_password, "EXISTS", "edgepulse:session:" + token, timeout=30)
+            stored = compose("exec", "-T", "redis", "sh", "-c",
+                             "REDISCLI_AUTH=\"$REDIS_PASSWORD\" redis-cli --no-auth-warning EXISTS edgepulse:session:" + token,
+                             timeout=30)
         except (OSError, subprocess.SubprocessError) as failure:
             report("Redis 保存共享会话键", False, str(failure))
         else:
             report("Redis 保存共享会话键", stored.returncode == 0 and stored.stdout.strip() == "1", f"EXISTS={stored.stdout.strip() or '无输出'}")
 
+        browser_ok, browser_detail = check_browser_websocket(NGINX_HTTP, token)
+        report("nginx 8080 /api/ws 升级成功（101）", browser_ok, browser_detail)
+
         # 用开发 Agent 证书注册一个真实节点，再用同一证书建 WS；节点身份由 mTLS 指纹核对。
+        # 注册走 nginx 的 9443 TCP 透传，证明这条链路没有被 L7 终止。
         status, enrollment = request_json("POST", f"http://{HOST}:{INSTANCES['edgepulse-1']['http']}/api/enrollment-tokens",
                                          {"action": "enroll", "expiresInSeconds": 3600, "nodeName": "ha-check-agent"}, token=token)
         enrollment_data = enrollment.get("data") or {}
@@ -559,17 +754,18 @@ def main() -> int:
         client_context = ssl.create_default_context(cafile=str(CERTS / "ca.pem"))
         client_context.load_cert_chain(certfile=str(CERTS / "agent.pem"), keyfile=str(CERTS / "agent-key.pem"))
         status, registration = request_json(
-            "POST", f"https://{HOST}:{INSTANCES['edgepulse-1']['agent']}/api/agent/register",
+            "POST", f"https://{HOST}:{NGINX_AGENT}/api/agent/register",
             {"name": "ha-check-agent", "agentVersion": "ha-check", "certFingerprint": fingerprint, "tenantCode": "default",
              "labels": "{}", "enrollmentToken": enrollment_token},
             context=client_context,
         )
         node_id = int((registration.get("data") or {}).get("id") or 0)
-        report("Agent 经实例 A 的 9443 注册", status == 200 and node_id > 0, f"HTTP {status}，nodeId={node_id}")
+        report("Agent 经 nginx 9443 TCP 透传注册", status == 200 and node_id > 0, f"HTTP {status}，nodeId={node_id}")
         if node_id <= 0:
             return 1
 
-        websocket = WebSocketConnection(INSTANCES["edgepulse-1"]["agent"], client_context)
+        websocket = WebSocketConnection(HOST, INSTANCES["edgepulse-1"]["agent"], "/api/agent/ws",
+                                        f"https://{HOST}:{NGINX_HTTPS}", client_context)
         try:
             websocket.send_text(json.dumps({"type": "hello", "nodeId": node_id, "agentVersion": "ha-check"}))
             hello = websocket.wait_for_text(10.0)
@@ -615,6 +811,54 @@ def main() -> int:
         finally:
             websocket.close()
 
+        # 跨实例共享固件卷：经 A 上传，经 B 下载，比较字节数。
+        firmware_payload = b"ha-check-firmware-" + b"x" * 65536
+        status, _, upload_raw = request_raw(
+            "POST", f"http://{HOST}:{INSTANCES['edgepulse-1']['http']}/api/firmware?name=ha-check&version=1.0.0&fileName=ha-check.bin",
+            data=firmware_payload, token=token, headers={"Content-Type": "application/octet-stream"}, timeout=60,
+        )
+        try:
+            upload_data = (json.loads(upload_raw.decode("utf-8", "replace")).get("data") or {}) if upload_raw else {}
+        except json.JSONDecodeError:
+            upload_data = {}
+        firmware_id = int(upload_data.get("id") or 0)
+        report("实例 A 上传固件", status == 200 and firmware_id > 0, f"HTTP {status}，firmwareId={firmware_id}")
+        if firmware_id <= 0:
+            return 1
+        status, _, downloaded = request_raw(
+            "GET", f"https://{HOST}:{INSTANCES['edgepulse-2']['agent']}/api/agent/firmware/{firmware_id}/download?nodeId={node_id}",
+            context=client_context, timeout=60,
+        )
+        report("实例 B 下载实例 A 上传的固件", status == 200 and downloaded == firmware_payload,
+               f"HTTP {status}，{len(downloaded)}/{len(firmware_payload)} 字节")
+
+        # 启用 agent_ca 后，经 nginx 9443 走一次真实续期：应用必须能读取 0400 私钥并完成签发。
+        csr = create_csr()
+        status, renewal = request_json(
+            "POST", f"https://{HOST}:{NGINX_AGENT}/api/agent/certificate/renew",
+            {"nodeId": node_id, "csrPem": csr}, context=client_context, timeout=30,
+        )
+        renewal_data = renewal.get("data") or {}
+        certificate_pem = str(renewal_data.get("certificatePem", ""))
+        renewal_fingerprint = str(renewal_data.get("fingerprint", "")).lower()
+        report("Agent 经 nginx 9443 续期并取得 CA 签发证书",
+               status == 200 and certificate_pem.startswith("-----BEGIN CERTIFICATE-----") and len(renewal_fingerprint) == 64,
+               f"HTTP {status}，fingerprint={renewal_fingerprint[:16]}…" if status == 200 else f"HTTP {status}")
+        if certificate_pem:
+            verify = compose(
+                "exec", "-T", "edgepulse-1", "sh", "-c",
+                "cat > /tmp/ha-renewed.pem && openssl verify -CAfile /etc/edgepulse/tls/ca.pem /tmp/ha-renewed.pem && "
+                "openssl x509 -in /tmp/ha-renewed.pem -noout -fingerprint -sha256; "
+                "rc=$?; rm -f /tmp/ha-renewed.pem; exit $rc",
+                timeout=60, input_text=certificate_pem, check=False,
+            )
+            match = re.search(r"Fingerprint=([0-9A-Fa-f:]+)", verify.stdout)
+            observed = match.group(1).replace(":", "").lower() if match else ""
+            report("续期证书由配置的 CA 验证通过且指纹一致",
+                   verify.returncode == 0 and observed == renewal_fingerprint, (verify.stdout or verify.stderr).strip()[-300:])
+        else:
+            report("续期证书由配置的 CA 验证通过且指纹一致", False, "续期响应没有证书")
+
         leader_state = wait_leader(30.0)
         report("sys_lease 选出 leader", leader_state is not None, f"holder={leader_state[0] if leader_state else '无'}，fence={leader_state[1] if leader_state else 0}")
         if leader_state is None:
@@ -622,6 +866,11 @@ def main() -> int:
         leader, leader_fence = leader_state
         follower = "edgepulse-2" if leader == "edgepulse-1" else "edgepulse-1"
         leader_ports = INSTANCES[leader]
+
+        pre_status, _ = readyz(leader_ports["ops"])
+        report("SIGTERM 前 leader /readyz 为 200", pre_status == 200, f"HTTP {pre_status}")
+        if pre_status != 200:
+            return 1
 
         # 用未完成的固件上传占住 HTTP 排空窗口：SIGTERM 后 /readyz 先变 503，ops 监听最后才关。
         stop_process: subprocess.Popen | None = None
@@ -716,6 +965,9 @@ def main() -> int:
             time.sleep(0.5)
         report("nginx 8080 在 leader 停机后仍有可用上游", nginx_ok, f"HTTP {status}")
 
+        browser_after, browser_after_detail = check_browser_websocket(NGINX_HTTP, token)
+        report("单实例停机后 nginx /api/ws 仍可升级（101）", browser_after, browser_after_detail)
+
         try:
             tls_context = ssl.create_default_context(cafile=str(CERTS / "ca.pem"))
             status, _ = request_json("GET", f"https://{HOST}:{NGINX_HTTPS}/api/health", context=tls_context, timeout=5.0)
@@ -732,17 +984,85 @@ def main() -> int:
         report("旧 leader 重启后不抢占有效租约",
                after_restart is not None and after_restart[0] == follower and after_restart[1] == (takeover[1] if takeover else -1),
                f"holder={after_restart[0] if after_restart else '无'}，fence={after_restart[1] if after_restart else 0}")
+
+        # 崩溃停机：直接 SIGKILL。unless-stopped 会把 kill 当成普通退出并自动拉起，先临时
+        # 改成 no，测完再恢复，才能观察「租约到期才接管」。
+        crash_leader = follower
+        crash_fence = takeover[1] if takeover else -1
+        crash_container = container_id(crash_leader)
+        if not crash_container:
+            report("SIGKILL 崩溃停机", False, "找不到 leader 容器")
+            return 1
+        # 等到 holder 刚续约过再杀，才能观察「必须等 TTL 到期」；否则剩余时间太短，
+        # 接管会看起来像立即抢占。
+        fresh = wait_until(lambda: (lease_remaining_seconds() or 0) >= 10, 20.0, 0.5)
+        if not fresh:
+            report("SIGKILL 前 leader 租约处于有效期", False, "20 秒内没有读到至少 10 秒的剩余租期")
+            return 1
+        report("SIGKILL 前 leader 租约处于有效期", True, f"剩余约 {lease_remaining_seconds()} 秒")
+        if not set_restart_policy(crash_container, "no"):
+            report("暂停 leader 的自动重启策略", False, "docker update --restart=no 失败")
+            return 1
+        report("暂停 leader 的自动重启策略", True)
+        crash_started = time.monotonic()
+        try:
+            killed = compose("kill", "-s", "SIGKILL", crash_leader, timeout=60)
+        except (OSError, subprocess.SubprocessError) as failure:
+            report("SIGKILL 崩溃停机", False, str(failure))
+            return 1
+        report("SIGKILL 崩溃停机", killed.returncode == 0, (killed.stderr or "").strip()[-200:])
+        if killed.returncode != 0:
+            return 1
+        crash_exit = inspect_exit_code(crash_leader)
+        report("SIGKILL 退出码为 137", crash_exit == "137", f"exit={crash_exit}")
+        time.sleep(0.5)
+        remaining = lease_remaining_seconds()
+        retained = lease_state()
+        report("SIGKILL 后旧 holder 仍留在租约行且未清空",
+               retained is not None and retained[0] == crash_leader and retained[1] == crash_fence,
+               f"holder={retained[0] if retained else '无'}，fence={retained[1] if retained else 0}，剩余 {remaining if remaining is not None else '?'} 秒")
+        crash_takeover = wait_until(
+            lambda: (lambda state: state if state is not None and state[0] == leader and state[1] > crash_fence else None)(lease_state()),
+            LEADER_TAKEOVER_LIMIT + 10.0, 0.5,
+        )
+        crash_elapsed = time.monotonic() - crash_started
+        # 旧 holder 的 expires_at 仍在未来时不允许立即接手；留 2 秒给轮询与整数秒截断
+        waited_for_expiry = remaining is None or crash_elapsed + 2.0 >= max(0, remaining)
+        report("崩溃后新 leader 在 2 个 TTL 内接管且未提前抢占",
+               crash_takeover is not None and crash_elapsed <= LEADER_TAKEOVER_LIMIT and waited_for_expiry,
+               f"{crash_elapsed:.2f} 秒，holder={crash_takeover[0] if crash_takeover else '无'}，fence={crash_takeover[1] if crash_takeover else 0}，"
+               f"剩余 {remaining if remaining is not None else '?'} 秒")
+        if crash_takeover is None:
+            return 1
+        report("崩溃接管后新 leader /readyz 就绪", wait_ready(INSTANCES[leader]["ops"], 60.0))
+        report("崩溃后 fence 递增", crash_takeover[1] > crash_fence, f"{crash_fence} -> {crash_takeover[1]}")
+
+        report("恢复旧 leader 的重启策略", set_restart_policy(crash_container, "unless-stopped"))
+        compose("start", crash_leader, timeout=120)
+        report("崩溃的旧 leader 重启后就绪", wait_ready(INSTANCES[crash_leader]["ops"], 120.0))
+        time.sleep(3.0)
+        after_crash_restart = lease_state()
+        report("崩溃重启的旧 holder 不清空新租约",
+               after_crash_restart is not None and after_crash_restart[0] == leader and after_crash_restart[1] == crash_takeover[1],
+               f"holder={after_crash_restart[0] if after_crash_restart else '无'}，fence={after_crash_restart[1] if after_crash_restart else 0}")
     except Exception as failure:  # noqa: BLE001
         import traceback
         traceback.print_exc()
         report("HA 验收执行未抛出异常", False, f"{type(failure).__name__}: {failure}")
     finally:
         if started:
-            logs = compose("logs", "--no-color", check=False, timeout=60)
-            LOG_PATH.write_text(redact(logs.stdout + logs.stderr), encoding="utf-8")
-            down = compose("down", "-v", "--remove-orphans", check=False, timeout=120)
-            report("清理 HA 容器、网络与卷", down.returncode == 0, (down.stderr or "").strip()[-300:])
-        remove_ca_key()
+            try:
+                logs = compose("logs", "--no-color", check=False, timeout=60)
+                LOG_PATH.write_text(redact(logs.stdout + logs.stderr), encoding="utf-8")
+            except (OSError, subprocess.SubprocessError) as failure:
+                print("WARN 保存 HA 栈日志失败：" + redact(str(failure)))
+            try:
+                down = compose("down", "-v", "--remove-orphans", check=False, timeout=120)
+            except (OSError, subprocess.SubprocessError) as failure:
+                report("清理 HA 容器、网络与卷", False, str(failure))
+            else:
+                report("清理 HA 容器、网络与卷", down.returncode == 0, (down.stderr or "").strip()[-300:])
+        remove_gate_secrets()
 
     print()
     if failures:
