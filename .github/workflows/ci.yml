@@ -134,12 +134,11 @@ jobs:
           echo "Agent binaries found"
       - name: Test
         run: ctest --preset debug --output-on-failure
-      # 环境变量门控的用例被跳过时全量 ctest 仍会绿，这里点名外部依赖用例并断言没有 Skipped
+      # 环境变量门控的用例被跳过时全量 ctest 仍会绿。直接复用脚本里的锚定正则与
+      # EXPECTED_TESTS，避免 CI 与本地门禁选中不同的用例集合；脚本会另起一次性容器，
+      # 断言 7 项全部执行且输出不含跳过标记。
       - name: Assert external tests ran
-        run: |
-          set -o pipefail
-          ctest --preset debug --output-on-failure --no-tests=error -R "ExternalStores|RealtimeBus" | tee /tmp/external-tests.log
-          ! grep -q "Skipped" /tmp/external-tests.log
+        run: python scripts/run-external-tests.py
       # 服务容器已拉取 mysql:8.4，脚本复用本地镜像，不额外等待下载
       - name: Backup and restore round trip
         run: python scripts/backup_restore_mysql_test.py
