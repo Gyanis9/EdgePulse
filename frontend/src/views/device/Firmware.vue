@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, defineAsyncComponent, onMounted, reactive, ref } from 'vue'
 import { Checkbox, DataTable, Drawer, Field, Select, Tag, TextInput, type Column } from '@/components/ui'
-import { FirmwareRolloutDetail, FirmwareRolloutDialog, FormDialog, ListPage, PermissionButton } from '@/components/business'
+import { FormDialog, ListPage, PermissionButton } from '@/components/business'
 import { deviceApi, fleetApi, systemApi, type FirmwarePolicy, type FirmwareRolloutAggregate, type FirmwareRow, type FirmwareTaskRow, type NodeRow } from '@/api'
 import { currentUser } from '@/composables/auth'
 import { useListPage } from '@/composables/list'
 import { confirm } from '@/composables/confirm'
 import { pushToast, toastError } from '@/composables/toast'
 import { formatLocalDateTime } from '@/utils/time'
+
+const FirmwareRolloutDialog = defineAsyncComponent(() => import('@/components/business/FirmwareRolloutDialog.vue'))
+const FirmwareRolloutDetail = defineAsyncComponent(() => import('@/components/business/FirmwareRolloutDetail.vue'))
 
 const columns: Column[] = [
   { key: 'name', title: '固件', minWidth: 200 },
