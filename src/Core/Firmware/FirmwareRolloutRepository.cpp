@@ -8,6 +8,7 @@
 #include "Base/Runtime/TimeFormat.h"
 #include "Database/Common/DatabaseValue.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -194,12 +195,59 @@ namespace EdgePulse::Firmware
                     }
                     const std::int64_t ownerTenantId = Sql::integer(*firmware, "tenant_id");
 
+                    if (draft.waves.empty())
+                    {
+                        throw Common::DatabaseException("创建灰度发布失败：至少需要一个波次");
+                    }
+                    std::vector<int>          waveIndexes;
+                    std::vector<std::int64_t> nodeIds;
+                    for (const FirmwareRolloutWaveDraft &wave: draft.waves)
+                    {
+                        if (wave.wave.waveIndex < 0)
+                        {
+                            throw Common::DatabaseException("创建灰度发布失败：波次下标必须为非负整数");
+                        }
+                        if (std::find(waveIndexes.begin(), waveIndexes.end(), wave.wave.waveIndex) != waveIndexes.end())
+                        {
+                            throw Common::DatabaseException("创建灰度发布失败：波次下标不能重复");
+                        }
+                        waveIndexes.push_back(wave.wave.waveIndex);
+                        for (const FirmwareRolloutTargetRecord &target: wave.targets)
+                        {
+                            if (std::find(nodeIds.begin(), nodeIds.end(), target.nodeId) == nodeIds.end())
+                            {
+                                nodeIds.push_back(target.nodeId);
+                            }
+                        }
+                    }
+
+                    // 目标节点必须存在、未删除且与固件同租户；一次查询覆盖全部目标，缺一个就整笔拒绝
+                    if (!nodeIds.empty())
+                    {
+                        std::string                placeholders;
+                        std::vector<DatabaseValue> nodeParameters{ownerTenantId};
+                        for (std::size_t index = 0; index < nodeIds.size(); ++index)
+                        {
+                            placeholders += index == 0 ? "?" : ", ?";
+                            nodeParameters.emplace_back(nodeIds[index]);
+                        }
+                        const auto rows =
+                                Sql::executeOrThrow(connection, "SELECT id FROM biz_node WHERE tenant_id = ? AND deleted = 0 AND id IN (" + placeholders + ")", nodeParameters);
+                        std::size_t found = 0;
+                        while (rows->next())
+                        {
+                            ++found;
+                        }
+                        if (found != nodeIds.size())
+                        {
+                            throw Common::DatabaseException("创建灰度发布失败：目标节点不存在、已删除或不属于发布租户");
+                        }
+                    }
+
                     const std::string      now     = Common::nowDateTimeUtc();
                     FirmwareRolloutRecord &rollout = draft.rollout;
-                    if (rollout.id == 0)
-                    {
-                        rollout.id = Common::nextIdentifier();
-                    }
+                    // 主键一律由仓储生成，避免调用方传错主键把唯一冲突误判成节点重复
+                    rollout.id         = Common::nextIdentifier();
                     rollout.tenantId   = ownerTenantId;
                     rollout.totalWaves = static_cast<int>(draft.waves.size());
                     if (rollout.status.empty())
@@ -242,10 +290,7 @@ namespace EdgePulse::Firmware
 
                         for (FirmwareRolloutWaveDraft &wave: draft.waves)
                         {
-                            if (wave.wave.id == 0)
-                            {
-                                wave.wave.id = Common::nextIdentifier();
-                            }
+                            wave.wave.id          = Common::nextIdentifier();
                             wave.wave.rolloutId   = rollout.id;
                             wave.wave.targetCount = static_cast<int>(wave.targets.size());
                             if (wave.wave.status.empty())
@@ -264,10 +309,7 @@ namespace EdgePulse::Firmware
 
                             for (FirmwareRolloutTargetRecord &target: wave.targets)
                             {
-                                if (target.id == 0)
-                                {
-                                    target.id = Common::nextIdentifier();
-                                }
+                                target.id        = Common::nextIdentifier();
                                 target.rolloutId = rollout.id;
                                 target.waveId    = wave.wave.id;
                                 target.tenantId  = ownerTenantId;
@@ -413,9 +455,19 @@ namespace EdgePulse::Firmware
                         current->pausedAt    = now;
                         current->pauseReason = pauseReason;
                     }
-                    if (status == "completed" || status == "rolled_back" || status == "aborted" || status == "failed")
+                    const bool terminal = status == "completed" || status == "rolled_back" || status == "aborted" || status == "failed";
+                    if (terminal)
                     {
                         current->finishedAt = now;
+                    } else
+                    {
+                        // 活动态与回滚不能沿用上一次终止时间
+                        current->finishedAt.clear();
+                    }
+                    // 恢复运行与回滚会离开失败现场；未提供新原因时清掉旧值，避免旧错误继续挂在活动态上
+                    if ((status == "running" || status == "rolling_back") && lastError.empty())
+                    {
+                        current->lastError.clear();
                     }
                     if (!lastError.empty())
                     {
@@ -525,18 +577,32 @@ namespace EdgePulse::Firmware
                 loop,
                 [targetId, update = std::move(update), tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    std::vector<DatabaseValue> parameters{
-                            update.status,    update.healthJson,         update.healthJson,         update.taskId, update.taskId, update.commandId,
-                            update.commandId, update.previousFirmwareId, update.previousFirmwareId, update.waveId, update.waveId, Common::nowDateTimeUtc(),
-                            targetId};
-                    std::string clause;
+                    std::vector<DatabaseValue> parameters{update.status,
+                                                          update.status,
+                                                          update.healthJson,
+                                                          update.healthJson,
+                                                          update.taskId,
+                                                          update.taskId,
+                                                          update.commandId,
+                                                          update.commandId,
+                                                          update.previousFirmwareId,
+                                                          update.previousFirmwareId,
+                                                          update.waveId,
+                                                          update.waveId,
+                                                          Common::nowDateTimeUtc(),
+                                                          targetId};
+                    // 指定波次时必须留在同一发布内；波次不存在或属于其他发布时更新落空
+                    std::string clause =
+                            " AND (? < 0 OR EXISTS (SELECT 1 FROM biz_firmware_rollout_wave w WHERE w.id = ? AND w.rollout_id = biz_firmware_rollout_target.rollout_id))";
+                    parameters.emplace_back(update.waveId);
+                    parameters.emplace_back(update.waveId);
                     if (!tenant.allTenants)
                     {
-                        clause = " AND tenant_id = ?";
+                        clause += " AND tenant_id = ?";
                         parameters.emplace_back(tenant.tenantId);
                     }
                     const auto result = Sql::executeOrThrow(connection,
-                                                            "UPDATE biz_firmware_rollout_target SET status = ?, "
+                                                            "UPDATE biz_firmware_rollout_target SET status = CASE WHEN ? = '' THEN status ELSE ? END, "
                                                             "health_json = CASE WHEN ? = '' THEN health_json ELSE ? END, "
                                                             "task_id = CASE WHEN ? >= 0 THEN ? ELSE task_id END, "
                                                             "command_id = CASE WHEN ? >= 0 THEN ? ELSE command_id END, "

@@ -17,7 +17,8 @@ namespace EdgePulse::Device
     /**
      * @brief 把节点转成前端消费的形状
      * @param node 节点行
-     * @return {id,name,status,agentVersion,certFingerprint,certNotAfter,certRevokedAt,previousCertFingerprint,previousCertNotAfter,labels,lastSeen,version}
+     * @return
+     * {id,name,status,agentVersion,installedFirmwareVersion,certFingerprint,certNotAfter,certRevokedAt,previousCertFingerprint,previousCertNotAfter,labels,lastSeen,version}
      */
     [[nodiscard]] AsynGyanis::Base::ConfigValue nodeToJson(const NodeRecord &node);
 } // namespace EdgePulse::Device

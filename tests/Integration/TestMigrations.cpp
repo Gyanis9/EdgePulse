@@ -152,6 +152,9 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         EXPECT_EQ(11, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_firmware_rollout_target')"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout') WHERE name = 'idx_fw_rollout_tenant'"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout_wave') WHERE name = 'idx_fw_rollout_wave'"));
+        // 同一发布的波次下标唯一，协调器重复物化波次时由数据库兜底
+        EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout_wave') AS il, pragma_index_info(il.name) AS ii "
+                                                     "WHERE il.\"unique\" = 1 AND ii.name IN ('rollout_id', 'wave_index')"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout_target') WHERE name = 'idx_fw_rollout_target_wave'"));
         // 同一节点在一个发布里只能出现一次，并发物化目标时靠这条唯一索引兜底
         EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_rollout_target') AS il, pragma_index_info(il.name) AS ii "
@@ -160,7 +163,8 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
                                                      "WHERE name IN ('rollout_id', 'wave_id', 'command_id')"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_firmware_task') WHERE name = 'idx_fw_task_rollout'"));
         EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_node') WHERE name = 'installed_firmware_version'"));
-        EXPECT_EQ(22, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 23"));
+        EXPECT_EQ(23, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }

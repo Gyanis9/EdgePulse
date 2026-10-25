@@ -90,7 +90,7 @@ namespace EdgePulse::Firmware
 
     /**
      * @brief 创建用的波次草稿
-     * @details 仓储生成波次主键后回填到本波目标，调用方不必预先分配波次标识。
+     * @details 仓储生成波次主键后回填到本波目标，调用方传入的主键会被覆盖。
      */
     struct FirmwareRolloutWaveDraft
     {
@@ -103,8 +103,8 @@ namespace EdgePulse::Firmware
      */
     struct FirmwareRolloutDraft
     {
-        FirmwareRolloutRecord                 rollout; ///< 发布头部；租户与主键由仓储决定
-        std::vector<FirmwareRolloutWaveDraft> waves;   ///< 波次与目标
+        FirmwareRolloutRecord                 rollout; ///< 发布头部；租户、主键与总波次数由仓储决定
+        std::vector<FirmwareRolloutWaveDraft> waves;   ///< 波次与目标；至少一项
     };
 
     /**
@@ -128,7 +128,7 @@ namespace EdgePulse::Firmware
         std::int64_t taskId{-1};             ///< 固件任务，负表示不改
         std::int64_t commandId{-1};          ///< 固件命令，负表示不改
         std::int64_t previousFirmwareId{-1}; ///< 下发前固件，负表示不改
-        std::int64_t waveId{-1};             ///< 调整到的波次，负表示不改
+        std::int64_t waveId{-1};             ///< 调整到的波次，负表示不改；非负值必须属于同一发布
     };
 
     /**
@@ -151,10 +151,11 @@ namespace EdgePulse::Firmware
         /**
          * @brief 在一个事务里写入发布、波次与目标
          * @param loop 恢复协程用的事件循环
-         * @param draft 聚合草稿；租户取自仓储视图，主键为 0 时由仓储生成
+         * @param draft 聚合草稿；租户取自仓储视图，主键一律由仓储生成
          * @return std::int64_t 发布标识
-         * @throws Common::DatabaseException 固件不存在、同一节点重复出现或数据库写入失败
-         * @note 同一发布内 node_id 必须唯一；固件与发布必须同租户
+         * @throws Common::DatabaseException 固件不存在、波次为空或下标重复、目标节点不存在或不属于发布租户、同一节点重复出现，或数据库写入失败
+         * @note 同一发布内 node_id 必须唯一；固件、目标节点与发布必须同租户
+         * @note 至少需要一个波次；草稿也必须带完整波次计划，当前不提供追加波次接口
          */
         AsynGyanis::Core::Task<std::int64_t> create(AsynGyanis::Core::EventLoop &loop, FirmwareRolloutDraft draft);
 
@@ -183,9 +184,10 @@ namespace EdgePulse::Firmware
          * @param status 新状态
          * @param currentWave 当前波次；负表示不改
          * @param pauseReason 暂停原因；进入 running 时清空
-         * @param lastError 失败原因；空表示保留原值
+         * @param lastError 失败原因；空表示保留原值，但进入 running 或 rolling_back 时旧值会被清空
          * @return true 状态已推进且版本加一
          * @return false 发布不存在、不在租户边界内或版本已变
+         * @note 终止状态记录 finished_at；活动状态与回滚清空 finished_at，避免复用上一次终止时间
          */
         AsynGyanis::Core::Task<bool> updateStatus(AsynGyanis::Core::EventLoop &loop, std::int64_t rolloutId, std::int64_t expectedVersion, std::string status, int currentWave = -1,
                                                   std::string pauseReason = {}, std::string lastError = {});
@@ -212,6 +214,7 @@ namespace EdgePulse::Firmware
          * @return true 已追加
          * @return false 波次不存在或不在租户边界内
          * @note 同一波次的多条快照以换行分隔，按写入顺序保留
+         * @note 只应由控制面 leader 单飞调用；事务只保证单次读改写，跨实例追加仍靠 leader 串行化
          */
         AsynGyanis::Core::Task<bool> appendGate(AsynGyanis::Core::EventLoop &loop, std::int64_t waveId, std::string gateJson);
 

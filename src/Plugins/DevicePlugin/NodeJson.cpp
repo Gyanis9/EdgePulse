@@ -21,6 +21,7 @@ namespace EdgePulse::Device
                                                       {"name", node.name},
                                                       {"status", node.status},
                                                       {"agentVersion", node.agentVersion},
+                                                      {"installedFirmwareVersion", node.installedFirmwareVersion},
                                                       {"certFingerprint", node.certFingerprint},
                                                       {"certNotAfter", node.certNotAfter},
                                                       {"certRevokedAt", node.certRevokedAt},

@@ -2,6 +2,7 @@
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareRepository.h"
 #include "Core/Firmware/FirmwareRolloutRepository.h"
+#include "Plugins/DevicePlugin/NodeJson.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,12 +35,31 @@ namespace
     }
 
     /**
+     * @brief 在仓储所属租户下创建四个节点
+     * @return 按创建顺序排列的节点标识
+     */
+    std::vector<std::int64_t> createNodes(EdgePulse::TestSupport::EventLoopRunner &runner, EdgePulse::Device::NodeRepository &nodes, const std::string &prefix)
+    {
+        std::vector<std::int64_t> ids;
+        for (int index = 0; index < 4; ++index)
+        {
+            ids.push_back(runner.run(nodes.create(runner.loop(), prefix + "-" + std::to_string(index), "{}")).id);
+        }
+        return ids;
+    }
+
+    /**
      * @brief 构造一份三波次、四目标的灰度聚合
      * @param firmwareId 固件标识
+     * @param nodeIds 四个真实节点标识，前两个进入第一波，其余各成一波
      * @return 可直接交给仓储创建的草稿
      */
-    EdgePulse::Firmware::FirmwareRolloutDraft makeDraft(const std::int64_t firmwareId)
+    EdgePulse::Firmware::FirmwareRolloutDraft makeDraft(const std::int64_t firmwareId, const std::vector<std::int64_t> &nodeIds)
     {
+        if (nodeIds.size() != 4)
+        {
+            throw std::invalid_argument("makeDraft 需要四个节点");
+        }
         EdgePulse::Firmware::FirmwareRolloutDraft draft;
         draft.rollout.firmwareId = firmwareId;
         draft.rollout.name       = "灰度发布 A";
@@ -46,7 +67,7 @@ namespace
         draft.rollout.status     = "scheduled";
         draft.rollout.createdBy  = 7;
 
-        const std::vector<std::vector<std::int64_t>> waveNodes{{101, 102}, {103}, {104}};
+        const std::vector<std::vector<std::int64_t>> waveNodes{{nodeIds[0], nodeIds[1]}, {nodeIds[2]}, {nodeIds[3]}};
         for (std::size_t index = 0; index < waveNodes.size(); ++index)
         {
             EdgePulse::Firmware::FirmwareRolloutWaveDraft wave;
@@ -74,6 +95,22 @@ namespace
                                          [nodeId](const EdgePulse::Firmware::FirmwareRolloutTargetRecord &row) { return row.nodeId == nodeId; });
         return target == aggregate.targets.end() ? nullptr : &*target;
     }
+
+    /**
+     * @brief 断言创建被拒且原因包含指定片段
+     */
+    void expectCreateRejected(EdgePulse::TestSupport::EventLoopRunner &runner, EdgePulse::Firmware::FirmwareRolloutRepository &rollouts,
+                              EdgePulse::Firmware::FirmwareRolloutDraft draft, const std::string &fragment)
+    {
+        try
+        {
+            static_cast<void>(runner.run(rollouts.create(runner.loop(), std::move(draft))));
+            FAIL() << "非法聚合必须拒绝创建";
+        } catch (const EdgePulse::Common::DatabaseException &failure)
+        {
+            EXPECT_NE(std::string::npos, std::string{failure.what()}.find(fragment)) << failure.what();
+        }
+    }
 } // namespace
 
 // 钉住：一次创建同时写入 rollout、三波次与四目标，读取聚合时按波次与目标还原
@@ -82,10 +119,12 @@ TEST(FirmwareRolloutRepository, CreatesAndReadsAggregate)
     EdgePulse::TestSupport::AuthTestContext        context;
     EdgePulse::TestSupport::EventLoopRunner        runner;
     EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
     EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
     const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.0");
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-aggregate");
 
-    const std::int64_t rolloutId = runner.run(rollouts.create(runner.loop(), makeDraft(firmwareId)));
+    const std::int64_t rolloutId = runner.run(rollouts.create(runner.loop(), makeDraft(firmwareId, nodeIds)));
     ASSERT_GT(rolloutId, 0);
 
     const std::optional<EdgePulse::Firmware::FirmwareRolloutAggregate> aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
@@ -113,7 +152,7 @@ TEST(FirmwareRolloutRepository, CreatesAndReadsAggregate)
     EXPECT_EQ(1, aggregate->waves[2].targetCount);
 
     ASSERT_EQ(4U, aggregate->targets.size());
-    const EdgePulse::Firmware::FirmwareRolloutTargetRecord *second = findTarget(*aggregate, 102);
+    const EdgePulse::Firmware::FirmwareRolloutTargetRecord *second = findTarget(*aggregate, nodeIds[1]);
     ASSERT_NE(nullptr, second);
     EXPECT_EQ(1, second->tenantId);
     EXPECT_EQ(aggregate->waves[0].id, second->waveId);
@@ -131,15 +170,17 @@ TEST(FirmwareRolloutRepository, CreatesAndReadsAggregate)
     EXPECT_EQ(0, runner.run(otherTenant->list(runner.loop(), firmwareId, EdgePulse::Common::PageParameters{1, 10})).total);
 }
 
-// 钉住：状态推进按版本比较交换，旧版本与跨租户写入都落空，暂停与恢复同步维护时间戳
+// 钉住：状态推进按版本比较交换，旧版本与跨租户写入都落空，暂停、恢复与回滚同步维护时间戳与失败原因
 TEST(FirmwareRolloutRepository, StatusCompareAndSwap)
 {
     EdgePulse::TestSupport::AuthTestContext        context;
     EdgePulse::TestSupport::EventLoopRunner        runner;
     EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
     EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
     const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.1");
-    const std::int64_t                             rolloutId  = runner.run(rollouts.create(runner.loop(), makeDraft(firmwareId)));
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-status");
+    const std::int64_t                             rolloutId  = runner.run(rollouts.create(runner.loop(), makeDraft(firmwareId, nodeIds)));
 
     ASSERT_TRUE(runner.run(rollouts.updateStatus(runner.loop(), rolloutId, 1, "running", 1)));
     auto aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
@@ -166,16 +207,41 @@ TEST(FirmwareRolloutRepository, StatusCompareAndSwap)
     EXPECT_TRUE(aggregate->rollout.pausedAt.empty());
     EXPECT_TRUE(aggregate->rollout.pauseReason.empty());
 
-    EXPECT_TRUE(runner.run(rollouts.updateStatus(runner.loop(), rolloutId, 4, "completed", 3)));
+    // 完成时记录终止时间与失败原因
+    EXPECT_TRUE(runner.run(rollouts.updateStatus(runner.loop(), rolloutId, 4, "completed", 3, "", "第三次失败")));
     aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
     ASSERT_TRUE(aggregate.has_value());
     EXPECT_EQ("completed", aggregate->rollout.status);
     EXPECT_EQ(3, aggregate->rollout.currentWave);
     EXPECT_FALSE(aggregate->rollout.finishedAt.empty());
+    EXPECT_EQ("第三次失败", aggregate->rollout.lastError);
+
+    // 回滚属于活动态：终止时间清空，未提供新原因时旧失败原因也不保留
+    EXPECT_TRUE(runner.run(rollouts.updateStatus(runner.loop(), rolloutId, 5, "rolling_back", 2)));
+    aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    EXPECT_EQ("rolling_back", aggregate->rollout.status);
+    EXPECT_TRUE(aggregate->rollout.finishedAt.empty());
+    EXPECT_TRUE(aggregate->rollout.lastError.empty());
+
+    // 失败终止记录终止时间与新的原因
+    EXPECT_TRUE(runner.run(rollouts.updateStatus(runner.loop(), rolloutId, 6, "failed", 3, "", "回滚失败")));
+    aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    EXPECT_FALSE(aggregate->rollout.finishedAt.empty());
+    EXPECT_EQ("回滚失败", aggregate->rollout.lastError);
+
+    // 再次恢复运行清掉终止时间与失败原因
+    EXPECT_TRUE(runner.run(rollouts.updateStatus(runner.loop(), rolloutId, 7, "running", 0)));
+    aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    EXPECT_TRUE(aggregate->rollout.finishedAt.empty());
+    EXPECT_TRUE(aggregate->rollout.lastError.empty());
+    EXPECT_FALSE(aggregate->rollout.startedAt.empty());
 
     // 跨租户写入按不存在处理
     const auto otherTenant = rollouts.scoped(EdgePulse::System::TenantScope{2, false});
-    EXPECT_FALSE(runner.run(otherTenant->updateStatus(runner.loop(), rolloutId, 5, "aborted")));
+    EXPECT_FALSE(runner.run(otherTenant->updateStatus(runner.loop(), rolloutId, 8, "aborted")));
 }
 
 // 钉住：同一节点在一个发布里只能出现一次；唯一冲突让整笔事务回滚，不留下半份聚合
@@ -184,10 +250,12 @@ TEST(FirmwareRolloutRepository, RejectsDuplicateNodeAndRollsBack)
     EdgePulse::TestSupport::AuthTestContext        context;
     EdgePulse::TestSupport::EventLoopRunner        runner;
     EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
     EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
     const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.2");
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-duplicate");
 
-    EdgePulse::Firmware::FirmwareRolloutDraft draft = makeDraft(firmwareId);
+    EdgePulse::Firmware::FirmwareRolloutDraft draft = makeDraft(firmwareId, nodeIds);
     draft.waves[1].targets[0].nodeId                = draft.waves[0].targets[0].nodeId;
     try
     {
@@ -195,10 +263,64 @@ TEST(FirmwareRolloutRepository, RejectsDuplicateNodeAndRollsBack)
         FAIL() << "同一节点重复出现时创建必须失败";
     } catch (const EdgePulse::Common::DatabaseException &failure)
     {
-        EXPECT_NE(std::string::npos, std::string{failure.what()}.find("重复"));
+        EXPECT_NE(std::string::npos, std::string{failure.what()}.find("重复")) << failure.what();
     }
 
     // 创建先写聚合再写波次与目标，唯一冲突后不能留下 rollout 头
+    EXPECT_EQ(0, runner.run(rollouts.list(runner.loop(), firmwareId, EdgePulse::Common::PageParameters{1, 10})).total);
+}
+
+// 钉住：目标节点必须存在、未删除且属于发布租户，任何一条不满足都拒绝整笔创建
+TEST(FirmwareRolloutRepository, RejectsMissingDeletedAndCrossTenantTargets)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
+    EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
+    const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.5");
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-invalid-target");
+
+    // 不存在的节点
+    std::vector<std::int64_t> missing = nodeIds;
+    missing[3]                        = 999999999;
+    expectCreateRejected(runner, rollouts, makeDraft(firmwareId, missing), "目标节点");
+
+    // 已软删除的节点
+    ASSERT_TRUE(runner.run(nodes.remove(runner.loop(), nodeIds[3])));
+    expectCreateRejected(runner, rollouts, makeDraft(firmwareId, nodeIds), "目标节点");
+
+    // 另一租户的节点
+    const auto                otherTenantNodes = nodes.scoped(EdgePulse::System::TenantScope{2, false});
+    const std::int64_t        foreignNodeId    = runner.run(otherTenantNodes->create(runner.loop(), "rollout-foreign-target", "{}")).id;
+    std::vector<std::int64_t> mixed            = nodeIds;
+    mixed[3]                                   = foreignNodeId;
+    expectCreateRejected(runner, rollouts, makeDraft(firmwareId, mixed), "目标节点");
+
+    // 三次拒绝都不能留下发布头
+    EXPECT_EQ(0, runner.run(rollouts.list(runner.loop(), firmwareId, EdgePulse::Common::PageParameters{1, 10})).total);
+}
+
+// 钉住：没有波次或波次下标重复的聚合在写库前就被拒绝
+TEST(FirmwareRolloutRepository, RejectsInvalidWavePlan)
+{
+    EdgePulse::TestSupport::AuthTestContext        context;
+    EdgePulse::TestSupport::EventLoopRunner        runner;
+    EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
+    EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
+    const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.6");
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-wave-plan");
+
+    EdgePulse::Firmware::FirmwareRolloutDraft zeroWaves;
+    zeroWaves.rollout.firmwareId = firmwareId;
+    zeroWaves.rollout.name       = "空波次";
+    expectCreateRejected(runner, rollouts, std::move(zeroWaves), "波次");
+
+    EdgePulse::Firmware::FirmwareRolloutDraft duplicateWaves = makeDraft(firmwareId, nodeIds);
+    duplicateWaves.waves[1].wave.waveIndex                   = duplicateWaves.waves[0].wave.waveIndex;
+    expectCreateRejected(runner, rollouts, std::move(duplicateWaves), "波次下标");
+
     EXPECT_EQ(0, runner.run(rollouts.list(runner.loop(), firmwareId, EdgePulse::Common::PageParameters{1, 10})).total);
 }
 
@@ -249,7 +371,7 @@ TEST(FirmwareRolloutRepository, TaskUpdatesScopeByCommandId)
     }
 }
 
-// 钉住：心跳写入 Agent 上报的已安装固件版本；省略该参数时保留原值
+// 钉住：心跳写入 Agent 上报的已安装固件版本，节点 JSON 同步透出；省略该参数时保留原值
 TEST(FirmwareRolloutRepository, HeartbeatPersistsInstalledFirmwareVersion)
 {
     EdgePulse::TestSupport::AuthTestContext context;
@@ -261,31 +383,40 @@ TEST(FirmwareRolloutRepository, HeartbeatPersistsInstalledFirmwareVersion)
     ASSERT_TRUE(beat.has_value());
     EXPECT_EQ("2.0.0", beat->node.installedFirmwareVersion);
     EXPECT_EQ("2.0.0", runner.run(nodes.findById(runner.loop(), nodeId))->installedFirmwareVersion);
+    const AsynGyanis::Base::ConfigValue json = EdgePulse::Device::nodeToJson(beat->node);
+    EXPECT_EQ("2.0.0", json["installedFirmwareVersion"].get<std::string>());
 
     // 旧 Agent 不带版本：只刷新 Agent 版本，已安装固件版本保持不变
     const auto legacy = runner.run(nodes.heartbeat(runner.loop(), nodeId, "1.2.1"));
     ASSERT_TRUE(legacy.has_value());
     EXPECT_EQ("1.2.1", legacy->node.agentVersion);
     EXPECT_EQ("2.0.0", legacy->node.installedFirmwareVersion);
+    EXPECT_EQ("2.0.0", EdgePulse::Device::nodeToJson(legacy->node)["installedFirmwareVersion"].get<std::string>());
 
     const std::int64_t freshNodeId = runner.run(nodes.create(runner.loop(), "rollout-fresh-node", "{}")).id;
     EXPECT_TRUE(runner.run(nodes.findById(runner.loop(), freshNodeId))->installedFirmwareVersion.empty());
+    EXPECT_TRUE(EdgePulse::Device::nodeToJson(*runner.run(nodes.findById(runner.loop(), freshNodeId)))["installedFirmwareVersion"].get<std::string>().empty());
 }
 
-// 钉住：波次时间戳、目标健康快照与门控快照可分别更新，待推进列表只收运行态发布
+// 钉住：波次时间戳、目标健康快照与门控快照可分别更新；目标更新受租户、所属发布波次约束
 TEST(FirmwareRolloutRepository, UpdatesWaveTargetGateAndListsDue)
 {
     EdgePulse::TestSupport::AuthTestContext        context;
     EdgePulse::TestSupport::EventLoopRunner        runner;
     EdgePulse::Firmware::FirmwareRepository        firmware(context.database);
+    EdgePulse::Device::NodeRepository              nodes(context.database);
     EdgePulse::Firmware::FirmwareRolloutRepository rollouts(context.database);
     const std::int64_t                             firmwareId = createFirmware(runner, firmware, "3.0.4");
+    const std::vector<std::int64_t>                nodeIds    = createNodes(runner, nodes, "rollout-wave-target");
 
-    EdgePulse::Firmware::FirmwareRolloutDraft draft     = makeDraft(firmwareId);
+    EdgePulse::Firmware::FirmwareRolloutDraft draft     = makeDraft(firmwareId, nodeIds);
     const std::int64_t                        rolloutId = runner.run(rollouts.create(runner.loop(), draft));
     auto                                      aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
     ASSERT_TRUE(aggregate.has_value());
     const std::int64_t firstWaveId = aggregate->waves[0].id;
+    const auto        *firstTarget = findTarget(*aggregate, nodeIds[0]);
+    ASSERT_NE(nullptr, firstTarget);
+    const std::int64_t firstTargetId = firstTarget->id;
 
     const std::vector<EdgePulse::Firmware::FirmwareRolloutRecord> due = runner.run(rollouts.listDueRollouts(runner.loop(), 10));
     ASSERT_EQ(1U, due.size());
@@ -306,29 +437,67 @@ TEST(FirmwareRolloutRepository, UpdatesWaveTargetGateAndListsDue)
     EXPECT_NE(std::string::npos, aggregate->waves[0].gateJson.find(R"({"passed":2,"failed":0})"));
     EXPECT_NE(std::string::npos, aggregate->waves[0].gateJson.find('\n'));
 
-    const auto *firstTarget = findTarget(*aggregate, 101);
-    ASSERT_NE(nullptr, firstTarget);
     EdgePulse::Firmware::FirmwareRolloutTargetUpdate targetUpdate;
     targetUpdate.status     = "healthy";
     targetUpdate.healthJson = R"({"command":"succeeded"})";
     targetUpdate.taskId     = 501;
     targetUpdate.commandId  = 601;
-    EXPECT_TRUE(runner.run(rollouts.updateTarget(runner.loop(), firstTarget->id, targetUpdate)));
+    EXPECT_TRUE(runner.run(rollouts.updateTarget(runner.loop(), firstTargetId, targetUpdate)));
     aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
     ASSERT_TRUE(aggregate.has_value());
-    firstTarget = findTarget(*aggregate, 101);
+    firstTarget = findTarget(*aggregate, nodeIds[0]);
     ASSERT_NE(nullptr, firstTarget);
     EXPECT_EQ("healthy", firstTarget->status);
     EXPECT_EQ(R"({"command":"succeeded"})", firstTarget->healthJson);
     EXPECT_EQ(501, firstTarget->taskId);
     EXPECT_EQ(601, firstTarget->commandId);
 
+    // 只更新健康快照时状态与关联字段保持原值
+    EdgePulse::Firmware::FirmwareRolloutTargetUpdate healthOnly;
+    healthOnly.healthJson = R"({"gate":"ok"})";
+    EXPECT_TRUE(runner.run(rollouts.updateTarget(runner.loop(), firstTargetId, healthOnly)));
+    aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    firstTarget = findTarget(*aggregate, nodeIds[0]);
+    ASSERT_NE(nullptr, firstTarget);
+    EXPECT_EQ("healthy", firstTarget->status);
+    EXPECT_EQ(R"({"gate":"ok"})", firstTarget->healthJson);
+    EXPECT_EQ(501, firstTarget->taskId);
+    EXPECT_EQ(601, firstTarget->commandId);
+
+    // 目标只能移到同一发布的波次：另一发布的波次下标命中不了
+    EdgePulse::Firmware::FirmwareRolloutDraft secondDraft = makeDraft(firmwareId, nodeIds);
+    secondDraft.rollout.name                              = "灰度发布 B";
+    secondDraft.rollout.status                            = "draft";
+    const std::int64_t secondRolloutId                    = runner.run(rollouts.create(runner.loop(), secondDraft));
+    const auto         secondAggregate                    = runner.run(rollouts.find(runner.loop(), secondRolloutId));
+    ASSERT_TRUE(secondAggregate.has_value());
+    EdgePulse::Firmware::FirmwareRolloutTargetUpdate crossRollout;
+    crossRollout.waveId = secondAggregate->waves[1].id;
+    EXPECT_FALSE(runner.run(rollouts.updateTarget(runner.loop(), firstTargetId, crossRollout)));
+    aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    firstTarget = findTarget(*aggregate, nodeIds[0]);
+    ASSERT_NE(nullptr, firstTarget);
+    EXPECT_EQ(firstWaveId, firstTarget->waveId);
+
+    // 同一发布的波次可以正常指定
+    EdgePulse::Firmware::FirmwareRolloutTargetUpdate ownWave;
+    ownWave.waveId = firstWaveId;
+    EXPECT_TRUE(runner.run(rollouts.updateTarget(runner.loop(), firstTargetId, ownWave)));
+
     const auto otherTenant = rollouts.scoped(EdgePulse::System::TenantScope{2, false});
     EXPECT_FALSE(runner.run(otherTenant->setWave(runner.loop(), firstWaveId, "failed")));
     EXPECT_FALSE(runner.run(otherTenant->appendGate(runner.loop(), firstWaveId, R"({"passed":0})")));
+    EXPECT_FALSE(runner.run(otherTenant->updateTarget(runner.loop(), firstTargetId, healthOnly)));
+    aggregate = runner.run(rollouts.find(runner.loop(), rolloutId));
+    ASSERT_TRUE(aggregate.has_value());
+    firstTarget = findTarget(*aggregate, nodeIds[0]);
+    ASSERT_NE(nullptr, firstTarget);
+    EXPECT_EQ(R"({"gate":"ok"})", firstTarget->healthJson);
 
     // 草稿不进入待推进集合
-    EdgePulse::Firmware::FirmwareRolloutDraft draftOnly = makeDraft(firmwareId);
+    EdgePulse::Firmware::FirmwareRolloutDraft draftOnly = makeDraft(firmwareId, nodeIds);
     draftOnly.rollout.status                            = "draft";
     ASSERT_GT(runner.run(rollouts.create(runner.loop(), draftOnly)), 0);
     EXPECT_EQ(1U, runner.run(rollouts.listDueRollouts(runner.loop(), 10)).size());
