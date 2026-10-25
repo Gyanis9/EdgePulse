@@ -1140,8 +1140,8 @@ namespace EdgePulse::Firmware
                            fail(response, Common::kCodeNotFound, "固件不存在", traceId);
                            co_return;
                        }
-                       std::error_code error;
-                       std::filesystem::remove(removed->storagePath, error);
+                       // 文件删除是阻塞 IO，放到工作线程；失败只记日志，响应仍按元数据删除成功处理
+                       co_await removeStoredFile(loop, removed->storagePath);
                        Common::writeSuccess(response, nullptr, traceId);
                        co_return;
                    });

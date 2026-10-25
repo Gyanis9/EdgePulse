@@ -86,7 +86,20 @@ namespace EdgePulse::Web
          * @return std::string 面向日志的错误文本；不含凭据
          */
         [[nodiscard]] virtual std::string lastError() const = 0;
+
+        /**
+         * @brief 该实现声明的单条命令超时
+         * @return int 毫秒；0 表示实现没有单独的有限超时
+         * @note 只用于启动与用例观察「发布路径是否被限时」，不参与收发本身
+         */
+        [[nodiscard]] virtual int commandTimeoutMilliseconds() const noexcept
+        {
+            return 0;
+        }
     };
+
+    /// 发布连接的单条命令上限：半开连接最多卡住事件循环两秒，而不是连接默认的三十秒
+    inline constexpr int kPublisherCommandTimeoutMilliseconds = 2000;
 
     /**
      * @brief 生成跨实例信封
@@ -135,6 +148,14 @@ namespace EdgePulse::Web
     };
 
     /**
+     * @brief 构造真实 Redis 发布连接
+     * @param options Redis 参数
+     * @return std::unique_ptr<PublisherTransport> 尚未连接、命令超时已收紧到 kPublisherCommandTimeoutMilliseconds 的发布连接
+     * @note 构造不发起网络交互；连接与超时应用发生在 connect()。公开它是为了让用例能核对发布路径的有限超时
+     */
+    [[nodiscard]] std::unique_ptr<PublisherTransport> makeRedisPublisherTransport(const RealtimeBusOptions &options);
+
+    /**
      * @brief 实时事件总线
      * @details publish() 先在本进程扇出（WebSocket 与告警 SSE），再把同一事件以带实例标识的信封发到 Redis；
      *          publishAgent() 走同一条频道，但只投给本实例登记的 Agent 投递口，不进入浏览器扇出。
@@ -142,6 +163,8 @@ namespace EdgePulse::Web
      *          target 的旧信封）走本地浏览器扇出；两条路径都不再二次发布。
      * @note publish() 与 publishAgent() 都在服务器循环上调用，只做本地投递与不等待的 PUBLISH 尝试，
      *       不重连也不 PING；发布连接的恢复只由订阅线程在后台完成
+     * @note 跨实例转发是尽力而为：Redis 不可用或发布锁被占住时本轮远端事件直接丢弃，本地投递不受影响；
+     *       恢复后不补发历史事件，依赖远端副本书写的调用方必须以本地数据库与 Agent 轮询兜底
      */
     class RealtimeBus
     {

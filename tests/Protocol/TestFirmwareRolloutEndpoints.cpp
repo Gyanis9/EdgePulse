@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -224,6 +225,32 @@ namespace
         std::filesystem::path                                           m_storage;
     };
 } // namespace
+
+// 钉住：删除固件时成品文件的移除在工作线程完成，响应返回时文件已消失；重复删除仍为 404
+TEST_F(FirmwareRolloutEndpointsTest, DeleteRemovesStoredFileAndKeepsNotFound)
+{
+    std::error_code error;
+    std::filesystem::create_directories(m_storage, error);
+    ASSERT_FALSE(error) << error.message();
+
+    const std::string  token      = login();
+    const std::int64_t firmwareId = createFirmware("9.9.9");
+    const auto         stored     = m_runner->run(m_firmware->find(m_runner->loop(), firmwareId));
+    ASSERT_TRUE(stored.has_value());
+    {
+        std::ofstream firmwareFile(stored->storagePath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(firmwareFile.is_open());
+        firmwareFile << "firmware-bytes";
+    }
+    ASSERT_TRUE(std::filesystem::exists(stored->storagePath));
+
+    const HttpResult removed = m_server->send("DELETE", "/api/firmware/" + std::to_string(firmwareId), {}, {}, bearer(token));
+    EXPECT_EQ(200, removed.status) << removed.body;
+    EXPECT_FALSE(std::filesystem::exists(stored->storagePath));
+
+    const HttpResult again = m_server->send("DELETE", "/api/firmware/" + std::to_string(firmwareId), {}, {}, bearer(token));
+    EXPECT_EQ(404, again.status) << again.body;
+}
 
 // 钉住：匿名请求一律 401；创建阶段拒绝空目标、空波次与不存在的固件
 TEST_F(FirmwareRolloutEndpointsTest, RejectsAnonymousAndInvalidCreate)

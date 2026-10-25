@@ -98,11 +98,15 @@ namespace EdgePulse::Web
         {
         public:
             /**
-             * @brief 绑定连接配置；此阶段不发生网络交互
+             * @brief 绑定连接配置与收发超时；此阶段不发生网络交互
              * @param configuration Redis 连接配置
+             * @param timeoutMilliseconds 连接与单条命令上限；发布在事件循环上执行，必须保持有限
              */
-            explicit RedisPublisherTransport(const AsynGyanis::Database::ConnectionConfig &configuration) : m_connection(configuration)
+            RedisPublisherTransport(const AsynGyanis::Database::ConnectionConfig &configuration, const int timeoutMilliseconds) : m_connection(configuration)
             {
+                // 建连与 PUBLISH 都可能在服务器半开时阻塞；发布路径不承接默认三十秒的命令超时
+                m_connection.setConnectTimeout(timeoutMilliseconds);
+                m_connection.setQueryTimeout(timeoutMilliseconds);
             }
 
             bool connect() override
@@ -136,10 +140,20 @@ namespace EdgePulse::Web
                 return m_connection.lastError();
             }
 
+            [[nodiscard]] int commandTimeoutMilliseconds() const noexcept override
+            {
+                return m_connection.queryTimeout();
+            }
+
         private:
             AsynGyanis::Database::RedisConnection m_connection; ///< 事件发布专用连接
         };
     } // namespace
+
+    std::unique_ptr<PublisherTransport> makeRedisPublisherTransport(const RealtimeBusOptions &options)
+    {
+        return std::make_unique<RedisPublisherTransport>(redisConfig(options), kPublisherCommandTimeoutMilliseconds);
+    }
 
     std::string makeRealtimeEnvelope(const std::string_view instanceId, const std::string_view base, const std::int64_t tenantId, const std::string_view payload)
     {
@@ -386,7 +400,7 @@ namespace EdgePulse::Web
         {
             return m_options.publisherFactory();
         }
-        return std::make_unique<RedisPublisherTransport>(redisConfig(m_options));
+        return makeRedisPublisherTransport(m_options);
     }
 
     bool RealtimeBus::reconnectPublisherLocked()

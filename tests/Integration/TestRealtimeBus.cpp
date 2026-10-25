@@ -144,6 +144,20 @@ namespace
     }
 } // namespace
 
+// 钉住：发布连接的单条命令超时不超过两秒，半开 Redis 不能把事件循环卡满默认的三十秒
+TEST(RealtimeBus, RedisPublisherUsesBoundedCommandTimeout)
+{
+    EdgePulse::Web::RealtimeBusOptions options;
+    options.host = "127.0.0.1";
+    options.port = 1;
+
+    const std::unique_ptr<EdgePulse::Web::PublisherTransport> transport = EdgePulse::Web::makeRedisPublisherTransport(options);
+    ASSERT_NE(nullptr, transport);
+    EXPECT_GT(transport->commandTimeoutMilliseconds(), 0);
+    EXPECT_LE(transport->commandTimeoutMilliseconds(), 2000);
+    EXPECT_EQ(EdgePulse::Web::kPublisherCommandTimeoutMilliseconds, transport->commandTimeoutMilliseconds());
+}
+
 // 钉住：浏览器发布仍是 target=browser 的本地扇出加一次 PUBLISH，agent 路径不改变它
 TEST(RealtimeBus, BrowserPublishKeepsBrowserTargetAndLocalFanout)
 {
