@@ -10,6 +10,7 @@
 #include "Base/Runtime/IdGenerator.h"
 #include "Base/Runtime/TimeFormat.h"
 #include "Core/Auth/AuthService.h"
+#include "Core/Auth/DataScopeService.h"
 #include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Command/CommandRepository.h"
 #include "Core/Device/AgentAuthorization.h"
@@ -225,6 +226,10 @@ namespace EdgePulse::Firmware
                 std::function<AsynGyanis::Core::Task<FirmwareRolloutResult<bool>>(AsynGyanis::Core::EventLoop &, System::TenantScope, std::int64_t, const std::string &)>;
         using FirmwareRolloutActionHandler = std::function<AsynGyanis::Core::Task<>(AsynGyanis::Net::HttpRequest &, AsynGyanis::Net::HttpResponse &)>;
 
+        [[nodiscard]] AsynGyanis::Core::Task<Auth::DataScope> resolveDataScope(Auth::DataScopeService *dataScopes, AsynGyanis::Core::EventLoop &loop,
+                                                                               const Auth::SessionRecord &session);
+        [[nodiscard]] FirmwareRolloutTargetScope targetScopeFrom(const Auth::DataScope &scope);
+
         /**
          * @brief 生成人工动作的处理函数
          * @param loop 请求所属事件循环
@@ -261,13 +266,28 @@ namespace EdgePulse::Firmware
                     fail(response, Common::kCodeBadRequest, "强制提升必须提供 reason", traceId);
                     co_return;
                 }
+                const Auth::DataScope scope = co_await resolveDataScope(dependencies.dataScopes, loop, *session);
+                if (!scope.all)
+                {
+                    // 动作会影响整笔发布；只要有一个目标在数据范围外就拒绝，避免借动作越权触碰别家节点
+                    const auto full = co_await dependencies.rollouts->find(loop, session->tenantScope(), *id);
+                    if (full.has_value())
+                    {
+                        const auto visible = co_await dependencies.rollouts->find(loop, session->tenantScope(), *id, targetScopeFrom(scope));
+                        if (!visible.has_value() || visible->targets.size() != full->targets.size())
+                        {
+                            fail(response, Common::kCodeForbidden, "灰度发布包含数据范围外的目标，不能操作", traceId);
+                            co_return;
+                        }
+                    }
+                }
                 const auto changed = co_await action(loop, session->tenantScope(), *id, reason);
                 if (!changed.has_value())
                 {
                     fail(response, rolloutHttpStatus(changed.error().kind), changed.error().message, traceId);
                     co_return;
                 }
-                const auto aggregate = co_await dependencies.rollouts->find(loop, session->tenantScope(), *id);
+                const auto aggregate = co_await dependencies.rollouts->find(loop, session->tenantScope(), *id, targetScopeFrom(scope));
                 if (!aggregate.has_value())
                 {
                     fail(response, Common::kCodeNotFound, "灰度发布不存在", traceId);
@@ -312,6 +332,42 @@ namespace EdgePulse::Firmware
             return dependencies.signingPolicy != nullptr && dependencies.signingPolicy->signatureRequired();
         }
 
+        /**
+         * @brief 解析会话的数据范围；平台管理员与未配置数据范围时按全部可见处理
+         */
+        [[nodiscard]] AsynGyanis::Core::Task<Auth::DataScope> resolveDataScope(Auth::DataScopeService *dataScopes, AsynGyanis::Core::EventLoop &loop,
+                                                                               const Auth::SessionRecord &session)
+        {
+            if (dataScopes == nullptr || session.platformAdmin)
+            {
+                co_return Auth::DataScope{true, false, session.userId, {}};
+            }
+            co_return co_await dataScopes->resolve(loop, session.userId);
+        }
+
+        [[nodiscard]] FirmwareRolloutTargetScope targetScopeFrom(const Auth::DataScope &scope)
+        {
+            FirmwareRolloutTargetScope targetScope;
+            targetScope.all       = scope.all;
+            targetScope.selfOnly  = scope.selfOnly;
+            targetScope.userId    = scope.userId;
+            targetScope.deptIds   = scope.deptIds;
+            return targetScope;
+        }
+
+        [[nodiscard]] bool nodeVisibleInScope(const Device::NodeRecord &node, const Auth::DataScope &scope)
+        {
+            if (scope.all)
+            {
+                return true;
+            }
+            if (scope.selfOnly)
+            {
+                return node.createdBy == scope.userId;
+            }
+            return std::find(scope.deptIds.begin(), scope.deptIds.end(), node.ownerDeptId) != scope.deptIds.end();
+        }
+
         [[nodiscard]] std::string joinedIdentifiers(const std::vector<std::int64_t> &identifiers)
         {
             std::string joined;
@@ -333,19 +389,20 @@ namespace EdgePulse::Firmware
          * @param scope 会话租户边界
          * @param nodeIds 请求里的节点标识
          * @param firmwareTenantId 固件归属租户
-         * @return 不存在、不可见或与固件不同租户的节点标识；全部合法时为空
+         * @param dataScope 会话数据范围；调用方已解析时传入
+         * @return 不存在、不可见、不在数据范围或与固件不同租户的节点标识；全部合法时为空
          * @note 平台管理员的边界是全租户，此时仍要求节点租户与固件租户一致
          */
         [[nodiscard]] AsynGyanis::Core::Task<std::vector<std::int64_t>> invalidFirmwareTargets(AsynGyanis::Core::EventLoop &loop, const Device::NodeRepository &nodes,
                                                                                                const System::TenantScope scope, const std::vector<std::int64_t> &nodeIds,
-                                                                                               const std::int64_t firmwareTenantId)
+                                                                                               const std::int64_t firmwareTenantId, const Auth::DataScope &dataScope)
         {
             const auto                scopedNodes = nodes.scoped(scope);
             std::vector<std::int64_t> invalid;
             for (const std::int64_t nodeId: nodeIds)
             {
                 const auto node = co_await scopedNodes->findById(loop, nodeId);
-                if (!node.has_value() || node->tenantId != firmwareTenantId)
+                if (!node.has_value() || node->tenantId != firmwareTenantId || !nodeVisibleInScope(*node, dataScope))
                 {
                     invalid.push_back(nodeId);
                 }
@@ -487,6 +544,20 @@ namespace EdgePulse::Firmware
                                 fail(response, Common::kCodeBadRequest, "缺少 policy 或 policyJson", traceId);
                                 co_return;
                             }
+                            const auto firmware = co_await dependencies.firmware->scoped(session->tenantScope())->find(loop, *id);
+                            if (!firmware.has_value())
+                            {
+                                fail(response, Common::kCodeNotFound, "固件不存在", traceId);
+                                co_return;
+                            }
+                            const Auth::DataScope dataScope = co_await resolveDataScope(dependencies.dataScopes, loop, *session);
+                            const auto           invalidTargets =
+                                    co_await invalidFirmwareTargets(loop, *dependencies.nodes, session->tenantScope(), nodeIds, firmware->tenantId, dataScope);
+                            if (!invalidTargets.empty())
+                            {
+                                fail(response, Common::kCodeBadRequest, "目标节点不存在、不可见、不在数据范围内或不属于固件所在租户：" + joinedIdentifiers(invalidTargets), traceId);
+                                co_return;
+                            }
                             const auto created = co_await dependencies.rollouts->create(loop, session->tenantScope(), session->userId, *id, name, policyText, nodeIds);
                             if (!created.has_value())
                             {
@@ -518,9 +589,10 @@ namespace EdgePulse::Firmware
                                fail(response, Common::kCodeBadRequest, "固件标识不合法", traceId);
                                co_return;
                            }
-                           const Common::QueryMap       query  = request.queryParams();
+                           const Common::QueryMap  query      = request.queryParams();
                            const Common::PageParameters page   = Common::parsePageParameters(query);
-                           const auto                   result = co_await dependencies.rollouts->list(loop, session->tenantScope(), *id, page);
+                           const Auth::DataScope dataScope    = co_await resolveDataScope(dependencies.dataScopes, loop, *session);
+                           const auto                   result = co_await dependencies.rollouts->list(loop, session->tenantScope(), *id, page, targetScopeFrom(dataScope));
                            ConfigValue                  rows   = ConfigValue::array();
                            for (const FirmwareRolloutRecord &record: result.rows)
                            {
@@ -549,6 +621,19 @@ namespace EdgePulse::Firmware
                            if (!aggregate.has_value())
                            {
                                fail(response, Common::kCodeNotFound, "灰度发布不存在", traceId);
+                               co_return;
+                           }
+                           const Auth::DataScope dataScope = co_await resolveDataScope(dependencies.dataScopes, loop, *session);
+                           if (!dataScope.all)
+                           {
+                               const auto visible = co_await dependencies.rollouts->find(loop, session->tenantScope(), *id, targetScopeFrom(dataScope));
+                               if (!visible.has_value() || visible->targets.empty())
+                               {
+                                   // 目标全部在数据范围外时不暴露发布头
+                                   fail(response, Common::kCodeNotFound, "灰度发布不存在", traceId);
+                                   co_return;
+                               }
+                               Common::writeSuccess(response, rolloutAggregateJson(*visible), traceId);
                                co_return;
                            }
                            Common::writeSuccess(response, rolloutAggregateJson(*aggregate), traceId);
@@ -862,7 +947,7 @@ namespace EdgePulse::Firmware
                             co_return;
                         }
                         // 目标节点必须在会话租户内可见且与固件同租户：否则任务行会指向看不见的节点，任务列表还可能带出别家节点名
-                        const auto invalidTargets = co_await invalidFirmwareTargets(loop, *deps->nodes, session->tenantScope(), nodeIds, firmware->tenantId);
+                        const auto invalidTargets = co_await invalidFirmwareTargets(loop, *deps->nodes, session->tenantScope(), nodeIds, firmware->tenantId, Auth::DataScope{true, false, session->userId, {}});
                         if (!invalidTargets.empty())
                         {
                             fail(response, Common::kCodeBadRequest, "目标节点不存在、不可见或不属于固件所在租户：" + joinedIdentifiers(invalidTargets), traceId);
@@ -953,7 +1038,7 @@ namespace EdgePulse::Firmware
                             co_return;
                         }
                         // 回滚目标必须是本租户可见节点，且与源固件同租户；校验放在解析历史版本与建任务之前
-                        const auto invalidTargets = co_await invalidFirmwareTargets(loop, *deps->nodes, session->tenantScope(), nodeIds, firmware->tenantId);
+                        const auto invalidTargets = co_await invalidFirmwareTargets(loop, *deps->nodes, session->tenantScope(), nodeIds, firmware->tenantId, Auth::DataScope{true, false, session->userId, {}});
                         if (!invalidTargets.empty())
                         {
                             fail(response, Common::kCodeBadRequest, "目标节点不存在、不可见或不属于固件所在租户：" + joinedIdentifiers(invalidTargets), traceId);

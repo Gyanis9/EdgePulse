@@ -118,6 +118,28 @@ namespace EdgePulse::Firmware
     };
 
     /**
+     * @brief 目标节点的数据范围过滤
+     * @details 与节点列表使用同一套判据：全部、仅本人创建，或指定部门集合。
+     */
+    struct FirmwareRolloutTargetScope
+    {
+        bool                      all{true};      ///< 可见全部目标
+        bool                      selfOnly{false}; ///< 仅本人创建的节点
+        std::int64_t              userId{0};       ///< 当前账号
+        std::vector<std::int64_t> deptIds;         ///< 可见部门；all 为假且非 selfOnly 时生效
+    };
+
+    /**
+     * @brief 抢占一个待派发目标的结果
+     */
+    enum class FirmwareRolloutClaimResult
+    {
+        Claimed,          ///< 抢到派发权
+        RolloutChanged,   ///< 发布状态、版本或当前波次已变化
+        TargetNotClaimable, ///< 目标已被其他派发或已进入终局
+    };
+
+    /**
      * @brief 目标更新的可选字段
      * @details 字符串为空表示保持原值；整数字段为负表示保持原值。
      */
@@ -163,18 +185,22 @@ namespace EdgePulse::Firmware
          * @brief 读取完整聚合
          * @param loop 恢复协程用的事件循环
          * @param rolloutId 发布标识
+         * @param scope 目标节点的数据范围；默认不过滤
          * @return std::optional<FirmwareRolloutAggregate> 发布、波次与目标；不在租户边界内时为空
          */
-        AsynGyanis::Core::Task<std::optional<FirmwareRolloutAggregate>> find(AsynGyanis::Core::EventLoop &loop, std::int64_t rolloutId);
+        AsynGyanis::Core::Task<std::optional<FirmwareRolloutAggregate>> find(AsynGyanis::Core::EventLoop &loop, std::int64_t rolloutId,
+                                                                             const FirmwareRolloutTargetScope &scope = {});
 
         /**
          * @brief 分页查询发布
          * @param loop 恢复协程用的事件循环
          * @param firmwareId 固件过滤，0 表示全部
          * @param page 分页
+         * @param scope 目标节点的数据范围；只返回至少有一个可见目标的发布
          * @return Common::PageRows<FirmwareRolloutRecord> 当前页
          */
-        AsynGyanis::Core::Task<Common::PageRows<FirmwareRolloutRecord>> list(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, const Common::PageParameters &page);
+        AsynGyanis::Core::Task<Common::PageRows<FirmwareRolloutRecord>> list(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, const Common::PageParameters &page,
+                                                                             const FirmwareRolloutTargetScope &scope = {});
 
         /**
          * @brief 以版本比较交换推进发布状态
@@ -224,10 +250,45 @@ namespace EdgePulse::Firmware
          * @param loop 恢复协程用的事件循环
          * @param targetId 目标标识
          * @param update 要写入的字段；空字符串与负整数表示保持原值
+         * @param expectedStatus 非空时只在目标仍处于该状态时写入
          * @return true 命中本租户的目标
-         * @return false 目标不存在或不在租户边界内
+         * @return false 目标不存在、不在租户边界内或状态已变化
          */
-        AsynGyanis::Core::Task<bool> updateTarget(AsynGyanis::Core::EventLoop &loop, std::int64_t targetId, FirmwareRolloutTargetUpdate update);
+        AsynGyanis::Core::Task<bool> updateTarget(AsynGyanis::Core::EventLoop &loop, std::int64_t targetId, FirmwareRolloutTargetUpdate update,
+                                                  std::string expectedStatus = {});
+
+        /**
+         * @brief 在发布头版本与目标状态同时满足时抢占一个目标的派发权
+         * @param loop 恢复协程用的事件循环
+         * @param rolloutId 发布标识
+         * @param targetId 目标标识
+         * @param expectedVersion 调用方读到的发布版本
+         * @param waveIndex 当前波次
+         * @param expectedStatus 调用方读到的目标状态
+         * @param expectedTaskId 调用方读到的任务标识
+         * @param expectedCommandId 调用方读到的命令标识
+         * @param rollbackPhase true 表示回滚派发，只接受 rolling_back 的发布头
+         * @param claimedHealth 抢占期间的占位健康快照
+         * @param staleBefore 早于该时刻的 dispatching 目标允许被重新抢占
+         * @return FirmwareRolloutClaimResult 抢占结论
+         * @note 发布头版本、状态、当前波次与目标状态在同一事务里校验；失败时不留下任何写入
+         */
+        AsynGyanis::Core::Task<FirmwareRolloutClaimResult> claimTarget(AsynGyanis::Core::EventLoop &loop, std::int64_t rolloutId, std::int64_t targetId,
+                                                                       std::int64_t expectedVersion, int waveIndex, std::string expectedStatus,
+                                                                       std::int64_t expectedTaskId, std::int64_t expectedCommandId, bool rollbackPhase,
+                                                                       std::string claimedHealth, std::string staleBefore);
+
+        /**
+         * @brief 释放抢占并恢复目标原有状态与绑定
+         * @param loop 恢复协程用的事件循环
+         * @param targetId 目标标识
+         * @param expectedStatus 当前状态，必须为 dispatching
+         * @param restore 恢复后的字段
+         * @return true 恢复成功
+         * @return false 目标已被其他动作改写
+         */
+        AsynGyanis::Core::Task<bool> releaseTarget(AsynGyanis::Core::EventLoop &loop, std::int64_t targetId, std::string expectedStatus,
+                                                   FirmwareRolloutTargetUpdate restore);
 
         /**
          * @brief 取需要协调器推进的发布

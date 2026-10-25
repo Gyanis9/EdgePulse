@@ -1076,6 +1076,7 @@ namespace EdgePulse::App
         firmwareDependencies.maximumUploadBytes = static_cast<std::size_t>(m_configuration.maximumFirmwareBytes);
         firmwareDependencies.signingPolicy      = m_signingPolicy;
         firmwareDependencies.rollouts           = m_rolloutService.get();
+        firmwareDependencies.dataScopes         = m_dataScopeService.get();
         Firmware::registerFirmwareRoutes(router, loop, firmwareDependencies);
 
         Ops::OpsDependencies opsDependencies;

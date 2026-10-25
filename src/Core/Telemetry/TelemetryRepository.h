@@ -62,6 +62,15 @@ namespace EdgePulse::Telemetry
         AsynGyanis::Core::Task<std::optional<TelemetryFreshness>> newestTimestamps(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
 
         /**
+         * @brief 节点最新一条遥测的接收时间与采集时间
+         * @param loop 恢复协程用的事件循环
+         * @param nodeId 节点
+         * @return std::optional<TelemetryFreshness> 没有任何遥测时为空
+         * @note 两个时间来自同一行；门控必须用一条样本同时证明接收与采集都发生在窗口之后
+         */
+        AsynGyanis::Core::Task<std::optional<TelemetryFreshness>> newestSample(AsynGyanis::Core::EventLoop &loop, std::int64_t nodeId);
+
+        /**
          * @brief 批量写入遥测
          * @param loop 恢复协程用的事件循环
          * @param nodeId 节点

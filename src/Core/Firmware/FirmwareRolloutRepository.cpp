@@ -129,6 +129,38 @@ namespace EdgePulse::Firmware
             return record;
         }
 
+        /**
+         * @brief 把节点数据范围拼成 SQL 条件
+         * @param scope 数据范围
+         * @param parameters 追加的参数
+         * @param nodeAlias 节点表别名
+         * @return std::string 以 AND 开头、可直接拼在 WHERE 之后的条件
+         */
+        [[nodiscard]] std::string targetScopeClause(const FirmwareRolloutTargetScope &scope, std::vector<DatabaseValue> &parameters, const std::string &nodeAlias)
+        {
+            if (scope.all)
+            {
+                return {};
+            }
+            if (scope.selfOnly)
+            {
+                parameters.emplace_back(scope.userId);
+                return " AND " + nodeAlias + ".created_by = ?";
+            }
+            if (scope.deptIds.empty())
+            {
+                // 既不是全部也没有部门：按不可见处理，不能退化成全租户
+                return " AND 1 = 0";
+            }
+            std::string placeholders;
+            for (const std::int64_t deptId: scope.deptIds)
+            {
+                placeholders += placeholders.empty() ? "?" : ", ?";
+                parameters.emplace_back(deptId);
+            }
+            return " AND " + nodeAlias + ".owner_dept_id IN (" + placeholders + ")";
+        }
+
         [[nodiscard]] std::optional<FirmwareRolloutRecord> findRolloutOnConnection(DatabaseConnection &connection, const std::int64_t rolloutId, const System::TenantScope &tenant)
         {
             std::vector<DatabaseValue> parameters{rolloutId};
@@ -361,11 +393,12 @@ namespace EdgePulse::Firmware
                 });
     }
 
-    AsynGyanis::Core::Task<std::optional<FirmwareRolloutAggregate>> FirmwareRolloutRepository::find(AsynGyanis::Core::EventLoop &loop, const std::int64_t rolloutId)
+    AsynGyanis::Core::Task<std::optional<FirmwareRolloutAggregate>> FirmwareRolloutRepository::find(AsynGyanis::Core::EventLoop &loop, const std::int64_t rolloutId,
+                                                                                                   const FirmwareRolloutTargetScope &scope)
     {
         co_return co_await m_database->withConnection<std::optional<FirmwareRolloutAggregate>>(
                 loop,
-                [rolloutId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareRolloutAggregate>
+                [rolloutId, scope, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<FirmwareRolloutAggregate>
                 {
                     const std::optional<FirmwareRolloutRecord> rollout = findRolloutOnConnection(connection, rolloutId, tenant);
                     if (!rollout.has_value())
@@ -389,6 +422,13 @@ namespace EdgePulse::Firmware
                         targetClause = " AND tenant_id = ?";
                         targetParameters.emplace_back(tenant.tenantId);
                     }
+                    if (!scope.all)
+                    {
+                        // 目标可见性由节点归属决定；已删除节点不再对任何人可见
+                        targetClause += " AND EXISTS (SELECT 1 FROM biz_node n WHERE n.id = biz_firmware_rollout_target.node_id AND n.deleted = 0";
+                        targetClause += targetScopeClause(scope, targetParameters, "n");
+                        targetClause += ")";
+                    }
                     const auto targets =
                             Sql::executeOrThrow(connection, std::string{kSelectTarget} + "WHERE rollout_id = ?" + targetClause + " ORDER BY wave_id, id", targetParameters);
                     while (targets->next())
@@ -400,11 +440,11 @@ namespace EdgePulse::Firmware
     }
 
     AsynGyanis::Core::Task<Common::PageRows<FirmwareRolloutRecord>> FirmwareRolloutRepository::list(AsynGyanis::Core::EventLoop &loop, const std::int64_t firmwareId,
-                                                                                                    const Common::PageParameters &page)
+                                                                                                    const Common::PageParameters &page, const FirmwareRolloutTargetScope &scope)
     {
         co_return co_await m_database->withConnection<Common::PageRows<FirmwareRolloutRecord>>(
                 loop,
-                [firmwareId, page, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<FirmwareRolloutRecord>
+                [firmwareId, page, scope, tenant = m_tenant](DatabaseConnection &connection) -> Common::PageRows<FirmwareRolloutRecord>
                 {
                     std::string                filter = "WHERE 1 = 1";
                     std::vector<DatabaseValue> parameters;
@@ -417,6 +457,14 @@ namespace EdgePulse::Firmware
                     {
                         filter += " AND firmware_id = ?";
                         parameters.emplace_back(firmwareId);
+                    }
+                    if (!scope.all)
+                    {
+                        // 只列出至少有一个可见目标的发布；目标全部在数据范围外时不暴露发布头
+                        filter += " AND EXISTS (SELECT 1 FROM biz_firmware_rollout_target t JOIN biz_node n ON n.id = t.node_id AND n.deleted = 0 "
+                                  "WHERE t.rollout_id = biz_firmware_rollout.id";
+                        filter += targetScopeClause(scope, parameters, "n");
+                        filter += ")";
                     }
                     const auto                              count = Sql::executeOrThrow(connection, "SELECT COUNT(*) AS total FROM biz_firmware_rollout " + filter, parameters);
                     Common::PageRows<FirmwareRolloutRecord> pageRows;
@@ -588,11 +636,12 @@ namespace EdgePulse::Firmware
                 });
     }
 
-    AsynGyanis::Core::Task<bool> FirmwareRolloutRepository::updateTarget(AsynGyanis::Core::EventLoop &loop, const std::int64_t targetId, FirmwareRolloutTargetUpdate update)
+    AsynGyanis::Core::Task<bool> FirmwareRolloutRepository::updateTarget(AsynGyanis::Core::EventLoop &loop, const std::int64_t targetId, FirmwareRolloutTargetUpdate update,
+                                                                         std::string expectedStatus)
     {
         co_return co_await m_database->withConnection<bool>(
                 loop,
-                [targetId, update = std::move(update), tenant = m_tenant](DatabaseConnection &connection) -> bool
+                [targetId, update = std::move(update), expectedStatus = std::move(expectedStatus), tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
                     std::vector<DatabaseValue> parameters{update.status,
                                                           update.status,
@@ -607,12 +656,18 @@ namespace EdgePulse::Firmware
                                                           update.waveId,
                                                           update.waveId,
                                                           Common::nowDateTimeUtc(),
-                                                          targetId};
+                                                          targetId,
+                                                          update.waveId,
+                                                          update.waveId};
                     // 指定波次时必须留在同一发布内；波次不存在或属于其他发布时更新落空
                     std::string clause =
                             " AND (? < 0 OR EXISTS (SELECT 1 FROM biz_firmware_rollout_wave w WHERE w.id = ? AND w.rollout_id = biz_firmware_rollout_target.rollout_id))";
-                    parameters.emplace_back(update.waveId);
-                    parameters.emplace_back(update.waveId);
+                    if (!expectedStatus.empty())
+                    {
+                        // 状态条件把读取与写入绑成一次比较交换，终局目标不会被迟到的派发改写
+                        clause += " AND status = ?";
+                        parameters.emplace_back(expectedStatus);
+                    }
                     if (!tenant.allTenants)
                     {
                         clause += " AND tenant_id = ?";
@@ -628,6 +683,123 @@ namespace EdgePulse::Firmware
                                                                     clause,
                                                             parameters);
                     return result->affectedRowCount() > 0;
+                });
+    }
+
+    AsynGyanis::Core::Task<FirmwareRolloutClaimResult> FirmwareRolloutRepository::claimTarget(AsynGyanis::Core::EventLoop &loop, const std::int64_t rolloutId,
+                                                                                             const std::int64_t targetId, const std::int64_t expectedVersion,
+                                                                                             const int waveIndex, std::string expectedStatus,
+                                                                                             const std::int64_t expectedTaskId, const std::int64_t expectedCommandId,
+                                                                                             const bool rollbackPhase, std::string claimedHealth, std::string staleBefore)
+    {
+        co_return co_await m_database->withConnection<FirmwareRolloutClaimResult>(
+                loop,
+                [rolloutId, targetId, expectedVersion, waveIndex, expectedStatus = std::move(expectedStatus), expectedTaskId, expectedCommandId, rollbackPhase,
+                 claimedHealth = std::move(claimedHealth), staleBefore = std::move(staleBefore), tenant = m_tenant](DatabaseConnection &connection) -> FirmwareRolloutClaimResult
+                {
+                    try
+                    {
+                        Sql::executeOrThrowVoid(connection, "BEGIN");
+                        std::vector<DatabaseValue> headerParameters{rolloutId};
+                        std::string                headerClause;
+                        if (!tenant.allTenants)
+                        {
+                            headerClause = " AND tenant_id = ?";
+                            headerParameters.emplace_back(tenant.tenantId);
+                        }
+                        const auto header =
+                                Sql::executeOrThrow(connection, "SELECT status, current_wave, version FROM biz_firmware_rollout WHERE id = ?" + headerClause, headerParameters);
+                        if (!header->next())
+                        {
+                            rollbackQuietly(connection);
+                            return FirmwareRolloutClaimResult::RolloutChanged;
+                        }
+                        const std::string  status      = Sql::text(*header, "status");
+                        const int          currentWave = static_cast<int>(Sql::integer(*header, "current_wave"));
+                        const std::int64_t version     = Sql::integer(*header, "version");
+                        const bool         allowedStatus =
+                                rollbackPhase ? status == "rolling_back" : (status == "scheduled" || status == "preparing" || status == "running");
+                        if (version != expectedVersion || currentWave != waveIndex || !allowedStatus)
+                        {
+                            rollbackQuietly(connection);
+                            return FirmwareRolloutClaimResult::RolloutChanged;
+                        }
+                        std::vector<DatabaseValue> parameters{std::string{"dispatching"},
+                                                              claimedHealth,
+                                                              Common::nowDateTimeUtc(),
+                                                              targetId,
+                                                              rolloutId,
+                                                              expectedStatus,
+                                                              expectedTaskId,
+                                                              expectedCommandId,
+                                                              staleBefore,
+                                                              rolloutId,
+                                                              expectedVersion,
+                                                              static_cast<std::int64_t>(waveIndex)};
+                        const std::string allowed = rollbackPhase ? "('rolling_back')" : "('scheduled', 'preparing', 'running')";
+                        std::string       clause;
+                        if (!tenant.allTenants)
+                        {
+                            clause = " AND tenant_id = ?";
+                            parameters.emplace_back(tenant.tenantId);
+                        }
+                        // 发布头版本、状态与当前波次作为同一事务里的卫兵；目标状态与绑定再挡一次并发派发
+                        const auto update = Sql::executeOrThrow(
+                                connection,
+                                "UPDATE biz_firmware_rollout_target SET status = ?, health_json = ?, updated_at = ? "
+                                "WHERE id = ? AND rollout_id = ? AND status = ? AND task_id = ? AND command_id = ? "
+                                "AND (status <> 'dispatching' OR updated_at <= ?) "
+                                "AND EXISTS (SELECT 1 FROM biz_firmware_rollout r WHERE r.id = ? AND r.version = ? AND r.current_wave = ? AND r.status IN " +
+                                        allowed + ")" + clause,
+                                parameters);
+                        if (update->affectedRowCount() == 0)
+                        {
+                            rollbackQuietly(connection);
+                            return FirmwareRolloutClaimResult::TargetNotClaimable;
+                        }
+                        Sql::executeOrThrowVoid(connection, "COMMIT");
+                        return FirmwareRolloutClaimResult::Claimed;
+                    } catch (...)
+                    {
+                        rollbackQuietly(connection);
+                        throw;
+                    }
+                });
+    }
+
+    AsynGyanis::Core::Task<bool> FirmwareRolloutRepository::releaseTarget(AsynGyanis::Core::EventLoop &loop, const std::int64_t targetId, std::string expectedStatus,
+                                                                          FirmwareRolloutTargetUpdate restore)
+    {
+        co_return co_await m_database->withConnection<bool>(
+                loop,
+                [targetId, expectedStatus = std::move(expectedStatus), restore = std::move(restore), tenant = m_tenant](DatabaseConnection &connection) -> bool
+                {
+                    std::vector<DatabaseValue> parameters{restore.status,
+                                                          restore.status,
+                                                          restore.healthJson,
+                                                          restore.healthJson,
+                                                          restore.taskId,
+                                                          restore.taskId,
+                                                          restore.commandId,
+                                                          restore.commandId,
+                                                          Common::nowDateTimeUtc(),
+                                                          targetId,
+                                                          expectedStatus};
+                    std::string                clause = " AND status = ?";
+                    if (!tenant.allTenants)
+                    {
+                        clause += " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto update = Sql::executeOrThrow(connection,
+                                                            "UPDATE biz_firmware_rollout_target SET status = CASE WHEN ? = '' THEN status ELSE ? END, "
+                                                            "health_json = CASE WHEN ? = '' THEN health_json ELSE ? END, "
+                                                            "task_id = CASE WHEN ? >= 0 THEN ? ELSE task_id END, "
+                                                            "command_id = CASE WHEN ? >= 0 THEN ? ELSE command_id END, "
+                                                            "updated_at = ? WHERE id = ?" +
+                                                                    clause,
+                                                            parameters);
+                    return update->affectedRowCount() > 0;
                 });
     }
 

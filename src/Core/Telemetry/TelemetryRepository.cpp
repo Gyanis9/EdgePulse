@@ -170,6 +170,34 @@ namespace EdgePulse::Telemetry
                 });
     }
 
+    AsynGyanis::Core::Task<std::optional<TelemetryFreshness>> TelemetryRepository::newestSample(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId)
+    {
+        co_return co_await m_database->withConnection<std::optional<TelemetryFreshness>>(
+                loop,
+                [nodeId, tenant = m_tenant](DatabaseConnection &connection) -> std::optional<TelemetryFreshness>
+                {
+                    std::vector<DatabaseValue> parameters{nodeId};
+                    std::string                clause;
+                    if (!tenant.allTenants)
+                    {
+                        clause = " AND tenant_id = ?";
+                        parameters.emplace_back(tenant.tenantId);
+                    }
+                    // 只取一行：接收时间与采集时间必须来自同一条样本，不能用两行各自的最大值拼出新鲜度
+                    const auto rows = Sql::executeOrThrow(
+                            connection, "SELECT created_at, collected_at FROM biz_telemetry WHERE node_id = ?" + clause + " ORDER BY created_at DESC, id DESC LIMIT 1",
+                            parameters);
+                    if (!rows->next())
+                    {
+                        return std::nullopt;
+                    }
+                    TelemetryFreshness freshness;
+                    freshness.createdAt   = Sql::dateTimeText(*rows, "created_at");
+                    freshness.collectedAt = Sql::dateTimeText(*rows, "collected_at");
+                    return freshness;
+                });
+    }
+
     AsynGyanis::Core::Task<std::vector<TelemetryPoint>> TelemetryRepository::series(AsynGyanis::Core::EventLoop &loop, const std::int64_t nodeId, std::string metric,
                                                                                     std::string from, std::string to, const int limit)
     {

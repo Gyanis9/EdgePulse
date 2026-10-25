@@ -26,6 +26,7 @@ namespace AsynGyanis::Net
 namespace EdgePulse::Auth
 {
     class AuthService;
+    class DataScopeService;
 }
 namespace EdgePulse::Command
 {
@@ -68,6 +69,7 @@ namespace EdgePulse::Firmware
         std::size_t                            maximumUploadBytes{256U * 1024U * 1024U}; ///< 上传上限
         std::shared_ptr<FirmwareSigningPolicy> signingPolicy;                            ///< 签名门禁；为空时按不强制签名处理
         FirmwareRolloutService                *rollouts{nullptr};                        ///< 灰度服务；为空时不注册灰度路由
+        Auth::DataScopeService                *dataScopes{nullptr};                      ///< 数据范围；为空时按全部可见处理
     };
 
     /**

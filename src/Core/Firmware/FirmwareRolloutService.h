@@ -49,6 +49,7 @@ namespace EdgePulse::Firmware
     class FirmwareRepository;
     struct FirmwareRecord;
     struct FirmwareSigningPolicy;
+    struct FirmwareTaskRecord;
 } // namespace EdgePulse::Firmware
 namespace EdgePulse::Telemetry
 {
@@ -141,9 +142,11 @@ namespace EdgePulse::Firmware
          * @param loop 恢复协程用的事件循环
          * @param scope 租户边界
          * @param rolloutId 发布标识
+         * @param targetScope 目标节点的数据范围；默认不过滤
          * @return std::optional<FirmwareRolloutAggregate> 发布、波次与目标
          */
-        AsynGyanis::Core::Task<std::optional<FirmwareRolloutAggregate>> find(AsynGyanis::Core::EventLoop &loop, System::TenantScope scope, std::int64_t rolloutId);
+        AsynGyanis::Core::Task<std::optional<FirmwareRolloutAggregate>> find(AsynGyanis::Core::EventLoop &loop, System::TenantScope scope, std::int64_t rolloutId,
+                                                                             const FirmwareRolloutTargetScope &targetScope = {});
 
         /**
          * @brief 分页查询发布
@@ -151,10 +154,11 @@ namespace EdgePulse::Firmware
          * @param scope 租户边界
          * @param firmwareId 固件过滤，0 表示全部
          * @param page 分页
+         * @param targetScope 目标节点的数据范围；只返回至少有一个可见目标的发布
          * @return Common::PageRows<FirmwareRolloutRecord> 当前页
          */
         AsynGyanis::Core::Task<Common::PageRows<FirmwareRolloutRecord>> list(AsynGyanis::Core::EventLoop &loop, System::TenantScope scope, std::int64_t firmwareId,
-                                                                             const Common::PageParameters &page);
+                                                                             const Common::PageParameters &page, const FirmwareRolloutTargetScope &targetScope = {});
 
         /// 暂停；只接受 scheduled、preparing 与 running
         AsynGyanis::Core::Task<FirmwareRolloutResult<bool>> pause(AsynGyanis::Core::EventLoop &loop, System::TenantScope scope, std::int64_t rolloutId, std::string reason);
@@ -226,9 +230,12 @@ namespace EdgePulse::Firmware
         AsynGyanis::Core::Task<>                 cancelTarget(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, std::string reason);
 
         AsynGyanis::Core::Task<std::int64_t> resolvePreviousFirmware(AsynGyanis::Core::EventLoop &loop, const FirmwareRecord &firmware, const Device::NodeRecord &node);
-        AsynGyanis::Core::Task<bool>         failTarget(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, std::string reason);
-        AsynGyanis::Core::Task<std::int64_t> existingTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t rolloutId, std::int64_t waveId,
-                                                          std::int64_t nodeId);
+        AsynGyanis::Core::Task<bool>         failTarget(AsynGyanis::Core::EventLoop &loop, const FirmwareRolloutTargetRecord &target, std::string reason,
+                                                        std::string expectedStatus = {});
+        AsynGyanis::Core::Task<bool>         rolloutStillReady(AsynGyanis::Core::EventLoop &loop, std::int64_t rolloutId, std::int64_t expectedVersion, int waveIndex,
+                                                              const std::vector<std::string> &allowedStatuses);
+        AsynGyanis::Core::Task<std::optional<FirmwareTaskRecord>> existingTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t rolloutId,
+                                                                               std::int64_t waveId, std::int64_t nodeId);
         AsynGyanis::Core::Task<std::int64_t> existingRollbackTask(AsynGyanis::Core::EventLoop &loop, std::int64_t firmwareId, std::int64_t rolloutId, std::int64_t waveId,
                                                                   std::int64_t nodeId);
 
