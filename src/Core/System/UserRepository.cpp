@@ -786,25 +786,42 @@ namespace EdgePulse::System
             // 管理员已经改过口令：环境变量不得覆盖，也不参与策略判定
             return {};
         }
-        if (options.password.empty())
+        // 环境变量常从 .env 或编排文件带入尾部空白；两端空白去掉，纯空白等同未设置
+        const auto trimmedPassword = [](const std::string &value) -> std::string
         {
-            if (options.developmentMode)
+            const auto begin = value.find_first_not_of(" \t\r\n");
+            if (begin == std::string::npos)
+            {
+                return {};
+            }
+            const auto end = value.find_last_not_of(" \t\r\n");
+            return value.substr(begin, end - begin + 1);
+        };
+        const std::string password = trimmedPassword(options.password);
+        if (password.empty())
+        {
+            if (options.allowDefaultAdmin)
             {
                 return {};
             }
             return DefaultAdminPasswordGuardResult{
                     false,
-                    "检测到默认管理员 admin 仍使用种子口令 admin123。请设置环境变量 EDGEPULSE_ADMIN_PASSWORD 为至少 10 个字符、同时包含大写字母、小写字母、数字与符号的强口令后重启；"
-                    "仅在本机开发时可把 edgepulse.captcha.expose_code 设为 true 以保留默认口令。"};
+                    "检测到默认管理员 admin 仍使用种子口令 admin123。请设置环境变量 EDGEPULSE_ADMIN_PASSWORD 为符合口令策略的强口令后重启，"
+                    "或先通过数据库或控制台把 admin 口令改成非种子值；生产环境不要保留种子口令。"
+                    "仅本机开发或隔离验收可设置 EDGEPULSE_ALLOW_DEFAULT_ADMIN=true 显式保留种子口令。"};
         }
         // 至少十位是任务给定下限；部署配置可以更严，但不能更宽
         const Common::PasswordPolicy policy(std::max(10, options.minimumLength), options.requireComplexity);
-        if (const std::expected<void, std::string> validation = policy.validate(options.password); !validation)
+        if (const std::expected<void, std::string> validation = policy.validate(password); !validation)
         {
-            return DefaultAdminPasswordGuardResult{false, "EDGEPULSE_ADMIN_PASSWORD 不符合口令策略：" + validation.error() +
-                                                                "；请改为至少 10 位且同时包含大写字母、小写字母、数字与符号的口令"};
+            std::string requirement = "至少 " + std::to_string(std::max(10, options.minimumLength)) + " 位";
+            if (options.requireComplexity)
+            {
+                requirement += "，且同时包含大写字母、小写字母、数字与符号";
+            }
+            return DefaultAdminPasswordGuardResult{false, "EDGEPULSE_ADMIN_PASSWORD 不符合口令策略：" + validation.error() + "；请改为" + requirement + "的口令"};
         }
-        const std::array<DatabaseValue, 4> parameters{Common::hashPassword(options.password), Common::nowDateTimeUtc(), storedId, storedHash};
+        const std::array<DatabaseValue, 4> parameters{Common::hashPassword(password), Common::nowDateTimeUtc(), storedId, storedHash};
         const auto                         update = execute(connection,
                                                             "UPDATE sys_user SET password = ?, failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, updated_at = ? "
                                                             "WHERE id = ? AND password = ?",

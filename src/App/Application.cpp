@@ -122,9 +122,6 @@ namespace EdgePulse::App
 {
     namespace
     {
-        /// 命令超时宽限：在 timeout_seconds 之上给 Agent 回报与队列留出的余量
-        constexpr int kCommandTimeoutGraceSeconds = 30;
-
         /// 命令超时扫描周期：调度循环每两秒一拍，十五拍约三十秒
         constexpr std::size_t kCommandTimeoutSweepTicks = 15;
 
@@ -223,7 +220,7 @@ namespace EdgePulse::App
                 // 迁移后、监听器前收紧种子管理员：生产档仍用 admin123 时宁可拒绝启动
                 const System::DefaultAdminPasswordGuardResult adminPasswordGuard = System::UserRepository::enforceDefaultAdminPassword(
                         *connection, System::DefaultAdminPasswordGuardOptions{.password = m_configuration.adminPassword,
-                                                                              .developmentMode = m_configuration.exposeCaptchaCode,
+                                                                              .allowDefaultAdmin = m_configuration.exposeCaptchaCode || m_configuration.allowDefaultAdmin,
                                                                               .minimumLength  = m_configuration.passwordMinimumLength,
                                                                               .requireComplexity = m_configuration.passwordRequireComplexity});
                 if (!adminPasswordGuard.error.empty())
@@ -769,8 +766,7 @@ namespace EdgePulse::App
                                               try
                                               {
                                                   const Command::CommandTimeoutSweepResult expired =
-                                                          co_await allCommands->expireTimedOut(loop, std::chrono::system_clock::now(), kCommandTimeoutGraceSeconds,
-                                                                                               kCommandTimeoutSweepBatch);
+                                                          co_await allCommands->expireTimedOut(loop, std::chrono::system_clock::now(), kCommandTimeoutSweepBatch);
                                                   for (const Command::CommandRecord &command: expired.commands)
                                                   {
                                                       LOG_WARN_FMT("命令执行超时已收尾：command={} node={} type={}", command.id, command.nodeId, command.type);

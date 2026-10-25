@@ -120,6 +120,18 @@ namespace EdgePulse::App
         }
 
         /**
+         * @brief 把环境变量文本解析成布尔开关
+         * @param text 环境变量原值
+         * @return 只有明确的真值才返回 true；无法识别时按 false 处理，避免误放开危险开关
+         */
+        [[nodiscard]] bool environmentFlag(const std::string_view text)
+        {
+            std::string value = trimCopy(text);
+            std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char character) { return static_cast<char>(std::tolower(character)); });
+            return value == "1" || value == "true" || value == "yes" || value == "on";
+        }
+
+        /**
          * @brief 按逗号拆分 Origin 白名单并丢掉空项
          * @param text YAML 里的逗号分隔文本
          * @return std::vector<std::string> 去空白后的非空项
@@ -366,10 +378,15 @@ namespace EdgePulse::App
         {
             configuration.redisPassword = *password;
         }
-        // 种子管理员口令只从环境变量读取；空值与未设置同义，不写日志也不回显
+        // 种子管理员口令只从环境变量读取；空值与纯空白同义，两端空白不进哈希，也不写日志或回显
         if (const auto password = Common::environmentValue("EDGEPULSE_ADMIN_PASSWORD"); password.has_value())
         {
-            configuration.adminPassword = *password;
+            configuration.adminPassword = trimCopy(*password);
+        }
+        // 显式确认保留种子口令，供本机开发或隔离验收；只认明确的真值
+        if (const auto allowDefaultAdmin = Common::environmentValue("EDGEPULSE_ALLOW_DEFAULT_ADMIN"); allowDefaultAdmin.has_value())
+        {
+            configuration.allowDefaultAdmin = environmentFlag(*allowDefaultAdmin);
         }
         // 指纹允许通过环境变量覆盖，run-dev.sh 会在生成证书后导出
         if (configuration.agentFingerprint.empty())

@@ -45,6 +45,7 @@ namespace EdgePulse::App
         std::string              databaseUser{"edgepulse"};                           ///< MySQL 用户
         std::string              databasePassword;                                    ///< MySQL 口令，只从环境变量读取
         std::string              adminPassword;                                       ///< 种子管理员口令，只从环境变量读取；不入日志
+        bool                     allowDefaultAdmin{false};                            ///< 显式确认允许保留种子管理员口令，仅供本机开发或隔离验收
         std::string              instanceId;                                          ///< 实例标识；空值时装载阶段生成 hostname-pid-random
         bool                     haEnabled{false};                                    ///< 是否按多实例 HA 部署；为 false 时单实例仍运行租约
         bool                     redisEnabled{false};                                 ///< 是否使用 Redis 会话

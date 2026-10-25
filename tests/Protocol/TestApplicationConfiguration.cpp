@@ -352,3 +352,25 @@ TEST(ApplicationConfiguration, ReadsAdminPasswordFromEnvironmentOnly)
         EXPECT_TRUE(configuration->adminPassword.empty());
     }
 }
+
+// 钉住：口令两端的空白被去掉，纯空白等同未设置；显式确认开关只认环境变量
+TEST(ApplicationConfiguration, TrimsAdminPasswordAndReadsDefaultAdminAcknowledgement)
+{
+    const TemporaryConfigurationFile file("edgepulse:\n  threads: 1\n");
+    {
+        const ScopedEnvironmentVariable password("EDGEPULSE_ADMIN_PASSWORD", "  Env-admin-pass1\t");
+        const ScopedEnvironmentVariable acknowledgement("EDGEPULSE_ALLOW_DEFAULT_ADMIN", "true");
+        const auto                      configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_TRUE(configuration.has_value()) << configuration.error().message;
+        EXPECT_EQ("Env-admin-pass1", configuration->adminPassword);
+        EXPECT_TRUE(configuration->allowDefaultAdmin);
+    }
+    {
+        const ScopedEnvironmentVariable password("EDGEPULSE_ADMIN_PASSWORD", " \t ");
+        const ScopedEnvironmentVariable acknowledgement("EDGEPULSE_ALLOW_DEFAULT_ADMIN", "false");
+        const auto                      configuration = EdgePulse::App::ApplicationConfiguration::load(file.path());
+        ASSERT_TRUE(configuration.has_value()) << configuration.error().message;
+        EXPECT_TRUE(configuration->adminPassword.empty()) << "纯空白不能被当成有效口令";
+        EXPECT_FALSE(configuration->allowDefaultAdmin);
+    }
+}

@@ -287,7 +287,7 @@ TEST(AuthService, DefaultAdminPasswordGuardAppliesEnvironmentPassword)
     ASSERT_NE(nullptr, connection);
 
     const auto result = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
-            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "Ha-guard-pass1", .developmentMode = false});
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "Ha-guard-pass1", .allowDefaultAdmin = false});
     ASSERT_TRUE(result.error.empty()) << result.error;
     EXPECT_TRUE(result.applied);
     EXPECT_FALSE(loginWithCaptcha(context, runner, "admin123").has_value());
@@ -304,19 +304,34 @@ TEST(AuthService, DefaultAdminPasswordGuardFailsClosedInProductionAndAllowsDev)
     ASSERT_NE(nullptr, connection);
 
     const auto production = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
-            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "", .developmentMode = false});
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "", .allowDefaultAdmin = false});
     EXPECT_FALSE(production.applied);
     EXPECT_NE(std::string::npos, production.error.find("EDGEPULSE_ADMIN_PASSWORD")) << production.error;
     EXPECT_NE(std::string::npos, production.error.find("admin123")) << production.error;
+    EXPECT_NE(std::string::npos, production.error.find("EDGEPULSE_ALLOW_DEFAULT_ADMIN")) << production.error;
+    EXPECT_EQ(std::string::npos, production.error.find("expose_code")) << "生产环境错误提示不能建议打开验证码暴露";
     EXPECT_TRUE(loginWithCaptcha(context, runner, "admin123").has_value());
 
     const auto weak = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
-            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "short", .developmentMode = false});
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "short", .allowDefaultAdmin = false});
     EXPECT_FALSE(weak.applied);
     EXPECT_NE(std::string::npos, weak.error.find("口令策略")) << weak.error;
 
+    const auto whitespace = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = " \t ", .allowDefaultAdmin = false});
+    EXPECT_FALSE(whitespace.applied);
+    EXPECT_NE(std::string::npos, whitespace.error.find("EDGEPULSE_ADMIN_PASSWORD")) << "纯空白必须按未设置处理：" << whitespace.error;
+
+    // 关闭复杂度时只按长度提示，不能再重复四类字符要求
+    const auto lengthOnly = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
+            *connection,
+            EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "short", .allowDefaultAdmin = false, .minimumLength = 12, .requireComplexity = false});
+    EXPECT_FALSE(lengthOnly.applied);
+    EXPECT_NE(std::string::npos, lengthOnly.error.find("至少 12 位")) << lengthOnly.error;
+    EXPECT_EQ(std::string::npos, lengthOnly.error.find("符号")) << "未要求复杂度时不能提示符号要求：" << lengthOnly.error;
+
     const auto development = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
-            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "", .developmentMode = true});
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "", .allowDefaultAdmin = true});
     EXPECT_TRUE(development.error.empty()) << development.error;
     EXPECT_FALSE(development.applied);
     EXPECT_TRUE(loginWithCaptcha(context, runner, "admin123").has_value());
@@ -334,7 +349,7 @@ TEST(AuthService, DefaultAdminPasswordGuardLeavesChangedPasswordUntouched)
     ASSERT_NE(nullptr, connection->execute("UPDATE sys_user SET password = '" + changedHash + "' WHERE username = 'admin'")) << connection->lastError();
 
     const auto result = EdgePulse::System::UserRepository::enforceDefaultAdminPassword(
-            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "Ignored-pass1", .developmentMode = false});
+            *connection, EdgePulse::System::DefaultAdminPasswordGuardOptions{.password = "Ignored-pass1", .allowDefaultAdmin = false});
     EXPECT_TRUE(result.error.empty()) << result.error;
     EXPECT_FALSE(result.applied);
     EXPECT_FALSE(loginWithCaptcha(context, runner, "Ignored-pass1").has_value());

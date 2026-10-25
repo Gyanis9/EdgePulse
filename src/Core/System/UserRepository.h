@@ -59,8 +59,8 @@ namespace EdgePulse::System
      */
     struct DefaultAdminPasswordGuardOptions
     {
-        std::string password;                   ///< EDGEPULSE_ADMIN_PASSWORD 原值；空表示未设置
-        bool        developmentMode{false};     ///< 开发档保留种子口令 admin123
+        std::string password;                   ///< EDGEPULSE_ADMIN_PASSWORD 原值；空或纯空白表示未设置
+        bool        allowDefaultAdmin{false};   ///< 显式允许保留种子口令，仅供本机开发或隔离验收
         int         minimumLength{10};          ///< 最低长度；实际判定不小于 10
         bool        requireComplexity{true};    ///< 是否要求同时包含四类字符
     };
@@ -279,7 +279,8 @@ namespace EdgePulse::System
          * @param options 环境变量口令、开发档标记与口令策略
          * @return DefaultAdminPasswordGuardResult 已收紧时为 applied；error 非空表示必须拒绝启动
          * @note 只在 admin 仍是种子口令 admin123 时动作；已改过的口令忽略环境变量
-         * @note 生产档（developmentMode 为 false）缺少环境变量口令时失败；开发档保留 admin123
+         * @note 未显式允许默认口令时缺少有效环境变量会失败；允许时保留 admin123
+         * @note 环境变量两端空白会被去掉，纯空白按未设置处理
          * @note 错误与日志都不回显口令内容
          */
         static DefaultAdminPasswordGuardResult enforceDefaultAdminPassword(AsynGyanis::Database::DatabaseConnection &connection,
