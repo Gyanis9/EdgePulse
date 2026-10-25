@@ -29,7 +29,7 @@ namespace EdgePulse::Command
         using AsynGyanis::Database::DatabaseValue;
 
         constexpr std::string_view kSelectCommand = "SELECT c.id, c.tenant_id, c.node_id, c.type, c.payload, c.status, c.result, c.message, c.created_by, c.created_at, "
-                                                    "c.dispatched_at, c.finished_at, c.timeout_seconds, c.scheduled_at, c.batch_id, "
+                                                    "c.dispatched_at, c.finished_at, c.timeout_seconds, c.scheduled_at, c.batch_id, c.deadline_at, "
                                                     "COALESCE(n.name, '') AS node_name FROM biz_command c LEFT JOIN biz_node n ON n.id = c.node_id ";
 
         [[nodiscard]] CommandRecord readCommand(const DatabaseResult &result)
@@ -51,6 +51,7 @@ namespace EdgePulse::Command
             command.timeoutSeconds = static_cast<int>(Sql::integer(result, "timeout_seconds"));
             command.scheduledAt    = Sql::dateTimeText(result, "scheduled_at");
             command.batchId        = Sql::integer(result, "batch_id");
+            command.deadlineAt     = Sql::dateTimeText(result, "deadline_at");
             return command;
         }
 
@@ -112,6 +113,26 @@ namespace EdgePulse::Command
         }
 
         /**
+         * @brief 按起算时刻与超时秒数算截止时刻
+         * @param baseText SQL DATETIME 文本
+         * @param timeoutSeconds 超时秒数；0 或负数表示不参与超时收尾
+         * @return 截止时刻文本；起算时刻不合法或超时关闭时为空
+         */
+        [[nodiscard]] std::string deadlineAfter(const std::string_view baseText, const int timeoutSeconds)
+        {
+            if (timeoutSeconds <= 0)
+            {
+                return {};
+            }
+            const std::optional<std::chrono::system_clock::time_point> base = parseSqlDateTime(baseText);
+            if (!base.has_value())
+            {
+                return {};
+            }
+            return Common::formatDateTimeUtc(*base + std::chrono::seconds{timeoutSeconds} + std::chrono::seconds{kCommandTimeoutGraceSeconds});
+        }
+
+        /**
          * @brief 从命令载荷里取固件标识，供旧版未绑定任务按固件与节点兜底匹配
          */
         [[nodiscard]] std::int64_t payloadFirmwareId(const std::string &payload)
@@ -162,7 +183,10 @@ namespace EdgePulse::Command
                     const std::int64_t                  id             = Common::nextIdentifier();
                     const std::string                   now            = Common::nowDateTimeUtc();
                     const DatabaseValue                 scheduledValue = scheduledAt.empty() ? DatabaseValue{std::monostate{}} : DatabaseValue{scheduledAt};
-                    const std::array<DatabaseValue, 12> parameters{id,
+                    // 计划命令从计划时刻起算，立即命令从创建时刻起算；两者都含固定宽限
+                    const std::string                   deadlineValue  = deadlineAfter(scheduledAt.empty() ? now : scheduledAt, timeoutSeconds);
+                    const DatabaseValue                 deadline       = deadlineValue.empty() ? DatabaseValue{std::monostate{}} : DatabaseValue{deadlineValue};
+                    const std::array<DatabaseValue, 13> parameters{id,
                                                                    ownerTenantId,
                                                                    nodeId,
                                                                    type,
@@ -173,10 +197,11 @@ namespace EdgePulse::Command
                                                                    static_cast<std::int64_t>(timeoutSeconds),
                                                                    std::string{"pending"},
                                                                    scheduledValue,
-                                                                   batchId};
+                                                                   batchId,
+                                                                   deadline};
                     Sql::executeOrThrowVoid(connection,
                                             "INSERT INTO biz_command (id, tenant_id, node_id, type, payload, status, created_by, created_at, timeout_seconds, message, "
-                                            "scheduled_at, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                            "scheduled_at, batch_id, deadline_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                             parameters);
                     return findOnConnection(connection, id, tenant);
                 });
@@ -322,15 +347,30 @@ namespace EdgePulse::Command
                 loop,
                 [commandId, tenant = m_tenant](DatabaseConnection &connection) -> bool
                 {
-                    std::vector<DatabaseValue> parameters{Common::nowDateTimeUtc(), commandId};
+                    std::vector<DatabaseValue> selectParameters{commandId};
                     std::string                clause;
                     if (!tenant.allTenants)
                     {
                         clause = " AND tenant_id = ?";
+                        selectParameters.emplace_back(tenant.tenantId);
+                    }
+                    const auto timeoutRows = Sql::executeOrThrow(connection, "SELECT timeout_seconds FROM biz_command WHERE id = ? AND status = 'pending'" + clause, selectParameters);
+                    if (!timeoutRows->next())
+                    {
+                        return false;
+                    }
+                    const int         timeoutSeconds = static_cast<int>(Sql::integer(*timeoutRows, "timeout_seconds"));
+                    const std::string now            = Common::nowDateTimeUtc();
+                    const std::string deadlineValue  = deadlineAfter(now, timeoutSeconds);
+                    const DatabaseValue deadline     = deadlineValue.empty() ? DatabaseValue{std::monostate{}} : DatabaseValue{deadlineValue};
+                    std::vector<DatabaseValue> parameters{now, deadline, commandId};
+                    if (!tenant.allTenants)
+                    {
                         parameters.emplace_back(tenant.tenantId);
                     }
-                    const auto rows = Sql::executeOrThrow(connection, "UPDATE biz_command SET status = 'running', dispatched_at = ? WHERE id = ? AND status = 'pending'" + clause,
-                                                          parameters);
+                    // 下发时刻重新起算：命令在待执行队列里等待的时间不计入执行超时
+                    const auto rows = Sql::executeOrThrow(
+                            connection, "UPDATE biz_command SET status = 'running', dispatched_at = ?, deadline_at = ? WHERE id = ? AND status = 'pending'" + clause, parameters);
                     return rows->affectedRowCount() > 0;
                 });
     }
@@ -441,11 +481,11 @@ namespace EdgePulse::Command
     }
 
     AsynGyanis::Core::Task<CommandTimeoutSweepResult> CommandRepository::expireTimedOut(AsynGyanis::Core::EventLoop &loop, const std::chrono::system_clock::time_point now,
-                                                                                      const int graceSeconds, const std::size_t limit)
+                                                                                      const std::size_t limit)
     {
         co_return co_await m_database->withConnection<CommandTimeoutSweepResult>(
                 loop,
-                [now, graceSeconds, limit, tenant = m_tenant](DatabaseConnection &connection) -> CommandTimeoutSweepResult
+                [now, limit, tenant = m_tenant](DatabaseConnection &connection) -> CommandTimeoutSweepResult
                 {
                     struct Candidate
                     {
@@ -458,7 +498,7 @@ namespace EdgePulse::Command
                     Sql::executeOrThrowVoid(connection, "BEGIN");
                     try
                     {
-                        std::vector<DatabaseValue> parameters;
+                        std::vector<DatabaseValue> parameters{Common::formatDateTimeUtc(now)};
                         std::string                clause;
                         if (!tenant.allTenants)
                         {
@@ -466,41 +506,17 @@ namespace EdgePulse::Command
                             parameters.emplace_back(tenant.tenantId);
                         }
                         parameters.emplace_back(static_cast<std::int64_t>(limit));
-                        // 先按真正开始执行的时刻排序：running 看 dispatched_at，pending 看 scheduled_at；
-                        // 两者都为空时才回退 created_at。窗口必须有界，单次最多处理 limit 条
+                        // 截止时间在创建与下发时按 timeout_seconds 写入，扫描直接按 (status, deadline_at) 取最早到期的一批；
+                        // 不再先取固定窗口再在内存判定，积压时已到期命令不会被更早创建但未到期的行挤出
                         const auto rows = Sql::executeOrThrow(connection,
-                                                              "SELECT c.id, c.tenant_id, c.node_id, c.payload, c.status, c.created_at, c.dispatched_at, c.scheduled_at, "
-                                                              "c.timeout_seconds FROM biz_command c WHERE c.status IN ('pending', 'running') AND c.timeout_seconds > 0" +
-                                                                      clause + " ORDER BY COALESCE(c.dispatched_at, c.scheduled_at, c.created_at), c.id LIMIT ?",
+                                                              "SELECT c.id, c.tenant_id, c.node_id, c.payload FROM biz_command c "
+                                                              "WHERE c.status IN ('pending', 'running') AND c.deadline_at IS NOT NULL AND c.deadline_at < ?" +
+                                                                      clause + " ORDER BY c.deadline_at, c.id LIMIT ?",
                                                               parameters);
 
-                        const auto nowSeconds = std::chrono::floor<std::chrono::seconds>(now);
-                        const auto grace      = std::chrono::seconds{std::max(0, graceSeconds)};
                         std::vector<Candidate> candidates;
                         while (rows->next())
                         {
-                            const int         timeoutSeconds = static_cast<int>(Sql::integer(*rows, "timeout_seconds"));
-                            const std::string status         = Sql::text(*rows, "status");
-                            const std::string dispatchedAt   = Sql::dateTimeText(*rows, "dispatched_at");
-                            const std::string scheduledAt    = Sql::dateTimeText(*rows, "scheduled_at");
-                            const std::string createdAt      = Sql::dateTimeText(*rows, "created_at");
-                            std::string       baseText       = createdAt;
-                            if (status == "running" && !dispatchedAt.empty())
-                            {
-                                baseText = dispatchedAt;
-                            } else if (status != "running" && !scheduledAt.empty())
-                            {
-                                baseText = scheduledAt;
-                            }
-                            const std::optional<std::chrono::system_clock::time_point> base = parseSqlDateTime(baseText);
-                            if (timeoutSeconds <= 0 || !base.has_value())
-                            {
-                                continue;
-                            }
-                            if (*base + std::chrono::seconds{timeoutSeconds} + grace > nowSeconds)
-                            {
-                                continue;
-                            }
                             candidates.push_back(Candidate{Sql::integer(*rows, "id"), Sql::integer(*rows, "tenant_id"), Sql::integer(*rows, "node_id"),
                                                            Sql::text(*rows, "payload")});
                         }

@@ -30,6 +30,9 @@ namespace AsynGyanis::Core
 
 namespace EdgePulse::Command
 {
+    /// 命令超时宽限：截止时间在建单或下发时写为起算时刻加 timeout_seconds 加该秒数
+    constexpr int kCommandTimeoutGraceSeconds = 30;
+
     /**
      * @brief 一条命令
      */
@@ -51,6 +54,7 @@ namespace EdgePulse::Command
         int          timeoutSeconds{60}; ///< 超时秒数
         std::string  scheduledAt;        ///< 计划执行时间，空表示立即
         std::int64_t batchId{0};         ///< 批量标识，0 表示单条
+        std::string  deadlineAt;         ///< 超时截止时刻；空表示不参与超时收尾
     };
 
     /**
@@ -128,18 +132,18 @@ namespace EdgePulse::Command
         AsynGyanis::Core::Task<std::vector<CommandRecord>> listDue(AsynGyanis::Core::EventLoop &loop, std::size_t limit = 100);
 
         /**
-         * @brief 把超过 timeout_seconds + 宽限期的 pending/running 命令标记为 timeout
+         * @brief 把超过截止时间的 pending/running 命令标记为 timeout
          * @param loop 恢复协程用的事件循环
-         * @param now 本次判定使用的当前时刻；测试注入假时钟，生产传 system_clock::now()
-         * @param graceSeconds 超时之上的宽限秒数，给 Agent 回报留出网络与排队余量
-         * @param limit 本次最多检查多少条候选，必须有界
+         * @param now 本次判定使用的当前时刻；截止时间严格早于该时刻才收尾
+         * @param limit 本次最多收尾多少条，必须有界
          * @return CommandTimeoutSweepResult 本批命令与同步标记失败的固件任务数
-         * @note 只由控制面 leader 周期调用；timeout_seconds 为 0 或负数的命令不参与
-         * @note pending 从 created_at、running 从 dispatched_at（为空时回退 created_at）起算
+         * @note 只由控制面 leader 周期调用；扫描按 deadline_at 升序，索引为 (status, deadline_at)
+         * @note 截止时间在建单与下发时写入：pending 从 scheduled_at（为空时 created_at）起算，
+         *       running 从 dispatched_at 起算，均为起算时刻加 timeout_seconds 加宽限
          * @note 固件任务先按 command_id 命中；未命中时才按命令载荷的 firmwareId 与 node_id 匹配旧版未绑定任务
          * @note 已 installed 的任务不会被改写；单个事务失败时整批回滚
          */
-        AsynGyanis::Core::Task<CommandTimeoutSweepResult> expireTimedOut(AsynGyanis::Core::EventLoop &loop, std::chrono::system_clock::time_point now, int graceSeconds,
+        AsynGyanis::Core::Task<CommandTimeoutSweepResult> expireTimedOut(AsynGyanis::Core::EventLoop &loop, std::chrono::system_clock::time_point now,
                                                                          std::size_t limit = 200);
 
         /**

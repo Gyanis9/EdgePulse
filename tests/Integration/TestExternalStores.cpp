@@ -84,7 +84,7 @@ namespace
     }
 } // namespace
 
-// 钉住：MySQL 上能完整应用二十四版迁移，V7 归属列与 V15 至 V24 的注册、配置、签名、登录加固、企业身份、证书轮换、租约、灰度与任务命令唯一索引生效，日志仓储按部门范围过滤
+// 钉住：MySQL 上能完整应用二十五版迁移，V7 归属列与 V15 至 V25 的注册、配置、签名、登录加固、企业身份、证书轮换、租约、灰度、任务命令唯一索引与命令截止时间生效，日志仓储按部门范围过滤
 TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
 {
     const std::optional<std::string> host = environmentText("EDGEPULSE_TEST_MYSQL_HOST");
@@ -121,7 +121,7 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
         const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirect(options);
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
         EdgePulse::System::MigrationRunner::apply(*connection, std::filesystem::path(EDGEPULSE_SOURCE_DIR) / "migrations");
-        EXPECT_EQ(24, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
+        EXPECT_EQ(25, queryCount(*connection, "SELECT COUNT(*) AS total FROM schema_migrations"));
         EXPECT_EQ(11, queryCount(*connection,
                                  "SELECT COUNT(*) AS total FROM information_schema.tables WHERE table_schema = ? AND table_name IN "
                                  "('biz_agent_enrollment', 'biz_node_config', 'biz_node_config_revision', 'biz_agent_certificate', 'sys_api_token', 'sys_idempotency', "
@@ -130,6 +130,14 @@ TEST(ExternalStores, MySqlAppliesMigrationsAndScopesLogs)
         EXPECT_EQ(3, queryCount(*connection,
                                 "SELECT COUNT(*) AS total FROM information_schema.columns WHERE table_schema = ? AND table_name = 'biz_firmware_task' AND "
                                 "column_name IN ('rollout_id', 'wave_id', 'command_id')",
+                                std::array<AsynGyanis::Database::DatabaseValue, 1>{options.database}));
+        EXPECT_EQ(1, queryCount(*connection,
+                                "SELECT COUNT(*) AS total FROM information_schema.columns WHERE table_schema = ? AND table_name = 'biz_command' AND "
+                                "column_name = 'deadline_at'",
+                                std::array<AsynGyanis::Database::DatabaseValue, 1>{options.database}));
+        EXPECT_EQ(2, queryCount(*connection,
+                                "SELECT COUNT(*) AS total FROM information_schema.statistics WHERE table_schema = ? AND table_name = 'biz_command' AND "
+                                "index_name = 'idx_biz_command_status_deadline' AND column_name IN ('status', 'deadline_at')",
                                 std::array<AsynGyanis::Database::DatabaseValue, 1>{options.database}));
         EXPECT_EQ(1, queryCount(*connection,
                                 "SELECT COUNT(*) AS total FROM information_schema.columns WHERE table_schema = ? AND table_name = 'biz_node' AND "

@@ -252,12 +252,17 @@ TEST(FleetServices, CommandTimeoutSweepExpiresStuckCommandAndBoundTask)
     const auto        scheduled = runner.run(repository.create(runner.loop(), nodeId, "reboot", "{}", 1, 30, future));
     ASSERT_TRUE(scheduled.has_value());
 
+    // 截止时间由创建/下发时按 timeout_seconds 写入；这里改成固定时刻，避免依赖真实墙钟
     executeSql(context.databasePath(),
-               "UPDATE biz_command SET created_at = '2026-01-02 00:00:00', scheduled_at = '2026-01-02 00:00:00' WHERE id = " + std::to_string(stuck->id));
+               "UPDATE biz_command SET created_at = '2026-01-02 00:00:00', scheduled_at = '2026-01-02 00:00:00', deadline_at = '2026-01-02 00:00:30' WHERE id = " +
+                       std::to_string(stuck->id));
     executeSql(context.databasePath(), "UPDATE biz_command SET created_at = '2026-01-02 00:00:00' WHERE id = " + std::to_string(noTimeout->id));
-    executeSql(context.databasePath(), "UPDATE biz_command SET scheduled_at = '2026-01-02 03:00:00' WHERE id = " + std::to_string(scheduled->id));
+    executeSql(context.databasePath(),
+               "UPDATE biz_command SET scheduled_at = '2026-01-02 03:00:00', deadline_at = '2026-01-02 03:01:00' WHERE id = " + std::to_string(scheduled->id));
+    executeSql(context.databasePath(),
+               "UPDATE biz_command SET deadline_at = '2026-01-02 02:00:00' WHERE id = " + std::to_string(fresh->id));
 
-    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 30, 100));
+    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 100));
     ASSERT_EQ(1U, sweep.commands.size());
     EXPECT_EQ(stuck->id, sweep.commands[0].id);
     EXPECT_EQ("timeout", sweep.commands[0].status);
@@ -281,7 +286,7 @@ TEST(FleetServices, CommandTimeoutSweepExpiresStuckCommandAndBoundTask)
     ASSERT_TRUE(stillScheduled.has_value());
     EXPECT_EQ("pending", stillScheduled->status);
 
-    const auto secondSweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 30, 100));
+    const auto secondSweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 100));
     EXPECT_TRUE(secondSweep.commands.empty()) << "已超时的命令不能被重复收尾";
 }
 
@@ -310,14 +315,63 @@ TEST(FleetServices, CommandTimeoutSweepFailsLegacyTaskByFirmware)
     const auto stuck = runner.run(repository.create(runner.loop(), nodeId, "firmware.update",
                                                     AsynGyanis::Base::ConfigValue::object({{"firmwareId", firmwareId}}).dump(), 1, 10));
     ASSERT_TRUE(stuck.has_value());
-    executeSql(context.databasePath(), "UPDATE biz_command SET created_at = '2026-01-02 00:00:00' WHERE id = " + std::to_string(stuck->id));
+    executeSql(context.databasePath(),
+               "UPDATE biz_command SET created_at = '2026-01-02 00:00:00', deadline_at = '2026-01-02 00:00:40' WHERE id = " + std::to_string(stuck->id));
 
-    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 30, 100));
+    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 100));
     ASSERT_EQ(1U, sweep.commands.size());
     EXPECT_EQ(1U, sweep.failedFirmwareTasks);
     const auto task = runner.run(firmware.findTask(runner.loop(), taskId));
     ASSERT_TRUE(task.has_value());
     EXPECT_EQ("failed", task->status);
+}
+
+// 钉住：扫描按截止时间取最早的一批，201 条更早创建但未到期的命令不能把已到期命令挤出窗口
+TEST(FleetServices, CommandTimeoutSweepReachesExpiredBehindFullWindow)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Command::CommandRepository   repository(context.database);
+    EdgePulse::Device::NodeRepository       nodes(context.database);
+    const std::int64_t                      nodeId = runner.run(nodes.create(runner.loop(), "timeout-backlog-node", "{}")).id;
+
+    for (int index = 0; index < 201; ++index)
+    {
+        ASSERT_TRUE(runner.run(repository.create(runner.loop(), nodeId, "diagnostics.collect", "{}", 1, 600)).has_value());
+    }
+    executeSql(context.databasePath(), "UPDATE biz_command SET deadline_at = '2026-01-02 02:00:00' WHERE node_id = " + std::to_string(nodeId));
+
+    const auto expired = runner.run(repository.create(runner.loop(), nodeId, "diagnostics.collect", "{}", 1, 600));
+    ASSERT_TRUE(expired.has_value());
+    executeSql(context.databasePath(), "UPDATE biz_command SET deadline_at = '2026-01-01 23:59:59' WHERE id = " + std::to_string(expired->id));
+
+    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 200));
+    ASSERT_EQ(1U, sweep.commands.size()) << "固定窗口不能因更早创建但未到期的命令而漏掉已到期命令";
+    EXPECT_EQ(expired->id, sweep.commands[0].id);
+
+    const auto stillPending = runner.run(repository.pendingCount(runner.loop()));
+    EXPECT_EQ(201, stillPending) << "未到期命令必须留在待执行队列";
+}
+
+// 钉住：截止时间与当前时刻相等时不收尾，只有严格早于当前时刻才标记 timeout
+TEST(FleetServices, CommandTimeoutSweepDeadlineBoundaryIsExclusive)
+{
+    EdgePulse::TestSupport::AuthTestContext context;
+    EdgePulse::TestSupport::EventLoopRunner runner;
+    EdgePulse::Command::CommandRepository   repository(context.database);
+    EdgePulse::Device::NodeRepository       nodes(context.database);
+    const std::int64_t                      nodeId = runner.run(nodes.create(runner.loop(), "timeout-boundary-node", "{}")).id;
+
+    const auto atBoundary = runner.run(repository.create(runner.loop(), nodeId, "diagnostics.collect", "{}", 1, 30));
+    const auto justBefore = runner.run(repository.create(runner.loop(), nodeId, "diagnostics.collect", "{}", 1, 30));
+    ASSERT_TRUE(atBoundary.has_value());
+    ASSERT_TRUE(justBefore.has_value());
+    executeSql(context.databasePath(), "UPDATE biz_command SET deadline_at = '2026-01-02 01:00:00' WHERE id = " + std::to_string(atBoundary->id));
+    executeSql(context.databasePath(), "UPDATE biz_command SET deadline_at = '2026-01-02 00:59:59' WHERE id = " + std::to_string(justBefore->id));
+
+    const auto sweep = runner.run(repository.expireTimedOut(runner.loop(), fakeNow(), 200));
+    ASSERT_EQ(1U, sweep.commands.size());
+    EXPECT_EQ(justBefore->id, sweep.commands[0].id);
 }
 
 // 钉住：同一计划命令在节流间隔内不重复发布，间隔到点后允许重试；离开到期集合后清掉记录

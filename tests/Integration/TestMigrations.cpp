@@ -175,7 +175,13 @@ TEST(Migrations, AppliesSchemaSeedAndIsIdempotent)
         ASSERT_NE(nullptr, connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, command_id) VALUES (99003, 1, 1, 1, 'pending', -99003)"));
         ASSERT_NE(nullptr, connection->execute("INSERT INTO biz_firmware_task (id, tenant_id, firmware_id, node_id, status, command_id) VALUES (99004, 1, 1, 1, 'pending', -99004)"))
                 << "未绑定命令的任务用不同的负值占位，可以共存";
-        EXPECT_EQ(24, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 25"));
+        // 超时扫描按截止时间走索引，缺列或列序反了都会退化成全表扫描
+        EXPECT_EQ(1, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_table_info('biz_command') WHERE name = 'deadline_at'"));
+        EXPECT_EQ(2, querySingleInteger(*connection, "SELECT COUNT(*) FROM pragma_index_list('biz_command') AS il, pragma_index_info(il.name) AS ii "
+                                                     "WHERE il.name = 'idx_biz_command_status_deadline' AND "
+                                                     "((ii.name = 'status' AND ii.seqno = 0) OR (ii.name = 'deadline_at' AND ii.seqno = 1))"));
+        EXPECT_EQ(25, querySingleInteger(*connection, "SELECT COUNT(*) FROM schema_migrations"));
     }
     std::filesystem::remove(databasePath);
 }
