@@ -41,6 +41,9 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 - 注册令牌：`enroll` 用于新节点，`rebind` 用于已有节点换证；令牌一次性消费，数据库只存 SHA-256，明文只在签发响应出现一次。有效期限制在 300 到 2592000 秒。生产使用 `enrollment_mode=required`，新注册与换证都必须持对应令牌。
 - 固件签名：固件签名覆盖文件 SHA-256 的 32 字节原始摘要，算法为 Ed25519，传输标识 `ed25519-sha256`。服务端只从 `trusted_keys_dir` 加载 Ed25519 公钥；`require_signature=true` 时缺签名、未知 key id、摘要不符或签名格式错误的固件不能上传、部署或回滚。公钥变更后重启加载，`GET /api/firmware/policy` 可确认已加载的 key id。
 - 运维口：`/metrics`、`/debug/loops`、`/debug/connections` 与 `/debug/log-level` 需要 Bearer；`/healthz` 与 `/readyz` 只暴露进程与就绪状态。代码默认监听回环；生产样例与 Compose 为容器抓取绑 `0.0.0.0`，必须用主机防火墙或容器网络策略限制来源。
+- 控制面租约与 fence：多实例用 `sys_lease` 的 `control-plane` 行选出唯一 leader，获取/续约都是带 `holder` 与 `fence` 条件的 UPDATE。接管时 fence 递增，旧 leader 恢复后无法续约或写回；失去租约只停止计划命令调度、保留期清理与离线扫描，不阻断请求处理。租约时间取本机 UTC，所有实例必须 NTP 对齐，偏差超过 TTL 会形成双 leader。
+- Agent 命令通道的信任边界：命令先本地投递，再经 Redis 频道 `edgepulse:events` 的 `target=agent` 信封转给持有该节点连接的实例；只有写出成功才把命令推进到 `running`，关闭消息最多重试 3 次。信封在 Redis 层没有额外签名或加密，能写该频道或改写 `sys_lease` 的攻击者可以伪造命令、关闭在线 Agent 或抢占 leader；Redis 与数据库必须放在受信内网、使用强口令并限制可达来源，样例未启用 Redis TLS。Agent 侧仍按 mTLS 叶证书绑定节点，命令执行只接受白名单类型，重复投递按命令标识去重。
+- 证书与私钥分离：应用只读证书目录放 `ca.pem`、`server.pem` 与 `server-key.pem`；nginx 证书目录只放 `server.pem` 与 `server-key.pem`，看不到 CA 信任锚；Agent CA 私钥走独立 Compose secret，由一次性初始化容器复制到属主为服务账号、权限 0400 的命名卷，应用只读挂载。三层互不越权，泄露 nginx 证书不会带出签发能力。
 - 出站 SSRF：租户填写的 Webhook 地址在创建/修改与每次投递前都要通过地址检查。默认拒绝回环、RFC1918 私网、CGNAT、组播、保留与文档示例段、IPv4/IPv6 链路本地段以及云元数据地址和主机名。开启 `allow_private_webhooks` 会跳过整个私网/保留段分类，只保留云元数据主机名与地址、链路本地元数据段（169.254.0.0/16、fe80::/10 及已知 IPv6 元数据端点）的拒绝；CGNAT、0.0.0.0/8、文档与基准测试段、组播、240/4、IPv6 ULA 等其余私网与保留地址都会放行，只应在受信的自托管网关开启，不能当作通用的 SSRF 豁免。该防护只覆盖 Webhook 的 HTTP(S) 出站；SMTP 邮件渠道的 `smtp://`、`smtps://` 与 `starttls://` 端点不经过这道 HTTP 地址检查，必须由运维选择可信服务器并自行校验。
 - 登录加固：建号、重置与改密共用口令策略；窗口内连续失败达到阈值后锁定账号；登录入口有按 IP 的频率限制，公开 HTTP/HTTPS/h3 可启用共享令牌桶。审计日志对 `password`、`token`、`captcha` 等字段脱敏。
 
@@ -52,7 +55,9 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 - 幂等键的边界：身份在中间件与处理器各校验一次，吊销后的重试不能重放，但处理中途崩溃后由新请求接管时，业务可能执行第二次（至少一次语义）。幂等表会保存最多 256 KiB 的响应正文与 24 小时历史，不要把敏感正文写进可缓存的写接口响应。API 令牌不能创建或轮换令牌（包括子令牌），因此不存在父令牌轮换或吊销后的级联问题；令牌也还没有独立的速率限制，仍受 owner 权限与全局限流约束。
 - 生产 Agent 的边界：控制面可选启用内部 CA（`edgepulse.agent_ca`）为 Agent 签发与续期证书；关闭时节点证书仍由外部 CA 或 `scripts/gen-agent-certs.sh` 签发。自动续期依赖 Agent 主动发起，没有 CRL 或 OCSP：吊销只在控制面按指纹与吊销时间生效，不会让已签发证书在 TLS 层失效。旧指纹重叠窗口是应用层判定（`previous_cert_not_after`），不是 TLS 会话缓存；窗口最长 168 小时。节点 `ca_file` 未包含签发 Agent 证书的 CA 时，续期返回的证书链校验失败会按不可重试错误停止续期，旧证书到期后节点离线，必须补齐信任包后重启。能写数据库的攻击者可以改节点指纹、续期历史或延长重叠窗口，数据库写权限失守不在本阶段防护范围内。首次安装（配置路径原本没有证书）时若进程死在两次替换之间，没有 `.bak` 可恢复，安装标记会保留，启动加载失败并按既有逻辑拒绝启动，需要人工放置证书。调度、离线扫描与保留期清理仍是单实例进程内定时器。Agent 安装包由外部托管，控制面只在 `agent.update` 命令里给出下载地址。Windows 升级模式固定服务名 `EdgePulseAgent`，自定义 SCM 服务名不支持自动升级。
 - 手工 Agent 升级：`install-agent.sh --upgrade` 与 `install-agent.ps1 -Upgrade` 只校验包内 `checksums.sha256`，不验证归档的 Ed25519 签名。自动路径的归档认证由 Agent 在下载前后完成；手工升级必须由操作者确认归档来源。
-- 单实例调度：离线扫描、生命周期处理与保留期清理依赖进程内定时器，没有 HA 选主或分布式租约；计划命令的到点判断在查询侧，也没有跨实例协调。多实例部署时不要假设只有一个实例在扫描，需要明确的活动实例或外部协调。
+- 多实例协调：控制面用 `sys_lease` 行选主，离线扫描、保留期清理与计划命令调度只由 leader 执行；接管最长要等一个 TTL（15 秒），崩溃重启的实例也要等租约过期才能重新当选。数据库不可用时实例降为 follower，单飞任务停摆但请求处理不受影响。迁移锁只覆盖 MySQL（`GET_LOCK`），SQLite 不承诺多实例。系统时钟未对齐 NTP 时，偏差超过 TTL 会出现双 leader 与重复扫描。
+- HA 的存储与服务边界：MySQL、Redis 与 nginx 在样例中都是单实例，本阶段没有存储层高可用、跨地域多活或自动分片。Redis 不可用时跨实例 Agent 命令路由退化为本地投递，最迟要等 Agent 的 60 秒兜底轮询；Redis 恢复后由订阅线程重连，不需要重启。nginx 只有被动健康检查，故障瞬间可能有一个请求收到 502 或超时，upstream 主机名在启动时解析一次。
+- 租户与数据面限额：没有按租户或按 Agent 的配额、命令并发上限、独立速率限制或固件下载带宽限制；全局限流按实例计数，`N` 个实例的实际总速率是各自配置之和。多实例经 nginx 后来源 IP 是代理地址，登录限频、MFA 来源绑定与审计按代理地址共享，详见上面的反向代理边界。需要隔离时在网关层按租户或令牌限流，并给高负载 Agent 单独规划连接与命令队列。
 - h3 空闲超时：HTTP/3 的空闲计时由 QUIC 传输层决定，取 `server.quic.idle_timeout_seconds`（默认 30 秒，允许 1 到 3600，启动时生效）。`server.limits.idle_timeout_ms` 不作用于 h3 连接，调大它不会延长 h3 连接。
 - 备份与恢复：恢复必须停止服务，运行中的进程会持有数据库、WAL 或固件文件句柄；SQLite 备份支持在线快照，但一致性归档仍建议放在维护窗口。证书、运维令牌与固件签名私钥不要和数据库备份放在同一份未加密介质里。
 - Agent 身份绑定只存在于 mTLS 通道：开发与测试的明文链路不做叶证书绑定，不要把 Agent 路由暴露到明文监听器。
@@ -63,9 +68,11 @@ EdgePulse 同时处理浏览器会话、Agent 证书身份、一次性注册令�
 - 不提交私钥、证书、令牌、`.env`、日志或任何明文凭据。`.gitignore` 只覆盖开发证书所在的 `var/`（含 `var/certs/`）、`config/prod.yaml`、`config/firmware-keys/` 与部署令牌；生产 `cert_dir`（如 `/etc/edgepulse/tls`）在仓库之外，不受仓库忽略规则保护，必须由主机文件权限与备份策略单独保护。`var/`、`config/prod.yaml` 与 `deploy/prometheus/ops-token` 同时在 `.dockerignore` 中。
 - 数据库、Redis、运维口、UDP 遥测、OIDC、两步验证与初始口令提示只从环境变量读取：`EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD`、`EDGEPULSE_OPS_BEARER_TOKEN`、`EDGEPULSE_UDP_TELEMETRY_SECRET`、`EDGEPULSE_OIDC_CLIENT_SECRET`、`EDGEPULSE_MFA_KEY`、`EDGEPULSE_INITIAL_PASSWORD`。`EDGEPULSE_MFA_KEY` 用 `openssl rand -base64 32` 生成，同一数据库的所有实例共用同一值，与数据库备份分开保管。
 - 固件签名私钥留在签名工作站或密钥管理系统，只把公钥分发到各实例的 `trusted_keys_dir`；不要复用历史 key id 覆盖公钥，轮换时使用新文件名并在确认旧固件不再需要后移除旧公钥。
+- HA 下的共享秘密：同一数据库上的所有实例必须使用相同的 `EDGEPULSE_DB_PASSWORD`、`EDGEPULSE_REDIS_PASSWORD` 与 `EDGEPULSE_MFA_KEY`；运维口 Bearer 可以按实例不同，但 Prometheus 抓取配置要与之对应。`EDGEPULSE_INSTANCE_ID` 不是秘密，但必须唯一且写进每台实例的配置副本。nginx 只挂服务器证书，不挂 `ca.pem` 与任何 CA 私钥。
 - 服务器证书与私钥放在 `cert_dir` 指向的目录，Agent 客户端证书的信任锚是同一目录的 `ca.pem`。证书文件权限只给服务账号读取。
 - 节点侧 `ca_file` 同时用于验证 9443 服务器证书链和续期返回的 Agent 证书链。独立 CA 部署时它必须是拼接信任包，至少包含服务器链根与所有可能签发 Agent 证书的 CA；只放 9443 根会让续期证书失败，Agent 按不可重试的安装错误停止续期。
-- `edgepulse.agent_ca.key_file` 是签发 Agent 证书的 CA 私钥，必须放在公开证书卷之外的独立路径、仅服务账号可读（POSIX 上启动时要求 0600 或更严），不要与 `cert_dir` 一起挂进容器、写进镜像或提交到版本库。`edgepulse.agent_ca.certificate_file` 在 9443 监听开启时必须与它的信任锚一致：`ca.pem` 是拼接信任包时，签发 CA 必须包含在其中，启动时按 SHA-256 指纹核对；9443 监听关闭时不做这项比对。
+- `edgepulse.agent_ca.key_file` 是签发 Agent 证书的 CA 私钥，必须放在公开证书卷之外的独立路径、仅服务账号可读（POSIX 上启动时要求 0600 或更严），不要与 `cert_dir` 一起挂进容器、写进镜像或提交到版本库。HA 编排用 `EDGEPULSE_AGENT_CA_KEY_FILE` 指向宿主机文件（权限 0400），由一次性 `ca-key-init` 容器复制到属主为服务账号、权限 0400 的命名卷，应用只读挂载 `/run/secrets`；宿主机 Windows 绑定挂载恒为宽松权限时，这层复制是让启动期权限检查成立的唯一路径。`docker compose down` 不会删除该命名卷，彻底清理用 `down -v`。
+- `edgepulse.agent_ca.certificate_file` 在 9443 监听开启时必须与它的信任锚一致：`ca.pem` 是拼接信任包时，签发 CA 必须包含在其中，启动时按 SHA-256 指纹核对；9443 监听关闭时不做这项比对。
 - CA 轮换：先把新 Agent CA 追加到每台节点的 `ca_file` 和 9443 的 `ca.pem` 信任包，确认节点重新加载后仍在线上，再切换 `agent_ca.certificate_file` 与 `key_file`，用续期或 `rebind` 确认新证书能通过握手；旧 CA 签发的 Agent 全部换证后再从节点与控制面移除旧信任锚并重启节点。CA 私钥泄露时按事故处理：立即停用内部 CA、吊销受影响节点证书，并要求重新入场。
 
 ### 证书轮换

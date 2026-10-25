@@ -19,6 +19,7 @@
 - [安全模型](#安全模型)
 - [测试与验收](#测试与验收)
 - [部署](#部署)
+- [高可用部署](#高可用部署)
 - [Agent](#agent)
 - [项目结构](#项目结构)
 - [Roadmap](#roadmap)
@@ -46,6 +47,7 @@
 | 遥测与告警 | HTTP 与 UDP 遥测（HMAC-SHA256 防重放）、告警规则与确认/恢复生命周期、Webhook（HMAC 签名）与 SMTP 通知、投递记录与失败原因 |
 | 固件与命令 | 流式上传、ETag 与单段 Range 下载、Ed25519 签名与验签门禁、分批灰度与回滚、命令批量/计划/取消、Agent WebSocket 推送与轮询兜底 |
 | 实时 | 浏览器 WebSocket 的节点/告警/命令主题、告警 SSE、Redis 跨实例事件扇出、Agent 命令长连接 |
+| 高可用 | 双实例共享 MySQL/Redis/固件卷，nginx 统一 8080/8443/9443；`sys_lease` 租约与 fence 单飞、MySQL 迁移锁、跨实例 Agent 命令路由、`/readyz` 五项依赖、优雅停机与崩溃切换 |
 | 可观测 | Prometheus HTTP 与业务指标、`/readyz`、运维总览、OTLP 指标出口、操作/登录统计与热力图 |
 | 交付与运维 | 设备影子配置（期望/实际/漂移/修订/回滚）、备份与恢复工具、Docker Compose、systemd、生产静态站点、Windows/Linux/前端/密钥扫描 CI |
 
@@ -157,6 +159,8 @@ python scripts/restore.py --archive backups/edgepulse.tar.gz --driver sqlite \
 
 | 配置键 | 开发档 | 生产样例 | 说明 |
 |---|---|---|---|
+| `edgepulse.instance_id` | 空（按 `hostname-pid-random` 生成） | 空；HA 必须显式唯一 | 实例标识，1–128 字符且不含空白；进入日志、租约 holder 与跨实例信封，同时存活的实例必须唯一 |
+| `edgepulse.ha.enabled` | `false` | `false`（多实例可改 `true`） | 只影响启动日志的 HA 标记；租约与单飞不依赖它 |
 | `edgepulse.agent.enrollment_mode` | `off` | `required` | `required` 时新节点必须持 `enroll` 令牌，换证书必须持 `rebind` 令牌 |
 | `edgepulse.agent.heartbeat_interval_seconds` | `10` | `30` | Agent 心跳周期 |
 | `edgepulse.agent.heartbeat_timeout_seconds` | `30` | `90` | 超过该时长未心跳即转离线 |
@@ -198,6 +202,8 @@ bash scripts/sign-firmware.sh var/firmware-signing-key.pem <固件> prod-2026
 | 9555/UDP | UDP | HMAC 签名的遥测数据报，默认关闭 |
 
 `/healthz` 与 `/readyz` 匿名可读；`/metrics`、`/debug/*` 必须带 `EDGEPULSE_OPS_BEARER_TOKEN`。`ops_address` 的代码默认是 `127.0.0.1`；`config/prod.yaml.example` 与 Compose 为容器抓取显式设为 `0.0.0.0`，此时必须用主机防火墙或容器网络策略限制来源，只在本机抓取时改回回环并核对监听地址。
+
+`/api/health` 与 `/healthz` 只表示进程存活；`/readyz` 依次检查数据库、启停状态、缓存、实时总线与固件目录，任一不就绪返回 503 和第一条原因。HA 部署把 8080/8443/9443 交给 nginx：8080 与 8443 转发到实例的 8080（8443 在 nginx 终止 TLS），9443 只做 TCP 透传；应用容器不发布这些端口。
 
 ## API 与实时通道
 
@@ -269,7 +275,7 @@ python scripts/check-agent-e2e.py
 # SQLite 备份与恢复：往返、边车清理、路径与私钥过滤
 python scripts/backup_restore_test.py
 
-# 真机外部依赖：一次性 MySQL 8.4 与 Redis 7 容器，断言三项门控用例全部执行
+# 真机外部依赖：一次性 MySQL 8.4 与 Redis 7 容器，断言 7 项环境门控用例全部执行
 python scripts/run-external-tests.py
 
 # MySQL 备份与恢复往返：同样自带一次性容器
@@ -277,13 +283,17 @@ python scripts/backup_restore_mysql_test.py
 
 # Docker 全栈：镜像、MySQL/Redis、Prometheus、OTel collector 与优雅停机
 python scripts/check-docker-stack.py --build
+
+# HA 双实例：Compose 起 MySQL/Redis/两实例/nginx，断言跨实例会话、命令路由、优雅停机与崩溃切换
+python scripts/check-ha-stack.py --require-docker
 ```
 
 - 2026-10-24 全量回归（`feat/p6-production-agent` @ `bca5b24`）：`ctest --preset debug` 注册 306 项，通过 302，跳过 4，失败 0，耗时 102.95 秒；`npm run test:unit` 30 项、`npm run test:e2e` 9 项全部通过，`npm run build` 类型检查与构建通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0；`python scripts/backup_restore_test.py` 6 项中 5 项通过，1 项 Windows 文件权限位用例按平台跳过；`python scripts/run-external-tests.py` 三项门控用例全部通过、无跳过；`python scripts/backup_restore_mysql_test.py` 完成 MySQL 备份与恢复往返。
 - 2026-10-25 P7 门禁（代码基线 `8e3885c`，只含文档改动）：`cmake --build --preset debug` 无待编译目标；`ctest --preset debug` 注册 401 项，通过 397，跳过 4，失败 0，耗时 143.85 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42 项、E2E 18 项全部通过，`npm run build` 通过且产物含 `openapi.json`；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 50 项、失败 0、跳过 0。
 - 2026-10-25 P8 门禁（`feat/enterprise-hardening`，最终评审修复后）：`cmake --build --preset debug` 退出 0；`ctest --preset debug` 注册 512 项，通过 507，跳过 5，失败 0，耗时 167.96 秒；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42/42、E2E 20/20 通过（38.8 秒），`npm run build` 通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 66 项、失败 0、跳过 0，覆盖短期证书自动续期、PID 不变、旧指纹重叠窗口、WebSocket 命令通道与续期后的心跳/遥测/命令。
+- 2026-10-25 P9 门禁（`feat/enterprise-hardening` @ `ace30dd`，只含文档改动）：`cmake --build --preset debug` 无待编译目标；`ctest --preset debug` 注册 553 项，通过 544，跳过 9，失败 0，耗时 184.86 秒；`python scripts/check-ha-stack.py --require-docker` 56 项全部通过（跨实例会话、命令 0.02 秒送达、SIGTERM 后 1.75 秒接管、SIGKILL 后 16.71 秒接管且 fence 2→3）；`python scripts/generate-openapi.py --check` 无漂移；前端单测 42/42、E2E 20/20（38.7 秒），`npm run build` 通过；`python scripts/check-acceptance.py` 通过 86 项、失败 0、跳过 0；`python scripts/check-agent-e2e.py` 通过 66 项、失败 0、跳过 0。
 - 远程 Linux 实测（阿里云 ECS，Ubuntu 24.04/systemd 255）：真实 `edgepulse-agent` 的 50 项端到端检查通过；`install-agent.sh` 安装后服务为 active，`systemctl stop/start` 正常，注册退避期间停止立即生效，`uninstall-agent.sh --purge` 清理二进制、unit、配置、状态与日志。
-- `ExternalStores.*` 与 `RealtimeBus.*` 需要真实 MySQL/Redis：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性容器并注入 `EDGEPULSE_TEST_MYSQL_*`、`EDGEPULSE_TEST_REDIS_*`，随后断言三项用例确实执行且输出不含 Skipped；镜像可用 `--mysql-image`/`--redis-image` 覆盖。直接跑 `ctest` 缺变量时仍 SKIP，不伪造通过。
+- `ExternalStores.*`、`RealtimeBus.Redis*` 与 `AgentCommandBus.RedisFanout*` 需要真实 MySQL/Redis：`scripts/run-external-tests.py` 启动只监听回环随机端口的一次性容器并注入 `EDGEPULSE_TEST_MYSQL_*`、`EDGEPULSE_TEST_REDIS_*`，随后断言 7 项用例确实执行且输出不含 Skipped；镜像可用 `--mysql-image`/`--redis-image` 覆盖。直接跑 `ctest` 缺变量时仍 SKIP，不伪造通过。
 - 并发与时序断言由用例自己构造条件，不依赖机器上已安装的组件或调度运气。
 - CI 跑 Windows/Linux 后端构建与 ctest、Linux 后端 MySQL 8.4/Redis 7 service 与 MySQL 备份往返、Agent 端到端、前端单测/构建、密钥扫描与 actionlint；Linux 后端任务单独断言外部用例没有被 Skip。Playwright 在本地用系统 Edge 运行。
 - 验收证据与逐项输出见 [docs/验收.md](docs/验收.md)。
@@ -291,11 +301,65 @@ python scripts/check-docker-stack.py --build
 ## 部署
 
 - Docker Compose：`cd deploy/docker && cp .env.example .env`，填好 MySQL/Redis/运维令牌后 `docker compose up -d`；需要两步验证时再填入 `EDGEPULSE_MFA_KEY`（`openssl rand -base64 32`）。样例含 MySQL 8、Redis 7 与 Prometheus。
-- systemd：`deploy/systemd/edgepulse.service` 是单实例模板，二进制、`web/`、`migrations/` 与配置分目录放置，秘密走 `EnvironmentFile`。
+- 双实例 HA：同一目录的 `docker-compose.ha.yml` 起 MySQL、Redis、`edgepulse-1/2` 与 nginx，两个实例共享配置、证书、固件卷与 Redis，只差 `EDGEPULSE_INSTANCE_ID`；见下文[高可用部署](#高可用部署)。
+- systemd：`deploy/systemd/edgepulse.service` 是单实例模板，`edgepulse@.service` 是按实例名模板化的多实例单元（`/etc/edgepulse/<实例>.yaml` 与 `<实例>.env`）；二进制、`web/`、`migrations/` 与配置分目录放置，秘密走 `EnvironmentFile`。
 - 静态站点：`bash scripts/build-web.sh`，由后端直接托管。
-- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、两步验证挑战与尝试计数、实时扇出）、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、可用备份。
+- 生产至少核对：MySQL 档、多实例时配置 Redis（跨实例会话、验证码与登录失败计数、租户状态、两步验证挑战与尝试计数、实时扇出与 Agent 命令路由）、每个实例唯一的 `edgepulse.instance_id`、共享固件目录、服务器证书与 Agent CA、`enrollment_mode=required`、`firmware.require_signature=true` 且信任键目录只含公钥、强口令与登录锁定、非零全局限流（HA 按实例计数，N 个实例各配总额的 1/N）、运维口仅回环或仅对受信来源开放（防火墙）、`allow_private_webhooks=false`、可用备份。
 
 备份归档包含数据库快照、固件与非敏感配置，逐文件 SHA-256 校验；恢复必须先停服务，先 `--dry-run` 再执行。完整步骤见 [docs/部署.md](docs/部署.md)。
+
+## 高可用部署
+
+控制面支持双实例 active/active：两个实例共享 MySQL、Redis 与固件目录，nginx 在前面分发浏览器流量，Agent 仍走 mTLS 9443。
+
+```mermaid
+flowchart LR
+    Browser["浏览器"] -->|"8080 / 8443"| Nginx["nginx<br/>8443 终止 TLS"]
+    Agent["edgepulse-agent"] -->|"9443 mTLS<br/>TCP 透传"| Nginx
+    Nginx --> A["edgepulse-1"]
+    Nginx --> B["edgepulse-2"]
+    A --> MySQL[("共享 MySQL")]
+    B --> MySQL
+    A --> Redis[("共享 Redis")]
+    B --> Redis
+    A --> Firmware[("共享固件卷")]
+    B --> Firmware
+```
+
+- 实例身份：每个实例显式配置唯一的 `edgepulse.instance_id`；Docker HA 编排用入口脚本按 `EDGEPULSE_INSTANCE_ID` 生成各自的配置副本，两个容器只共享一份只读 `prod.yaml`。
+- 租约与单飞：`sys_lease` 的 `control-plane` 行是唯一协调点，TTL 15 秒、每 5 秒续约；条件 UPDATE 命中才算 leader，接管时 fence 递增。只有 leader 执行计划命令调度、保留期清理、离线扫描与离线告警；指标读数每个实例都刷新。旧 leader 恢复后不能续约；崩溃重启的实例要等一个 TTL 才能重新当选。
+- 迁移：MySQL 迁移前持有 `GET_LOCK('edgepulse:migrations:<库名>', 30)`，并发启动的实例串行迁移，拿不到锁的实例拒绝启动。SQLite 仍是单实例开发档。
+- Agent 命令：先在本地投递，再经 Redis 的 `target=agent` 信封转给持有该节点连接的实例；Agent 在已连接时仍每 60 秒轮询一次，断开时按 `command_poll_interval_seconds`（默认 15 秒）轮询，重复投递按命令标识去重。
+- 就绪：`/readyz` 依次检查数据库、启停状态、缓存探针、实时总线与固件目录可写，任一不就绪返回 503 和第一条原因；容器健康检查与 nginx 摘流都以它为准，`/api/health` 只表示进程存活。
+- 证书分工：应用证书目录只放 `ca.pem`、`server.pem` 与 `server-key.pem`；nginx 只拿 `server.pem` 与 `server-key.pem`；Agent CA 私钥走独立 Compose secret 与 0400 命名卷，nginx 与应用证书卷都看不到它。
+
+快速开始：
+
+```bash
+cd deploy/docker
+cp .env.example .env          # 填 MySQL/Redis/运维令牌，按需填 MFA 密钥
+# 准备 certs/app、certs/nginx、config/firmware-keys 与 CA 私钥，见 .env.example 注释
+docker compose -f docker-compose.ha.yml up -d --build
+curl -fsS http://127.0.0.1:8080/api/health
+docker compose -f docker-compose.ha.yml exec -T mysql \
+  sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" mysql -uedgepulse edgepulse -e "SELECT holder,fence,expires_at FROM sys_lease"'
+```
+
+故障演练与滚动升级：
+
+- 优雅停机：向实例发 SIGTERM，`/readyz` 先变 503 并立即清空租约 holder，随后按 HTTP、HTTPS、mTLS、QUIC、Ops 顺序排空，容器 `stop_grace_period` 为 40 秒。实测停机后新 leader 在 1.75 秒内接管、fence 递增。
+- 崩溃切换：`SIGKILL` 后旧 holder 留在租约行直到 TTL 过期，新 leader 在 2 个 TTL（30 秒）内接管；实测 16.71 秒，fence 由 2 升到 3，重启的旧 leader 不抢占有效租约。
+- 滚动升级：一次只动一个实例，先摘流（或 `docker compose stop edgepulse-1`），等 `/readyz` 503 并退出，再用新镜像 `up -d edgepulse-1`；新实例 `/readyz` 200 后 nginx 自动接回。两个实例不要同时重启，否则 nginx 没有可用上游，Agent 长连接与在途请求都会中断。
+- 全量门禁：`python scripts/check-ha-stack.py --require-docker` 覆盖跨实例会话、Agent 命令路由、nginx 8080/8443/9443、共享固件、CA 私钥权限、SIGTERM 与 SIGKILL 两条停机路径。
+
+已知限制：
+
+- MySQL 与 Redis 仍是单点；本阶段不做存储层高可用、跨地域多活与自动分片。
+- 开源自建 nginx 只有被动健康检查（`max_fails=2 fail_timeout=5s`），故障瞬间可能有一个请求收到 502 或超时；upstream 主机名在启动时解析一次，容器重建换 IP 后要 reload 或重启 nginx。
+- 限流按实例计数：总额定速率 R 要拆成 N 份，`burst_capacity` 同样除 N；nginx 不传真实来源地址，应用也不信任 `X-Forwarded-For`，登录限频、MFA 来源绑定与审计看到的是代理地址。
+- 固件目录必须共享卷；只挂本地卷会让上传与下载落到不同实例。SQLite 不参与 HA。
+- 所有实例必须显式配置唯一 `edgepulse.instance_id` 并由 NTP 对齐时钟；时钟偏差超过 TTL 时，仍存活的 holder 可能被误判为过期。
+- 租户配额、按租户或按 Agent 的数据面限流、命令并发上限不在本阶段范围内。
 
 ## Agent
 
@@ -365,10 +429,10 @@ src/
 agent/        生产 Agent 源码与 Linux/Windows 打包脚本
 frontend/      Vue 3 + Vite 管理后台与 Playwright E2E
 3rd/AsynGyanis/  引擎 git submodule，只读，以 Conan 包消费
-migrations/    SQL 迁移 V1–V20，已应用文件不可修改
+migrations/    SQL 迁移 V1–V21，已应用文件不可修改
 config/        非敏感配置样例；生产配置与信任键目录不入库
-deploy/        Docker、systemd、Prometheus
-scripts/       证书、开发运行、固件签名、备份恢复与验收
+deploy/        Docker（含 HA 编排）、nginx、systemd、Prometheus
+scripts/       证书、开发运行、固件签名、备份恢复、HA 与验收
 samples/       DeviceAgent（协议探针 edgepulse-agent-probe）、FirmwareVerifier、H3Probe 样例
 tests/         GoogleTest 单元、集成与协议用例
 docs/          架构、API、部署、验收与覆盖率
@@ -379,7 +443,7 @@ docs/          架构、API、部署、验收与覆盖率
 
 ## Roadmap
 
-P7 已交付 API Token、TOTP 两步验证、写请求幂等键与 OpenAPI 3.1 契约；P8 已交付控制面内部 CA、Agent CSR 续期与旧指纹重叠窗口。仍延后的能力见 [docs/ROADMAP.md](docs/ROADMAP.md)：`/api/v1` 版本前缀、OTLP tracing、HA 选主、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入，以及租户级 MFA 强制策略、按令牌限流等后续项。
+P7 已交付 API Token、TOTP 两步验证、写请求幂等键与 OpenAPI 3.1 契约；P8 已交付控制面内部 CA、Agent CSR 续期与旧指纹重叠窗口；P9 已交付控制面双实例 HA：租约与 fence 单飞、MySQL 迁移锁、跨实例 Agent 命令路由、五项依赖的 `/readyz` 与 Compose/nginx/systemd 编排。仍延后的能力见 [docs/ROADMAP.md](docs/ROADMAP.md)：`/api/v1` 版本前缀、OTLP tracing、跨地域多活与存储层 HA、通用事件订阅、OTA 自动灰度、批量节点编辑/CSV 导入，以及租户级 MFA 强制策略、按令牌或按租户限流等后续项。
 
 ## 贡献
 
