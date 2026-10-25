@@ -307,6 +307,141 @@ TEST(LeaderLease, DuplicatedInstanceIdWaitsForExpiry)
     removeDatabaseFiles(databasePath);
 }
 
+// 钉住：续约周期远长于 TTL 时，本地单调截止一到 isLeader 就转 false，不等下一次续约
+TEST(LeaderLease, LocalDeadlineDemotesWithoutRenewTick)
+{
+    const std::filesystem::path databasePath = makeTemporaryDatabasePath();
+    applyMigrations(databasePath);
+
+    std::shared_ptr<EdgePulse::Common::Database> database = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    EdgePulse::TestSupport::EventLoopRunner      runner;
+    {
+        // 循环只在启动时续约一次，之后 30 秒不会再动；截止必须由本地 steady_clock 判定
+        EdgePulse::System::LeaderLease lease(database, "instance-a", "control-plane", std::chrono::seconds{1}, std::chrono::seconds{30});
+        ASSERT_TRUE(runner.run(lease.start(runner.loop())));
+        EXPECT_TRUE(lease.isLeader());
+        EXPECT_EQ(1, lease.fence());
+
+        ASSERT_TRUE(waitUntil([&lease] { return !lease.isLeader(); }, std::chrono::seconds{4})) << "本地截止已过，isLeader 仍报 leader";
+        EXPECT_FALSE(lease.isLeader());
+        EXPECT_EQ(1, lease.fence()) << "本地截止降级不应改写 fence";
+        lease.stop();
+    }
+    database.reset();
+    removeDatabaseFiles(databasePath);
+}
+
+// 钉住：行已被改成过期后，延迟到达的续约不能延长它；只能重新获取并递增 fence
+TEST(LeaderLease, DelayedRenewCannotExtendExpiredRow)
+{
+    const std::filesystem::path databasePath = makeTemporaryDatabasePath();
+    applyMigrations(databasePath);
+
+    std::shared_ptr<EdgePulse::Common::Database> database = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    EdgePulse::TestSupport::EventLoopRunner      runner;
+    {
+        // 本地截止 2 秒、续约 500 毫秒：手工把行改成过期后，下一次续约仍发生在本地截止之内
+        EdgePulse::System::LeaderLease lease(database, "instance-a", "control-plane", std::chrono::seconds{2}, std::chrono::milliseconds{500});
+        ASSERT_TRUE(runner.run(lease.start(runner.loop())));
+        EXPECT_TRUE(lease.isLeader());
+        EXPECT_EQ(1, lease.fence());
+
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+            const std::vector<AsynGyanis::Database::DatabaseValue>          parameters{"2000-01-01 00:00:00", "control-plane"};
+            ASSERT_NE(nullptr, connection->execute("UPDATE sys_lease SET expires_at = ? WHERE name = ?", parameters)) << connection->lastError();
+            EXPECT_EQ("2000-01-01 00:00:00", queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'"));
+        }
+
+        // 续约必须因 expires_at > now 不成立而失败；重新获取会递增 fence，
+        // 旧实现会把过期行直接续到未来，fence 永远停在 1
+        ASSERT_TRUE(waitUntil([&lease] { return lease.fence() == 2; }, std::chrono::seconds{6})) << "过期行被续约延长，或过期后没有重新获取";
+        EXPECT_TRUE(lease.isLeader());
+        EXPECT_EQ(2, lease.fence());
+        {
+            const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+            EXPECT_EQ("instance-a", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'"));
+            EXPECT_EQ(2, queryInteger(*connection, "SELECT fence FROM sys_lease WHERE name = 'control-plane'"));
+        }
+        lease.stop();
+    }
+    database.reset();
+    removeDatabaseFiles(databasePath);
+}
+
+// 钉住：同一个 instance_id 的两个实例，A 的 stop 只清自己 fence 的行，不能清掉 B 已接手的行
+TEST(LeaderLease, StopWithStaleFenceDoesNotClearDuplicateHolder)
+{
+    const std::filesystem::path databasePath = makeTemporaryDatabasePath();
+    applyMigrations(databasePath);
+
+    std::shared_ptr<EdgePulse::Common::Database> databaseA = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    std::shared_ptr<EdgePulse::Common::Database> databaseB = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    EdgePulse::TestSupport::EventLoopRunner      runner;
+    {
+        EdgePulse::System::LeaderLease leaseA(databaseA, "shared-instance", "control-plane", std::chrono::seconds{2}, std::chrono::seconds{10});
+        EdgePulse::System::LeaderLease leaseB(databaseB, "shared-instance", "control-plane", std::chrono::seconds{10}, std::chrono::milliseconds{100});
+
+        ASSERT_TRUE(runner.run(leaseA.start(runner.loop())));
+        EXPECT_EQ(1, leaseA.fence());
+        ASSERT_FALSE(runner.run(leaseB.start(runner.loop())));
+        ASSERT_TRUE(waitUntil([&leaseB] { return leaseB.isLeader(); }, std::chrono::seconds{8})) << "A 过期后 B 未接手";
+        EXPECT_EQ(2, leaseB.fence());
+
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::string                                               expiryBeforeStop = queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'");
+
+        leaseA.stop();
+        EXPECT_EQ("shared-instance", queryText(*connection, "SELECT holder FROM sys_lease WHERE name = 'control-plane'")) << "A 的 stop 清掉了 B 同 instance_id 的行";
+        EXPECT_EQ(2, queryInteger(*connection, "SELECT fence FROM sys_lease WHERE name = 'control-plane'"));
+        ASSERT_TRUE(waitUntil([&connection, &expiryBeforeStop] { return queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'") > expiryBeforeStop; },
+                              std::chrono::seconds{3}))
+                << "A 停止后 B 的续约没有继续";
+        EXPECT_TRUE(leaseB.isLeader());
+        EXPECT_EQ(2, leaseB.fence());
+
+        leaseB.stop();
+    }
+    databaseA.reset();
+    databaseB.reset();
+    removeDatabaseFiles(databasePath);
+}
+
+// 钉住：一次续约数据库异常不立即降级，本地截止内保留 leadership，恢复后沿用原 fence
+TEST(LeaderLease, TransientRenewFailureKeepsLeaderUntilDeadline)
+{
+    const std::filesystem::path databasePath = makeTemporaryDatabasePath();
+    applyMigrations(databasePath);
+
+    std::shared_ptr<EdgePulse::Common::Database> database = EdgePulse::Common::Database::openSqlite(databasePath.string());
+    EdgePulse::TestSupport::EventLoopRunner      runner;
+    {
+        EdgePulse::System::LeaderLease lease(database, "instance-a", "control-plane", std::chrono::seconds{5}, std::chrono::milliseconds{100});
+        ASSERT_TRUE(runner.run(lease.start(runner.loop())));
+        EXPECT_TRUE(lease.isLeader());
+        EXPECT_EQ(1, lease.fence());
+
+        const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = EdgePulse::Common::Database::openDirectSqlite(databasePath.string());
+        const std::string                                               expiryBeforeFailure = queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'");
+
+        // 表暂时不可见，期间至少跨过两个续约周期，续约只可能抛异常
+        ASSERT_NE(nullptr, connection->execute("ALTER TABLE sys_lease RENAME TO sys_lease_offline")) << connection->lastError();
+        std::this_thread::sleep_for(std::chrono::milliseconds{350});
+        EXPECT_TRUE(lease.isLeader()) << "一次续约异常就降级，没有按本地截止保留 leadership";
+        EXPECT_EQ(1, lease.fence());
+
+        ASSERT_NE(nullptr, connection->execute("ALTER TABLE sys_lease_offline RENAME TO sys_lease")) << connection->lastError();
+        ASSERT_TRUE(waitUntil([&connection, &expiryBeforeFailure] { return queryText(*connection, "SELECT expires_at FROM sys_lease WHERE name = 'control-plane'") > expiryBeforeFailure; },
+                              std::chrono::seconds{5}))
+                << "异常恢复后续约没有继续";
+        EXPECT_TRUE(lease.isLeader());
+        EXPECT_EQ(1, lease.fence()) << "续约异常后不应重新走获取流程";
+        lease.stop();
+    }
+    database.reset();
+    removeDatabaseFiles(databasePath);
+}
+
 // 钉住：SQLite 是单写者，迁移锁返回无害的 no-op，release 与重复 release 都不抛
 TEST(MigrationLock, SqliteIsNoOpAndReleaseIsIdempotent)
 {

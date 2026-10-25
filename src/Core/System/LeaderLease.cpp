@@ -35,19 +35,45 @@ namespace EdgePulse::System
         /// 否则两个实例配了同一个 instanceId 时会同时把自己当成可续期的 holder
         constexpr const char *kAcquireSql = "UPDATE sys_lease SET holder = ?, fence = fence + 1, expires_at = ?, updated_at = ? "
                                             "WHERE name = ? AND (holder = '' OR expires_at IS NULL OR expires_at < ?)";
-        /// 续约必须带 holder 与 fence，旧 leader 恢复后无法覆盖新 holder
-        constexpr const char *kRenewSql = "UPDATE sys_lease SET expires_at = ?, updated_at = ? WHERE name = ? AND holder = ? AND fence = ?";
-        /// 停止只清自己的 holder，不碰已经接手的新实例
-        constexpr const char *kClearSql = "UPDATE sys_lease SET holder = '', expires_at = NULL, updated_at = ? WHERE name = ? AND holder = ?";
+        /// 回读时再确认库内到期时间仍在未来，慢查询不能凭一次 UPDATE 命中就自认 leader
+        constexpr const char *kReadBackSql = "SELECT fence FROM sys_lease WHERE name = ? AND holder = ? AND expires_at > ?";
+        /// 续约必须带 holder、fence 与未过期：延迟到达的续约不能延长已经过期的行
+        constexpr const char *kRenewSql = "UPDATE sys_lease SET expires_at = ?, updated_at = ? WHERE name = ? AND holder = ? AND fence = ? AND expires_at > ?";
+        /// 停止只清自己 fence 的行，同 instanceId 的后来者已经接手时不会被误清
+        constexpr const char *kClearSql = "UPDATE sys_lease SET holder = '', expires_at = NULL, updated_at = ? WHERE name = ? AND holder = ? AND fence = ?";
 
         /**
-         * @brief 取当前时刻加 TTL 的 SQL DATETIME 文本
-         * @param ttl 租约有效期
-         * @return std::string 形如 2026-10-25 12:00:15
+         * @brief 一次成功的获取或续约在数据库线程上算出的结果
          */
-        [[nodiscard]] std::string expiryText(const std::chrono::seconds ttl)
+        struct LeaseGrant
         {
-            return Common::formatDateTimeUtc(std::chrono::system_clock::now() + ttl);
+            std::int64_t              fence{0};        ///< 行内 fence
+            std::chrono::milliseconds remainingTtl{0}; ///< 按库内到期时间算出的剩余有效期
+        };
+
+        /**
+         * @brief 取 steady_clock 当前刻度（纳秒）
+         * @return std::int64_t 单调时钟纳秒数
+         */
+        [[nodiscard]] std::int64_t steadyNanoseconds() noexcept
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        /**
+         * @brief 按库内到期时间算剩余有效期，并夹在 TTL 之内
+         * @param expiresAt 库内到期时刻
+         * @param ttl 本次获取或续约写入的有效期
+         * @return std::chrono::milliseconds 剩余毫秒；已过期返回 0
+         */
+        [[nodiscard]] std::chrono::milliseconds leaseRemainingTtl(const std::chrono::system_clock::time_point expiresAt, const std::chrono::seconds ttl) noexcept
+        {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(expiresAt - std::chrono::system_clock::now());
+            if (remaining <= std::chrono::milliseconds::zero())
+            {
+                return std::chrono::milliseconds::zero();
+            }
+            return std::min(remaining, std::chrono::duration_cast<std::chrono::milliseconds>(ttl));
         }
 
         /**
@@ -110,7 +136,7 @@ namespace EdgePulse::System
     {
         if (m_started.exchange(true, std::memory_order_acq_rel))
         {
-            co_return m_leader.load(std::memory_order_acquire);
+            co_return isLeader();
         }
         m_loop.store(&loop, std::memory_order_release);
         if (m_stopped.load(std::memory_order_acquire))
@@ -119,10 +145,12 @@ namespace EdgePulse::System
         }
 
         const bool acquired = co_await acquireOnce(loop);
-        // 获取期间收到停止请求：释放刚拿到的行，不再启动循环
+        // 获取期间收到停止请求：按当前 fence 释放刚拿到的行，不再启动循环。
+        // acquireOnce 已在停止分支里用回读到的 fence 清过一次，这里兜住它返回成功后才置停止位的交错
         if (m_stopped.load(std::memory_order_acquire))
         {
-            co_await releaseHolder(loop);
+            co_await releaseHolder(loop, m_fence.load(std::memory_order_acquire));
+            markFollower();
             co_return false;
         }
 
@@ -159,12 +187,13 @@ namespace EdgePulse::System
             return;
         }
 
-        // 用独立直连立即清空自己的 holder，让故障转移不用等循环下一次醒来
+        // 用独立直连立即清空自己的 holder，让故障转移不用等循环下一次醒来；
+        // 条件里带自身 fence，同 instanceId 的后来者已经接手时不会被这次停止清掉
         try
         {
             const std::unique_ptr<AsynGyanis::Database::DatabaseConnection> connection = Common::Database::openDirect(m_database->options());
-            const std::array<AsynGyanis::Database::DatabaseValue, 3>        parameters{Common::nowDateTimeUtc(), m_name, m_instanceId};
-            const std::unique_ptr<AsynGyanis::Database::DatabaseResult>     result = connection->execute(kClearSql, parameters);
+            const std::array<AsynGyanis::Database::DatabaseValue, 4>         parameters{Common::nowDateTimeUtc(), m_name, m_instanceId, m_fence.load(std::memory_order_acquire)};
+            const std::unique_ptr<AsynGyanis::Database::DatabaseResult>      result = connection->execute(kClearSql, parameters);
             if (!result)
             {
                 LOG_WARN_FMT("停止时清空控制面租约失败：instance={} error={}", m_instanceId, connection->lastError());
@@ -178,7 +207,13 @@ namespace EdgePulse::System
 
     bool LeaderLease::isLeader() const noexcept
     {
-        return m_leader.load(std::memory_order_acquire);
+        if (!m_leader.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        // markLeader 先写截止再放开 m_leader，看到 true 时这里读到的一定是配对值
+        const std::int64_t deadline = m_leaderDeadline.load(std::memory_order_relaxed);
+        return steadyNanoseconds() < deadline;
     }
 
     std::int64_t LeaderLease::fence() const noexcept
@@ -198,7 +233,8 @@ namespace EdgePulse::System
         {
             try
             {
-                if (m_leader.load(std::memory_order_acquire))
+                // 用带本地截止的判定选路径：截止已过就立即改走重试获取，不拿过期行续约
+                if (isLeader())
                 {
                     static_cast<void>(co_await renewOnce(loop));
                 } else
@@ -207,7 +243,11 @@ namespace EdgePulse::System
                 }
             } catch (const std::exception &failure)
             {
-                markFollower();
+                // 兜底只处理没有在单次操作里收口的异常；本地截止仍有效时不得凭一次异常降级
+                if (!isLeader())
+                {
+                    markFollower();
+                }
                 LOG_WARN_FMT("控制面租约循环失败：instance={} error={}", m_instanceId, failure.what());
             }
 
@@ -230,7 +270,7 @@ namespace EdgePulse::System
         }
 
         // stop 已经清过；这里兜住直连清理失败或获取与停止交错的情形
-        co_await releaseHolder(loop);
+        co_await releaseHolder(loop, m_fence.load(std::memory_order_acquire));
         markFollower();
         {
             // 与析构里的判据共用同一把锁：先落标志再通知，不会漏掉已经进入等待的析构
@@ -243,42 +283,62 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<bool> LeaderLease::acquireOnce(AsynGyanis::Core::EventLoop &loop)
     {
-        const std::string now        = Common::nowDateTimeUtc();
-        const std::string expiresAt  = expiryText(m_ttl);
         const std::string instanceId = m_instanceId;
         const std::string name       = m_name;
+        const auto        ttl        = m_ttl;
         try
         {
-            const std::optional<std::int64_t> acquiredFence = co_await m_database->withConnection<std::optional<std::int64_t>>(
+            const std::optional<LeaseGrant> grant = co_await m_database->withConnection<std::optional<LeaseGrant>>(
                     loop,
-                    [instanceId, name, now, expiresAt](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<std::int64_t>
+                    [instanceId, name, ttl](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<LeaseGrant>
                     {
-                        const std::array<AsynGyanis::Database::DatabaseValue, 5> parameters{instanceId, expiresAt, now, name, now};
-                        const auto                                               update = Sql::executeOrThrow(connection, kAcquireSql, parameters);
+                        // 时间在数据库线程上按执行时刻生成，排队等待连接或线程调度不会把到期时间写成过去
+                        const auto        acquiredAt = std::chrono::system_clock::now();
+                        const std::string nowText    = Common::formatDateTimeUtc(acquiredAt);
+                        const std::string expiresAt  = Common::formatDateTimeUtc(acquiredAt + ttl);
+                        const std::array<AsynGyanis::Database::DatabaseValue, 5> parameters{instanceId, expiresAt, nowText, name, nowText};
+                        const auto update = Sql::executeOrThrow(connection, kAcquireSql, parameters);
                         if (update->affectedRowCount() <= 0)
                         {
                             return std::nullopt;
                         }
-                        const std::array<AsynGyanis::Database::DatabaseValue, 2> selectParameters{name, instanceId};
-                        const auto row = Sql::executeOrThrow(connection, "SELECT fence FROM sys_lease WHERE name = ? AND holder = ?", selectParameters);
+
+                        // 回读要求库内到期时间仍在未来，只有 UPDATE 命中不足以承认 leader
+                        const std::string verifyAt = Common::formatDateTimeUtc(std::chrono::system_clock::now());
+                        const std::array<AsynGyanis::Database::DatabaseValue, 3> selectParameters{name, instanceId, verifyAt};
+                        const auto row = Sql::executeOrThrow(connection, kReadBackSql, selectParameters);
                         if (!row->next())
                         {
                             return std::nullopt;
                         }
-                        return Sql::integer(*row, "fence");
+                        const auto remaining = leaseRemainingTtl(acquiredAt + ttl, ttl);
+                        if (remaining <= std::chrono::milliseconds::zero())
+                        {
+                            return std::nullopt;
+                        }
+                        return LeaseGrant{Sql::integer(*row, "fence"), remaining};
                     });
-            if (!acquiredFence.has_value())
+            if (!grant.has_value())
             {
                 markFollower();
                 co_return false;
             }
             if (m_stopped.load(std::memory_order_acquire))
             {
-                co_await releaseHolder(loop);
+                // 停止请求可能早于 m_fence 更新，必须用本次回读到的 fence 清刚拿到的行
+                co_await releaseHolder(loop, grant->fence);
+                markFollower();
                 co_return false;
             }
-            markLeader(*acquiredFence);
-            LOG_INFO_FMT("获得控制面租约：instance={} fence={} expires={}", m_instanceId, *acquiredFence, expiresAt);
+            markLeader(grant->fence, grant->remainingTtl);
+            // 停止请求与这次获取交错时，stop 的清理可能早于 m_fence 更新；这里再按取得的 fence 收口
+            if (m_stopped.load(std::memory_order_acquire))
+            {
+                co_await releaseHolder(loop, grant->fence);
+                markFollower();
+                co_return false;
+            }
+            LOG_INFO_FMT("获得控制面租约：instance={} fence={} 剩余有效期={}ms", m_instanceId, grant->fence, grant->remainingTtl.count());
             co_return true;
         } catch (const std::exception &failure)
         {
@@ -290,22 +350,34 @@ namespace EdgePulse::System
 
     AsynGyanis::Core::Task<bool> LeaderLease::renewOnce(AsynGyanis::Core::EventLoop &loop)
     {
-        const std::string  now          = Common::nowDateTimeUtc();
-        const std::string  expiresAt    = expiryText(m_ttl);
         const std::string  instanceId   = m_instanceId;
         const std::string  name         = m_name;
+        const auto         ttl          = m_ttl;
         const std::int64_t currentFence = m_fence.load(std::memory_order_acquire);
         try
         {
-            const bool renewed = co_await m_database->withConnection<bool>(
+            const std::optional<LeaseGrant> grant = co_await m_database->withConnection<std::optional<LeaseGrant>>(
                     loop,
-                    [instanceId, name, now, expiresAt, currentFence](AsynGyanis::Database::DatabaseConnection &connection) -> bool
+                    [instanceId, name, ttl, currentFence](AsynGyanis::Database::DatabaseConnection &connection) -> std::optional<LeaseGrant>
                     {
-                        const std::array<AsynGyanis::Database::DatabaseValue, 5> parameters{expiresAt, now, name, instanceId, currentFence};
-                        const auto                                               update = Sql::executeOrThrow(connection, kRenewSql, parameters);
-                        return update->affectedRowCount() > 0;
+                        // 时间同样在执行时刻生成；AND expires_at > ? 让延迟到达的续约无法延长已过期的行
+                        const auto        renewedAt = std::chrono::system_clock::now();
+                        const std::string nowText   = Common::formatDateTimeUtc(renewedAt);
+                        const std::string expiresAt = Common::formatDateTimeUtc(renewedAt + ttl);
+                        const std::array<AsynGyanis::Database::DatabaseValue, 6> parameters{expiresAt, nowText, name, instanceId, currentFence, nowText};
+                        const auto update = Sql::executeOrThrow(connection, kRenewSql, parameters);
+                        if (update->affectedRowCount() <= 0)
+                        {
+                            return std::nullopt;
+                        }
+                        const auto remaining = leaseRemainingTtl(renewedAt + ttl, ttl);
+                        if (remaining <= std::chrono::milliseconds::zero())
+                        {
+                            return std::nullopt;
+                        }
+                        return LeaseGrant{currentFence, remaining};
                     });
-            if (!renewed)
+            if (!grant.has_value())
             {
                 if (m_leader.exchange(false, std::memory_order_acq_rel))
                 {
@@ -313,16 +385,34 @@ namespace EdgePulse::System
                 }
                 co_return false;
             }
-            co_return !m_stopped.load(std::memory_order_acquire);
+            if (m_stopped.load(std::memory_order_acquire))
+            {
+                markFollower();
+                co_return false;
+            }
+            markLeader(grant->fence, grant->remainingTtl);
+            // 停止请求可能落在前一次检查之后，markLeader 之后再确认一次，避免 stop 后又被抬成 leader
+            if (m_stopped.load(std::memory_order_acquire))
+            {
+                markFollower();
+                co_return false;
+            }
+            co_return true;
         } catch (const std::exception &failure)
         {
+            // 数据库短暂不可用不等于租约丢失：本地截止未到就保留最后已知的 leadership，下一轮重试
+            if (isLeader())
+            {
+                LOG_WARN_FMT("续约控制面租约异常，本地截止前保持 leader：instance={} fence={} error={}", m_instanceId, currentFence, failure.what());
+                co_return false;
+            }
             markFollower();
             LOG_WARN_FMT("续约控制面租约失败：instance={} fence={} error={}", m_instanceId, currentFence, failure.what());
             co_return false;
         }
     }
 
-    AsynGyanis::Core::Task<> LeaderLease::releaseHolder(AsynGyanis::Core::EventLoop &loop)
+    AsynGyanis::Core::Task<> LeaderLease::releaseHolder(AsynGyanis::Core::EventLoop &loop, const std::int64_t fence)
     {
         const std::string instanceId = m_instanceId;
         const std::string name       = m_name;
@@ -330,23 +420,25 @@ namespace EdgePulse::System
         try
         {
             static_cast<void>(co_await m_database->withConnection<bool>(loop,
-                                                                        [instanceId, name, now](AsynGyanis::Database::DatabaseConnection &connection) -> bool
+                                                                        [instanceId, name, now, fence](AsynGyanis::Database::DatabaseConnection &connection) -> bool
                                                                         {
-                                                                            const std::array<AsynGyanis::Database::DatabaseValue, 3> parameters{now, name, instanceId};
+                                                                            const std::array<AsynGyanis::Database::DatabaseValue, 4> parameters{now, name, instanceId, fence};
                                                                             const auto update = Sql::executeOrThrow(connection, kClearSql, parameters);
                                                                             return update->affectedRowCount() > 0;
                                                                         }));
         } catch (const std::exception &failure)
         {
-            LOG_WARN_FMT("清空控制面租约失败：instance={} error={}", m_instanceId, failure.what());
+            LOG_WARN_FMT("清空控制面租约失败：instance={} fence={} error={}", m_instanceId, fence, failure.what());
         }
         co_return;
     }
 
-    void LeaderLease::markLeader(const std::int64_t fence) noexcept
+    void LeaderLease::markLeader(const std::int64_t fence, const std::chrono::milliseconds remainingTtl) noexcept
     {
-        // 先写 fence 再放开 leader，读侧看到 true 时 fence 一定已经就位
+        // 先写 fence 与本地截止再放开 leader，读侧看到 true 时两者一定已经就位
+        const std::int64_t deadline = steadyNanoseconds() + std::chrono::duration_cast<std::chrono::nanoseconds>(remainingTtl).count();
         m_fence.store(fence, std::memory_order_relaxed);
+        m_leaderDeadline.store(deadline, std::memory_order_relaxed);
         m_leader.store(true, std::memory_order_release);
     }
 
