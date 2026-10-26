@@ -1,16 +1,27 @@
 # EdgePulse
 
-> 边缘节点与设备运维平台：C++23 控制面 + Vue 3 管理后台 + mTLS Agent 数据面。
+<p align="center">
+  <b>边缘节点与设备运维平台</b><br>
+  C++23 控制面 · Vue 3 管理后台 · mTLS Agent 数据面
+</p>
 
-[![CI](https://github.com/Gyanis9/EdgePulse/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Gyanis9/EdgePulse/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![C++](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
-[![Vue](https://img.shields.io/badge/Vue-3-42b883.svg)](https://vuejs.org/)
+<p align="center">
+  <a href="https://github.com/Gyanis9/EdgePulse/actions/workflows/ci.yml"><img src="https://github.com/Gyanis9/EdgePulse/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/C%2B%2B-C%2B%2B23-00599C?logo=c%2B%2B&logoColor=white" alt="C++23">
+  <img src="https://img.shields.io/badge/Vue-3-42b883.svg" alt="Vue 3">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-informational" alt="Windows and Linux">
+</p>
+
+<p align="center">
+  <img src="docs/images/console-dashboard.jpg" width="900" alt="工作台：登录脉搏、在线用户、接口调用、操作成功率、数据权限分布与今日操作泳道">
+</p>
 
 ## 目录
 
 - [为什么是 EdgePulse](#为什么是-edgepulse)
 - [特性](#特性)
+- [界面一览](#界面一览)
 - [架构](#架构)
 - [快速开始](#快速开始)
 - [配置](#配置)
@@ -51,6 +62,17 @@
 | 高可用 | 双实例共享 MySQL/Redis/固件卷，nginx 统一 8080/8443/9443；`sys_lease` 租约与 fence 单飞、MySQL 迁移锁、跨实例 Agent 命令路由、`/readyz` 五项依赖、优雅停机与崩溃切换 |
 | 可观测 | Prometheus HTTP 与业务指标、`/readyz`、运维总览、OTLP 指标出口、操作/登录统计与热力图 |
 | 交付与运维 | 设备影子配置（期望/实际/漂移/修订/回滚）、备份与恢复工具、Docker Compose、systemd、生产静态站点、Windows/Linux/前端/密钥扫描 CI |
+
+## 界面一览
+
+登录、节点、遥测与设备影子都在同一套管理后台里。
+
+<p>
+  <img src="docs/images/console-login.jpg" width="460" alt="登录页：深色画布、实时时钟、服务健康与账号/验证码登录">
+  <img src="docs/images/console-nodes.jpg" width="460" alt="节点列表：在线状态、Agent 版本、最后心跳、分组与标签">
+  <img src="docs/images/console-telemetry.jpg" width="460" alt="遥测数据：指标卡片与 CPU 使用率 24 小时曲线">
+  <img src="docs/images/console-node-config.jpg" width="460" alt="节点配置：期望配置与 Agent 实际版本对比、配置漂移提示">
+</p>
 
 ## 架构
 
@@ -319,6 +341,10 @@ running/paused/failed -> rolling_back -> rolled_back | rollback_unavailable | fa
 节点通过心跳上报 `installedFirmwareVersion`，空值不会清空已有版本；Agent 的固件状态上报可带 `commandId`，只推进该命令绑定的任务，避免不同波次或手工下发的任务互相覆盖。
 
 管理端操作：固件页的“灰度发布”打开向导，按加载到的节点勾选目标（勾选顺序决定波次归属），填写累计波次百分比（默认 5/25/100，最后一波必须 100%），按需调整并发、沉降、观察、单波上限、成功率、失败数、遥测新鲜度、超时动作与自动回滚，提交后直接打开详情。详情每 5 秒轮询，展示发布/波次/目标状态、门控原因与已安装版本，并按状态提供暂停、恢复、提升、强制提升、中止与回滚；发布历史列表接口已提供，但页面尚无独立历史入口。
+
+<p align="center">
+  <img src="docs/images/console-firmware.jpg" width="900" alt="固件管理：签名状态、文件摘要、下发、灰度发布、回滚与任务入口">
+</p>
 
 ## 安全模型
 
