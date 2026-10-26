@@ -4,7 +4,7 @@
 
 ## 环境与构建
 
-- Windows + MSVC ≥ 19.40，或 Linux + GCC ≥ 14 / Clang ≥ 17。
+- Windows + MSVC ≥ 19.40，或 Linux + GCC 14（引擎包用 GCC 13 预构建）/ Clang ≥ 17。
 - CMake ≥ 3.25、Ninja、Conan 2、Python 3、Node.js ≥ 20。
 - Git 含 submodule；OpenSSL 用于开发证书与固件签名。
 
@@ -21,6 +21,15 @@ ctest --preset debug --output-on-failure
 ```
 
 `debug` 预设是 RelWithDebInfo；Windows/MSVC 下强制 `/MD` 运行期库，与 Release 引擎包共用 CRT。改了 `CMakeLists.txt`、依赖或公开头后重新执行 `conan install .`，不要手工改 `build/generators`。
+
+Linux 上引擎包固定用系统 GCC 13 构建，EdgePulse 本体用 GCC 14：引擎以 `-Werror` 编译，GCC 14 会在其协程析构上报 `maybe-uninitialized` 误报。Ubuntu 24.04 示例：
+
+```bash
+CC=gcc CXX=g++ conan create 3rd/AsynGyanis/packaging/conan --build=missing \
+  -s compiler.cppstd=23 -s build_type=Release -o "&:with_mysql=True"
+CC=gcc-14 CXX=g++-14 conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
+CC=gcc-14 CXX=g++-14 cmake --preset debug
+```
 
 ## 后端测试
 

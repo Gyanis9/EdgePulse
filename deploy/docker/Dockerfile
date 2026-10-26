@@ -13,20 +13,20 @@ RUN sed -i "s|http://archive.ubuntu.com/ubuntu|http://${APT_MIRROR}|g; s|http://
         zlib1g-dev libssl-dev libsqlite3-dev libhiredis-dev \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CC=gcc-14 CXX=g++-14
 RUN python3 -m venv /opt/conan && /opt/conan/bin/pip install --no-cache-dir "conan>=2"
 ENV PATH=/opt/conan/bin:$PATH
-RUN conan profile detect --force \
-    && sed -i 's/^compiler.version=.*/compiler.version=14/' "$(conan profile path default)"
+RUN conan profile detect --force
 
 WORKDIR /src
 COPY . /src
 
-RUN conan create 3rd/AsynGyanis/packaging/conan --build=missing \
+# 引擎包始终用系统 GCC 13 构建：GCC 14 在协程析构上报 maybe-uninitialized 误报，
+# 而引擎以 -Werror 编译。EdgePulse 自身代码与最终链接仍使用 GCC 14。
+RUN CC=gcc CXX=g++ conan create 3rd/AsynGyanis/packaging/conan --build=missing \
         -s compiler.cppstd=23 -s build_type=Release -o "&:with_mysql=True"
 
 RUN conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
-RUN cmake --preset release -DEDGEPULSE_BUILD_TESTS=OFF
+RUN CC=gcc-14 CXX=g++-14 cmake --preset release -DEDGEPULSE_BUILD_TESTS=OFF
 RUN cmake --build --preset release --target edgepulse-server --parallel
 
 ARG NODE_IMAGE
