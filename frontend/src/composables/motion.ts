@@ -132,6 +132,7 @@ export function pageEnter(el: Element, done: () => void) {
   const page = el as HTMLElement
   if (skipMotion()) {
     page.classList.add('is-entrance-ready')
+    page.querySelectorAll('.page').forEach(child => child.classList.add('is-entrance-ready'))
     return done()
   }
   const items = page.querySelectorAll('.reveal')
