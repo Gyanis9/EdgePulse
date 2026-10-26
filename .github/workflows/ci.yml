@@ -113,13 +113,18 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++-14 libssl-dev default-libmysqlclient-dev
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++ g++-14 libssl-dev default-libmysqlclient-dev
       - name: Install Conan
+        env:
+          CC: gcc
+          CXX: g++
         run: |
           pip install conan
           conan profile detect --force
-          sed -i 's/^compiler.version=.*/compiler.version=14/' "$(conan profile path default)"
       - name: Build engine package
+        env:
+          CC: gcc
+          CXX: g++
         run: conan create 3rd/AsynGyanis/packaging/conan --build=missing -s compiler.cppstd=23 -s build_type=Release -o "&:with_mysql=True"
       - name: Install dependencies
         run: conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
@@ -193,13 +198,18 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++-14 libssl-dev default-libmysqlclient-dev
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++ g++-14 libssl-dev default-libmysqlclient-dev
       - name: Install Conan
+        env:
+          CC: gcc
+          CXX: g++
         run: |
           pip install conan
           conan profile detect --force
-          sed -i 's/^compiler.version=.*/compiler.version=14/' "$(conan profile path default)"
       - name: Build engine package
+        env:
+          CC: gcc
+          CXX: g++
         run: conan create 3rd/AsynGyanis/packaging/conan --build=missing -s compiler.cppstd=23 -s build_type=Release -o "&:with_mysql=True"
       - name: Install dependencies
         run: conan install . --build=missing -s compiler.cppstd=23 -s build_type=Release
