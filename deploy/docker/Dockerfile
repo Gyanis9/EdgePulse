@@ -9,13 +9,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i "s|http://archive.ubuntu.com/ubuntu|http://${APT_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|http://${APT_MIRROR}|g" \
         /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build python3 python3-pip python3-venv git curl ca-certificates \
+        build-essential g++-14 cmake ninja-build python3 python3-pip python3-venv git curl ca-certificates \
         zlib1g-dev libssl-dev libsqlite3-dev libhiredis-dev \
     && rm -rf /var/lib/apt/lists/*
 
+ENV CC=gcc-14 CXX=g++-14
 RUN python3 -m venv /opt/conan && /opt/conan/bin/pip install --no-cache-dir "conan>=2"
 ENV PATH=/opt/conan/bin:$PATH
-RUN conan profile detect --force
+RUN conan profile detect --force \
+    && sed -i 's/^compiler.version=.*/compiler.version=14/' "$(conan profile path default)"
 
 WORKDIR /src
 COPY . /src

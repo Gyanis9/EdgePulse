@@ -4,7 +4,7 @@
 
 ## 环境与构建
 
-- Windows + MSVC ≥ 19.40，或 Linux + GCC ≥ 13 / Clang ≥ 17。
+- Windows + MSVC ≥ 19.40，或 Linux + GCC ≥ 14 / Clang ≥ 17。
 - CMake ≥ 3.25、Ninja、Conan 2、Python 3、Node.js ≥ 20。
 - Git 含 submodule；OpenSSL 用于开发证书与固件签名。
 
