@@ -62,12 +62,13 @@ namespace EdgePulse::Command
 
     Web::AgentMessage makeAgentCommandMessage(const CommandRecord &command)
     {
-        return Web::AgentMessage{.nodeId = command.nodeId, .payload = makeAgentCommandPayload(command), .commandId = command.id};
+        return Web::AgentMessage{
+                .nodeId = command.nodeId, .payload = makeAgentCommandPayload(command), .commandId = command.id, .close = false, .closeCode = 1008, .closeReason = ""};
     }
 
     Web::AgentMessage makeAgentCloseMessage(const std::int64_t nodeId, const int code, std::string reason)
     {
-        return Web::AgentMessage{.nodeId = nodeId, .close = true, .closeCode = code, .closeReason = std::move(reason)};
+        return Web::AgentMessage{.nodeId = nodeId, .payload = "", .commandId = 0, .close = true, .closeCode = code, .closeReason = std::move(reason)};
     }
 
     AgentCommandDelivery::AgentCommandDelivery(AgentChannelRegistry &channels, std::shared_ptr<CommandRepository> commands, DispatchNotifier notifier) :

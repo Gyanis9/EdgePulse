@@ -171,7 +171,7 @@ namespace EdgePulse::Auth
             }
             co_await recordAudit(
                     loop, LoginAuditEntry{credentials.username, credentials.clientIp, true, "登录成功，等待两步验证", credentials.traceId, user->id, user->departmentId, tenantId});
-            co_return LoginResult{.mfaRequired = true, .challengeToken = *challenge, .challengeExpiresIn = MfaService::kChallengeTtlSeconds};
+            co_return LoginResult{.token = "", .expiresIn = 0, .mfaRequired = true, .challengeToken = *challenge, .challengeExpiresIn = MfaService::kChallengeTtlSeconds};
         }
 
         auto issued = co_await createSessionForUser(loop, *user, credentials.clientIp, credentials.traceId, "登录成功");
@@ -318,7 +318,7 @@ namespace EdgePulse::Auth
                 co_return std::unexpected(AuthError{Common::kCodeServiceUnavailable, Common::kCodeServiceUnavailable, "两步验证服务暂不可用，请稍后重试"});
             }
             co_await recordAudit(loop, LoginAuditEntry{user->username, clientIp, true, "登录成功，等待两步验证", traceId, user->id, user->departmentId, user->tenantId});
-            co_return LoginResult{.mfaRequired = true, .challengeToken = *challenge, .challengeExpiresIn = MfaService::kChallengeTtlSeconds};
+            co_return LoginResult{.token = "", .expiresIn = 0, .mfaRequired = true, .challengeToken = *challenge, .challengeExpiresIn = MfaService::kChallengeTtlSeconds};
         }
         co_return co_await createSessionForUser(loop, *user, clientIp, traceId, auditMessage);
     }
@@ -350,7 +350,7 @@ namespace EdgePulse::Auth
             LOG_WARN_FMT("登录时间未更新：user={}", user.username);
         }
         co_await recordAudit(loop, LoginAuditEntry{user.username, clientIp, true, auditMessage, traceId, user.id, user.departmentId, user.tenantId});
-        co_return LoginResult{session.token, m_sessions->ttlSeconds()};
+        co_return LoginResult{.token = session.token, .expiresIn = m_sessions->ttlSeconds(), .mfaRequired = false, .challengeToken = "", .challengeExpiresIn = 0};
     }
 
     AsynGyanis::Core::Task<std::optional<SessionRecord>> AuthService::authenticate(AsynGyanis::Core::EventLoop &loop, const std::string_view token)
