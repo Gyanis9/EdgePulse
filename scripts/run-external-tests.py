@@ -34,6 +34,7 @@ EXPECTED_TESTS = (
     "ExternalStores.RedisKeyValueStoreRoundTrip",
     "ExternalStores.RedisCacheProbeRecoversAfterConnectionLoss",
     "RealtimeBus.RedisFanoutReachesSecondInstance",
+    "RealtimeBus.RedisPublisherUsesBoundedCommandTimeout",
     "RealtimeBus.RedisPublisherRecoversAfterServerSideKill",
     "RealtimeBus.RedisSubscriberSurvivesMalformedEnvelopes",
     "AgentCommandBus.RedisFanoutReachesAgentHandlerOnSecondInstance",
