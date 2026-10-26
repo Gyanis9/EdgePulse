@@ -31,16 +31,19 @@ namespace EdgePulse::Auth
         }
     } // namespace
 
-    void registerOidcRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, OidcService &oidc)
+    void registerOidcStatusRoute(AsynGyanis::Net::Router &router, const bool enabled)
     {
         router.get("/api/auth/oidc/enabled",
-                   [&oidc](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
+                   [enabled](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {
                        const std::string traceId = Web::resolveRequestId(request);
-                       Common::writeSuccess(response, ConfigValue::object({{"enabled", oidc.enabled()}, {"label", "企业登录"}}), traceId);
+                       Common::writeSuccess(response, ConfigValue::object({{"enabled", enabled}, {"label", "企业登录"}}), traceId);
                        co_return;
                    });
+    }
 
+    void registerOidcRoutes(AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &loop, OidcService &oidc)
+    {
         router.get("/api/auth/oidc/start",
                    [&loop, &oidc](AsynGyanis::Net::HttpRequest &request, AsynGyanis::Net::HttpResponse &response) -> AsynGyanis::Core::Task<>
                    {

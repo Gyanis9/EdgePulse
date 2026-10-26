@@ -219,9 +219,9 @@ namespace EdgePulse::App
                 System::MigrationRunner::apply(*connection, m_configuration.migrationsDirectory);
                 // 迁移后、监听器前收紧种子管理员：生产档仍用 admin123 时宁可拒绝启动
                 const System::DefaultAdminPasswordGuardResult adminPasswordGuard = System::UserRepository::enforceDefaultAdminPassword(
-                        *connection, System::DefaultAdminPasswordGuardOptions{.password = m_configuration.adminPassword,
+                        *connection, System::DefaultAdminPasswordGuardOptions{.password          = m_configuration.adminPassword,
                                                                               .allowDefaultAdmin = m_configuration.exposeCaptchaCode || m_configuration.allowDefaultAdmin,
-                                                                              .minimumLength  = m_configuration.passwordMinimumLength,
+                                                                              .minimumLength     = m_configuration.passwordMinimumLength,
                                                                               .requireComplexity = m_configuration.passwordRequireComplexity});
                 if (!adminPasswordGuard.error.empty())
                 {
@@ -1038,6 +1038,7 @@ namespace EdgePulse::App
         registerOpenApiRoute(router, m_webRoot);
         Auth::registerRoutes(router, loop, *m_authService, *m_captchaService, m_configuration.exposeCaptchaCode);
         Auth::registerMfaRoutes(router, loop, *m_authService, *m_mfaService, *m_logRepository);
+        Auth::registerOidcStatusRoute(router, m_oidcService != nullptr);
         if (m_oidcService)
         {
             Auth::registerOidcRoutes(router, loop, *m_oidcService);

@@ -1,4 +1,5 @@
 #include "Plugins/AuthPlugin/AuthController.h"
+#include "Plugins/AuthPlugin/OidcController.h"
 #include "Base/Config/ConfigValue.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
@@ -193,4 +194,39 @@ TEST_F(AuthEndpointsTest, ChangesPasswordAndUsesNewCredential)
 
     const auto newCredential = loginWithFreshCaptcha("admin", "new-pass-123");
     EXPECT_EQ(200, newCredential.status) << newCredential.body;
+}
+
+// 钉住：OIDC 未启用时状态端点仍然匿名可用，登录页不需要以 404 推断能力
+class OidcStatusEndpointTest : public ::testing::Test
+{
+protected:
+    [[nodiscard]] static std::unique_ptr<EdgePulse::TestSupport::ServerHarness> makeServer(const bool enabled)
+    {
+        return std::make_unique<EdgePulse::TestSupport::ServerHarness>([enabled](AsynGyanis::Net::Router &router, AsynGyanis::Core::EventLoop &)
+                                                                       { EdgePulse::Auth::registerOidcStatusRoute(router, enabled); });
+    }
+};
+
+TEST_F(OidcStatusEndpointTest, ReportsDisabledWithoutOidcService)
+{
+    const std::unique_ptr<EdgePulse::TestSupport::ServerHarness> server   = makeServer(false);
+    const EdgePulse::TestSupport::HttpResult                     response = server->get("/api/auth/oidc/enabled");
+    ASSERT_TRUE(response.transportOk);
+    EXPECT_EQ(200, response.status) << response.body;
+    const auto json = response.json();
+    ASSERT_TRUE(json.has_value());
+    EXPECT_EQ(200, (*json)["code"].get<int>());
+    EXPECT_FALSE((*json)["data"]["enabled"].get<bool>());
+    EXPECT_EQ("企业登录", (*json)["data"]["label"].get<std::string>());
+}
+
+TEST_F(OidcStatusEndpointTest, ReportsEnabledWhenConfigured)
+{
+    const std::unique_ptr<EdgePulse::TestSupport::ServerHarness> server   = makeServer(true);
+    const EdgePulse::TestSupport::HttpResult                     response = server->get("/api/auth/oidc/enabled");
+    ASSERT_TRUE(response.transportOk);
+    EXPECT_EQ(200, response.status) << response.body;
+    const auto json = response.json();
+    ASSERT_TRUE(json.has_value());
+    EXPECT_TRUE((*json)["data"]["enabled"].get<bool>());
 }
