@@ -1,9 +1,16 @@
 import type { HttpClient, QueryParams } from './http'
 
+export interface DashboardActivity {
+  who: string
+  target: string
+  time: string
+  tint: string
+}
+
 export interface DashboardSummary {
   stats: Array<Record<string, unknown>>
   trend: number[]
-  activities: Array<Record<string, unknown>>
+  activities: DashboardActivity[]
   roleDist: Array<{ label: string; value: number }>
   trendTotal: number
   successRate: number

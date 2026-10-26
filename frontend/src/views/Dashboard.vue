@@ -18,6 +18,7 @@ import { currentUser, navGroups, pathOf } from '@/composables/auth'
 import { toastError } from '@/composables/toast'
 import { EASE, firstTimeInSession, gsap, motionSkipped, trackGlow } from '@/composables/motion'
 import { hasPermission } from '@/directives/permission'
+import { formatLocalDateTime } from '@/utils/time'
 
 /* ============================================================
    工作台 · 主次布局：8 列主卡（登录脉搏）+ 4 列侧块，
@@ -59,6 +60,7 @@ const loginDelta = computed(() => {
   if (!summary.value || !loginPrev.value) return summary.value ? 0 : null
   return Math.round(((loginTotal.value - loginPrev.value) / loginPrev.value) * 1000) / 10
 })
+const successRateText = computed(() => summary.value ? `${Math.round(summary.value.successRate * 10) / 10}%` : '—')
 const trendLabels = computed(() => {
   const n = trend.value.length
   const base = new Date()
@@ -247,7 +249,7 @@ onMounted(() => {
           <TickRing :value="summary?.successRate" label="成功" :size="164" />
           <dl class="ring-readouts">
             <div><dt>操作</dt><dd class="tnum">{{ summary?.trendTotal ?? '—' }}</dd></div>
-            <div><dt>成功率</dt><dd class="tnum">{{ summary?.successRate ?? '—' }}%</dd></div>
+            <div><dt>成功率</dt><dd class="tnum">{{ successRateText }}</dd></div>
           </dl>
         </div>
       </section>
@@ -288,7 +290,7 @@ onMounted(() => {
             <Avatar :name="String(a.who)" :size="30" />
             <div class="activity-main">
               <div class="ellipsis"><b>{{ a.who }}</b> <span class="muted">{{ a.target }}</span></div>
-              <div class="faint mono-time">{{ a.time }}</div>
+              <div class="faint mono-time">{{ formatLocalDateTime(a.time) }}</div>
             </div>
             <Tag :tone="a.tint === 'ok' ? 'ok' : 'danger'" dot>{{ a.tint === 'ok' ? '成功' : '失败' }}</Tag>
           </div>
