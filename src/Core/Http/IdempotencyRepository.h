@@ -48,7 +48,7 @@ namespace EdgePulse::Web
     struct IdempotencyBeginResult
     {
         IdempotencyState  state{IdempotencyState::Started}; ///< 本次占位的结局
-        IdempotencyReplay replay;                           ///< Replay 时的首次响应
+        IdempotencyReplay replay{};                         ///< Replay 时的首次响应
     };
 
     /**

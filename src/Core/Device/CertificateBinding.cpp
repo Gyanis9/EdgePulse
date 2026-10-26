@@ -76,7 +76,7 @@ namespace EdgePulse::Device
         {
             return std::nullopt;
         }
-        char buffer[32]{};
+        char buffer[64]{};
         std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", expires.tm_year + 1900, expires.tm_mon + 1, expires.tm_mday, expires.tm_hour, expires.tm_min,
                       expires.tm_sec);
         return std::string{buffer};

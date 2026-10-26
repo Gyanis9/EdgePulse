@@ -356,7 +356,7 @@ namespace EdgePulse::Device
             {
                 return std::unexpected("证书时间解析失败：ASN.1 时间不是可识别格式");
             }
-            char buffer[32]{};
+            char buffer[64]{};
             std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", value.tm_year + 1900, value.tm_mon + 1, value.tm_mday, value.tm_hour, value.tm_min,
                           value.tm_sec);
             return std::string{buffer};

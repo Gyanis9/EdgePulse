@@ -44,18 +44,6 @@ namespace EdgePulse::Firmware
             return point + std::chrono::seconds{seconds};
         }
 
-        [[nodiscard]] std::tm utcTime(const TimePoint point)
-        {
-            const std::time_t seconds = Clock::to_time_t(point);
-            std::tm           value{};
-#ifdef _WIN32
-            gmtime_s(&value, &seconds);
-#else
-            gmtime_r(&seconds, &value);
-#endif
-            return value;
-        }
-
         [[nodiscard]] std::optional<TimePoint> parseSqlTime(const std::string &text)
         {
             // 数据库时间统一为 YYYY-MM-DD HH:MM:SS，按定长逐位解析，避免 sscanf 的跨平台告警

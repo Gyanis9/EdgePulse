@@ -65,23 +65,23 @@ namespace EdgePulse::System
         [[nodiscard]] std::string formatDate(const std::int64_t epoch)
         {
             const std::tm        value = utcTime(epoch);
-            std::array<char, 16> buffer{};
+            std::array<char, 32> buffer{};
             std::snprintf(buffer.data(), buffer.size(), "%04d-%02d-%02d", value.tm_year + 1900, value.tm_mon + 1, value.tm_mday);
             return buffer.data();
         }
 
         [[nodiscard]] std::string formatHourLabel(const std::int64_t epoch)
         {
-            const std::tm       value = utcTime(epoch);
-            std::array<char, 8> buffer{};
+            const std::tm        value = utcTime(epoch);
+            std::array<char, 32> buffer{};
             std::snprintf(buffer.data(), buffer.size(), "%02d:00", value.tm_hour);
             return buffer.data();
         }
 
         [[nodiscard]] std::string formatDayLabel(const std::int64_t epoch)
         {
-            const std::tm       value = utcTime(epoch);
-            std::array<char, 8> buffer{};
+            const std::tm        value = utcTime(epoch);
+            std::array<char, 32> buffer{};
             std::snprintf(buffer.data(), buffer.size(), "%02d-%02d", value.tm_mon + 1, value.tm_mday);
             return buffer.data();
         }

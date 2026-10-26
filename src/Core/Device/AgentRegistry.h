@@ -55,7 +55,7 @@ namespace EdgePulse::Device
         std::int64_t tenantId{1};     ///< 节点归属租户，由注册请求的租户编码解析
 
         AsynGyanis::Core::TlsPeerIdentityPtr connectionIdentity{}; ///< 注册请求的 TLS 对端身份；非 TLS 链路为空
-        std::string                          enrollmentToken;      ///< 一次性注册/改绑令牌明文，可空
+        std::string                          enrollmentToken{};    ///< 一次性注册/改绑令牌明文，可空
     };
 
     /// 心跳后的节点状态回调；每次注册或心跳成功后都会调用，becameOnline 表示本次是否把节点拉回在线

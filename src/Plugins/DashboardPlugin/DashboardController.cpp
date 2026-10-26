@@ -52,16 +52,6 @@ namespace EdgePulse::Dashboard
             return 86400;
         }
 
-        [[nodiscard]] ConfigValue seriesJson(const std::vector<TimeBucket> &series)
-        {
-            ConfigValue array = ConfigValue::array();
-            for (const TimeBucket &bucket: series)
-            {
-                array.push_back(ConfigValue::object({{"bucket", bucket.label}, {"total", bucket.total}, {"failed", bucket.failed}}));
-            }
-            return array;
-        }
-
         [[nodiscard]] AsynGyanis::Core::Task<System::LogScope> resolveLogScope(Auth::DataScopeService *dataScopes, AsynGyanis::Core::EventLoop &loop,
                                                                                const EdgePulse::Auth::SessionRecord &session)
         {
