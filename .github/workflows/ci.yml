@@ -80,6 +80,14 @@ jobs:
     env:
       CC: gcc-14
       CXX: g++-14
+      EDGEPULSE_TEST_MYSQL_HOST: 127.0.0.1
+      EDGEPULSE_TEST_MYSQL_PORT: "3306"
+      EDGEPULSE_TEST_MYSQL_USER: root
+      EDGEPULSE_TEST_MYSQL_PASSWORD: test
+      EDGEPULSE_TEST_MYSQL_DATABASE: edgepulse_test
+      EDGEPULSE_TEST_REDIS_HOST: 127.0.0.1
+      EDGEPULSE_TEST_REDIS_PORT: "6379"
+      EDGEPULSE_TEST_REDIS_PASSWORD: ""
     services:
       mysql:
         image: mysql:8.4
@@ -96,15 +104,6 @@ jobs:
         options: >-
           --health-cmd="redis-cli ping"
           --health-interval=5s --health-timeout=5s --health-retries=30
-    env:
-      EDGEPULSE_TEST_MYSQL_HOST: 127.0.0.1
-      EDGEPULSE_TEST_MYSQL_PORT: "3306"
-      EDGEPULSE_TEST_MYSQL_USER: root
-      EDGEPULSE_TEST_MYSQL_PASSWORD: test
-      EDGEPULSE_TEST_MYSQL_DATABASE: edgepulse_test
-      EDGEPULSE_TEST_REDIS_HOST: 127.0.0.1
-      EDGEPULSE_TEST_REDIS_PORT: "6379"
-      EDGEPULSE_TEST_REDIS_PASSWORD: ""
     steps:
       - uses: actions/checkout@v4
         with:
