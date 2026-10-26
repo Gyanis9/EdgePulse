@@ -78,12 +78,6 @@ add_library(edgepulse-core STATIC
         Telemetry/UdpTelemetryProtocol.cpp)
 add_library(EdgePulse::Core ALIAS edgepulse-core)
 
-# GCC 14 在 LeaderLease 析构内联引擎协程句柄析构时误报 maybe-uninitialized；
-# 只对这个实现文件关闭该告警，其余文件保持开启
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
-    set_source_files_properties(System/LeaderLease.cpp PROPERTIES COMPILE_OPTIONS "-Wno-maybe-uninitialized")
-endif()
-
 target_include_directories(edgepulse-core PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(edgepulse-core
         PUBLIC EdgePulse::Base
