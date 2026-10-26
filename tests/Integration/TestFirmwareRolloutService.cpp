@@ -805,8 +805,8 @@ TEST(FirmwareRolloutService, BoundsPauseAndForcePromoteReasons)
 
     const auto resumed = harness.m_runner->run(harness.m_service->resume(harness.m_runner->loop(), EdgePulse::System::TenantScope{1, false}, rolloutId, later(base, 2)));
     ASSERT_TRUE(resumed.has_value()) << (resumed.has_value() ? "" : resumed.error().message);
-    const auto forced = harness.m_runner->run(harness.m_service->forcePromote(harness.m_runner->loop(), EdgePulse::System::TenantScope{1, false}, rolloutId, longReason,
-                                                                              later(base, 3)));
+    const auto forced =
+            harness.m_runner->run(harness.m_service->forcePromote(harness.m_runner->loop(), EdgePulse::System::TenantScope{1, false}, rolloutId, longReason, later(base, 3)));
     ASSERT_TRUE(forced.has_value()) << (forced.has_value() ? "" : forced.error().message);
     aggregate = harness.aggregate(rolloutId);
     EXPECT_EQ("completed", aggregate.rollout.status);
@@ -967,6 +967,52 @@ TEST(FirmwareRolloutService, RollbackResumesRemainingTargetsAfterInterruption)
     EXPECT_EQ("rolled_back", targetOf(aggregate, second)->status);
 }
 
+// 钉住：回滚命令已绑定后门控摘要写库失败，下一拍仍要补记而不是永久丢掉派发数
+TEST(FirmwareRolloutService, RollbackGateBackfilledAfterAppendFailure)
+{
+    RolloutHarness     harness;
+    const TimePoint    base   = fakeBase();
+    const std::int64_t first  = harness.createNode("rollout-gate-retry-a");
+    const std::int64_t second = harness.createNode("rollout-gate-retry-b");
+    harness.heartbeatAt(first, "1.0.0", later(base, 1));
+    harness.heartbeatAt(second, "1.0.0", later(base, 1));
+    static_cast<void>(harness.createFirmware("1.0.0"));
+    const std::int64_t target    = harness.createFirmware("2.9.2");
+    const char        *policy    = R"({"waves":[{"size":2}],"settleSeconds":2,"observeSeconds":4,"maxWaveSeconds":30,"autoRollback":true})";
+    const std::int64_t rolloutId = harness.createRollout(target, "回滚门控补齐", policy, {first, second});
+    harness.tick(base);
+    ASSERT_EQ(2U, harness.published.size());
+    harness.completeCommand(0, "2.9.2", later(base, 2));
+    harness.completeCommand(1, "2.9.2", later(base, 2));
+    harness.raiseAlarm(second, "cpu.high", 203);
+    harness.tick(later(base, 2));
+    ASSERT_EQ("rolling_back", harness.aggregate(rolloutId).rollout.status);
+    // 回滚摘要写入失败时，命令绑定与发布仍会完成；下一拍不能因目标已带命令而跳过补记
+    harness.executeSql("CREATE TRIGGER fail_rollback_gate BEFORE UPDATE OF gate_json ON biz_firmware_rollout_wave "
+                       "WHEN NEW.gate_json LIKE '%\"rollback\":true%' BEGIN SELECT RAISE(ABORT, '门控写入失败'); END");
+    harness.tick(later(base, 3));
+    auto aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolling_back", aggregate.rollout.status);
+    ASSERT_EQ(4U, harness.published.size());
+    EXPECT_EQ(std::string::npos, aggregate.waves[0].gateJson.find("\"rollback\":true"));
+
+    harness.dropTrigger("fail_rollback_gate");
+    harness.tick(later(base, 4));
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolling_back", aggregate.rollout.status);
+    EXPECT_NE(std::string::npos, aggregate.waves[0].gateJson.find("\"rollback\":true"));
+    EXPECT_NE(std::string::npos, aggregate.waves[0].gateJson.find("\"issued\":2"));
+
+    harness.completeCommand(2, "1.0.0", later(base, 5));
+    harness.completeCommand(3, "1.0.0", later(base, 5));
+    harness.tick(later(base, 6));
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("rolled_back", aggregate.rollout.status);
+    EXPECT_EQ("rolled_back", targetOf(aggregate, first)->status);
+    EXPECT_EQ("rolled_back", targetOf(aggregate, second)->status);
+    EXPECT_NE(std::string::npos, aggregate.waves[0].gateJson.find("\"issued\":2"));
+}
+
 // 钉住：进程重启后从同一数据库恢复回滚派发，未确认的目标不会被跳过
 TEST(FirmwareRolloutService, RollbackResumesAfterServiceRestart)
 {
@@ -1117,8 +1163,8 @@ TEST(FirmwareRolloutService, OnlyLeaderTickDispatches)
 // 钉住：候选窗口按游标轮转，二十五个同时活动的发布都能在后续拍里被推进
 TEST(FirmwareRolloutService, RotatesDueWindowAcrossManyActiveRollouts)
 {
-    RolloutHarness  harness(false, 10);
-    const TimePoint base = fakeBase();
+    RolloutHarness     harness(false, 10);
+    const TimePoint    base       = fakeBase();
     const std::int64_t firmwareId = harness.createFirmware("2.9.4");
 
     std::vector<std::int64_t> nodeIds;
@@ -1521,9 +1567,9 @@ TEST(FirmwareRolloutService, TwoWaveCanaryRollbackCoversPassedWave)
     const std::int64_t second = harness.createNode("rollout-two-wave-b");
     harness.heartbeatAt(first, "0.9.0", later(base, 1));
     harness.heartbeatAt(second, "0.9.0", later(base, 1));
-    const std::int64_t previous = harness.createFirmware("0.9.0");
-    const std::int64_t target   = harness.createFirmware("3.0.1");
-    const char        *policy   = R"({"waves":[{"size":1},{"size":1}],"settleSeconds":2,"observeSeconds":4,"maxWaveSeconds":30,"autoRollback":true})";
+    const std::int64_t previous  = harness.createFirmware("0.9.0");
+    const std::int64_t target    = harness.createFirmware("3.0.1");
+    const char        *policy    = R"({"waves":[{"size":1},{"size":1}],"settleSeconds":2,"observeSeconds":4,"maxWaveSeconds":30,"autoRollback":true})";
     const std::int64_t rolloutId = harness.createRollout(target, "两波回滚", policy, {first, second});
     harness.tick(base);
     ASSERT_EQ(1U, harness.published.size());
@@ -1565,9 +1611,9 @@ TEST(FirmwareRolloutService, CanaryRollbackCoversWholeRolloutAndSkipsNeverDispat
     {
         harness.heartbeatAt(nodeId, "0.9.0", later(base, 1));
     }
-    const std::int64_t previous = harness.createFirmware("0.9.0");
-    const std::int64_t target   = harness.createFirmware("3.0.0");
-    const char        *policy   = R"({"waves":[{"size":1},{"size":2},{"size":1}],"settleSeconds":2,"observeSeconds":4,
+    const std::int64_t previous  = harness.createFirmware("0.9.0");
+    const std::int64_t target    = harness.createFirmware("3.0.0");
+    const char        *policy    = R"({"waves":[{"size":1},{"size":2},{"size":1}],"settleSeconds":2,"observeSeconds":4,
         "maxWaveSeconds":30,"autoRollback":true})";
     const std::int64_t rolloutId = harness.createRollout(target, "两波金丝雀", policy, {first, second, third, fourth});
     EXPECT_EQ(previous, targetOf(harness.aggregate(rolloutId), first)->previousFirmwareId);
@@ -1689,8 +1735,8 @@ TEST(FirmwareRolloutService, ReusesInstallingTaskWhenTargetWriteWasLost)
     const std::int64_t rolloutId  = harness.createRollout(firmwareId, "安装中重启", kSinglePolicy, {nodeId});
     harness.tick(base);
     ASSERT_EQ(1U, harness.published.size());
-    const auto         first        = harness.aggregate(rolloutId);
-    const auto        *firstTarget  = targetOf(first, nodeId);
+    const auto  first       = harness.aggregate(rolloutId);
+    const auto *firstTarget = targetOf(first, nodeId);
     ASSERT_NE(nullptr, firstTarget);
     const std::int64_t taskId    = firstTarget->taskId;
     const std::int64_t commandId = firstTarget->commandId;
@@ -1704,7 +1750,7 @@ TEST(FirmwareRolloutService, ReusesInstallingTaskWhenTargetWriteWasLost)
 
     harness.tick(later(base, 1));
     EXPECT_EQ(1U, harness.published.size()) << "已有 installing 任务时不能再发布第二条命令";
-    const auto repaired = harness.aggregate(rolloutId);
+    const auto  repaired       = harness.aggregate(rolloutId);
     const auto *repairedTarget = targetOf(repaired, nodeId);
     ASSERT_NE(nullptr, repairedTarget);
     EXPECT_EQ("installing", repairedTarget->status);
@@ -1726,8 +1772,8 @@ TEST(FirmwareRolloutService, ReusesInstalledTaskWhenTargetWriteWasLost)
     const std::int64_t rolloutId  = harness.createRollout(firmwareId, "安装完成回写丢失", kSinglePolicy, {nodeId});
     harness.tick(base);
     ASSERT_EQ(1U, harness.published.size());
-    const auto         first       = harness.aggregate(rolloutId);
-    const auto        *firstTarget = targetOf(first, nodeId);
+    const auto  first       = harness.aggregate(rolloutId);
+    const auto *firstTarget = targetOf(first, nodeId);
     ASSERT_NE(nullptr, firstTarget);
     const std::int64_t taskId    = firstTarget->taskId;
     const std::int64_t commandId = firstTarget->commandId;
@@ -1797,6 +1843,36 @@ TEST(FirmwareRolloutService, OfflineDuringInstallFailsGate)
     EXPECT_NE(std::string::npos, targetOf(aggregate, nodeId)->healthJson.find("离线"));
 }
 
+// 钉住：在线节点的最新心跳略早于沉降边界时，观察窗口内应继续等待而不是立即判失败
+TEST(FirmwareRolloutService, OnlineNodeWithHeartbeatBeforeSettleWaitsForObserveEnd)
+{
+    RolloutHarness     harness;
+    const TimePoint    base       = fakeBase();
+    const std::int64_t nodeId     = harness.createNode("rollout-stale-heartbeat");
+    const std::int64_t firmwareId = harness.createFirmware("3.1.9");
+    const std::int64_t rolloutId  = harness.createRollout(firmwareId, "沉降边界心跳", kSinglePolicy, {nodeId});
+    harness.tick(base);
+    ASSERT_EQ(1U, harness.published.size());
+    // 安装确认与心跳都发生在沉降窗口内，窗口结束时心跳还没有覆盖边界
+    harness.completeCommand(0, "3.1.9", later(base, 1));
+    harness.insertTelemetryAt(nodeId, later(base, 2), later(base, 2));
+    harness.tick(later(base, 2));
+    auto aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("running", aggregate.rollout.status);
+    ASSERT_NE(nullptr, targetOf(aggregate, nodeId));
+    EXPECT_EQ("installing", targetOf(aggregate, nodeId)->status);
+    const std::string waitingHealth = targetOf(aggregate, nodeId)->healthJson;
+    EXPECT_NE(std::string::npos, waitingHealth.find("心跳尚未覆盖观察窗口")) << waitingHealth;
+
+    harness.heartbeatAt(nodeId, "3.1.9", later(base, 3));
+    harness.insertTelemetryAt(nodeId, later(base, 3), later(base, 3));
+    // 观察窗口结束才宣布通过，覆盖窗口内出现的迟到失败
+    harness.tick(later(base, 4));
+    aggregate = harness.aggregate(rolloutId);
+    EXPECT_EQ("completed", aggregate.rollout.status);
+    EXPECT_EQ("healthy", targetOf(aggregate, nodeId)->status);
+}
+
 // 钉住：安装尚未确认也需要评估节点状态；离线目标在观察窗口结束判失败，不再悬在 installing
 TEST(FirmwareRolloutService, GateFailsOfflineBeforeInstallAtObserveEnd)
 {
@@ -1827,8 +1903,8 @@ TEST(FirmwareRolloutService, GateFailsOfflineBeforeInstallAtObserveEnd)
 TEST(FirmwareRolloutService, GateFailsDeletedNodeAfterSettle)
 {
     RolloutHarness     harness;
-    const TimePoint    base       = fakeBase();
-    const std::int64_t nodeId     = harness.createNode("rollout-deleted-before-install");
+    const TimePoint    base   = fakeBase();
+    const std::int64_t nodeId = harness.createNode("rollout-deleted-before-install");
     harness.heartbeatAt(nodeId, "0.9.0", later(base, 1));
     const std::int64_t firmwareId = harness.createFirmware("3.2.1");
     const std::int64_t rolloutId  = harness.createRollout(firmwareId, "安装前删除", kSinglePolicy, {nodeId});
