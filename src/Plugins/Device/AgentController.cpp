@@ -1,4 +1,4 @@
-#include "Plugins/DevicePlugin/AgentController.h"
+#include "Plugins/Device/AgentController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
@@ -9,7 +9,7 @@
 #include "Core/Device/AgentRegistry.h"
 #include "Core/Device/NodeConfigRepository.h"
 #include "Core/System/TenantRepository.h"
-#include "Plugins/DevicePlugin/NodeJson.h"
+#include "Plugins/Device/NodeJson.h"
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
 #include "Net/Http/Routing/Router.h"

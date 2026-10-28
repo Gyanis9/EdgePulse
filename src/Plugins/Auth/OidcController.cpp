@@ -1,4 +1,4 @@
-#include "Plugins/AuthPlugin/OidcController.h"
+#include "Plugins/Auth/OidcController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "Plugins/CommandPlugin/CommandController.h"
+#include "Plugins/Command/CommandController.h"
 
 #include <cstddef>
 #include <memory>

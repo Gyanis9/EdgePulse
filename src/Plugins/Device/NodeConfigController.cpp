@@ -1,4 +1,4 @@
-#include "Plugins/DevicePlugin/NodeConfigController.h"
+#include "Plugins/Device/NodeConfigController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

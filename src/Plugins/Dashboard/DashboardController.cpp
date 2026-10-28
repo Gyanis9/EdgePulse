@@ -1,4 +1,4 @@
-#include "Plugins/DashboardPlugin/DashboardController.h"
+#include "Plugins/Dashboard/DashboardController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/QueryParameters.h"

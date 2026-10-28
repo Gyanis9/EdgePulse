@@ -13,8 +13,8 @@
 #include "Net/Http/Message/HttpRequest.h"
 #include "Net/Http/Message/HttpResponse.h"
 #include "Net/Http/Routing/Router.h"
-#include "Plugins/AuthPlugin/AuthController.h"
-#include "Plugins/SystemPlugin/ApiTokenController.h"
+#include "Plugins/Auth/AuthController.h"
+#include "Plugins/System/ApiTokenController.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
 

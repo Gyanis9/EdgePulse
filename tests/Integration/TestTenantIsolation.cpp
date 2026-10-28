@@ -17,7 +17,7 @@
 #include "Core/System/TenantRepository.h"
 #include "Core/System/UserRepository.h"
 #include "Core/Telemetry/TelemetryRepository.h"
-#include "Plugins/SystemPlugin/SystemController.h"
+#include "Plugins/System/SystemController.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 #include "TestSupport/HttpClientHarness.h"

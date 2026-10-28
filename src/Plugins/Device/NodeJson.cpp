@@ -1,4 +1,4 @@
-#include "Plugins/DevicePlugin/NodeJson.h"
+#include "Plugins/Device/NodeJson.h"
 
 #include <optional>
 #include <utility>

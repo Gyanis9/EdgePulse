@@ -1,4 +1,4 @@
-#include "Plugins/SystemPlugin/NotificationController.h"
+#include "Plugins/System/NotificationController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

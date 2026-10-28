@@ -1,24 +1,24 @@
 add_library(edgepulse-plugins STATIC
-        AlarmPlugin/AlarmController.cpp
-        AuthPlugin/AuthController.cpp
-        AuthPlugin/MfaController.cpp
-        AuthPlugin/OidcController.cpp
-        CommandPlugin/CommandController.cpp
-        DashboardPlugin/DashboardController.cpp
-        DevicePlugin/AgentController.cpp
-        DevicePlugin/DeviceController.cpp
-        DevicePlugin/EnrollmentController.cpp
-        DevicePlugin/NodeConfigController.cpp
-        DevicePlugin/NodeGroupController.cpp
-        DevicePlugin/NodeJson.cpp
-        FirmwarePlugin/FirmwareController.cpp
-        MonitorPlugin/MonitorController.cpp
-        OpsPlugin/OpsController.cpp
-        TelemetryPlugin/TelemetryController.cpp
-        SystemPlugin/SystemController.cpp
-        SystemPlugin/TenantController.cpp
-        SystemPlugin/ApiTokenController.cpp
-        SystemPlugin/NotificationController.cpp)
+        Alarm/AlarmController.cpp
+        Auth/AuthController.cpp
+        Auth/MfaController.cpp
+        Auth/OidcController.cpp
+        Command/CommandController.cpp
+        Dashboard/DashboardController.cpp
+        Device/AgentController.cpp
+        Device/DeviceController.cpp
+        Device/EnrollmentController.cpp
+        Device/NodeConfigController.cpp
+        Device/NodeGroupController.cpp
+        Device/NodeJson.cpp
+        Firmware/FirmwareController.cpp
+        Monitor/MonitorController.cpp
+        Ops/OpsController.cpp
+        Telemetry/TelemetryController.cpp
+        System/SystemController.cpp
+        System/TenantController.cpp
+        System/ApiTokenController.cpp
+        System/NotificationController.cpp)
 add_library(EdgePulse::Plugins ALIAS edgepulse-plugins)
 
 target_include_directories(edgepulse-plugins PUBLIC ${PROJECT_SOURCE_DIR}/src)

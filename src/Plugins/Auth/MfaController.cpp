@@ -1,4 +1,4 @@
-#include "Plugins/AuthPlugin/MfaController.h"
+#include "Plugins/Auth/MfaController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

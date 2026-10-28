@@ -1,4 +1,4 @@
-#include "Plugins/SystemPlugin/TenantController.h"
+#include "Plugins/System/TenantController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

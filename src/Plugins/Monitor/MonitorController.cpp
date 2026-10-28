@@ -1,4 +1,4 @@
-#include "Plugins/MonitorPlugin/MonitorController.h"
+#include "Plugins/Monitor/MonitorController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/CsvWriter.h"

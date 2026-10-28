@@ -1,4 +1,4 @@
-#include "Plugins/SystemPlugin/ApiTokenController.h"
+#include "Plugins/System/ApiTokenController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

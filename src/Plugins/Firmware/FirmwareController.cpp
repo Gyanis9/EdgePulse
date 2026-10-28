@@ -1,4 +1,4 @@
-#include "Plugins/FirmwarePlugin/FirmwareController.h"
+#include "Plugins/Firmware/FirmwareController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

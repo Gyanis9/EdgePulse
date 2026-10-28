@@ -1,11 +1,11 @@
-#include "Plugins/DevicePlugin/DeviceController.h"
+#include "Plugins/Device/DeviceController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"
 #include "Base/Api/Pagination.h"
 #include "Base/Api/QueryParameters.h"
 #include "Base/Log/LogMacros.h"
-#include "Plugins/DevicePlugin/NodeJson.h"
+#include "Plugins/Device/NodeJson.h"
 #include "Core/Command/AgentCommandDelivery.h"
 #include "Core/Device/NodeConfigRepository.h"
 #include "Core/Device/NodeLifecycleService.h"

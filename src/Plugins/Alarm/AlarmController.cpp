@@ -1,4 +1,4 @@
-#include "Plugins/AlarmPlugin/AlarmController.h"
+#include "Plugins/Alarm/AlarmController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

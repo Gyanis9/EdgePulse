@@ -1,4 +1,4 @@
-#include "Plugins/AuthPlugin/AuthController.h"
+#include "Plugins/Auth/AuthController.h"
 
 #include "Core/Auth/AuthService.h"
 #include "Core/Auth/CaptchaService.h"

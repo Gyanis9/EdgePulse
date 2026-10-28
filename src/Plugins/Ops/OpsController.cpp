@@ -1,4 +1,4 @@
-#include "Plugins/OpsPlugin/OpsController.h"
+#include "Plugins/Ops/OpsController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

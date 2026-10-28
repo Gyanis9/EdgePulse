@@ -1,4 +1,4 @@
-#include "Plugins/DevicePlugin/EnrollmentController.h"
+#include "Plugins/Device/EnrollmentController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

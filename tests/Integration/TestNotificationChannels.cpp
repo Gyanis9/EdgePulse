@@ -5,7 +5,7 @@
 #include "Core/Notification/NotificationRepository.h"
 #include "Core/Notification/NotificationService.h"
 #include "Core/Telemetry/TelemetryModels.h"
-#include "Plugins/SystemPlugin/NotificationController.h"
+#include "Plugins/System/NotificationController.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 #include "TestSupport/HttpClientHarness.h"

@@ -1,4 +1,4 @@
-#include "Plugins/SystemPlugin/SystemController.h"
+#include "Plugins/System/SystemController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/CsvWriter.h"

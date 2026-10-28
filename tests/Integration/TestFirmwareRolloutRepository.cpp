@@ -3,7 +3,7 @@
 #include "Core/Device/NodeRepository.h"
 #include "Core/Firmware/FirmwareRepository.h"
 #include "Core/Firmware/FirmwareRolloutRepository.h"
-#include "Plugins/DevicePlugin/NodeJson.h"
+#include "Plugins/Device/NodeJson.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/EventLoopRunner.h"
 

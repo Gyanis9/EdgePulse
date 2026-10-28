@@ -1,4 +1,4 @@
-#include "Plugins/CommandPlugin/CommandController.h"
+#include "Plugins/Command/CommandController.h"
 
 #include "Base/Api/ApiResponse.h"
 #include "Base/Api/ErrorCatalog.h"

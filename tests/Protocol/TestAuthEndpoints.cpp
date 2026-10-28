@@ -1,5 +1,5 @@
-#include "Plugins/AuthPlugin/AuthController.h"
-#include "Plugins/AuthPlugin/OidcController.h"
+#include "Plugins/Auth/AuthController.h"
+#include "Plugins/Auth/OidcController.h"
 #include "Base/Config/ConfigValue.h"
 #include "TestSupport/AuthTestContext.h"
 #include "TestSupport/HttpClientHarness.h"
